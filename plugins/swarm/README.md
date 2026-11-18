@@ -4,6 +4,13 @@ A Claude Code plugin that runs a team of named agents on one task. The agents sp
 
 Use it when a task divides cleanly across separate files, packages, test suites or questions. Every worker is its own agent, so a swarm uses quota much faster than one conversation.
 
+## Install
+
+```
+claude plugin marketplace add marspater/claude-swarm
+claude plugin install swarm@swarm-local
+```
+
 ## Use
 
 ```
@@ -125,7 +132,7 @@ The plugin and its guidance were written for this project. The RLM pattern follo
 | Models | Defaults: coordinator Opus at high effort, workers Sonnet at medium, verifier Opus at high. Name another model or effort in the prompt for any worker, all workers, or the verifier |
 | Swarm pane | **Swarm: The Board** in Desktop, or `/swarm-board` in the terminal |
 
-The `.swarm` folder ignores itself in git, unless it already holds a `.gitignore` of the project's own, which is left as it is. Verification leaves run data out of the source fingerprint either way.
+The `.swarm` folder ignores itself in git, unless it already holds a `.gitignore` of the project's own, which is left as it is. Verification leaves the project's own `.swarm` folder out of the source fingerprint either way. A folder named `.swarm` anywhere else in the repository is source like any other.
 
 ## Limits
 
@@ -145,7 +152,7 @@ The `.swarm` folder ignores itself in git, unless it already holds a `.gitignore
 - The project is the session's working directory, with the run stored in `<project>/.swarm/<run>`. Isolated verification requires Git. Shared verification can fingerprint a project without Git.
 - `board.py` and `verify.py` need Python 3.8 or later and a POSIX system (they lock with `fcntl`), and use the standard library only. `verify.py` needs Git for isolated runs.
 - Past about 3 MB of posts the pane reads only the newest part of the board; `board.py` itself always has all of it.
-- Background workers run under this session's permission settings. If a worker stops on a permission prompt for the board command, allow `Bash(python3 */skills/swarm/scripts/board.py *)` in your settings, and `Bash(python3 */skills/swarm/scripts/verify.py *)` for the verifier. A designer working on an Apple target also reads `skills/design-craft/references/apple-design.md` from the plugin folder, which is outside the project.
+- Background workers run under this session's permission settings. If a worker stops on a permission prompt for the board command, allow `Bash(python3 */skills/swarm/scripts/board.py *)` in your settings, and `Bash(python3 */skills/swarm/scripts/verify.py *)` for the verifier. A designer working on an Apple target also reads the files in `skills/design-craft/references/` from the plugin folder, which is outside the project.
 - The pane is a hooks module, an early-access Claude Code API. The skill, the agents and the board script work without it.
 
 ## Develop

@@ -42,19 +42,30 @@ def toplevel(project):
         raise ValueError(f"git could not read {project}: {error}") from None
 
 
-def source_digest(project):
+def repository(project):
+    """The repository root and the project's own .swarm folder as Git names it from there, or None outside one."""
     top = toplevel(project)
     if top is None:
+        return None
+    root = Path(os.fsdecode(top.rstrip(b"\n"))).resolve()
+    return root, os.fsencode((project.resolve() / ".swarm").relative_to(root).as_posix()).split(b"/")
+
+
+def source_digest(project, nested=False):
+    """Fingerprint the sources. The project's own .swarm folder holds run data and is left out; a folder of that
+    name anywhere else, a nested repository's included, is the user's and counts as source."""
+    found = repository(project)
+    if found is None:
         root = project
         files = (os.fsencode(path.relative_to(root)) for path in root.rglob("*")
-                 if not {".swarm", ".git"}.intersection(path.relative_to(root).parts)
+                 if ".git" not in (parts := path.relative_to(root).parts) and (nested or parts[0] != ".swarm")
                  and (path.is_symlink() or not path.is_dir()))
         head = b"non-git"
     else:
-        root = Path(os.fsdecode(top.rstrip(b"\n")))
+        root, run_data = found
         # Run data is never source, whatever the project's .swarm/.gitignore says.
-        files = (file for file in git(root, "ls-files", "-z", "--cached", "--others",
-                                      "--exclude-standard").split(b"\0") if file and not is_run_data(file))
+        files = (file for file in git(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard").split(b"\0")
+                 if file and (nested or not is_run_data(file, run_data)))
         head = git(root, "rev-parse", "HEAD", optional=True) or b"unborn"
     digest = hashlib.sha256(head + b"\0")
     for name in sorted(set(files)):
@@ -84,8 +95,8 @@ def source_digest(project):
                     raise ValueError(f"source changed while fingerprinting {path}")
                 digest.update(content.digest())
         elif stat.S_ISDIR(mode) and (path / ".git").exists():
-            digest.update(b"repo\0" + bytes.fromhex(source_digest(path)))
-        elif stat.S_ISDIR(mode) and top is not None and (link := git(root, "rev-parse", "--verify", "-q", ":" + os.fsdecode(name), optional=True)):
+            digest.update(b"repo\0" + bytes.fromhex(source_digest(path, nested=True)))
+        elif stat.S_ISDIR(mode) and found is not None and (link := git(root, "rev-parse", "--verify", "-q", ":" + os.fsdecode(name), optional=True)):
             # A submodule that is not checked out, as in a fresh worktree: its recorded commit stands for it.
             digest.update(b"gitlink\0" + link.strip())
         else:
@@ -160,13 +171,14 @@ def check_inputs(run, candidate):
         raise ValueError("source files changed; prepare and test a new candidate")
 
 
-def is_run_data(name):
-    """A path under a .swarm folder: a path component of exactly that name, not a name that ends with it."""
-    return b".swarm" in name.rstrip(b"/").split(b"/")
+def is_run_data(name, run_data):
+    """A path, as Git names it from the repository root, that is the project's own .swarm folder or lies under it."""
+    return name.rstrip(b"/").split(b"/")[:len(run_data)] == run_data
 
 
 def pending_changes(project):
     """Paths git reports as changed or untracked, other than Swarm's own run data."""
+    _, run_data = repository(project)
     entries = git(project, "status", "--porcelain", "-z", "--untracked-files=all").split(b"\0")
     pending, index = [], 0
     while index < len(entries):
@@ -178,7 +190,7 @@ def pending_changes(project):
         if any(letter in entry[:2] for letter in (b"R", b"C")):
             paths.append(entries[index])  # the other side of a rename can cross the .swarm boundary
             index += 1
-        pending.extend(path for path in paths if not is_run_data(path))
+        pending.extend(path for path in paths if not is_run_data(path, run_data))
     return pending
 
 

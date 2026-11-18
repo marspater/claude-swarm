@@ -29,7 +29,7 @@ The verifier owns the independent check. It re-renders and measures your deliver
 
 ## Your rules
 
-Your role skill `swarm:design-craft` is loaded when you start. Its folder holds one more file, `references/apple-design.md`: the rules for native macOS, iOS, and iPadOS design.
+Your role skill `swarm:design-craft` is loaded when you start. Its folder holds two more files: `references/apple-design.md`, the rules for native macOS, iOS, and iPadOS design, and `references/liquid-glass.md`, the glass implementation detail that `apple-design.md` sends you to when the work needs it.
 
 - When your brief's `Platform:` names macOS, iOS, or iPadOS, Read `references/apple-design.md` before you design, and let its rules win where the two conflict. For web, marketing, or any other target, leave it unread.
 - The path: your BOARD command names the board script, `<plugin>/skills/swarm/scripts/board.py`. The file is `<plugin>/skills/design-craft/references/apple-design.md`.

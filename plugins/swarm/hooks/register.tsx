@@ -802,7 +802,10 @@ export const register: Register = on => {
     } catch (error) {
       return { deny: `The board tool failed (${error instanceof Error ? error.message : String(error)}). End your turn and report this sentence to the coordinator.` }
     }
-  })
+  }).catch(() => (
+    // The hook is the whole tool: one that ran out of time is refused in words, never left unanswered.
+    { deny: 'The board tool ran out of time. End your turn and report this sentence to the coordinator.' }
+  ))
 
   on('tool.call', async ($, e, next) => {
     // A tool call in the main conversation means the coordinator is mid-turn, even when this

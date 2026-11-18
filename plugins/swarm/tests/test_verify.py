@@ -96,6 +96,15 @@ def scenario():
         (lookalike / "note").unlink()
         lookalike.rmdir()
         (project / "docs").rmdir()
+        # so is a .swarm folder that is not the project's own: an untracked file in it is a pending change
+        foreign = project / "docs" / ".swarm" / "note"
+        foreign.parent.mkdir(parents=True)
+        foreign.write_text("mine")
+        gate("accept", good["candidate"], ok=False)
+        assert git("rev-parse", "HEAD") == base and foreign.read_text() == "mine"
+        foreign.unlink()
+        foreign.parent.rmdir()
+        (project / "docs").rmdir()
         gate("accept", good["candidate"])
         gate("accept", good["candidate"])
         assert git("rev-parse", "HEAD") == good["commit"]
@@ -109,6 +118,16 @@ def scenario():
                                         capture_output=True, text=True).stderr
         git("checkout", "--", "left")
         post("post", "verifier", "@coordinator " + line)
+
+        # a .swarm folder that is not the project's own is source: it is fingerprinted and blocks acceptance
+        fixture = project / "fixtures" / ".swarm" / "sample"
+        fixture.parent.mkdir(parents=True)
+        fixture.write_text("fixture")
+        gate("accept", good["candidate"], ok=False)
+        fixture.unlink()
+        fixture.parent.rmdir()
+        fixture.parent.parent.rmdir()
+        gate("accept", good["candidate"])
 
         package = project / "package"
         nested_run = run(sys.executable, SCRIPTS / "board.py", package / ".swarm" / "demo", "init", "Nested project")
