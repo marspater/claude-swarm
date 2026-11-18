@@ -1,0 +1,6 @@
+.DS_Store
+__pycache__/
+*.pyc
+.swarm/
+*.zip
+node_modules/

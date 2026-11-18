@@ -1,0 +1,548 @@
+#!/usr/bin/env python3
+"""Check for board.py: python3 test_board.py"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+
+BOARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "board.py")
+
+
+def saved(d):
+    with open(os.path.join(d, "members.json"), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def run(d, *args, stdin=None, ok=True):
+    r = subprocess.run([sys.executable, BOARD, d, *args], input=stdin, capture_output=True, text=True)
+    assert (r.returncode == 0) == ok, (args, r.stdout, r.stderr)
+    return r.stdout
+
+
+def woken(d):
+    return [line.split()[0] for line in run(d, "wake").splitlines()]
+
+
+def scenario():
+    with tempfile.TemporaryDirectory() as tmp:
+        name = os.path.join(tmp, ".swarm", "demo")
+        # every init is its own run, even under one name in one second
+        d = run(name, "init", "Demo", "swarm").strip()
+        other = run(name, "init", "Second").strip()
+        assert d != other and os.path.dirname(d) == os.path.dirname(other)
+        run(other, "post", "coordinator", "hello")
+        assert run(d, "read", "coordinator") == "no new posts\n"  # the first run saw nothing of it
+        run(name, "read", "coordinator", ok=False)  # the bare name is no run
+        run(os.path.join(tmp, "elsewhere"), "init", "x", ok=False)  # must not drop a .gitignore outside .swarm
+        assert not os.path.exists(os.path.join(tmp, ".gitignore"))
+        for member, group in [("parser", "-"), ("fix-1", "fix"), ("fix-2", "fix"), ("verifier", "-")]:
+            run(d, "member", member, "group=" + group, "id=agent-" + member)
+
+        # 20 posts at once: seq 1..20, each exactly once, every line whole JSON
+        with ThreadPoolExecutor(20) as pool:
+            list(pool.map(lambda i: run(d, "post", "parser", stdin="note %d\n`$HOME` $(x) 'q'\n" % i), range(20)))
+        with open(os.path.join(d, "board.jsonl")) as f:
+            assert sorted(json.loads(line)["seq"] for line in f) == list(range(1, 21))
+
+        # routing: name, group and @all expand; the sender, unknown names and emails are not woken
+        run(d, "read", "verifier")
+        assert "-> @verifier\n" in run(d, "post", "parser", stdin="@Verifier, please check. cc a@b.com and @Override")
+        assert run(d, "wake").split()[:2] == ["@verifier", "agent-verifier"]
+        assert woken(d) == ["@verifier"]  # inspecting a wake leaves it pending
+        first_claim = run(d, "claim", "verifier", "agent-verifier", "21").strip()
+        assert first_claim
+        assert not run(d, "claim", "verifier", "agent-verifier", "21").strip()
+        run(d, "post", "parser", "@verifier one more thing")
+        run(d, "woke", "verifier", "21", first_claim)
+        assert woken(d) == ["@verifier"]  # acknowledging #21 cannot consume #22
+        assert not run(d, "claim", "verifier", "wrong-address", "22").strip()
+        claim = run(d, "claim", "verifier", "agent-verifier", "22").strip()
+        assert claim
+        run(d, "woke", "verifier", "22", first_claim, ok=False)
+        assert not run(d, "claim", "verifier", "agent-verifier", "22").strip()
+        assert "* #21" in run(d, "read", "verifier")
+        run(d, "post", "fix-1", "@fix status?")
+        claim = run(d, "claim", "fix-2", "agent-fix-2", "23").strip()
+        run(d, "woke", "fix-2", "23", claim)
+        assert woken(d) == []
+        run(d, "member", "fix-2", "killed=1")
+        run(d, "post", "verifier", "@all done")
+        assert woken(d) == ["@parser", "@fix-1"]
+        run(d, "member", "late")
+        run(d, "post", "coordinator", "@late BRIEF")
+        assert woken(d) == ["@parser", "@fix-1", "@late"]  # not spawned yet: listed until it has an id
+
+        # history: a removed member keeps its edges, and `show` gives a replacement the old posts
+        status = run(d, "status")
+        assert "@fix-1 -> @fix-2 x1" in status and "@verifier -> @fix-2" not in status
+        assert "#23" in run(d, "show", "fix-2") and "#24" not in run(d, "show", "fix-2")
+        assert "no new posts" in run(d, "read", "late").splitlines()[-1] or "#25" in run(d, "show", "late")
+        run(d, "post", "nobody", "hi", ok=False)
+        run(d, "post", "parser", "@coordinator @verifier READY parser. all done", ok=False)  # must use the ready command
+        run(d, "post", "parser", "@coordinator not READY yet, one test left")
+        binding = "a" * 64
+        run(d, "bind", binding)
+        run(d, "bind", "b" * 64, ok=False)
+        assert run(os.path.dirname(d), "restore", binding).strip() == d
+        assert not run(os.path.dirname(d), "restore", "b" * 64).strip()
+        run(d, "member", "late", "depends=parser")
+        run(d, "member", "parser", "depends=late", ok=False)
+        run(d, "member", "parser", "depends=missing", ok=False)
+        run(d, "ready", "late", stdin="blocked", ok=False)
+        run(d, "ready", "parser", stdin="@late ready to use")
+        run(d, "ready", "late", stdin="done")
+        run(d, "revise", "parser", "changing the contract")
+        run(d, "ready", "late", stdin="blocked again", ok=False)
+        run(d, "pause", "waiting for a decision")
+        assert not run(d, "wake").strip()
+        run(d, "resume")
+        assert woken(d)
+        # a reader gets posts addressed to it in full and the rest as one line each
+        run(d, "post", "parser", stdin="@fix-1 first line for fix-1\nsecond line")
+        seen = run(d, "read", "late")
+        assert "first line for fix-1" in seen and "second line" not in seen
+        assert "second line" in run(d, "read", "fix-1")
+        run(d, "post", "parser", stdin="note to nobody\nmore")
+        assert "more" in run(d, "read", "late", "--all")
+
+        # attention: an unanswered question is listed with its post until the recipient answers the asker
+        run(d, "post", "late", "@parser which format do you emit?")
+        report = json.loads(run(d, "attention", "--json"))
+        assert [i["member"] for i in report["items"] if i["kind"] == "unread"] in ([], ["coordinator"])
+        question = [i for i in report["items"] if i["kind"] == "question"]
+        assert question and question[0]["member"] == "parser" and report["members"]["late"]["asked"] == question[0]["seq"]
+        assert report["members"]["late"]["type"] == "worker" and report["members"]["late"]["model"] == "sonnet"
+        run(d, "post", "parser", "@late JSON lines")
+        assert not [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]
+
+        # limits: the roster cannot exceed them, and a model can be reserved for one type
+        run(d, "limit", "fable=architect", "max_workers=6")
+        run(d, "member", "probe", "profile=investigator", "writes=0", "model=fable", ok=False)  # Fable is an escalation only
+        run(d, "member", "probe", "profile=investigator", "writes=0", "model=opus", "effort=high", "owns=the retry bug")
+        run(d, "member", "design", "profile=architect", "writes=0")
+        run(d, "member", "extra", ok=False)  # a seventh worker
+        plan = run(d, "plan")
+        assert "@probe" in plan and "investigator" in plan and "the retry bug" in plan and "limits:" in plan
+        run(d, "limit", "bogus=1", ok=False)
+        run(d, "limit", "max_workers=2")  # a limit set below the roster is reported, and ids can still be recorded
+        run(d, "member", "probe", "id=agent-probe")
+        run(d, "member", "one-more", ok=False)
+        run(d, "limit", "max_workers=9")
+        # a designer is a profile that writes: no writes=0 is forced on it, and it runs on its own defaults
+        run(d, "member", "art", "profile=designer", "owns=assets/icons")
+        art = json.loads(run(d, "attention", "--json"))["members"]["art"]
+        assert (art["type"], art["model"], art["effort"]) == ("designer", "opus", "high")
+        assert saved(d)["members"]["art"].get("writes") != "0"
+        run(d, "member", "art", "role=verifier", ok=False)  # the profile belongs to a worker
+        run(d, "member", "art", "consult=1", ok=False)
+        run(d, "ready", "art", "a" * 40, stdin="icons drawn")  # unlike a specialist, its report may carry a commit
+        # a specialist turned designer writes again; one registered writes=0 stays read-only
+        run(d, "member", "art", "profile=architect")
+        run(d, "member", "art", "profile=designer")
+        with open(os.path.join(d, "members.json"), encoding="utf-8") as f:
+            assert json.load(f)["members"]["art"].get("writes") != "0"
+        run(d, "member", "art", "writes=0")
+        run(d, "member", "art", "profile=designer")  # naming the profile again does not undo an explicit writes=0
+        with open(os.path.join(d, "members.json"), encoding="utf-8") as f:
+            assert json.load(f)["members"]["art"].get("writes") == "0"
+        # tail: whole posts only, the newest within the byte budget; the pane reads it when the board outgrows one read
+        with open(os.path.join(d, "board.jsonl"), "rb") as f:
+            whole = f.read()
+        assert run(d, "tail").encode() == whole
+        cut = run(d, "tail", "300").encode()
+        assert 0 < len(cut) <= 300 and whole.endswith(cut) and whole[len(whole) - len(cut) - 1:len(whole) - len(cut)] == b"\n"
+        json.loads(cut.split(b"\n")[0])
+        run(d, "tail", "many", ok=False)
+        # a verification file that is not a candidate is refused, not a traceback
+        run(d, "member", "judge", "role=verifier")
+        for junk in ("null", "[]", '"text"'):
+            with open(os.path.join(d, "verification.json"), "w", encoding="utf-8") as f:
+                f.write(junk)
+            refused = subprocess.run([sys.executable, BOARD, d, "post", "judge", "@coordinator VERIFIED abc def"], capture_output=True, text=True)
+            assert refused.returncode != 0 and "Traceback" not in refused.stderr, refused.stderr
+        os.unlink(os.path.join(d, "verification.json"))
+        run(d, "member", "judge", "killed=1")
+        run(d, "member", "art", "killed=1")
+
+        # replace: the new member inherits the brief, the dependants and a pointer to the old one's posts
+        run(d, "post", "coordinator", stdin="@design BRIEF\nOwns: the storage design\nDone when: a plan is posted")
+        run(d, "member", "late", "depends=parser,design")
+        run(d, "post", "late", "@design which store should I target?")
+        out = run(d, "replace", "design", "design-2")
+        assert "now yours to answer" in run(d, "show", "design-2")
+        assert "swarm:architect" in out
+        brief = run(d, "show", "design-2")
+        assert "@design-2 BRIEF (replaces design)" in brief and "Owns: the storage design" in brief
+        status = run(d, "status")
+        assert "depends=parser,design-2" in status
+        blocked = [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "blocked"]
+        assert not blocked  # the dependant follows the replacement, so nothing waits on a removed member
+
+        # stale verification: a change reported after VERIFIED is flagged with the VERIFIED post
+        run(d, "member", "verifier", "role=verifier")
+        run(d, "post", "verifier", "@parser NOT VERIFIED: one test fails")
+        assert not [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "stale"]
+        run(d, "post", "verifier", "@coordinator VERIFIED, I ran the suite myself", ok=False)  # no candidate behind it
+        # ... and a line that merely looks right is not one: it must be the current candidate's, passed by the sender
+        line = "VERIFIED %s %s" % ("a" * 16, "b" * 64)
+        run(d, "post", "verifier", "@coordinator " + line, ok=False)
+        candidate = {"candidate": "a" * 16, "commit": None, "digest": "b" * 64}
+        def verification(**extra):
+            with open(os.path.join(d, "verification.json"), "w") as f:
+                json.dump({**candidate, **extra}, f)
+        verification()  # prepared, not passed
+        run(d, "post", "verifier", "@coordinator " + line, ok=False)
+        verification(verified_by="parser")  # passed by someone else
+        run(d, "post", "verifier", "@coordinator " + line, ok=False)
+        # a record with no sources to compare cannot be shown current, accepted or not;
+        # test_verify.py posts the lines of real candidates and covers the stale item
+        for extra in ({}, {"accepted": True}, {"accepted": True, "commit": "c" * 40}):
+            verification(verified_by="verifier", **extra)
+            run(d, "post", "verifier", "@coordinator " + line, ok=False)
+            run(d, "post", "verifier", "@coordinator VERIFIED %s %s" % ("a" * 16, "c" * 40), ok=False)
+        os.remove(os.path.join(d, "verification.json"))
+        run(d, "ready", "parser", stdin="changed again")
+
+        # --headers: a long report costs the reader one line, and is still marked read
+        run(d, "post", "parser", stdin="@coordinator summary line\n" + "detail\n" * 50)
+        assert "[unread] #" in run(d, "attention")  # reports the coordinator has not read are listed
+        brief = run(d, "read", "coordinator", "--headers")
+        assert "[unread]" not in run(d, "attention")
+        assert "summary line" in brief and "detail" not in brief
+        assert "READY | done" in brief  # a READY post shows its report's first line too
+        assert run(d, "read", "coordinator") == "no new posts\n"
+        run(d, "close")
+        assert not run(d, "wake").strip()
+        assert "(closed)" in run(d, "status")
+        # Each command starts a fresh process. Duplicate and concurrent reports
+        # must update the same run without losing turns or counting one twice.
+        budget_run = run(name, "init", "Persistent budget").strip()
+        run(budget_run, "limit", "budget=100")
+        run(budget_run, "member", "worker", "id=worker-address")
+        run(budget_run, "post", "coordinator", "@worker work")
+        actor = "a" * 64
+        reports = [("1" * 64, actor, "60"), ("1" * 64, actor, "60"),
+                   ("2" * 64, "coordinator", "40")]
+        with ThreadPoolExecutor(3) as pool:
+            accounting = list(pool.map(lambda args: json.loads(run(budget_run, "account", *args)), reports))
+        assert sum(entry["paused"] for entry in accounting) == 1
+        assert "100 of 100 tokens" in run(budget_run, "status")
+        assert not run(budget_run, "wake").strip()
+        assert not run(budget_run, "claim", "worker", "worker-address", "1").strip()
+        run(budget_run, "resume", ok=False)
+        run(budget_run, "limit", "budget=120")
+        run(budget_run, "resume")
+        assert "@worker" in run(budget_run, "wake")
+        assert not json.loads(run(budget_run, "account", "2" * 64, "coordinator", "40"))["paused"]
+        run(budget_run, "pause", "awaiting a decision")
+        assert not json.loads(run(budget_run, "account", "3" * 64, actor, "21"))["paused"]
+        assert "awaiting a decision" in run(budget_run, "attention")
+        run(budget_run, "resume", ok=False)
+        run(budget_run, "account", "bad key", actor, "1", ok=False)
+        run(budget_run, "account", "4" * 64, "raw-address", "1", ok=False)
+
+        finding_run = run(name, "init", "Investigator finding review").strip()
+        run(finding_run, "member", "explorer", "profile=explorer", "writes=0", "id=explorer")
+        run(finding_run, "member", "investigator", "profile=investigator", "writes=0", "id=investigator", "depends=explorer")
+        run(finding_run, "member", "writer", "id=writer", "depends=investigator")
+        run(finding_run, "ready", "explorer", stdin="Trace starts in refresh.")
+        run(finding_run, "read", "investigator")
+
+        assert "-> @coordinator\n" in run(finding_run, "ready", "investigator", stdin="A runtime log is still needed.")
+        assert "@writer" not in woken(finding_run)
+        run(finding_run, "ready", "writer", stdin="Still blocked.", ok=False)
+        review = json.loads(run(finding_run, "attention", "--json"))
+        assert not review["members"]["investigator"]["ready"]
+        assert review["members"]["writer"]["blocked_on"] == ["investigator"]
+        assert [(item["member"], item["seq"]) for item in review["items"] if item["kind"] == "review"] == [("investigator", 2)]
+
+        run(finding_run, "revise", "investigator", "Awaiting runtime evidence.")
+        assert "@writer" not in woken(finding_run)
+        run(finding_run, "confirm", "investigator", "2", ok=False)
+        run(finding_run, "ready", "investigator", stdin="The log confirms the retry runs twice.")
+        run(finding_run, "revise", "explorer", "Entry point changed.")
+        run(finding_run, "ready", "explorer", stdin="Mapped the corrected route.")
+        run(finding_run, "confirm", "investigator", "4", ok=False)
+        run(finding_run, "ready", "investigator", stdin="The corrected route also retries twice.")
+        run(finding_run, "confirm", "investigator", "4", ok=False)
+        assert "-> @writer\n" in run(finding_run, "confirm", "investigator", "7")
+        run(finding_run, "confirm", "investigator", "7", ok=False)
+        assert "@writer" in woken(finding_run)
+        assert "finding #7" in run(finding_run, "read", "writer")
+        run(finding_run, "ready", "writer", stdin="Verified the fix.")
+        review = json.loads(run(finding_run, "attention", "--json"))
+        assert review["members"]["investigator"]["ready"] and review["members"]["writer"]["ready"]
+        assert not [item for item in review["items"] if item["kind"] == "review"]
+        run(finding_run, "revise", "investigator", "A new trace changes the finding.")
+        assert "@writer" in woken(finding_run)
+        run(finding_run, "ready", "writer", stdin="Blocked after revision.", ok=False)
+        # an investigator starts on Opus; Fable arrives only by replacing one that failed
+        escalation = run(name, "init", "Escalation").strip()
+        run(escalation, "member", "trace", "profile=investigator", "writes=0")
+        assert "opus" in run(escalation, "plan") and "fable" not in run(escalation, "plan")
+        run(escalation, "member", "trace", "model=claude-fable-5-2", ok=False)
+        run(escalation, "replace", "trace", "trace-2", "model=fable", "effort=medium")
+        assert "fable" in run(escalation, "plan")
+
+        # adopt: a conversation that never typed a recognisable board command still gets its run,
+        # the newest open one that registers the member it is starting, and nobody else's
+        parent, key = os.path.dirname(escalation), "c" * 64
+        assert not run(parent, "adopt", key, "nobody-here", ok=False).strip()  # open runs exist, none has the name
+        assert run(parent, "adopt", key, "trace-2").strip() == escalation
+        assert run(parent, "restore", key).strip() == escalation
+        assert not run(parent, "adopt", "d" * 64, "trace-2", ok=False).strip()  # another conversation's run
+        assert run(parent, "adopt", key, "trace-2").strip() == escalation
+        run(escalation, "close")
+        assert not run(parent, "adopt", key, "trace-2", ok=False).strip()
+
+        # Nothing addressed to a member goes unseen: its own posts say what it owes a read, a wake it
+        # answered without reading is repeated, and the run does not close over unread reports.
+        kept = run(name, "init", "Attention").strip()
+        run(kept, "member", "w", "id=agent-w")
+        assert "UNREAD" not in run(kept, "post", "coordinator", "@w go")
+        run(kept, "post", "w", "@coordinator which file?")
+        assert "UNREAD: 1 post(s) address @coordinator from #2 on" in run(kept, "post", "coordinator", "note")
+        assert "has not read 1 post(s)" in subprocess.run(
+            [sys.executable, BOARD, kept, "close"], capture_output=True, text=True).stderr
+        for attempt in range(3):
+            assert woken(kept) == ["@w"]
+            run(kept, "woke", "w", "1", run(kept, "claim", "w", "agent-w", "1").strip())
+            assert woken(kept) == [] and ("[ignored]" in run(kept, "attention")) == (attempt == 2)
+            run(kept, "rearm", "60000", "agent-w")  # a turn that was already running when the wake landed
+            assert woken(kept) == []
+            run(kept, "rearm", "0", "agent-w", "other-id")  # the turn the wake started ended and #1 is still unread
+        assert woken(kept) == []  # three wakes for one post: now the coordinator's problem
+        run(kept, "retry", "w")
+        assert woken(kept) == ["@w"] and "[ignored]" not in run(kept, "attention")
+        run(kept, "read", "w")
+        run(kept, "rearm", "0", "agent-w")
+        assert woken(kept) == []
+        run(kept, "post", "coordinator", "@w again")
+        run(kept, "woke", "w", "4", run(kept, "claim", "w", "agent-w", "4").strip())
+        run(kept, "member", "w", "id=agent-w2")  # a restarted member starts with a clean wake record
+        assert woken(kept) == ["@w"] and "told" not in saved(kept)["members"]["w"]
+        run(kept, "read", "w")
+        run(kept, "read", "coordinator")
+        run(kept, "close")
+
+        # A run is adopted only when there is no doubt which one: never the wrong conversation's.
+        twin = os.path.join(tmp, "twins", ".swarm")
+        first, second = (run(os.path.join(twin, "job"), "init", t).strip() for t in ("One", "Two"))
+        with open(os.path.join(twin, ".gitignore")) as f:
+            assert f.read() == "*\n"
+        with open(os.path.join(twin, ".gitignore"), "w") as f:
+            f.write("important-rule\n")
+        for each in (first, second):
+            run(each, "member", "worker")
+        guess = subprocess.run([sys.executable, BOARD, twin, "adopt", "e" * 64, "worker"], capture_output=True, text=True)
+        assert guess.returncode == 3 and not guess.stdout and os.path.basename(first) in guess.stderr, guess
+        # the run folder named in the member's prompt settles it
+        assert run(twin, "adopt", "e" * 64, "worker", "Board: python3 board.py %s read worker" % first).strip() == first
+        assert run(twin, "adopt", "e" * 64, "worker").strip() == first  # now this conversation's own
+        assert run(twin, "adopt", "f" * 64, "worker").strip() == second  # the only unowned one left
+        # an open run the conversation could drive that lacks the name: the member is unregistered, not "no swarm here"
+        stranger = subprocess.run([sys.executable, BOARD, twin, "adopt", "f" * 64, "ghost"], capture_output=True, text=True)
+        assert stranger.returncode == 4 and not stranger.stdout, stranger
+        third = run(os.path.join(twin, "job"), "init", "Three").strip()
+        with open(os.path.join(twin, ".gitignore")) as f:
+            assert f.read() == "important-rule\n"  # a later run leaves the project's own file alone
+
+        # An unanswered question stays listed until its recipient answers it.
+        run(third, "member", "w", "id=agent-w")
+        asked = lambda: [i["seq"] for i in json.loads(run(third, "attention", "--json"))["items"] if i["kind"] == "question"]
+        run(third, "post", "w", "@coordinator which file should I change?")
+        run(third, "post", "w", "@coordinator and which branch?")
+        assert asked() == [1, 2]
+        run(third, "post", "coordinator", "@w BRIEF\nOwns: a.py")  # a protocol post answers nothing
+        assert asked() == [1, 2]
+        run(third, "post", "coordinator", "@w re #2: main")  # a reply that cites a question answers that one only
+        assert asked() == [1]
+        run(third, "post", "w", "@coordinator and may I touch b.py?")
+        assert asked() == [1, 5]
+        # a plain reply answers what is still open, whatever post numbers or protocol words it mentions
+        run(third, "post", "coordinator", "@w change a.py as in #2, yes to b.py, and post READY when done")
+        assert asked() == []
+
+        # Replacement keeps what registration checked: a consultant stays one, and nobody ends up waiting for itself.
+        swap = run(os.path.join(tmp, "swap", ".swarm", "job"), "init", "Swap").strip()
+        roster = lambda: saved(swap)["members"]
+        run(swap, "member", "advisor", "profile=architect", "writes=0", "consult=1")
+        run(swap, "replace", "advisor", "advisor-2")
+        assert roster()["advisor-2"].get("consult") == "1"
+        run(swap, "member", "base")
+        run(swap, "member", "next", "depends=base")
+        loop = subprocess.run([sys.executable, BOARD, swap, "replace", "base", "base-2", "depends=next"], capture_output=True, text=True)
+        assert loop.returncode and "cycle" in loop.stderr, loop
+        assert "base-2" not in roster() and not roster()["base"].get("killed") and roster()["next"]["depends"] == "base"
+        run(swap, "replace", "base", "base-2", "depends=ghost", ok=False)
+        run(swap, "replace", "base", "base-2")
+        assert roster()["next"]["depends"] == "base-2"
+        run(swap, "member", "base-2", "killed=1")  # removed with no successor: @next is blocked, and can still be replaced
+        run(swap, "replace", "next", "next-2")
+        assert roster()["next-2"]["depends"] == "base-2"
+
+        # A name is one a mention can carry: "@name-" in prose is @name, so no name ends that way.
+        for bad in ("tail_", "tail-"):
+            run(swap, "member", bad, ok=False)
+            run(swap, "replace", "next", bad, ok=False)
+        assert "-> @next-2" in run(swap, "post", "coordinator", "ask @next-2- or @next-2_, then @base.")
+        state = saved(swap)  # a roster from before the rule still routes
+        state["members"]["tail_"] = {"role": "worker", "last_read_seq": 0}
+        with open(os.path.join(swap, "members.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        assert "@tail_" in run(swap, "post", "coordinator", "@tail_ go")
+        run(swap, "member", "tail_", "id=agent-tail")  # and stays manageable
+        run(swap, "member", "tail_", "killed=1")
+
+        durable = run(name, "init", "Interrupted update").strip()
+        roster_path = os.path.join(durable, "members.json")
+        board_path = os.path.join(durable, "board.jsonl")
+        for command in (("member",), ("read", "--all"), ("member", "w", "id"),
+                        ("member", "w", "last_read_seq=20"), ("member", "w", "writes=0", "writes=1"),
+                        ("member", "coordinator", "killed=1"), ("limit", "budget=²")):
+            result = subprocess.run([sys.executable, BOARD, durable, *command], capture_output=True, text=True)
+            assert result.returncode and "Traceback" not in result.stderr, result
+        run(durable, "member", "w", "id=current")
+        run(durable, "member", "observer", "profile=verifier")
+        assert "role=verifier" in next(line for line in run(durable, "status").splitlines() if "@observer" in line)
+        run(durable, "member", "other", "id=current", ok=False)
+        run(durable, "started", "w", "unwanted", "old-address", ok=False)
+        run(durable, "started", "w", "replacement", "current")
+        run(durable, "started", "w", "replacement", "current")
+        run(durable, "post", "w", "@coordinator which branch?")
+        run(durable, "post", "coordinator", "@w re #999: unrelated")
+        assert "[question] #1" in run(durable, "attention")
+        run(durable, "post", "coordinator", "@w re #1: main")
+        assert "[question]" not in run(durable, "attention")
+        # Simulate interruption after the roster write and partway through the replacement brief.
+        with open(roster_path) as f:
+            state = json.load(f)
+        state["members"]["other"] = {"role": "worker", "last_read_seq": 3}
+        pending = {"seq": 4, "agent": "coordinator", "text": "@other BRIEF\n" + "é" * 70,
+                   "time": "2026-11-18T10:00:00+0000", "to": ["other"]}
+        state["pending_post"] = pending
+        with open(roster_path, "w") as f:
+            json.dump(state, f)
+        with open(board_path, "ab") as f:
+            f.write(b'{"seq": 4, "agent":"coor')
+        assert "#4" in run(durable, "show", "--post=4")
+        # Replay after the post was appended but before the pending roster field was cleared.
+        with open(roster_path, "w") as f:
+            json.dump(state, f)
+        assert run(durable, "show", "other").count("#4") == 1
+        run(durable, "post", "coordinator", "@other " + "x" * 160)
+        first = run(durable, "read", "other", "--max-bytes=256")
+        assert "#4" in first and "#5" not in first and "more post(s) remain" in first
+        assert "#5" in run(durable, "read", "other", "--max-bytes=256")
+        run(durable, "read", "coordinator")
+        run(durable, "member", "w", "killed=1")
+        run(durable, "post", "w", "retired", ok=False)
+        run(durable, "close")
+        run(durable, "post", "other", "late", ok=False)
+        run(durable, "replace", "other", "next", ok=False)
+
+        detached = run(name, "init", "Restore pointer").strip()
+        key = "1" * 64
+        run(detached, "member", "new-probe", "id=recorded-probe")
+        parent = os.path.dirname(detached)
+        assert run(parent, "locate", key, "new-probe").strip() == detached
+        assert not run(parent, "restore", key).strip()
+        run(detached, "bind", key)
+        os.unlink(os.path.join(parent, ".bindings", key))
+        assert run(parent, "restore", key).strip() == detached
+        assert run(parent, "agent-run", key, "recorded-probe").strip() == detached
+
+        # edge cases of the protocol and the roster
+        edge = run(name, "init", "Edges").strip()
+        for member in ("a", "b", "gone"):
+            run(edge, "member", member, "id=agent-" + member)
+        run(edge, "member", "v", "role=verifier", "id=agent-v")
+        # several numbers after one "re" answer several questions; a removed asker's question closes with it
+        run(edge, "post", "a", "@b which port?")
+        run(edge, "post", "a", "@b and which host?")
+        run(edge, "post", "gone", "@b anything to add?")
+        assert len([i for i in json.loads(run(edge, "attention", "--json"))["items"] if i["kind"] == "question"]) == 3
+        run(edge, "post", "b", "@a re #1, #2 and nothing else: 8080 on localhost")
+        run(edge, "member", "gone", "killed=1")
+        assert not [i for i in json.loads(run(edge, "attention", "--json"))["items"] if i["kind"] == "question"]
+        # the protocol word is on the first line: a word on line two is prose, and FINDING is a report, not a question
+        run(edge, "post", "v", "@coordinator\nVERIFIED is what I would say if I had a candidate")
+        run(edge, "post", "a", "@coordinator FINDING is it the cache?")
+        assert not [i for i in json.loads(run(edge, "attention", "--json"))["items"] if i["kind"] == "question"]
+        # the coordinator is the conversation: only its backend is set on the roster
+        run(edge, "member", "coordinator", "model=opus", ok=False)
+        run(edge, "member", "coordinator", "backend=native")
+        run(edge, "member", "a", "group=all", ok=False)
+        run(edge, "member", "a", "group=Fix", ok=False)
+        run(edge, "member", "a", "group=b", ok=False)  # a member's name
+        # a limit names agent types or members; a typo is refused or noted
+        run(edge, "limit", "opus=Architects!", ok=False)
+        assert "names no agent type" in run(edge, "limit", "opus=architects")
+        assert "note:" not in run(edge, "limit", "opus=architect,a,none")
+        # show, post and revise with odd arguments
+        run(edge, "show", "--unknown", ok=False)
+        run(edge, "show", "nobody", ok=False)
+        run(edge, "post", "a", "   ", stdin="from stdin")
+        assert "from stdin" in run(edge, "show", "--post=7")
+        run(edge, "ready", "a", stdin="done")
+        run(edge, "revise", "a")
+        with open(os.path.join(edge, "board.jsonl"), encoding="utf-8") as f:
+            assert json.loads(f.readlines()[-1])["text"] == "REVISE"
+        # a removed member can still be replaced: its dependants then wait for the successor
+        run(edge, "member", "base")
+        run(edge, "member", "b", "depends=base")
+        run(edge, "member", "base", "killed=1")
+        run(edge, "replace", "base", "base-2")
+        assert saved(edge)["members"]["b"]["depends"] == "base-2"
+        # an investigator's confirmed finding reaches the verifier as well as the dependants
+        run(edge, "member", "probe", "profile=investigator", "writes=0", "model=sonnet")
+        run(edge, "ready", "probe", stdin="cause found")
+        with open(os.path.join(edge, "board.jsonl"), encoding="utf-8") as f:
+            finding = len(f.readlines())
+        run(edge, "confirm", "probe", str(finding))
+        with open(os.path.join(edge, "board.jsonl"), encoding="utf-8") as f:
+            assert "v" in json.loads(f.readlines()[-1])["to"]
+        # a board whose sequence is a JSON true is refused, not read as post 1
+        forged = run(name, "init", "Forged").strip()
+        with open(os.path.join(forged, "board.jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"seq": True, "agent": "coordinator", "text": "x", "time": "t"}) + "\n")
+        run(forged, "status", ok=False)
+        # a closed run asks for nothing, cannot be bound by another conversation, and is not restored
+        run(edge, "read", "coordinator")
+        run(edge, "post", "a", "@b one more question?")
+        run(edge, "close")
+        assert json.loads(run(edge, "attention", "--json"))["items"] == []
+        run(edge, "bind", "2" * 64, ok=False)
+        # the turn ledger keeps the newest entries only
+        ledger = run(name, "init", "Ledger").strip()
+        state = saved(ledger)
+        state["usage"] = {"tokens": {}, "turns": {("%064x" % n): True for n in range(2100)}}
+        with open(os.path.join(ledger, "members.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        run(ledger, "account", "f" * 64, "coordinator", "10")
+        turns = saved(ledger)["usage"]["turns"]
+        assert len(turns) == 2000 and "f" * 64 in turns and ("%064x" % 0) not in turns
+        # a read-only run folder can still be shown
+        os.chmod(os.path.join(edge, "board.jsonl"), 0o444)
+        os.unlink(os.path.join(edge, ".lock"))  # so the lock itself cannot be created either
+        os.chmod(edge, 0o555)
+        try:
+            assert "Edges" in run(edge, "status")
+            run(edge, "show")
+        finally:
+            os.chmod(edge, 0o755)
+
+
+class BoardScenario(unittest.TestCase):
+    """One end-to-end scenario against temporary run folders, so `python3 -m unittest discover` finds and runs it."""
+
+    def test_scenario(self):
+        scenario()
+
+
+if __name__ == "__main__":
+    scenario()
+    print("ok")

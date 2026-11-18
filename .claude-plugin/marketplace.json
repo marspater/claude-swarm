@@ -1,0 +1,14 @@
+{
+  "name": "swarm-local",
+  "description": "Local marketplace for the Swarm plugin.",
+  "owner": {
+    "name": "marspater"
+  },
+  "plugins": [
+    {
+      "name": "swarm",
+      "source": "./plugins/swarm",
+      "description": "A team of named agents on one shared message board, with a verifier and a live Swarm pane."
+    }
+  ]
+}
