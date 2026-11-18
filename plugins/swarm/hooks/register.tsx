@@ -792,7 +792,6 @@ export const register: Register = on => {
 
   // The board tool has a hook of its own, as the engine asks of a registered tool. Seen live: served
   // from the general hook below, a specialist resumed by a wake got "no tool.call hook answered".
-  // @ts-ignore TS2589: with every connected MCP tool in the generated types, this overload is too deep to check
   on('tool.call', { tool: BOARD_TOOL }, async ($, e) => {
     if (e.agentId) {
       moods.delete(e.agentId)

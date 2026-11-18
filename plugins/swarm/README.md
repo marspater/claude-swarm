@@ -108,7 +108,7 @@ The coordinator can select these profiles when splitting a task. You can also as
 
 All skills but `swarm` are hidden from the `/` menu. The coordinator reads its four references as it needs them. Each member type gets exactly one role skill, injected when it starts, and can load no other: the worker, designer and verifier deny the Skill tool, and the three specialists have a fixed tool list without it. The designer reads its Apple rules as a file.
 
-The orchestration, agent-selection, messaging, team-management and RLM guidance is adapted from the MIT-licensed [claude-team-orchestration](https://github.com/zircote-plugins/claude-team-orchestration) project, rewritten for this plugin's message board. The RLM pattern follows the Recursive Language Models paper (arXiv:2512.24601).
+The plugin and its guidance were written for this project. The RLM pattern follows the Recursive Language Models paper (arXiv:2512.24601).
 
 ## How it works
 
@@ -161,6 +161,15 @@ npx --yes --package typescript@7.0.2 tsc --noEmit
 
 The hook tests (`hooks/*.test.ts*`) import `claude-code/testing`, which only `claude plugin test` provides; `bun test` cannot run them.
 
-The type-check needs `.claude-plugin/types/`, which Claude Code generates when it loads the plugin from this folder and which is not committed or shipped. On a fresh checkout, load the plugin once (`claude --plugin-dir .`) before running `tsc`. Those declarations include every MCP tool connected on your machine, which is why one hook registration carries a `@ts-ignore` (TS2589). They are written by the Claude Code build that last loaded the plugin, so after an update `claude plugin validate` may check against newer types than `tsc` does until the plugin is loaded again. `validate` also sometimes reports `register.tsx` as "not type-checked" because its own check ran out of memory on those declarations; `tsc` is the check to trust then.
+The type-check needs `.claude-plugin/types/`, which Claude Code generates when it loads the plugin from this folder and which is not committed or shipped. On a fresh checkout, load the plugin once (`claude --plugin-dir .`) before running `tsc`. Those declarations include every MCP tool connected on your machine (`claude-code-mcp`). `tsconfig.json` leaves that set out of the check: the plugin calls no outside MCP server, its own board tool is declared in `types/index.d.ts`, and with the machine's tools included one `tool.call` hook alone costs millions of type instantiations.
+
+`claude plugin validate` does not use that setting: it reads `.claude-plugin/types/` as it is, so with many MCP servers connected it can report `register.tsx` as "not type-checked" after running out of memory. To validate cleanly, regenerate the folder from a session with no outside MCP servers, then validate:
+
+```
+claude --plugin-dir . --strict-mcp-config --mcp-config '{"mcpServers":{}}'
+claude plugin validate .
+```
+
+Loading the plugin from your usual session writes the full set again. The folder is local only: it is not committed or shipped, so none of this reaches a user of the plugin. They are written by the Claude Code build that last loaded the plugin, so after an update `claude plugin validate` may check against newer types than `tsc` does until the plugin is loaded again.
 
 `hooks/register.tsx` holds the session hooks and the pane. What needs no engine lives beside it and is tested directly in `hooks/units.test.ts`: `roster.ts` (reading the roster and the board), `text.ts` (cleaning and cutting post text), `models.ts` (agent types and their models), `command.ts` (recognising board commands), `graph.ts`, `hive.ts` and `palette.ts`.

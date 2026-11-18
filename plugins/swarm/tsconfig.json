@@ -1,6 +1,7 @@
 {
   "extends": "./.claude-plugin/types/tsconfig.json",
   "compilerOptions": {
+    "types": ["claude-code", "claude-code-tools"],
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noImplicitReturns": true
