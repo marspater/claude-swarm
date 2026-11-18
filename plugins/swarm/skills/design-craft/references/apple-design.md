@@ -1,14 +1,8 @@
----
-name: apple-design
-description: "Only for swarm:designer, and only when the design target is macOS, iOS, or iPadOS. Complements swarm:design-craft with native rules: HIG idiom, Liquid Glass, SF Symbols, Dynamic Type, semantic colors, app icons, and SwiftUI/AppKit-ready specs. Not for web or other platforms."
-user-invocable: false
----
-
 # Apple platform design
 
 Native first. The system's components, metrics, materials and text styles are the design system. Custom work is the exception and has to buy something specific.
 
-This skill complements `swarm:design-craft` and applies only when the design target is macOS, iOS, or iPadOS. Its rules override `design-craft` where they conflict.
+This file complements `design-craft` and applies only when the design target is macOS, iOS, or iPadOS. Its rules override `design-craft` where they conflict.
 
 Version check before relying on details: confirm the project's deployment target, and look up anything version-sensitive in the current HIG and SDK documentation (Xcode's documentation search, if connected). Liquid Glass has been retuned in every release since 26, so treat section 5 as principles and verify API names and behaviour.
 
@@ -56,6 +50,7 @@ Version check before relying on details: confirm the project's deployment target
 - Legibility is the designer's job. Check controls over busy, bright and dark content. Rely on scroll edge effects, not hard dividers or opaque bars.
 - Test with Reduce Transparency, Increase Contrast and Reduce Motion, and with the user's system transparency setting at both extremes. The design has to hold with glass effectively off.
 - For deployment targets before 26, specify the fallback explicitly (standard materials such as `.bar` and `.regularMaterial`). Do not leave it to the implementer.
+- For shipped-app benchmarks, WWDC25/26 references, 26→27 release changes, and SwiftUI/AppKit/UIKit implementation blueprints, read `liquid-glass.md` alongside this file.
 
 ## 6. SF Symbols and icons
 

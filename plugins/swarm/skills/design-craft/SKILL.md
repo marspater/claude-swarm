@@ -8,7 +8,7 @@ user-invocable: false
 
 Rules for output that survives measurement. Every rule has a default and a legitimate exception. An exception is fine when you can name it and never fine when it is an accident.
 
-`swarm:apple-design` complements this file when the target is macOS, iOS, or iPadOS, and its rules win where the two conflict. Load it only for those targets.
+`references/apple-design.md`, beside this file, complements it when the target is macOS, iOS, or iPadOS, and its rules win where the two conflict. Read it only for those targets.
 
 ## 0. Before drawing
 

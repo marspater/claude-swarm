@@ -139,7 +139,7 @@ Give the user the synthesis, the slice count, and the gaps the synthesizer liste
 
 | What happened | Do |
 | --- | --- |
-| An analyst stopped without a `READY` | Replace it with a new member for the same slice (`swarm:team-management`). Leave the others alone |
+| An analyst stopped without a `READY` | Replace it with a new member for the same slice (the `swarm` skill's `team-management.md` reference). Leave the others alone |
 | A report is a paste of the content | Ask that analyst for counts and line numbers instead, once. If it repeats, replace it |
 | The synthesizer is waiting on a slice that will never come | Either replace the analyst, or drop the dependency and tell the synthesizer to list the slice as missing |
 | Reports disagree across an overlap | The count boundary should prevent double counts, so check that both briefs carried one. The synthesizer resolves what is left with its spot-check budget; brief a closer look only if it still changes the answer |

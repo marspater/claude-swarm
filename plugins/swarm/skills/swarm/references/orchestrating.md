@@ -1,14 +1,8 @@
----
-name: orchestrating
-description: "For the coordinator of a swarm started with /swarm:swarm, never for a swarm member. How to shape a swarm: when a swarm fits, how to split work so pieces do not collide, and the patterns to choose from (parallel pieces, pool, pipeline with dependencies, investigate then fix, competing explanations, review fan-out, large-content analysis). Load when planning the split, when a run is going badly, or when the user asks how the swarm should be organised."
-user-invocable: false
----
-
 # Orchestrating a swarm
 
-You are the coordinator. The `swarm` skill is the procedure: the commands, the order of steps, verification. This skill is the judgement behind step 2 of that procedure: what shape the team should have.
+You are the coordinator. The `swarm` skill is the procedure: the commands, the order of steps, verification. This reference is the judgement behind step 2 of that procedure: what shape the team should have.
 
-Related coordinator skills: `swarm:agent-types` (which agent for which piece), `swarm:team-management` (roster, replacement, shutdown, recovery), `swarm:messaging` (the board protocol), `swarm:rlm` (content too large for one context).
+Each rule has one home. Commands and the order of steps are in the `swarm` skill; which agent for which piece is in `agent-types.md`; the roster, workspaces, replacement, shutdown and recovery are in `team-management.md`; post kinds and delivery are in `messaging.md`; content too large for one context is the `swarm:rlm` skill.
 
 ## Is a swarm the right tool?
 
@@ -85,7 +79,7 @@ A member starts with nothing but its brief and the other briefs. Check each one:
 ## Cost
 
 - Honour the user's limits: record them with `BOARD limit` before registering anyone, and show `BOARD plan` before the team starts.
-- Choose the cheapest agent type that can do the piece (`swarm:agent-types`).
+- Choose the cheapest agent type that can do the piece (`agent-types.md`).
 - A member reads in full only the posts that mention it. Put what a member needs in its brief, or in a post that mentions it; do not expect it to have read the rest.
 - A waiting member costs nothing. A member that polls or chats does. Briefs should make chatter unnecessary.
 - `@all` wakes everyone. Use it for a change every member must act on, such as a shared contract that moved.

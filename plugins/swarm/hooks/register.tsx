@@ -1175,7 +1175,8 @@ export const register: Register = on => {
 
   // The row in the chat that opens the pane: a queued /swarm-board waits for the turn to end, a press does not.
   on('ui.render', { component: 'Placed' }, async ($, e, next) => {
-    if (!e.props.id.startsWith(OPENER)) return next(e)
+    // Every plugin's hook hears every placed row: only this plugin's own opener is drawn here.
+    if (e.props.plugin !== $.plugin.name || !e.props.id.startsWith(OPENER)) return next(e)
     const { Box, Text, Button } = $.ui.resolve(e)
     const shown = await read($, swarm)
     const isShown = shown.dir !== '' && openerOf(shown.dir) === e.props.id
@@ -1222,7 +1223,8 @@ export const register: Register = on => {
     }
     const hiding = await read($, hideInactive)
     const columns = Math.max(20, e.props.bodyColumns ?? 40)
-    const rows = Math.max(8, (e.viewport?.rows ?? 24) - 6)
+    // The rows the pane's own window shows, less the header and the tab row; the viewport only where the surface gives no window.
+    const rows = Math.max(8, (e.props.scroll?.bodyRows ?? e.viewport?.rows ?? 24) - 6)
 
     if (shown.dir === '') {
       return (
@@ -1314,7 +1316,8 @@ export const register: Register = on => {
       const fitted: Post[] = []
       let used = 0
       for (const post of [...matching].reverse()) {
-        const text = preview(post)
+        // The opened post takes the rows it really draws, so the posts around it are fitted to what is left.
+        const text = post.seq === open ? openedText(post) : preview(post)
         const cost =
           4 + text.split('\n').length + Math.floor(text.length / columns)
         if (fitted.length > 0 && used + cost > rows) break
@@ -1697,6 +1700,9 @@ export const register: Register = on => {
                 if (name !== current) {
                   await stop($)
                   await stopLive($)
+                  // A post opened from another tab belongs to that visit: it is not kept selected behind the next tab.
+                  await update($, inspected, () => null)
+                  await update($, expanded, () => 0)
                   await update($, tab, () => name)
                 }
               }}

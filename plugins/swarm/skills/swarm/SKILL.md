@@ -22,17 +22,18 @@ As coordinator, split the work, brief the workers, prepare the verification cand
 
 ## Coordinator skills
 
-These skills are yours alone. Members cannot load them, and everything a member needs is in its own instructions and its brief. Each one costs you context, so load one only when its row applies. A task that splits into a few independent files with one verifier needs none of them. If the Skill tool does not offer one, read `${CLAUDE_PLUGIN_ROOT}/skills/<name>/SKILL.md` instead.
+These references are yours alone, and each one costs you context, so read one only when its row applies. A task that splits into a few independent files with one verifier needs none of them. They sit beside this skill: Read `${CLAUDE_SKILL_DIR}/references/<name>.md`. If that placeholder was not filled in, they are in the `references` folder next to the `scripts` folder that holds the board script (see below).
 
-| Skill | Load it |
+| Reference | Read it |
 | --- | --- |
-| `swarm:orchestrating` | Before step 2, only when the split is not obvious: more than three pieces, an order between pieces, an unknown cause, or a run that is going badly |
-| `swarm:agent-types` | Before step 2, only when a piece may need something other than a worker and a verifier: a designer, a specialist, a built-in agent, or another plugin's agent |
-| `swarm:rlm` | When a piece means reading content over about 1500 lines in full: a log, a data export, a long document, a whole codebase |
-| `swarm:messaging` | Before your first brief, and when posts are not reaching members |
-| `swarm:team-management` | When you add, replace or remove a member, when a member is stuck, after a restart or compaction, and when you close the run |
+| `orchestrating.md` | Before step 2, only when the split is not obvious: more than three pieces, an order between pieces, an unknown cause, or a run that is going badly |
+| `agent-types.md` | Before step 2, only when a piece may need something other than a worker and a verifier: a designer, a specialist, a built-in agent, or another plugin's agent |
+| `messaging.md` | When posts are not reaching members, or for a protocol edge case: `re #N`, `FINDING`, `NOT VERIFIED` |
+| `team-management.md` | When you add, replace or remove a member, when a member is stuck, after a restart or compaction, and when you close the run |
 
-Never paste these skills into a member's prompt or brief. Each member type preloads its own role skill (`implementing`, `verifying`, `design-craft`, `exploring`, `investigating`, `architecting`); those are not yours to load. The designer alone loads one more itself, `apple-design`, and only for a macOS, iOS or iPadOS target. In native mode Claude skips that preload: the member's agent definition still carries the essential rules, so do not compensate in the brief.
+One more is a skill of its own: load `swarm:rlm` when a piece means reading content over about 1500 lines in full, such as a log, a data export, a long document or a whole codebase. If the Skill tool does not offer it, read `${CLAUDE_PLUGIN_ROOT}/skills/rlm/SKILL.md` instead.
+
+Never paste these into a member's prompt or brief: everything a member needs is in its own instructions and its brief. Each member type preloads its own role skill (`implementing`, `verifying`, `design-craft`, `exploring`, `investigating`, `architecting`); those are not yours to load. In native mode Claude skips that preload: the member's agent definition still carries the essential rules, so do not compensate in the brief.
 
 **Your own reading.** `BOARD read coordinator` shows in full only the posts that mention you, and the rest as one line each. That is deliberate: your context is the one the run cannot afford to fill. Open another post with `BOARD show <name>` when you need it.
 
@@ -47,10 +48,10 @@ Below, **BOARD** means `python3 <script> <run>`, where `<run>` is the run folder
 | Command | What it does |
 | --- | --- |
 | `python3 <script> <working directory>/.swarm/<name> init <title>` | Creates a new run folder, `.swarm/<name>-<date>-<time>`, and prints it. That folder is `<run>` |
-| `BOARD member <name> [role=verifier] [group=<g>] [profile=<type>] [writes=0] [consult=1] [owns='<paths or question>'] [depends=<a,b>] [model=<m>] [effort=<e>] [id=<agent id>] [killed=1]` | Adds a member or updates one. Refused when it would break a limit. `BOARD member coordinator backend=native` marks a run on native Agent Teams; nothing else is set on the coordinator |
+| `BOARD member <name> [role=verifier] [group=<g>] [profile=<type>] [writes=0] [consult=1] [owns='<paths or question>'] [depends=<a,b>] [model=<m>] [effort=<e>] [id=<agent id>] [killed=1]` | Adds a member or updates one. Refused when it would break a limit. `effort` is `low`, `medium`, `high`, `xhigh` or `max`; `model` is a family (`haiku`, `sonnet`, `opus`, `fable`), an exact model id, or `inherit` for this conversation's model. `BOARD member coordinator backend=native` marks a run on native Agent Teams; nothing else is set on the coordinator |
 | `BOARD limit [max_workers=<n>] [max_members=<n>] [budget=<tokens>] [<model>=<types>]` | Sets the run's limits. `fable=architect` reserves a model for the listed types; `opus=none` forbids it |
 | `BOARD plan` | The team as a table: type, model, effort, what each waits for, what each owns |
-| `BOARD attention` | What needs someone: unanswered questions, findings to review, unstarted, blocked or unreachable members, stale verification, each with its post number. A closed run lists nothing |
+| `BOARD attention` | What needs someone, each item with its post number: a paused run, posts you have not read, findings to review, unanswered questions, unstarted, unreachable or ignored members, members waiting on a removed, unreachable or never-started member, and stale verification. A closed run lists nothing |
 | `BOARD retry <name>` | Lets delivery try an unreachable member again |
 | `BOARD replace <old> <new> [key=value ...]` | Retires `<old>` and registers `<new>` with its brief, dependants and a pointer to its posts |
 | `BOARD post <name>` | Posts the text given on stdin |
@@ -59,9 +60,9 @@ Below, **BOARD** means `python3 <script> <run>`, where `<run>` is the run folder
 | `BOARD wake` | Inspect unread mentions that still need delivery |
 | `BOARD claim NAME ADDRESS SEQ` | Reserve delivery through an exact sequence, returning a token |
 | `BOARD woke NAME SEQ TOKEN` | Acknowledge a successful send for that claim |
-| `BOARD ready NAME [COMMIT]` | Record worker readiness and notify dependents and reviewers |
+| `BOARD ready NAME [COMMIT]` | A member's command, never yours: records its readiness from the report on stdin and notifies you, the verifiers and its dependents |
 | `BOARD confirm NAME SEQ` | Confirm an investigator's exact finding after reviewing its evidence, then release dependents |
-| `BOARD revise NAME [REASON]` | Withdraw readiness before a revision |
+| `BOARD revise NAME [REASON]` | A member's command, never yours: withdraws its readiness before a revision |
 | `BOARD pause [REASON]` / `BOARD resume` | Pause automation while waiting for a decision, then resume |
 | `BOARD status` | Members, unread counts, and who mentioned whom |
 | `BOARD close` | Mark the run finished. Refused while posts addressed to you are unread: `read coordinator` first |
@@ -90,12 +91,12 @@ EOF
 
    | Agent | Assignment | Model and effort |
    | --- | --- | --- |
-   | `swarm:explorer` | Locate symbols, call sites, entry points and tests quickly | Haiku 5.5, medium |
-   | `swarm:investigator` | Trace subtle bugs, competing explanations and edge cases | Opus 5.5, high. Fable 5.2 is the escalation only, after an Opus investigator failed on the same question |
-   | `swarm:architect` | Design new software at any scale, review existing architecture, plan optimization and migration work, or advise you on a complex decision (a consultation) | Fable 5.2, high |
-   | `swarm:designer` | UI/UX and visual design within assigned paths: screens and component specs, design tokens, icons and vector assets, app-icon artwork. Hands workers a spec and assets; writes no production feature code | Opus 5.5, high |
-   | `swarm:worker` | Implement within assigned paths | Sonnet 5.5, medium |
-   | `swarm:verifier` | Verify the integrated candidate | Opus 5.5, high |
+   | `swarm:explorer` | Locate symbols, call sites, entry points and tests quickly | Haiku, medium |
+   | `swarm:investigator` | Trace subtle bugs, competing explanations and edge cases | Opus, high. Fable at medium effort is the escalation only, after an Opus investigator failed on the same question |
+   | `swarm:architect` | Design new software at any scale, review existing architecture, plan optimization and migration work, or advise you on a complex decision (a consultation) | Fable, high |
+   | `swarm:designer` | UI/UX and visual design within assigned paths: screens and component specs, design tokens, icons and vector assets, app-icon artwork. Hands workers a spec and assets; writes no production feature code | Opus, high |
+   | `swarm:worker` | Implement within assigned paths | Sonnet, medium |
+   | `swarm:verifier` | Verify the integrated candidate | Opus, high |
 
    Every member type runs on the newest model of its family. A family name you pass for a member (`model: "opus"`) starts that newest model, so name an exact older model only when the user asks for one.
 
@@ -157,7 +158,7 @@ EOF
 A member ended a turn, the monitor reported a stall, or the user wrote to you.
 
 1. Run `BOARD read coordinator`. Answer questions and steer through posts mentioning the relevant members.
-2. Run `BOARD attention`. It lists unanswered questions, members blocked on a removed or unreachable member, failed wakes and stale verification, each with the post that shows it. Deal with every item or tell the user why it stands. For an unreachable member run `BOARD retry <name>` once; if it is listed again, replace it.
+2. Run `BOARD attention`. It lists a paused run, posts you have not read, findings to review, unanswered questions, unstarted, unreachable or ignored members, members waiting on a removed, unreachable or never-started member, and stale verification, each with the post that shows it. Deal with every item or tell the user why it stands. For an unreachable member run `BOARD retry <name>` once; if it is listed again, replace it.
    For a finding that needs review, read the full post and compare its evidence with the investigator's brief. If it meets the completion criteria, run `BOARD confirm NAME SEQ` for that exact post. If essential evidence is missing, ask for it on the board and keep the assignment pending. If an Opus investigator cannot settle the question (its finding fails your review twice, or it reports that the reasoning is beyond it), escalate with `BOARD replace <old> <new> model=fable effort=medium` and pass `model: "fable"` and `effort: "medium"` on the successor's Agent call. The board refuses an investigator on Fable any other way.
 
    **Consult the architect** when you face a decision you cannot settle from the board: two members disagree about a contract, a finding implies a redesign, the split itself looks wrong, or the user asks a question about the system's structure. Register `BOARD member <name> profile=architect writes=0 consult=1 owns='consultation: <the question>'` (`consult=1` keeps it out of verification, so asking never blocks or voids a candidate), post a brief that states the question, the options you see, the board posts that hold the evidence, and what you will decide with the answer, then spawn it. It answers with a recommendation on the board; it changes nothing. One consultant per question, removed when it has answered (`killed=1`). A consultation on Fable follows the same ask-first rule as any Fable member, and a `fable=` limit that leaves out `architect` refuses it.

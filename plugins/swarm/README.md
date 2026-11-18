@@ -78,36 +78,35 @@ The **Members** tab says what each member is doing: working, waiting for a named
 
 ## Specialist and designer profiles
 
-- **`swarm:explorer`** uses Haiku 5.5 at medium effort to locate code, call sites, and tests.
-- **`swarm:investigator`** uses Opus 5.5 at high effort to investigate ambiguous bugs and design flaws. Fable 5.2 is an escalation only: when the Opus investigator cannot settle the question, the coordinator replaces it with one on Fable at medium effort that starts from its posts. The board refuses an investigator registered on Fable any other way.
-- **`swarm:architect`** uses Fable 5.2 at high effort to design new software from small tools to complex systems, review existing architecture, and plan optimization and migrations. It is also the coordinator's consultant: during a run the coordinator can ask it one question about a complex decision, such as a disputed contract or a doubtful split, and get a recommendation on the board.
+- **`swarm:explorer`** uses Haiku at medium effort to locate code, call sites, and tests.
+- **`swarm:investigator`** uses Opus at high effort to investigate ambiguous bugs and design flaws. Fable is an escalation only: when the Opus investigator cannot settle the question, the coordinator replaces it with one on Fable at medium effort that starts from its posts. The board refuses an investigator registered on Fable any other way.
+- **`swarm:architect`** uses Fable at high effort to design new software from small tools to complex systems, review existing architecture, and plan optimization and migrations. It is also the coordinator's consultant: during a run the coordinator can ask it one question about a complex decision, such as a disputed contract or a doubtful split, and get a recommendation on the board.
 
-- **`swarm:designer`** uses Opus 5.5 at high effort for UI/UX and visual design: screens and component specs, design tokens, icons and vector assets, and app-icon artwork. Unlike the three specialists it writes files and works through the shell board like a worker. It hands workers a spec and assets and writes no production feature code. For a macOS, iOS or iPadOS target it loads its Apple platform rules; for anything else it works from the platform-neutral ones. The verifier renders and measures its deliverables, and the UI workers build from them.
+- **`swarm:designer`** uses Opus at high effort for UI/UX and visual design: screens and component specs, design tokens, icons and vector assets, and app-icon artwork. Unlike the three specialists it writes files and works through the shell board like a worker. It hands workers a spec and assets and writes no production feature code. For a macOS, iOS or iPadOS target it reads its Apple platform rules; for anything else it works from the platform-neutral ones. The verifier renders and measures its deliverables, and the UI workers build from them.
 
-Every member type, the worker and verifier included, is pinned to the newest model of its family (Haiku 5.5, Sonnet 5.5, Opus 5.5, Fable 5.2), and a family name passed for a member starts that model.
+Every member type, the worker and verifier included, is pinned to the newest model of its family, and a family name passed for a member starts that model. The versions are in one table, `hooks/models.ts`, and in each agent file's `model:` line.
 
 The coordinator can select these profiles when splitting a task. You can also ask for one explicitly, for example `/swarm:swarm Have an investigator trace duplicate refreshes and an architect review the proposed fix`. The three specialists have read tools and a scoped board tool for findings and readiness. They require the hooks module. In native Agent Teams, use in-process display for specialists.
 
 ## Skills
 
-| Skill | For | What it holds |
+| Skill or reference | For | What it holds |
 | --- | --- | --- |
 | `swarm` | You, to start a swarm (`/swarm:swarm`) | The coordinator's procedure: board commands, start-up, the loop, verification, finishing |
-| `orchestrating` | Coordinator | When a swarm fits, how to split work, and the team shapes: parallel pieces, pool, pipeline, investigate then fix, competing explanations, review fan-out |
-| `agent-types` | Coordinator | Which agent for which piece: the swarm's six member types, the built-in agents, and other plugins' review, research, refactoring and SDLC agents |
-| `team-management` | Coordinator | The roster, workspaces, permissions, adding, replacing and removing members, shutdown, recovery, closing a run |
-| `messaging` | Coordinator | The board protocol: mentions, kinds of post, delivery, troubleshooting |
+| `swarm/references/orchestrating.md` | Coordinator, read when needed | When a swarm fits, how to split work, and the team shapes: parallel pieces, pool, pipeline, design then build, investigate then fix, competing explanations, review fan-out |
+| `swarm/references/agent-types.md` | Coordinator, read when needed | Which agent for which piece: the swarm's six member types, the built-in agents, and other plugins' agents |
+| `swarm/references/team-management.md` | Coordinator, read when needed | The roster, workspaces, permissions, adding, replacing and removing members, shutdown, recovery, closing a run |
+| `swarm/references/messaging.md` | Coordinator, read when needed | The board protocol: mentions, kinds of post, delivery, troubleshooting |
 | `rlm` | Coordinator | The RLM pattern for content too large for one context: partition the data, one cheap analyst per slice, one synthesizer |
-
-| `implementing` | `swarm:worker`, preloaded | Smallest change that meets the brief, narrow tests first, a short `READY` |
+| `implementing` | `swarm:worker`, preloaded | Smallest change that meets the brief, building from a designer's spec, narrow tests first, a short `READY` |
 | `verifying` | `swarm:verifier`, preloaded | Diffs against briefs, rendering and measuring design work, the full checks once on the integrated candidate |
 | `design-craft` | `swarm:designer`, preloaded | Platform-neutral rules for vector geometry, layout, type, color and tokens, component states, and the render-and-report step |
-| `apple-design` | `swarm:designer`, loaded by it only for a macOS, iOS or iPadOS target | Native rules that complement `design-craft`: HIG idiom, Liquid Glass, SF Symbols, Dynamic Type, app icons, SwiftUI-ready specs |
+| `design-craft/references/apple-design.md` | `swarm:designer`, read by it only for a macOS, iOS or iPadOS target | Native rules that complement `design-craft`: HIG idiom, Liquid Glass, SF Symbols, Dynamic Type, app icons, SwiftUI-ready specs. It points to `liquid-glass.md` beside it for references, release changes and implementation patterns |
 | `exploring` | `swarm:explorer`, preloaded | Search instead of reading; a short map of exact references |
 | `investigating` | `swarm:investigator`, preloaded | Trace the real path, test competing explanations, hand over a regression check |
 | `architecting` | `swarm:architect`, preloaded | Turn requirements into architecture, justify its complexity, and plan implementation and verification in stages |
 
-All skills but `swarm` are hidden from the `/` menu. The coordinator loads its five as it needs them. Each member type gets exactly one role skill, injected when it starts. The worker and verifier deny the Skill tool, and the three specialists have a fixed tool list without it, so they cannot load any other. The designer is the exception: it keeps the Skill tool to load `apple-design`, and only when the design target is an Apple platform.
+All skills but `swarm` are hidden from the `/` menu. The coordinator reads its four references as it needs them. Each member type gets exactly one role skill, injected when it starts, and can load no other: the worker, designer and verifier deny the Skill tool, and the three specialists have a fixed tool list without it. The designer reads its Apple rules as a file.
 
 The orchestration, agent-selection, messaging, team-management and RLM guidance is adapted from the MIT-licensed [claude-team-orchestration](https://github.com/zircote-plugins/claude-team-orchestration) project, rewritten for this plugin's message board. The RLM pattern follows the Recursive Language Models paper (arXiv:2512.24601).
 
@@ -139,22 +138,22 @@ The `.swarm` folder ignores itself in git, unless it already holds a `.gitignore
 - A member's model cannot be changed while it lives. The coordinator replaces the member instead.
 - The Attention tab's "Question" items are a heuristic: a post with a question mark that its recipient has not answered. A reply that cites a question's number (`re #12`) answers that question only; any other reply to the asker answers every earlier question from it, related or not; a BRIEF, READY, REVISE, FINDING, VERIFIED, NOT PASSED, NOT VERIFIED or SHUTDOWN answers none. A question in a code sample can show up there.
 - Limits are enforced on `swarm:` members. One-shot helpers and a `general-purpose` stand-in are kept inside them by the coordinator's instructions only.
-- The twelve skills other than `swarm` are hidden from the `/` menu, but their descriptions are listed to the model in every session where the plugin is enabled.
+- The seven skills other than `swarm` (the six role skills and `rlm`) are hidden from the `/` menu, but their descriptions are listed to the model in every session where the plugin is enabled. A role skill cannot be hidden from that list: Claude Code only preloads into an agent a skill the model may invoke. The coordinator's guides and the designer's Apple rules are plain reference files for that reason, and cost nothing until read.
 - In native Agent Teams mode Claude skips role-skill preload and applies the agent definition's instructions. In-process tests on Claude Code 2.1.325 covered registration, reading briefs, and waking an investigator, worker, and verifier. Split-pane mode and native teammate recovery after restart still need acceptance tests.
 - Token counts and budget enforcement need the hooks module. The board saves usage reported by turns in the conversation that drives the run. Only the coordinator and the run's members are counted: another agent started in the same conversation spends none of the run's budget.
 - The pane keeps the newest 300 posts for browsing, filtering, and graph replay. Attention can open posts outside that window. Edge counts and headings include every post. Desktop shows the animated diagram, and the terminal lists its edges.
 - The project is the session's working directory, with the run stored in `<project>/.swarm/<run>`. Isolated verification requires Git. Shared verification can fingerprint a project without Git.
 - `board.py` and `verify.py` need Python 3.8 or later and a POSIX system (they lock with `fcntl`), and use the standard library only. `verify.py` needs Git for isolated runs.
 - Past about 3 MB of posts the pane reads only the newest part of the board; `board.py` itself always has all of it.
-- Background workers run under this session's permission settings. If a worker stops on a permission prompt for the board command, allow `Bash(python3 */skills/swarm/scripts/board.py *)` in your settings, and `Bash(python3 */skills/swarm/scripts/verify.py *)` for the verifier.
+- Background workers run under this session's permission settings. If a worker stops on a permission prompt for the board command, allow `Bash(python3 */skills/swarm/scripts/board.py *)` in your settings, and `Bash(python3 */skills/swarm/scripts/verify.py *)` for the verifier. A designer working on an Apple target also reads `skills/design-craft/references/apple-design.md` from the plugin folder, which is outside the project.
 - The pane is a hooks module, an early-access Claude Code API. The skill, the agents and the board script work without it.
 
 ## Develop
 
 ```
-python3 skills/swarm/scripts/test_board.py
-python3 skills/swarm/scripts/test_verify.py
-python3 -m unittest discover -s skills/swarm/scripts -p "test_*.py"
+python3 tests/test_board.py
+python3 tests/test_verify.py
+python3 -m unittest discover -s tests -p "test_*.py"
 claude plugin validate .
 claude plugin test .
 npx --yes --package typescript@7.0.2 tsc --noEmit

@@ -553,6 +553,12 @@ def main(argv):
         # already owns, then the only unowned run with the member. Two unowned candidates are refused.
         key, name, hint = args[0], args[1].lstrip("@").lower(), " ".join(args[2:])
         binding_file(d, key)
+        # Two conversations starting members at the same moment must not both see a run as unowned and
+        # both choose it: the choice and the binding happen under one lock for the whole .swarm folder.
+        # It is always taken before a run's own lock, never after, so the two cannot deadlock.
+        if os.path.isdir(d):
+            choosing = open(os.path.join(d, ".adopt.lock"), "w")
+            fcntl.flock(choosing, fcntl.LOCK_EX)  # held until the process exits
         runs = list(saved_runs(d))
         mine, unowned, open_runs = [], [], 0
         for run, found in runs:
@@ -929,8 +935,14 @@ def main(argv):
             if (name == COORDINATOR or not waiting(member) or member.get("id") != args[1]
                     or seq not in unwoken(name) or previous.get("until", 0) > now):
                 return
-            attempts = previous.get("attempts", 0) if previous.get("seq") == seq else 0
+            # Failed attempts belong to the member, not to one post: a newer mention does not start the count
+            # again, or a member that cannot be reached would never be reported while posts keep arriving.
+            # A delivered wake (`woke`) or `retry` clears them.
+            attempts = previous.get("attempts", 0)
             if attempts >= WAKE_ATTEMPTS:
+                if previous.get("seq") != seq:  # still unreachable, now for the newest mention
+                    member["wake_claim"] = dict(previous, seq=seq)
+                    save(d, state)
                 return
             token = uuid.uuid4().hex
             member["wake_claim"] = {"token": token, "seq": seq, "attempts": attempts + 1,
@@ -958,11 +970,22 @@ def main(argv):
             started = time.time() - duration / 1000
             changed = False
             for name, member in members.items():
-                # A wake that landed while this turn ran is still queued and starts the next one.
-                if (not member.get("killed") and member.get("id") in args[1:] and member.get("told", {}).get("at", 0) <= started
-                        and unread(name) and not unwoken(name) and not ignored(name, members, posts)):
+                if (member.get("killed") or member.get("id") not in args[1:] or not unread(name) or unwoken(name)
+                        or ignored(name, members, posts)):
+                    continue
+                told = member.get("told", {})
+                # A wake that landed while this turn ran is still queued and starts the next one, so it is not
+                # owed again yet. Whether it landed before or during the turn is a comparison of two clocks
+                # and can be wrong by a moment, so a second turn that ends with the mention still unread is
+                # owed the wake whatever the clocks say: the doubt costs one turn at most, never the wake.
+                if told.get("at", 0) <= started or told.get("ended"):
                     member.pop("last_nudged_seq", None)
-                    changed = True
+                    told.pop("ended", None)
+                else:
+                    told["ended"] = True
+                if told:
+                    member["told"] = told
+                changed = True
             if changed:
                 save(d, state)
 

@@ -1,9 +1,3 @@
----
-name: agent-types
-description: "For the coordinator of a swarm started with /swarm:swarm, never for a swarm member. Choose the right agent type for each piece of work: the swarm's own members (worker, designer, verifier, explorer, investigator, architect), the built-in agents (Explore, Plan, general-purpose, Bash) and agents from other plugins (review, research, refactoring, SDLC). Load when selecting agent types, weighing what an agent can do, or matching agents to tasks."
-user-invocable: false
----
-
 # Choosing an agent type
 
 You are the coordinator. For every piece of work decide two things: whether it needs a **member** or a **one-shot helper**, and which agent type.
@@ -21,16 +15,16 @@ Explore and Plan cannot be resumed once they finish, so they cannot be woken. Th
 
 ## The swarm's own members
 
-Each type runs on the newest model of its family: Haiku 5.5, Sonnet 5.5, Opus 5.5, Fable 5.2.
+Each type runs on the newest model of its family. The table names families, not versions.
 
 | Type | Model, effort | Can | Cannot | Give it |
 | --- | --- | --- | --- | --- |
 | `swarm:explorer` | Haiku, medium | Read, search; board tool | Run commands, edit, judge a design | "Where is it": symbols, call sites, entry points, tests. Also the analyst for one slice of large content (`swarm:rlm`) |
 | `swarm:investigator` | Opus, high. Fable, medium only as an escalation after an Opus investigator failed on the same question, through `BOARD replace <old> <new> model=fable effort=medium` | Read, search, LSP; board tool | Run commands, edit | "Why does it fail": subtle bugs, competing explanations, edge cases |
 | `swarm:architect` | Fable, high | Read, search, LSP; board tool | Run commands, edit | "How should it be built": new software from small tools to complex systems, design review, optimisation, migrations. Also your consultant: a second opinion on a complex decision during a run |
-| `swarm:worker` | Sonnet, medium | Everything except spawning agents | Spawn agents | Implementation inside assigned paths, tests, docs. Also combining other members' reports |
-| `swarm:designer` | Opus, high | Everything except spawning agents, plus any connected design tools. Loads its Apple rules itself for a macOS, iOS or iPadOS target | Spawn agents; own production feature code | "How should it look and behave": screens and component specs, design tokens, icons and vector assets, app-icon artwork, art direction |
-| `swarm:verifier` | Opus, high | Read, run commands | Edit, spawn agents | The integrated candidate, once, with the exact checks. Also renders and measures design work: a designer's deliverables and UI built from its spec |
+| `swarm:worker` | Sonnet, medium | Everything except spawning agents and loading skills | Spawn agents, load skills | Implementation inside assigned paths, tests, docs. Also combining other members' reports |
+| `swarm:designer` | Opus, high | Everything except spawning agents, plus any connected design tools. Reads its Apple rules itself for a macOS, iOS or iPadOS target | Spawn agents, load skills; own production feature code | "How should it look and behave": screens and component specs, design tokens, icons and vector assets, app-icon artwork, art direction |
+| `swarm:verifier` | Opus, high | Read, run commands | Edit or write files, edit notebooks, spawn agents, load skills | The integrated candidate, once, with the exact checks. Also renders and measures design work: a designer's deliverables and UI built from its spec |
 
 The three specialists have no shell. They read and post through the board tool, so register them with `profile=<type> writes=0` and launch them with the board-tool instructions from the `swarm` skill.
 
@@ -66,7 +60,7 @@ Other installed plugins add types named `<plugin>:<agent>`. Use only the ones th
 2. **Cheapest type that can do it.** Locating is explorer work, not investigator work. Move a piece to a stronger type when a report shows the weaker one could not do it, not before.
 3. **A specialist needs a distinct assignment.** Do not add an architect to a task that has no design question, or a designer to a task with no visual or interaction decision to make. A consultation is a distinct assignment: one stated question, one recommendation.
 4. **One verifier per candidate.** More reviewers of the same diff are one-shot helpers, not more verifiers.
-5. **Do not swap a member's model in place.** Replace the member (`swarm:team-management`).
+5. **Do not swap a member's model in place.** Replace the member (`team-management.md`).
 6. **The user's choice wins.** If the user named a model, an effort or an agent type for a piece, use it and record it on the roster. A limit such as `opus=none` makes the board refuse an investigator on its default model: ask the user which model it may use, register it with that `model=`, and pass the same model on its Agent call.
 7. **Limits cover helpers too.** The board and the plugin enforce limits only on `swarm:` members. A one-shot helper, or `general-purpose` standing in for a member, is yours to keep inside them: when a model is reserved or forbidden, pass an allowed `model` on that Agent call. `Plan` runs at this conversation's model, so do not use it under a limit that forbids that model.
 8. **Each member type brings its own craft.** Each `swarm:` type's agent definition holds the rules it cannot work without, and its preloaded role skill holds the detailed method, so a brief states the piece and its limits and does not need to teach either. Native teammates start without the role skill and work from the definition alone.

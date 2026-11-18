@@ -30,5 +30,6 @@ Use the board tool's `ready` action to submit a finding when the evidence meets 
 - Cite `path:line` for the decisive steps. Give a line of evidence for each meaningful alternative you ruled out.
 - Tell the owner where the fix belongs and which behavior it must preserve.
 - Propose a regression check with setup, trigger, expected result, and the outcome expected on the current code.
+- If the question is beyond what you can settle after a real attempt, say so plainly in a post to the coordinator: what you ruled out and where the reasoning stops. The coordinator can then hand it to a stronger investigator, which starts from your posts.
 
 > Source-traced. Two refresh attempts can start while the first promise is pending. `src/refresh.ts:44` checks the pending map and line 61 writes to it after awaiting the fetch. The scheduler can dispatch twice through `src/events.ts:18`. Install the pending entry before awaiting and clear it on completion. Test by holding the first fetch open, triggering a second refresh, and asserting a single fetch while both callers receive the result.

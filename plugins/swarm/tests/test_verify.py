@@ -10,7 +10,7 @@ import sys
 import tempfile
 import unittest
 
-SCRIPTS = Path(__file__).resolve().parent
+SCRIPTS = Path(__file__).resolve().parent.parent / "skills" / "swarm" / "scripts"
 
 
 def run(*args, cwd=None, text=None, ok=True, env=None):

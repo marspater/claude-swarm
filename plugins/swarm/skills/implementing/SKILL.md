@@ -25,6 +25,15 @@ You own a bounded piece. Use its acceptance criteria to decide what to read, cha
 - When the brief or repository calls for a test, or existing tests would miss the regression, put the new check alongside the closest existing test. For a bug fix, confirm the assertion catches the old behavior when practical.
 - Check compatibility, failure, and retries where the changed behavior touches them. Preserve existing behavior and tests outside the brief. In shared work, report overlapping edits before changing someone else's lines.
 
+## Build from a designer's spec
+
+When your brief names a `swarm:designer`'s spec, tokens or assets as its source, the design decisions are already made. Your piece is to build them faithfully.
+
+- Use the designer's tokens, text styles and colour roles by name. A literal size, spacing or colour where the spec gives a token is a defect.
+- Its `#Preview`, HTML mock or SVG marked as reference shows the intent. Read the structure and values from it and write the production version in the project's own patterns; do not paste it in.
+- If the spec cannot be built as written (a platform limit, a missing API, a performance cost), post the conflict to the designer with the constraint and wait. Do not deviate quietly: the verifier renders what you built and measures it against the spec.
+- Report which spec sections you implemented and any value you could not match, with the reason.
+
 ## Prove
 
 - Run the narrowest check first: the one test file. Run the brief's full check once, before you report.

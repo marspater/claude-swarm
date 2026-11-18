@@ -5,10 +5,11 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
-BOARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "board.py")
+BOARD = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "skills", "swarm", "scripts", "board.py")
 
 
 def saved(d):
@@ -525,6 +526,48 @@ def scenario():
         run(ledger, "account", "f" * 64, "coordinator", "10")
         turns = saved(ledger)["usage"]["turns"]
         assert len(turns) == 2000 and "f" * 64 in turns and ("%064x" % 0) not in turns
+        # --- concurrency
+        race = run(name, "init", "Races").strip()
+        run(race, "member", "w", "id=agent-w")
+
+        def patch(change):
+            state = saved(race)
+            change(state["members"]["w"])
+            with open(os.path.join(race, "members.json"), "w", encoding="utf-8") as f:
+                json.dump(state, f)
+
+        # failed wake attempts carry over to a newer mention: the member is reported, not counted from zero again
+        run(race, "post", "coordinator", "@w first")
+        patch(lambda w: w.update(wake_claim={"token": "x" * 32, "seq": 1, "attempts": 3, "until": 0}))
+        run(race, "post", "coordinator", "@w second")
+        assert run(race, "claim", "w", "agent-w", "2") == ""
+        assert saved(race)["members"]["w"]["wake_claim"]["seq"] == 2
+        assert [i["member"] for i in json.loads(run(race, "attention", "--json"))["items"] if i["kind"] == "unreachable"] == ["w"]
+        run(race, "retry", "w")
+        token = run(race, "claim", "w", "agent-w", "2").strip()
+        assert len(token) == 32
+        run(race, "woke", "w", "2", token)
+        # a wake the clocks place inside the turn is not owed again at once, and is owed after the next turn whatever they say
+        patch(lambda w: w["told"].update(at=time.time() + 3600))
+        run(race, "rearm", "100", "agent-w")
+        after = saved(race)["members"]["w"]
+        assert after.get("last_nudged_seq") == 2 and after["told"].get("ended") is True
+        run(race, "rearm", "100", "agent-w")
+        after = saved(race)["members"]["w"]
+        assert "last_nudged_seq" not in after and "ended" not in after["told"]
+        # two conversations adopting one unowned run at the same moment: exactly one gets it
+        for attempt in range(6):
+            shared = run(name, "init", "Adopt %d" % attempt).strip()
+            run(shared, "member", "solo-%d" % attempt)
+            keys = [("%x" % (10 + attempt)) * 64, ("%x" % (4 + attempt % 2)) * 64]
+            with ThreadPoolExecutor(2) as pool:
+                results = list(pool.map(lambda key: subprocess.run(
+                    [sys.executable, BOARD, os.path.dirname(shared), "adopt", key, "solo-%d" % attempt],
+                    capture_output=True, text=True), keys))
+            won = [r for r in results if r.returncode == 0 and r.stdout.strip() == shared]
+            assert len(won) == 1, [(r.returncode, r.stdout, r.stderr) for r in results]
+            assert saved(shared)["binding"] in keys
+
         # a read-only run folder can still be shown
         os.chmod(os.path.join(edge, "board.jsonl"), 0o444)
         os.unlink(os.path.join(edge, ".lock"))  # so the lock itself cannot be created either
