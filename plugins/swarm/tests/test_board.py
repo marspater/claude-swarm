@@ -706,6 +706,22 @@ def audit(name):
             pass
     assert "binding" not in saved(team)
 
+    # Resuming tells the members a pause stopped mid-work, and only those.
+    halt = fresh("Resume")
+    for who, extra in (("mid", ["id=agent-mid"]), ("done", ["id=agent-done"]), ("unborn", []), ("blocked", ["id=agent-b", "depends=unborn"]),
+                        ("owed", ["id=agent-o"]), ("asker", ["id=agent-q"]), ("v", ["role=verifier", "id=agent-v"])):
+        run(halt, "member", who, *extra)
+    run(halt, "ready", "done", stdin="finished")
+    run(halt, "post", "asker", "@coordinator which API version do you want?")
+    run(halt, "post", "coordinator", "@owed take the second file too")
+    posted = lambda: sum(1 for _ in open(os.path.join(halt, "board.jsonl"), encoding="utf-8"))
+    count = posted()
+    run(halt, "resume")
+    assert posted() == count  # a run that was not paused stopped nobody
+    run(halt, "pause", "a question for the user")
+    assert run(halt, "resume").splitlines()[0] == "posted #%d -> @mid" % (count + 1)
+    assert "paused" not in saved(halt) and posted() == count + 1
+
     # Verification that keeps failing for one member is flagged at two cycles and pauses the run at three.
     loop = fresh("Rework")
     run(loop, "member", "a", "id=agent-a")

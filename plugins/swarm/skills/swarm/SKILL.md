@@ -4,7 +4,7 @@ description: "Run a team of named worker agents that split one task, work on the
 argument-hint: "[--native-teams (experimental)] <task, and how to check it>"
 disable-model-invocation: true
 model: opus
-effort: medium
+effort: high
 allowed-tools: Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/board.py *), Bash(python3 ${CLAUDE_PLUGIN_ROOT}/skills/swarm/scripts/board.py *), Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/verify.py *), Bash(python3 ${CLAUDE_PLUGIN_ROOT}/skills/swarm/scripts/verify.py *)
 ---
 
@@ -16,7 +16,7 @@ $ARGUMENTS
 
 If no task is given above, ask the user what the swarm should do and stop.
 
-The coordinator runs on Opus at medium effort by default; if the user named another model or effort for the coordinator, tell them to switch this conversation's model or effort themselves, since a skill cannot change either once the turn has started.
+The coordinator runs on Opus at high effort by default; if the user named another model or effort for the coordinator, tell them to switch this conversation's model or effort themselves, since a skill cannot change either once the turn has started.
 
 As coordinator, split the work, brief the workers, prepare the verification candidate, and report the result. Leave implementation and test execution to the workers and verifier. Carry the user's repository instructions into every brief, including any restriction on commit messages and attribution.
 
@@ -62,7 +62,7 @@ Below, **BOARD** means `python3 <script> <run>`, where `<run>` is the run folder
 | `BOARD ready NAME [COMMIT]` | A member's command, never yours: records its readiness from the report on stdin and notifies you, the verifiers and its dependents |
 | `BOARD confirm NAME SEQ` | Confirm an investigator's exact finding after reviewing its evidence, then release dependents |
 | `BOARD revise NAME [REASON]` | A member's command, never yours: withdraws its readiness before a revision |
-| `BOARD pause [REASON]` / `BOARD resume` | Pause automation while waiting for a decision, then resume |
+| `BOARD pause [REASON]` / `BOARD resume` | Pause automation while waiting for a decision, then resume. Resume tells the members the pause stopped mid-work to go on |
 | `BOARD status` | Members, unread counts, and who mentioned whom |
 | `BOARD close` | Mark the run finished. Refused while posts addressed to you are unread: `read coordinator` first |
 
@@ -164,7 +164,7 @@ A member ended a turn, the monitor reported a stall, or the user wrote to you.
 3. Run `BOARD wake` only when the hooks module is not running. A Swarm relay notice already names each waiting specialist with its address and sequence.
    - With the hooks module active, relay each pending specialist wake through your own `SendMessage` tool. For a native teammate, use the bare teammate name before `@` in the recorded address. Copy the message exactly, substituting the board sequence for `N`: `Swarm board: call the board tool with action read for mentions through #N.` The hook claims the wake and records delivery.
    - When the module is unavailable, use `BOARD claim NAME ADDRESS SEQ` for a pending entry. With the returned token, send one nudge containing the board read command for a worker, designer or verifier, or the board tool's `read` action for a specialist if its tool is available. Run `BOARD woke NAME SEQ TOKEN` only after Claude accepts delivery. An empty claim means the wake is no longer due or another delivery owns it.
-4. When the workers have reported ready, prepare the verification candidate for code changes and design work. Handle rework by preparing a fresh candidate after the affected workers report again. After two failed verification cycles on the same defect, stop: run `BOARD pause <reason>` and ask the user. The board pauses the run itself when one worker gets a third `NOT PASSED` in a row. When a worker reports it stopped on its own failing check, decide or ask the user; do not send it back unchanged. When you need a user's decision before the swarm can progress, run `BOARD pause <reason>`, explain what is needed, and run `BOARD resume` when they respond. A pause refuses each member's next tool call, so a member in the middle of its work ends its turn there: after `BOARD resume`, post `@<name> continue` to each member that had not reported, or it waits until the stall notice.
+4. When the workers have reported ready, prepare the verification candidate for code changes and design work. Handle rework by preparing a fresh candidate after the affected workers report again. After two failed verification cycles on the same defect, stop: run `BOARD pause <reason>` and ask the user. The board pauses the run itself when one worker gets a third `NOT PASSED` in a row. When a worker reports it stopped on its own failing check, decide or ask the user; do not send it back unchanged. When you need a user's decision before the swarm can progress, run `BOARD pause <reason>`, explain what is needed, and run `BOARD resume` when they respond. A pause refuses each member's next tool call, so a member in the middle of its work ends its turn there; `BOARD resume` posts to those members itself, so do not nudge them.
 5. Report current work or the blocking decision. The hooks notify you once when an open run is quiet and no member can advance.
 
 ## Verify what will land

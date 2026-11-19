@@ -1174,7 +1174,18 @@ def main(argv):
             else:
                 if over_budget:
                     sys.exit(f"token budget spent ({total} of {budget}); raise it with limit before resuming")
-                state.pop("paused", None)
+                # A pause refuses a member's next tool call, so one in the middle of its work ended its turn there
+                # and nothing addresses it. Only those are told: a member that is ready, blocked, waiting for a
+                # confirmation or an answer, or already owed a wake needs no turn.
+                ready, reports = readiness(members, posts), latest_reports(posts)
+                asking = {asker for _, asker, _ in unanswered(members, posts)}
+                halted = [name for name, member in team_of(members).items()
+                          if member.get("role") == "worker" and member.get("id") and member.get("consult") != "1"
+                          and name not in ready and all(dep in ready for dep in dependencies(member))
+                          and reports.get(name, {}).get("kind") != "finding" and name not in asking and not unread(name)]
+                if state.pop("paused", None) and halted:
+                    return post_message(COORDINATOR, "%s The run is resumed. Go on from where the pause stopped you."
+                                        % " ".join("@" + name for name in halted), halted, save_roster=True)
             save(d, state)
 
         elif cmd == "close":
