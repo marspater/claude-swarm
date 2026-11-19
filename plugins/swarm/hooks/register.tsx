@@ -2050,7 +2050,7 @@ export const register: Register = on => {
           {groups
             .filter(([, list]) => list.length > 0)
             .map(([title, list]) => (
-              <Box key={title} flexDirection="column" marginTop={1}>
+              <Box key={title} flexDirection="column" gap={1} marginTop={1}>
                 <Text bold dimColor>{`${title} · ${list.length}`}</Text>
                 {[...list].sort(byName).map(card)}
               </Box>
