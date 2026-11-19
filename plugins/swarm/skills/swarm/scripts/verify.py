@@ -464,6 +464,7 @@ def test_candidate(run, project, identifier, verifier, timeout_arg=None):
         candidate["attempt"] = attempt
         save_candidate(run, candidate)
 
+    failed = []
     for command in candidate["checks"]:
         print(f"$ {command}", flush=True)
         try:
@@ -472,7 +473,10 @@ def test_candidate(run, project, identifier, verifier, timeout_arg=None):
             raise ValueError(f"verification command timed out after {timeout}s: {command}") from None
         print(f"Exit {returncode}", flush=True)
         if returncode:
-            raise ValueError("verification failed")
+            failed.append(command)
+    if failed:
+        # Every check ran: a cycle that stops at the first failure hides the rest until the next candidate.
+        raise ValueError("verification failed: " + "; ".join(failed))
 
     with board_lock(run):
         candidate = candidate_for(run, project, identifier)

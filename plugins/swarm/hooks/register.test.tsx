@@ -2775,3 +2775,45 @@ test('hardening: runtime file edit guards, shared git commit guard, coordinator 
   await clock.advance(12_000)
   expect(seen.prompts.some(t => t.includes('board post'))).toBe(true)
 })
+
+test('a retired member whose build is still running in its worktree is reported with the processes to stop', async ($, on) => {
+  const state = {
+    title: 'Demo swarm',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 },
+      parser: { role: 'worker', id: 'a1b2', isolated: '1', last_read_seq: 1 } as Record<string, unknown>,
+      shared: { role: 'worker', id: 'c3d4', isolated: '0', last_read_seq: 1 } as Record<string, unknown>,
+    },
+  }
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['parser'], text: '@parser BRIEF' }),
+    roster: () => JSON.stringify(state),
+  })
+  on('process.run', (_, e) => {
+    if (e.argv[0] === 'lsof') {
+      return answer('p101\nn/project\np202\nn/project/.claude/worktrees/agent-a1b2/Tests\np303\nn/project/.claude/worktrees/agent-a1b2c3\np404\nn/project/.claude/worktrees/agent-a1b2\n')
+    }
+    if (e.argv[0] === 'ps') return answer(e.argv.at(-1) === '202,404' ? '  202 /usr/bin/xcodebuild\n  404 /bin/zsh\n' : '')
+    return answer(board(e))
+  })
+  // the agent itself has ended: only what it launched is left
+  on('agent.list', () => ({ value: [] }))
+  on('tool.call', (_, e) => {
+    const retiring = e.tool === 'Bash' ? /(?:member (parser|shared) killed=1|replace (shared) )/.exec(String(e.command))?.slice(1).find(Boolean) as 'parser' | 'shared' | undefined : undefined
+    if (retiring) state.members[retiring].killed = '1'
+    return { result: {} }
+  })
+  mock.clock(on)
+
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  const gone = await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" member parser killed=1` })
+  expect(gone.context?.join('\n')).toContain('@parser was retired, but 2 processes it started are still running in its worktree: 202 (xcodebuild), 404 (zsh)')
+  expect(gone.context?.join('\n')).toContain('kill 202 404')
+  expect(gone.context?.join('\n')).not.toContain('303')
+  // a shared writer's build cannot be attributed: said when it is replaced, and not when it is simply removed
+  const removed = await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" member shared killed=1` })
+  expect(removed.context?.join('\n') ?? '').not.toContain('@shared was retired')
+  const other = await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" replace shared shared-2` })
+  expect(other.context?.join('\n')).toContain('@shared was retired. A build or test it started in the shared folder cannot be told')
+})

@@ -569,6 +569,39 @@ class VerifyRegressions(unittest.TestCase):
             run(*gate, "accept", cand["candidate"])
             assert "accepted_seq" in json.loads(members_path.read_text())
 
+    def test_every_check_runs_and_two_verdicts_on_one_candidate_are_one_failure(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            (proj / "app.txt").write_text("ok")
+            board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "All checks")
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            run(*post, "ready", "w", text="done")
+            cand = json.loads(run(*gate, "prepare", "shared", "--check", "false", "--check", "echo second-ran", "--check", "test -e missing"))
+            res = subprocess.run([*gate, "test", cand["candidate"], "v"], capture_output=True, text=True)
+            # a failing first check does not hide what the others would have said
+            assert res.returncode != 0 and "second-ran" in res.stdout, res.stdout
+            assert "verification failed: false; test -e missing" in res.stderr, res.stderr
+            # a source review and the test results that follow it are one failed cycle for the worker
+            members_path = Path(board) / "members.json"
+            run(*post, "post", "v", "@w NOT PASSED: source review")
+            run(*post, "post", "v", "@w NOT PASSED: and the test results (adds to the above)")
+            run(*post, "post", "v", "@w NOT PASSED: one more note on the same candidate")
+            assert "paused" not in json.loads(members_path.read_text())
+            # new work reviewed before the next candidate exists is a new cycle too, though the old candidate is on the table
+            run(*post, "revise", "w", "fixing")
+            run(*post, "ready", "w", text="done again")
+            run(*post, "post", "v", "@w NOT PASSED: the fix is wrong, seen in review")
+            assert "paused" not in json.loads(members_path.read_text())
+            # a new candidate that fails is a new cycle
+            run(*post, "revise", "w", "fixing")
+            run(*post, "ready", "w", text="done a third time")
+            run(*gate, "prepare", "shared", "--check", "false")
+            run(*post, "post", "v", "@w NOT PASSED: still failing")
+            assert json.loads(members_path.read_text())["paused"] == "@w failed verification 3 times in a row"
+
     def test_negative_verdict_voids_the_pass_until_a_fresh_test(self):
         with tempfile.TemporaryDirectory() as t:
             proj = Path(t).resolve()

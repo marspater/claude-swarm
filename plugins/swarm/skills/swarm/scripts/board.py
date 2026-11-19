@@ -451,6 +451,16 @@ def void_pass(d):
         atomic_write(path, json.dumps(candidate, indent=2))
 
 
+def candidate_on_table(d):
+    """The identifier of the candidate being verified, or None when there is none or it was accepted."""
+    try:
+        with open(os.path.join(d, "verification.json"), encoding="utf-8") as f:
+            candidate = json.load(f)
+    except (FileNotFoundError, ValueError):
+        return None
+    return candidate.get("candidate") if isinstance(candidate, dict) and not candidate.get("accepted") else None
+
+
 def successor(name, members):
     seen = set()
     while name in members and members[name].get("killed") and members[name].get("replaced_by") and name not in seen:
@@ -487,20 +497,26 @@ def unanswered(members, posts):
 
 
 def rework(state, posts):
-    """The NOT PASSED posts each worker has received in a row. A verifier's VERIFIED covers every worker and
-    starts the count again, as does an accepted candidate."""
-    members, failed = state["members"], {}
+    """The NOT PASSED posts each worker has received in a row, one for each candidate it failed in: a second
+    verdict on the same candidate, such as test results added to a source review, is the same failure. A verifier's
+    VERIFIED covers every worker and starts the count again, as does an accepted candidate."""
+    members, failed, latest = state["members"], {}, {}
     for post in posts:
+        if post.get("kind") == "ready":
+            latest.pop(post["agent"], None)  # new work: a verdict on it is a new failure, whatever candidate is on the table
         word = REPORT_WORD.match(post["text"])
         if post["seq"] <= state.get("accepted_seq", 0) or not word or members.get(post["agent"], {}).get("role") != "verifier":
             continue
         if word[1] == "VERIFIED":
-            failed = {}
+            failed, latest = {}, {}
         elif word[1] == "NOT PASSED":
             first_workers = [name for name in targets(post["text"].split("\n", 1)[0], members, include_killed=True)
                              if name in post["to"] and members.get(name, {}).get("role") == "worker"]
             for name in (first_workers or [name for name in post["to"] if members.get(name, {}).get("role") == "worker"]):
-                failed.setdefault(name, []).append(post["seq"])
+                # A verdict made with no candidate on the table is counted on its own.
+                if post.get("candidate") is None or latest.get(name) != post["candidate"]:
+                    failed.setdefault(name, []).append(post["seq"])
+                latest[name] = post.get("candidate")
     return failed
 
 
@@ -1191,20 +1207,23 @@ def main(argv):
                          "Wait for the candidate; report anything else as NOT VERIFIED or as a note. "
                          "A pass a later NOT PASSED or NOT VERIFIED withdrew is restored only by running the test again.")
             recipients = [name for name in targets(text, members) if name != sender]
+            stuck, verdict = "", {}
+            if word == "NOT PASSED" and members[sender].get("role") == "verifier":
+                tested = candidate_on_table(d)
+                if tested:
+                    verdict = {"candidate": tested}
             if word in {"NOT PASSED", "NOT VERIFIED"} and members[sender].get("role") == "verifier":
                 void_pass(d)
-            stuck = ""
             if word == "NOT PASSED" and members[sender].get("role") == "verifier" and not state.get("paused"):
-                # Paused by the verdict itself, so a resumed run is stopped again only by a further one.
-                failed = rework(state, posts)
-                first_workers = [name for name in targets(first, members)
-                                 if name in recipients and members.get(name, {}).get("role") == "worker"]
-                charged = first_workers or [name for name in recipients if members[name].get("role") == "worker"]
-                stuck = next(("@%s failed verification %d times in a row" % (name, len(failed.get(name, [])) + 1) for name in charged
-                              if len(failed.get(name, [])) + 1 >= REWORK_PAUSE), "")
+                # Paused by the verdict itself, so a resumed run is stopped again only by a further one. Counted as the
+                # board will count it once posted: a second verdict on one candidate is no new failure.
+                seq = len(posts) + 1
+                failed = rework(state, posts + [{"seq": seq, "agent": sender, "text": text, "to": recipients, **verdict}])
+                stuck = next(("@%s failed verification %d times in a row" % (name, len(seqs)) for name, seqs in failed.items()
+                              if seqs[-1] == seq and len(seqs) >= REWORK_PAUSE), "")
                 if stuck:
                     state["paused"] = stuck
-            post_message(sender, text, recipients, save_roster=bool(stuck))
+            post_message(sender, text, recipients, save_roster=bool(stuck), **verdict)
             if stuck:
                 print("paused: %s. The coordinator asks the user how to go on" % stuck)
 

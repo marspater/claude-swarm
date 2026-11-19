@@ -652,6 +652,27 @@ async function resolveRealPath($: EngineInterface, absPath: string): Promise<str
   return absPath
 }
 
+/**
+ * What still runs inside a retired member's own worktree, whose folder carries the agent's id. A process started in
+ * the shared folder is not found: nothing ties it to the member that started it.
+ */
+async function leftRunning($: EngineInterface, id: string, listing: string): Promise<{ pid: string; command: string }[]> {
+  if (!/^[\w-]+$/.test(id)) return []
+  const pids: string[] = []
+  let pid = ''
+  for (const line of listing.split('\n')) {
+    if (line.startsWith('p')) pid = line.slice(1)
+    // The folder itself or anything under it, and not another agent's whose id only starts alike.
+    else if (line.startsWith('n') && /^\d+$/.test(pid) && (`${line}/`).includes(`/worktrees/agent-${id}/`)) pids.push(pid)
+  }
+  if (pids.length === 0) return []
+  const named = await $.process.run(['ps', '-o', 'pid=,comm=', '-p', [...new Set(pids)].join(',')]).catch(() => undefined)
+  return (named?.stdout ?? '').split('\n').flatMap(line => {
+    const match = /^\s*(\d+)\s+(.+)$/.exec(line)
+    return match ? [{ pid: match[1]!, command: clean(match[2]!.split('/').pop() ?? '').slice(0, 40) }] : []
+  }).slice(0, 12)
+}
+
 async function syncOwnedState(
   $: EngineInterface,
   dir: string,
@@ -1800,11 +1821,24 @@ export const register: Register = on => {
           if (retiredNames.length > 0 && ownedRoster && ownedRoster.dir === resolvedSyncDir && !ownedRoster.closed) {
             const liveAgents = await $.agent.list().catch(() => [])
             const zombieNotices: string[] = []
+            // Every process's working folder, read once for the command however many members it retires. lsof exits 1
+            // when it could not read every process and still lists the rest; -b keeps it off a mount that does not answer.
+            const listing = await $.process.run(['lsof', '-b', '-w', '-a', '-d', 'cwd', '-Fpn'], { timeoutMs: 5000 })
+              .then(listed => listed.stdout, () => '')
+            const replaced = new Set(calls.filter(c => c.action === 'replace').map(c => c.subarg?.trim()))
             for (const oldName of retiredNames) {
               const entry = memberNamed(ownedRoster.members, oldName)
               const live = entry?.killed && entry.id ? findAgent(liveAgents, entry.id) : undefined
               if (live && ['running', 'pending', 'waiting'].includes(live.status)) {
                 zombieNotices.push(`Swarm: @${oldName} was retired, but agent ${live.id} is still ${live.status}. Stop it before spawning a successor.`)
+              }
+              // Refusing its tools stops the agent, not a build it had already launched.
+              const left = entry?.killed && entry.id ? await leftRunning($, entry.id, listing) : []
+              if (left.length > 0) {
+                zombieNotices.push(`Swarm: @${oldName} was retired, but ${left.length} process${left.length === 1 ? '' : 'es'} it started ${left.length === 1 ? 'is' : 'are'} still running in its worktree: ${left.map(one => `${one.pid} (${one.command})`).join(', ')}. Unless the user wants ${left.length === 1 ? 'it' : 'them'} to finish, stop ${left.length === 1 ? 'it' : 'them'}: kill ${left.map(one => one.pid).join(' ')}`)
+              } else if (replaced.has(oldName) && entry?.killed && entry.id && entry.isolated !== '1' &&
+                  entry.role === 'worker' && entry.writes !== '0' && !['explorer', 'investigator', 'architect'].includes(entry.profile ?? '')) {
+                zombieNotices.push(`Swarm: @${oldName} was retired. A build or test it started in the shared folder cannot be told from the team's own, so nothing was checked: look for one before its successor builds.`)
               }
             }
             if (zombieNotices.length > 0 && result.deny === undefined) {
