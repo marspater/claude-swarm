@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import type { Post, Swarm } from '../types'
-import { edgesOf, graphSvg, isBroadcast } from './graph'
+import { edgesOf, graphHeight, graphSvg, isBroadcast } from './graph'
 import { statusDot } from './palette'
 
 test('the graph counts posts the pane no longer keeps', async () => {
@@ -291,4 +291,19 @@ test('peer detours separate solid and @all edges, badges expand for 3 digits and
   expect(statusDot('waiting')).toContain('r="1.6"')
   expect(statusDot('failed')).toContain('stroke-linecap="round"')
   expect(statusDot('not started')).toContain('stroke-width="1.5"')
+})
+
+test('the graph frame takes the shape of the drawing, so no band of empty space is left around it', () => {
+  const team = (names: string[]) => [
+    { name: 'coordinator', role: 'coordinator', status: 'coordinating', posts: 0 },
+    ...names.map(name => ({ name, role: 'worker', status: 'working', posts: 0 })),
+  ] as never
+  const many = team(['marker-key', 'lane-focus', 'feed-export', 'verifier', 'images', 'license', 'ci-audit', 'issue-dump', 'architect', 'tracker'])
+  for (const members of [team(['a', 'b']), team(['a', 'b', 'c', 'd', 'e', 'f']), many]) {
+    const [, width = 0, height = 0] = /viewBox="0 0 (\d+) (\d+)"/.exec(graphSvg({ members, posts: [], dir: '/r' } as never, 0, new Set(), false, true))?.map(Number) ?? []
+    // 8.77 px a column: the frame the pane asks for has the drawing's own proportions
+    expect(Math.abs(graphHeight(60, members) - 60 * 8.77 * height / width)).toBeLessThan(1)
+  }
+  // a wide drawing of many long names is no taller than a small one
+  expect(graphHeight(75, many)).toBeLessThan(graphHeight(75, team(['a', 'b', 'c', 'd', 'e', 'f'])))
 })

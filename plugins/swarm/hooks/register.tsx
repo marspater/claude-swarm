@@ -2655,7 +2655,7 @@ export const register: Register = on => {
           <Svg
             key="message-routes" source={graphSvg(shown, post.seq, hidden, animate, live, repeat, routeOffset, isExpanded)}
             width={1024}
-            height={graphHeight(columns, shown.members.length)}
+            height={graphHeight(columns, shown.members)}
             alt={`Post ${post.seq} · @${post.agent}${post.to.length ? ` to ${post.to.map(name => `@${name}`).join(', ')}` : ' · no mentions'}`}
             isInteractive
           />

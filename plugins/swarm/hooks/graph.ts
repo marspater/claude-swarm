@@ -37,10 +37,31 @@ export function pairOf(edge: string): [string, string] | undefined {
 const PILL_HEIGHT = 38
 const LEGEND = 50
 
-export function graphHeight(columns: number, memberCount: number): number {
-  // The desktop clamps the frame width to the actual slot. Columns estimate
-  // its height only, so a change in font metrics cannot narrow the frame.
-  return Math.max(200, Math.min(620, Math.round(columns * (memberCount > 8 ? 7.6 : memberCount > 6 ? 7.11 : 5.95))))
+const halfOf = (name: string) => Math.max(38, 22 + Math.min(15, name.length) * 4.7)
+
+/** The drawing's own size: it widens with long names and many members, so its shape is not one fixed ratio. */
+function stageOf(all: Swarm['members']) {
+  const coordinator = all.find(member => member.role === 'coordinator')
+  const outerMembers = all.filter(member => member !== coordinator)
+  const outerCount = outerMembers.length
+  const maxHalf = Math.max(38, ...outerMembers.map(member => halfOf(member.name)))
+  const rx = Math.max(186, outerCount <= 2 ? 186 : (maxHalf + 10) / Math.sin(Math.PI / outerCount))
+  const width = Math.max(560, Math.ceil((rx + maxHalf + 12) * 2))
+  const minRy = outerCount <= 2 ? 129 : (PILL_HEIGHT / 2 + 8) / Math.sin(Math.PI / outerCount)
+  const baseHeight = all.length > 6 ? 404 : 330
+  const height = Math.max(baseHeight, Math.ceil((Math.max(baseHeight / 2 - 36, minRy) + 36) * 2))
+  return { coordinator, outerMembers, outerCount, rx, width, height }
+}
+
+// What one text column measures across the frame, as the pane draws it.
+const COLUMN_WIDTH = 8.77
+
+export function graphHeight(columns: number, members: Swarm['members']): number {
+  // The desktop clamps the frame width to the actual slot. Columns estimate its height only, so a change in font
+  // metrics cannot narrow the frame. The height follows the drawing's shape: a frame taller than the drawing
+  // leaves the difference empty above the graph and below its legend.
+  const { width, height } = stageOf(members)
+  return Math.max(200, Math.min(620, Math.round(columns * COLUMN_WIDTH * (height + LEGEND) / width)))
 }
 
 const esc = (text: string) =>
@@ -72,17 +93,8 @@ export function graphSvg(
   const members = swarm.members.filter(member =>
     !hidden.has(member.name) && (live || participants.has(member.name)),
   )
-  const coordinator = swarm.members.find(member => member.role === 'coordinator')
-  const outerMembers = swarm.members.filter(member => member !== coordinator)
-  const halfOf = (name: string) => Math.max(38, 22 + Math.min(15, name.length) * 4.7)
+  const { coordinator, outerMembers, outerCount, rx, width, height } = stageOf(swarm.members)
   const centerHalf = coordinator ? halfOf(coordinator.name) : 0
-  const outerCount = outerMembers.length
-  const maxHalf = Math.max(38, ...outerMembers.map(member => halfOf(member.name)))
-  const rx = Math.max(186, outerCount <= 2 ? 186 : (maxHalf + 10) / Math.sin(Math.PI / outerCount))
-  const width = Math.max(560, Math.ceil((rx + maxHalf + 12) * 2))
-  const minRy = outerCount <= 2 ? 129 : (PILL_HEIGHT / 2 + 8) / Math.sin(Math.PI / outerCount)
-  const baseHeight = swarm.members.length > 6 ? 404 : 330
-  const height = Math.max(baseHeight, Math.ceil((Math.max(baseHeight / 2 - 36, minRy) + 36) * 2))
   const ry = height / 2 - 36
   const positions = new Map(swarm.members.map(member => {
     const label = member.name.length > 15 ? `${clipHead(member.name, 14)}…` : member.name
