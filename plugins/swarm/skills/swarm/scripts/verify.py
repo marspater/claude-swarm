@@ -413,6 +413,9 @@ def run_check(command, cwd, timeout):
         return process.wait(timeout=timeout)
     except BaseException:
         # A check that ends on its own may leave what it started for the next check; one that is cut short may not.
+        # A second signal must not cut the cleanup short: they are ignored until the group is gone.
+        for number in previous:
+            signal.signal(number, signal.SIG_IGN)
         for number in (signal.SIGTERM, signal.SIGKILL):
             if gone():
                 break
