@@ -1,6 +1,6 @@
 ---
 name: exploring
-description: "Only for swarm:explorer, which preloads it. Use for scoped code search and file-slice analysis. Covers finding registrations and aliases, confirming paths with small reads, reporting exact references, and documenting search limits."
+description: "Swarm explorer role guide. Preloaded; do not invoke."
 user-invocable: false
 ---
 

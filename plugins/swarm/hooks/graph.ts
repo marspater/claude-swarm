@@ -27,7 +27,9 @@ export function graphSvg(
   animate: boolean,
   live: boolean,
   repeat = false,
+  elapsed = 0,
 ): string {
+  const phase = elapsed % 3600
   const current = swarm.posts.find(post => post.seq === upTo)
   // Members whose only posts are older than the ones kept still took part.
   const participants = new Set<string>(Object.keys(swarm.earlierEdges ?? {}).flatMap(edge => edge.split('>')))
@@ -130,10 +132,10 @@ export function graphSvg(
       '</path>')
     if (animate || repeat) {
       const motion = repeat
-        ? `<animateMotion dur="3.6s" path="${d}" calcMode="spline" keyPoints="0;1;1" keyTimes="0;.24;1" keySplines=".22 .61 .36 1;0 0 1 1" repeatCount="indefinite"/>`
+        ? `<animateMotion begin="-${phase}ms" dur="3.6s" path="${d}" calcMode="spline" keyPoints="0;1;1" keyTimes="0;.24;1" keySplines=".22 .61 .36 1;0 0 1 1" repeatCount="indefinite"/>`
         : `<animateMotion dur="0.86s" path="${d}" calcMode="spline" keyPoints="0;1" keyTimes="0;1" keySplines=".22 .61 .36 1" fill="freeze"/>`
       const opacity = (peak: string) => repeat
-        ? `<animate attributeName="opacity" values="0;${peak};${peak};0;0" keyTimes="0;.025;.19;.265;1" dur="3.6s" repeatCount="indefinite"/>`
+        ? `<animate attributeName="opacity" values="0;${peak};${peak};0;0" keyTimes="0;.025;.19;.265;1" begin="-${phase}ms" dur="3.6s" repeatCount="indefinite"/>`
         : `<animate attributeName="opacity" values="0;${peak};${peak};0" keyTimes="0;.1;.8;1" dur="0.95s"/>`
       active.push(
         '<circle class="motion packet-halo" r="7" opacity="0">' +
@@ -163,7 +165,7 @@ export function graphSvg(
     const arrival = recipient && (animate || repeat)
       ? `<rect class="motion arrival" ${rect} opacity="0">` +
         (repeat
-          ? '<animate attributeName="opacity" values="0;.65;0;0" keyTimes="0;.027;.12;1" begin=".76s" dur="3.6s" repeatCount="indefinite"/>'
+          ? `<animate attributeName="opacity" values="0;.65;0;0" keyTimes="0;.027;.12;1" begin="${760 - phase}ms" dur="3.6s" repeatCount="indefinite"/>`
           : '<animate attributeName="opacity" values="0;.65;0" keyTimes="0;.22;1" begin=".76s" dur=".44s"/>') + '</rect>'
       : ''
     return (

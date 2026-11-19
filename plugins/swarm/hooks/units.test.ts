@@ -2,8 +2,8 @@ import { expect, test } from 'claude-code/testing'
 import type { Post } from '../types'
 import { BOARD_CALL, COORDINATOR_READ, RUN, runsNamed, wakeMessage, wakeSequence } from './command'
 import { graphSvg } from './graph'
-import { toolMood } from './hive'
-import { DEFAULT_MODEL, SWARM_AGENTS, familyOf, latestOf } from './models'
+import { toolMood, toolSummary } from './hive'
+import { DEFAULT_EFFORT, DEFAULT_MODEL, SWARM_AGENTS, familyOf, latestOf } from './models'
 import { statusKey } from './palette'
 import { parse, tokensUsed } from './roster'
 import { bodyOf, clean, clip, kindOf, openedText } from './text'
@@ -23,6 +23,8 @@ test('a board command is recognised in the forms a coordinator types it', async 
   }
   expect(COORDINATOR_READ.test('board.py DIR read --headers --max-bytes=4000 coordinator')).toBe(true)
   expect(COORDINATOR_READ.test('board.py DIR read parser')).toBe(false)
+  // the board takes a name with its @
+  expect(COORDINATOR_READ.test('board.py DIR read --all @coordinator')).toBe(true)
   expect(runsNamed(`a ${run} b demo-20261116-101010 other-20261117-090000x`)).toEqual(['demo-20261116-101010', 'other-20261117-090000x'])
   expect(wakeSequence(wakeMessage(12))).toBe(12)
   expect(Number.isSafeInteger(wakeSequence('hello'))).toBe(false)
@@ -32,6 +34,9 @@ test('every member type starts on the newest model of its family', async () => {
   expect([latestOf('opus'), latestOf('haiku'), latestOf('claude-opus-4-6'), latestOf(undefined)])
     .toEqual(['claude-opus-5-5', 'claude-haiku-5-5', 'claude-opus-4-6', undefined])
   expect(familyOf('claude-fable-5-2')).toBe('fable')
+  // a family name is read in any case, as familyOf reads it
+  expect([latestOf('Opus'), familyOf('Opus')]).toEqual(['claude-opus-5-5', 'opus'])
+  expect([DEFAULT_MODEL.verifier, DEFAULT_EFFORT.verifier]).toEqual(['claude-sonnet-5-5', 'medium'])
   for (const type of SWARM_AGENTS) expect(DEFAULT_MODEL[type.slice('swarm:'.length)]).toMatch(/^claude-/)
 })
 
@@ -45,6 +50,10 @@ test('the hive reads a tool call by what it does, the board by its subcommand', 
   expect(toolMood('Edit')).toBe('build')
   expect(toolMood('Agent')).toBe('relay')
   expect(toolMood('Other')).toBe('forage')
+  // a run of calls reads as one line
+  expect(toolSummary([{ tool: 'Grep' }, { tool: 'Read' }, { tool: 'Read' }, { tool: 'Edit' }, { tool: 'Bash', input: { command: 'npm test' }, isError: true },
+    { tool: 'Bash', input: { command: 'python3 /p/board.py /r post parser' } }, { tool: 'SendMessage' }]))
+    .toBe('Searched code, read 2 files, edited 1 file, ran 1 check, used the board, sent 1 message, 1 failed')
   expect([statusKey('unreachable'), statusKey('working'), statusKey('not started'), statusKey('killed')]).toEqual(['failed', 'working', 'inactive', 'inactive'])
 })
 
@@ -67,13 +76,15 @@ test('board text is cleaned, labelled and cut without breaking a character', asy
 test('the roster is read with its posts cleaned and its tokens summed', async () => {
   const roster = JSON.stringify({
     title: 'Demo\u0007 run', usage: { tokens: { coordinator: 10, a: 5 } }, limits: { budget: '100' },
-    members: { coordinator: { role: 'coordinator', last_read_seq: 0 }, parser: { role: 'worker', profile: 'designer', last_read_seq: 0 } },
+    members: { coordinator: { role: 'coordinator', last_read_seq: 0 }, parser: { role: 'worker', profile: 'designer', effort: 'high', last_read_seq: 0 } },
   })
   const board = `${JSON.stringify({ seq: 1, agent: 'parser', text: '@coordinator hi\r\nthere', time: 't' })}\n{"seq": 2, "agent": "par`
   const shown = parse('/project/.swarm/demo-20261116-101010', board, roster, [])
   expect(shown.title).toBe('Demo run')
   expect(shown.posts.map(p => [p.seq, p.text, p.to])).toEqual([[1, '@coordinator hi\nthere', ['coordinator']]])
   expect(shown.members.find(member => member.name === 'parser')?.type).toBe('designer')
+  // with no attention report the roster's own effort is shown
+  expect(shown.members.find(member => member.name === 'parser')?.effort).toBe('high')
   expect([shown.budget, tokensUsed(shown.tokens)]).toEqual([100, 15])
   // a member that has not started is drawn with one class, not two
   const svg = graphSvg(shown, 1, new Set(), false, true)

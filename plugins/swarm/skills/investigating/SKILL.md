@@ -1,6 +1,6 @@
 ---
 name: investigating
-description: "Only for swarm:investigator, which preloads it. Use for diagnosing failures. Covers tracing the failing path, disproving competing causes, distinguishing source evidence from runtime observations, and handing off a regression scenario."
+description: "Swarm investigator role guide. Preloaded; do not invoke."
 user-invocable: false
 ---
 
@@ -18,7 +18,7 @@ Explain the cause of a specific failure. Give the next member enough evidence to
 
 ## Read along the path
 
-- The board tool's `read` shows your brief in full and other posts as one line each. Read an explorer's map with `show` before you search for anything it already located.
+- The board tool's `read` shows your brief in full and other posts as one line each. Read an explorer's map with `show` and its `seq` before you search for anything it already located.
 - Read the functions on the failing path. Do not read modules the path does not touch.
 - Stop when the brief's question is answered. If it requires a run, log, or measurement you cannot obtain through your tools, post the missing observation and mention the member who can collect it. Include the action they should perform and what result would confirm or rule out your explanation.
 

@@ -1,6 +1,6 @@
 ---
 name: implementing
-description: "Only for swarm:worker, which preloads it. Use for implementing and testing a bounded change or synthesizing assigned reports. Covers checkout and scope, preserving shared work, proving a regression, and leaving an integrable handoff."
+description: "Swarm worker role guide. Preloaded; do not invoke."
 user-invocable: false
 ---
 
@@ -10,7 +10,7 @@ You own a bounded piece. Use its acceptance criteria to decide what to read, cha
 
 ## Read only what the piece needs
 
-- Your brief is shown in full. Other members' posts arrive as one line each. Open one with `BOARD show <name>` only when your work depends on it.
+- Your brief is shown in full. Other members' posts arrive as one line each. Open one with `BOARD show --post=<n>` only when your work depends on it.
 - Verify the checkout and assigned paths before touching a file. In a shared checkout, inspect the current diff for changes you need to preserve. For isolated work, identify the worktree from which your result will be handed off.
 - Read your files, their tests, and the callers or contracts that the change affects. Start from the normal entry point so a local fix also works through the feature's usual path.
 - Locate before you read: search for the symbol, then read the range around it. Read a whole file only when it is short or you own it.
@@ -39,7 +39,7 @@ When your brief names a `swarm:designer`'s spec, tokens or assets as its source,
 - Run the narrowest check first: the one test file. Run the brief's full check once, before you report.
 - Keep output small: use the runner's quiet mode, and on a failure read the failing assertion, not the whole log.
 - A failing check needs a reason. Identify whether it exercises your change, fails on the existing baseline, or is blocked by the environment when you can establish the difference. If a required check is blocked, post the command, decisive output, and what would unblock it. Leave the work pending until the coordinator resolves the requirement.
-- When successive attempts hit the same failure, go back to evidence. Share the failing assertion, what you tried, and the next decision or input you need.
+- After two attempts at the same failing check, stop retrying. Post the failing assertion, what you tried, and the decision or input you need, then end the turn.
 
 ## Synthesize assigned reports
 

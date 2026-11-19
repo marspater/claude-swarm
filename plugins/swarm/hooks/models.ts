@@ -9,10 +9,14 @@ export const SWARM_AGENTS = new Set(['swarm:worker', 'swarm:verifier', 'swarm:de
 export const LATEST: Record<string, string> = {
   haiku: 'claude-haiku-5-5', sonnet: 'claude-sonnet-5-5', opus: 'claude-opus-5-5', fable: 'claude-fable-5-2',
 }
-export const latestOf = (model: string | undefined) => (model !== undefined && Object.hasOwn(LATEST, model) ? LATEST[model] : model)
-export const DEFAULT_MODEL: Record<string, string> = {
-  worker: LATEST.sonnet!, verifier: LATEST.opus!, explorer: LATEST.haiku!, investigator: LATEST.opus!, architect: LATEST.fable!, designer: LATEST.opus!,
+// A family name in any case, as familyOf reads it: `Opus` is the newest opus, not a model of its own.
+export const latestOf = (model: string | undefined) => {
+  const family = model?.toLowerCase() ?? ''
+  return Object.hasOwn(LATEST, family) ? LATEST[family] : model
 }
-export const DEFAULT_EFFORT: Record<string, string> = { worker: 'medium', verifier: 'high', explorer: 'medium', investigator: 'high', architect: 'high', designer: 'high' }
+export const DEFAULT_MODEL: Record<string, string> = {
+  worker: LATEST.sonnet!, verifier: LATEST.sonnet!, explorer: LATEST.haiku!, investigator: LATEST.opus!, architect: LATEST.fable!, designer: LATEST.opus!,
+}
+export const DEFAULT_EFFORT: Record<string, string> = { worker: 'medium', verifier: 'medium', explorer: 'medium', investigator: 'high', architect: 'high', designer: 'high' }
 export const familyOf = (model: string) =>
   ['haiku', 'sonnet', 'opus', 'fable'].find(name => model.toLowerCase().includes(name)) ?? model

@@ -13,7 +13,7 @@ import sys
 import uuid
 
 sys.dont_write_bytecode = True
-from board import atomic_write, load, load_state, readiness
+from board import atomic_write, load, load_state, readiness, save
 
 
 def git(path, *args, optional=False):
@@ -63,8 +63,12 @@ def source_digest(project, nested=False):
         head = b"non-git"
     else:
         root, run_data = found
+        # Every tracked name with its "mode object stage"; a submodule's mode is 160000 and its object the recorded commit.
+        tracked = {name: meta.split() for meta, _, name in (
+            entry.partition(b"\t") for entry in git(root, "ls-files", "-z", "--stage").split(b"\0") if entry)}
+        gitlinks = {name: meta[1] for name, meta in tracked.items() if meta[0] == b"160000"}
         # Run data is never source, whatever the project's .swarm/.gitignore says.
-        files = (file for file in git(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard").split(b"\0")
+        files = (file for file in [*tracked, *git(root, "ls-files", "-z", "--others", "--exclude-standard").split(b"\0")]
                  if file and (nested or not is_run_data(file, run_data)))
         head = git(root, "rev-parse", "HEAD", optional=True) or b"unborn"
     digest = hashlib.sha256(head + b"\0")
@@ -94,11 +98,16 @@ def source_digest(project, nested=False):
                         "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")):
                     raise ValueError(f"source changed while fingerprinting {path}")
                 digest.update(content.digest())
-        elif stat.S_ISDIR(mode) and (path / ".git").exists():
+        elif stat.S_ISDIR(mode) and found is not None and name in gitlinks and not ((path / ".git").exists() and (
+                git(path, "rev-parse", "HEAD").strip() != gitlinks[name]
+                or git(path, "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none"))):
+            # A submodule's recorded commit stands for it, whether it is absent, as in a fresh worktree, or
+            # checked out clean at that commit: the integration worktree and the user's checkout then agree.
+            digest.update(b"gitlink\0" + gitlinks[name])
+        elif stat.S_ISDIR(mode) and (path / ".git").exists():  # a nested repository, or a submodule that moved or is dirty
             digest.update(b"repo\0" + bytes.fromhex(source_digest(path, nested=True)))
-        elif stat.S_ISDIR(mode) and found is not None and (link := git(root, "rev-parse", "--verify", "-q", ":" + os.fsdecode(name), optional=True)):
-            # A submodule that is not checked out, as in a fresh worktree: its recorded commit stands for it.
-            digest.update(b"gitlink\0" + link.strip())
+        elif stat.S_ISDIR(mode) and found is not None and name in tracked:
+            digest.update(b"dir\0")  # a tracked file replaced by a folder; the files in it are listed on their own
         else:
             raise ValueError(f"cannot fingerprint {path}")
     return digest.hexdigest()
@@ -160,7 +169,9 @@ def candidate_for(run, project, identifier):
 
 
 def check_inputs(run, candidate):
-    if not isinstance(candidate["checks"], list) or not candidate["checks"] or any(not isinstance(check, str) or not check.strip() for check in candidate["checks"]):
+    # An empty list passes only when `prepare --no-checks` asked for it: a candidate that lost its commands does not.
+    deliberate = candidate.get("no_checks") is True and candidate["checks"] == []
+    if not deliberate and (not isinstance(candidate["checks"], list) or not candidate["checks"] or any(not isinstance(check, str) or not check.strip() for check in candidate["checks"])):
         raise ValueError("the candidate is missing verification commands; prepare a new candidate")
     if candidate["inputs"] != inputs(run, candidate["mode"]):
         raise ValueError("worker readiness changed; prepare and test a new candidate")
@@ -217,9 +228,16 @@ def active_verifier(run, verifier):
 
 
 def prepare(run, project, mode, checks):
+    """CHECKS is None for a candidate with nothing a command could test, such as a designer's assets."""
     identifier = uuid.uuid4().hex[:16]
     with board_lock(run):
         recorded = inputs(run, mode)
+        if checks is None:
+            coders = sorted(name for name, member in load_state(run)["members"].items()
+                            if name in recorded and member.get("writes") != "0" and member.get("profile") != "designer")
+            if coders:
+                raise ValueError("--no-checks is for a run whose only writers are designers; give --check commands that test the work of "
+                                 + ", ".join("@" + name for name in coders))
     work = project
     integration = None
     base = commit = branch = None
@@ -245,18 +263,28 @@ def prepare(run, project, mode, checks):
                 raise ValueError("the requested project directory is missing in the candidate")
         candidate = {
             "candidate": identifier, "project": str(project), "path": str(work),
-            "mode": mode, "base": base, "commit": commit, "checks": checks,
+            "mode": mode, "base": base, "commit": commit, "checks": checks or [], "no_checks": checks is None,
             "branch": os.fsdecode(branch).strip() if branch else None,
             "worktree": str(integration) if integration else None,
             "inputs": recorded, "digest": source_digest(work),
         }
         with board_lock(run):
             check_inputs(run, candidate)
+            try:
+                with (run / "verification.json").open(encoding="utf-8") as file:
+                    previous = json.load(file)
+            except (OSError, ValueError):
+                previous = None
             save_candidate(run, candidate)
     except BaseException:  # an interrupt too: a half-built integration worktree is never left behind
         if integration is not None and integration.exists():
             git(project, "worktree", "remove", "--force", str(integration), optional=True)
         raise
+    # The candidate this one supersedes leaves its checkout behind. An accepted one is the record of what was
+    # tested and stays, and nothing outside this run's folder is ever removed.
+    stale = Path(previous.get("worktree") or "") if isinstance(previous, dict) and not previous.get("accepted") else None
+    if stale and stale.parent == run and stale.name.startswith("integration-"):
+        git(project, "worktree", "remove", "--force", str(stale), optional=True)
     print(json.dumps({"candidate": identifier, "path": str(work), "commit": commit,
                       "digest": candidate["digest"]}))
 
@@ -327,6 +355,9 @@ def accept(run, project, identifier):
                 raise
         candidate["accepted"] = True
         save_candidate(run, candidate)
+        state, posts = load(run)
+        state["accepted_seq"] = len(posts)  # the board counts failed verification cycles from here again
+        save(run, state)
     print(f"ACCEPTED {identifier} {candidate['commit'] or candidate['digest']}")
     integration = candidate.get("worktree") or candidate["path"]
     if candidate["mode"] == "isolated" and git(project, "worktree", "remove", integration, optional=True) is None:
@@ -340,7 +371,9 @@ def main():
     actions = parser.add_subparsers(dest="action", required=True)
     prep = actions.add_parser("prepare")
     prep.add_argument("mode", choices=("shared", "isolated"))
-    prep.add_argument("--check", action="append", required=True)
+    checks = prep.add_mutually_exclusive_group(required=True)
+    checks.add_argument("--check", action="append")
+    checks.add_argument("--no-checks", action="store_true")
     test = actions.add_parser("test")
     test.add_argument("candidate")
     test.add_argument("verifier")
@@ -354,9 +387,9 @@ def main():
     lock_directory = Path(os.fsdecode(git_dir.rstrip(b"\n"))) if git_dir else run.parent
     with verification_lock(lock_directory):
         if args.action == "prepare":
-            if any(not check.strip() for check in args.check):
+            if any(not check.strip() for check in args.check or []):
                 raise ValueError("each verification check must be a nonempty command")
-            prepare(run, project, args.mode, args.check)
+            prepare(run, project, args.mode, None if args.no_checks else args.check)
         elif args.action == "test":
             test_candidate(run, project, args.candidate, args.verifier)
         else:

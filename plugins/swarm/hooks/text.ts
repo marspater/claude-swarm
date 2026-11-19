@@ -50,10 +50,10 @@ export function openedText(post: Post): string {
 }
 
 // Cuts a long text at a word, not inside one.
-export function clip(text: string): string {
-  if (text.length <= CLIP) return text
-  const cut = head(text, CLIP)
+export function clip(text: string, length = CLIP): string {
+  if (text.length <= length) return text
+  const cut = head(text, length)
   const space = cut.search(/\s\S*$/)
 
-  return `${(space > CLIP / 2 ? cut.slice(0, space) : cut).trimEnd()} …`
+  return `${(space > length / 2 ? cut.slice(0, space) : cut).trimEnd()} …`
 }

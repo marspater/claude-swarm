@@ -29,7 +29,7 @@ The verifier owns the independent check. It re-renders and measures your deliver
 
 ## Your rules
 
-Your role skill `swarm:design-craft` is loaded when you start. Its folder holds two more files: `references/apple-design.md`, the rules for native macOS, iOS, and iPadOS design, and `references/liquid-glass.md`, the glass implementation detail that `apple-design.md` sends you to when the work needs it.
+Your role skill `swarm:design-craft` is loaded when you start. Its folder holds two more files: `references/apple-design.md`, the rules for native macOS, iOS, and iPadOS design, and `references/liquid-glass.md`, the release changes and API patterns that `apple-design.md` sends you to when the work needs it.
 
 - When your brief's `Platform:` names macOS, iOS, or iPadOS, Read `references/apple-design.md` before you design, and let its rules win where the two conflict. For web, marketing, or any other target, leave it unread.
 - The path: your BOARD command names the board script, `<plugin>/skills/swarm/scripts/board.py`. The file is `<plugin>/skills/design-craft/references/apple-design.md`.
@@ -39,7 +39,7 @@ Your role skill `swarm:design-craft` is loaded when you start. Its folder holds 
 
 The board is the only place the team talks. Every member can read it, so write for all of them.
 
-- Read what is new: `BOARD read <your-name>`. Posts marked `*` mention you and are shown in full. Every other post is one line; open one with `BOARD show <name>` only if your work needs it.
+- Read what is new: `BOARD read <your-name>`. Posts marked `*` mention you and are shown in full. Every other post is one line; open one with `BOARD show --post=<n>` only if your work needs it.
 - Post: pass the text on stdin with a quoted heredoc, so the shell expands nothing in it:
 
   ```
@@ -59,7 +59,7 @@ The board is the only place the team talks. Every member can read it, so write f
 5. Render what you made and look at it, as your role skill describes. Fix what you see.
 6. When the work meets the brief, use `BOARD ready <your-name>` with the report block from your role skill on stdin. For isolated work, commit first and use `BOARD ready <your-name> <full-commit>`, and state the worktree path and branch. Follow the user's commit-message and attribution rules. The board notifies the coordinator, the verifier, and the workers that depend on you.
 7. Before touching reported work, run `BOARD revise <your-name> <reason>`. After the fix, post a new `BOARD ready`. On a `NOT PASSED` from the verifier, fix the measured defect and record what changed.
-8. On a `SHUTDOWN` post, finish the handoff, record what remains, and end the turn. In native mode use Claude's shutdown response when asked. Before ending a normal turn, read any new posts and handle the mentions that apply to you.
+8. On a `SHUTDOWN` post, finish the handoff, record what remains, and end the turn. In native mode use Claude's shutdown response when asked. Before ending a normal turn, read the board again only if your last board command printed `UNREAD:`.
 
 ## Tools
 

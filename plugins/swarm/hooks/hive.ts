@@ -10,6 +10,31 @@ export function toolMood(tool: string, command = ''): Mood {
   if (['Agent','SendMessage','mcp__swarm__board'].includes(tool)) return 'relay'
   return 'forage'
 }
+// A run of tool calls as one line, by what they did, as the desktop app folds them: "Searched code, read 13 files, 1 failed".
+export function toolSummary(uses: readonly { tool: string; input?: Record<string, unknown>; isError?: true }[]): string {
+  const counts = new Map<string, number>()
+  for (const { tool, input } of uses) {
+    const command = tool === 'Bash' ? String(input?.command ?? '') : ''
+    const mood = toolMood(tool, command)
+    const what = tool === 'Read' ? 'read|file'
+      : tool === 'Grep' || tool === 'Glob' ? 'searched code|'
+      : tool === 'mcp__swarm__board' || /\bboard\.py\b/.test(command) ? 'used the board|'
+      : mood === 'verify' ? 'ran|check'
+      : tool === 'Bash' ? 'ran|command'
+      : mood === 'build' ? 'edited|file'
+      : mood === 'relay' ? 'sent|message'
+      : mood === 'inspect' ? 'made|lookup' : 'made|other call'
+    counts.set(what, (counts.get(what) ?? 0) + 1)
+  }
+  const parts = [...counts].map(([what, n]) => {
+    const [verb, noun] = what.split('|')
+    return noun ? `${verb} ${n} ${noun}${n === 1 ? '' : 's'}` : `${verb}`
+  })
+  const failed = uses.filter(use => use.isError).length
+  if (failed > 0) parts.push(`${failed} failed`)
+  const line = parts.join(', ')
+  return line.charAt(0).toUpperCase() + line.slice(1)
+}
 const scenes: Record<Mood, [string,string,string]> = {
   sleep: ['M1 2h3v1H3v1H2v1h2v1H1V5h1V4h1V3H1z','0,-1','0,-2'],
   inspect: ['M3 2h4v1H3zM2 3h1v3H2zM7 3h1v3H7zM3 6h4v1H3zM7 7h2v2H7z','3,-2','-2,1'],
@@ -18,7 +43,7 @@ const scenes: Record<Mood, [string,string,string]> = {
   relay: ['M1 3h8v5H1z','5,-2','-4,2'],
   forage: ['M4 3h2v2H4zM2 5h2v2H2z','4,-3','-2,2'],
 }
-export function hiveArt(mood: Mood): string {
+export function hiveArt(mood: Mood, elapsed = 0): string {
   const [prop, left, right] = scenes[mood]
   const sleeping = mood === 'sleep'
   const gesture = {
@@ -33,7 +58,7 @@ export function hiveArt(mood: Mood): string {
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 44 22" shape-rendering="crispEdges">
     <style>svg{--wing:#99c8c8;--honey:#e9ac55;--ink:#664437;--wax:#b46b46}
     @supports(color:color(display-p3 1 0 0)){svg{--wing:color(display-p3 .61 .80 .80);--honey:color(display-p3 .94 .68 .31);--ink:color(display-p3 .40 .26 .20);--wax:color(display-p3 .72 .42 .25)}}
-    @media(prefers-reduced-motion:no-preference){.left{animation:l ${sleeping?'5':'3.4'}s steps(${sleeping?1:4},end) infinite}.right{animation:r 4.8s steps(3,end) infinite}.prop{transform-box:fill-box;transform-origin:center;animation:signal 4s steps(2,end) infinite}${sleeping?'':'.wing{animation:flutter .28s steps(1,end) infinite}'}}
+    @media(prefers-reduced-motion:no-preference){.left{animation:l ${sleeping?'5':'3.4'}s steps(${sleeping?1:4},end) infinite;animation-delay:-${elapsed % (sleeping ? 5000 : 3400)}ms}.right{animation:r 4.8s steps(3,end) infinite;animation-delay:-${elapsed % 4800}ms}.prop{transform-box:fill-box;transform-origin:center;animation:signal 4s steps(2,end) infinite;animation-delay:-${elapsed % 4000}ms}${sleeping?'':`.wing{animation:flutter .28s steps(1,end) infinite;animation-delay:-${elapsed % 280}ms}`}}
     @keyframes l{0%,100%{transform:translate(0,0)}48%,64%{transform:translate(${move(left)})}}
     @keyframes r{0%,100%{transform:translate(0,0)}52%,70%{transform:translate(${move(right)})}}
     @keyframes flutter{50%{transform:translateY(1px)}}@keyframes signal{0%,100%{opacity:.5}55%{opacity:1;transform:${gesture}}}

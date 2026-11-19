@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Exercise the verification gate against temporary Git repositories."""
+import sys
+
+sys.dont_write_bytecode = True  # a test run leaves no __pycache__ in the plugin folder
 from pathlib import Path
 import fcntl
 import json
 import os
 import shlex
 import subprocess
-import sys
 import tempfile
 import unittest
 
@@ -238,10 +240,22 @@ def scenario():
         candidate = json.loads(run(*gate, "prepare", "shared", "--check", "test -s input", env=env))
         run(*gate, "test", candidate["candidate"], "verifier", env=env)
         run(*gate, "accept", candidate["candidate"], env=env)
+        # A run with nothing a command could test says so. An empty list it did not ask for is still refused.
+        run(*gate, "prepare", "shared", ok=False)
+        run(*gate, "prepare", "shared", "--check", "true", "--no-checks", ok=False)
+        assert "only writers are designers" in subprocess.run([*gate, "prepare", "shared", "--no-checks"], capture_output=True, text=True, env=env).stderr
+        run(*post, "member", "worker", "profile=designer")
+        bare = json.loads(run(*gate, "prepare", "shared", "--no-checks", env=env))
+        assert run(*gate, "test", bare["candidate"], "verifier", env=env) == "VERIFIED %s %s" % (bare["candidate"], bare["digest"])
+        record = Path(board) / "verification.json"
+        passed = record.read_text()
+        record.write_text(json.dumps(dict(json.loads(passed), no_checks=False)))
+        run(*gate, "accept", bare["candidate"], ok=False, env=env)
+        record.write_text(passed)
+        run(*gate, "accept", bare["candidate"], env=env)
 
     # A submodule that is not checked out (as in a fresh worktree) is fingerprinted by its recorded commit, and a
     # Git failure other than "not a repository" is an error, never a silent fall back to hashing every file.
-    sys.dont_write_bytecode = True
     sys.path.insert(0, str(SCRIPTS))
     import verify  # noqa: E402
 
@@ -275,6 +289,66 @@ def scenario():
             assert verify.toplevel(repo) is None
         finally:
             verify.git = real
+
+        # a tracked file replaced by a folder is a folder, not a submodule named by the old blob
+        (repo / "file").unlink()
+        (repo / "file").mkdir()
+        empty = verify.source_digest(repo)
+        git("update-index", "--cacheinfo", "100644,%s,file" % run("git", "hash-object", "-w", "--stdin", cwd=repo, text="2"))
+        assert verify.source_digest(repo) == empty
+        (repo / "file" / "inner").write_text("1")
+        assert verify.source_digest(repo) != empty
+
+    # A checked-out submodule: the integration worktree has it absent, the user's checkout has it clean at the
+    # recorded commit, and both must fingerprint alike or no isolated candidate could ever be accepted.
+    with tempfile.TemporaryDirectory() as temp:
+        library, project = Path(temp).resolve() / "library", Path(temp).resolve() / "project"
+        for repo in (library, project):
+            repo.mkdir()
+            run("git", "init", "-b", "main", cwd=repo)
+            for setting in (("user.name", "Swarm Test"), ("user.email", "swarm@example.invalid"), ("commit.gpgsign", "false")):
+                run("git", "config", *setting, cwd=repo)
+            (repo / "value").write_text("0")
+            run("git", "add", ".", cwd=repo)
+            run("git", "commit", "-m", "Initial", cwd=repo)
+        def git(*args):
+            return run("git", *args, cwd=project)
+        git("-c", "protocol.file.allow=always", "submodule", "add", str(library), "vendor/lib")
+        git("commit", "-m", "Add the library")
+        board = [sys.executable, SCRIPTS / "board.py", run(sys.executable, SCRIPTS / "board.py", project / ".swarm" / "demo", "init", "Submodule")]
+        gate = [sys.executable, SCRIPTS / "verify.py", board[2], project]
+        run(*board, "member", "w")
+        run(*board, "member", "verifier", "role=verifier")
+        git("switch", "-c", "work")
+        (project / "value").write_text("1")
+        git("commit", "-am", "Change value")
+        change = git("rev-parse", "HEAD")
+        git("switch", "main")
+        run(*board, "ready", "w", change, text="done")
+        superseded = json.loads(run(*gate, "prepare", "isolated", "--check", "test -s value"))
+        candidate = json.loads(run(*gate, "prepare", "isolated", "--check", "test -s value"))
+        # the candidate it replaced leaves no checkout behind, in the run folder or in Git's list
+        assert not Path(superseded["path"]).exists() and Path(candidate["path"]).exists()
+        assert superseded["candidate"] not in git("worktree", "list")
+        run(*gate, "test", candidate["candidate"], "verifier")
+        (project / "vendor" / "lib" / "stray").write_text("local edit")  # a dirty submodule is still a difference
+        dirty = verify.source_digest(project)
+        run(*gate, "accept", candidate["candidate"], ok=False)
+        (project / "vendor" / "lib" / "stray").unlink()
+        assert verify.source_digest(project) != dirty
+        run(*gate, "accept", candidate["candidate"])
+        assert git("rev-parse", "HEAD") == candidate["commit"]
+        assert json.loads((Path(board[2]) / "members.json").read_text())["accepted_seq"] == 1  # failed cycles count from here
+
+        # prune removes an integration checkout no candidate needs, and nothing else in a run folder
+        swarm = [sys.executable, SCRIPTS / "board.py", project / ".swarm", "prune"]
+        left, own = Path(board[2]) / "integration-left", Path(board[2]) / "worker-tree"
+        for tree in (left, own):
+            git("worktree", "add", "--detach", str(tree), "HEAD")
+        assert "would remove worktree %s" % left in run(*swarm, "--dry-run") and left.exists()
+        done = run(*swarm)
+        assert "remove worktree %s" % left in done and "remove 1 worktree(s) and archive 0 run(s)" in done
+        assert not left.exists() and own.exists() and "integration-left" not in git("worktree", "list")
 
 
 class VerifyScenario(unittest.TestCase):

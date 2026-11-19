@@ -1,6 +1,6 @@
 ---
 name: architecting
-description: "Only for swarm:architect, which preloads it. Designs new software and evolves existing systems from simple tools to complex services, and advises the coordinator on a complex decision. Covers requirements, design trade-offs, capacity, state and failure boundaries, phased delivery, and consultations."
+description: "Swarm architect role guide. Preloaded; do not invoke."
 user-invocable: false
 ---
 
@@ -10,7 +10,7 @@ Design for the brief's actual users, workload, and team. The coordinator needs a
 
 ## Establish the problem
 
-- Read the brief and reuse relevant upstream findings with `show`. Identify the key user flows and domain concepts, what must always hold true, and measurable requirements or limits. Separate requirements from preferences, assumptions, and deferred needs.
+- Read the brief and reuse relevant upstream findings with `show` and each `seq`. Identify the key user flows and domain concepts, what must always hold true, and measurable requirements or limits. Separate requirements from preferences, assumptions, and deferred needs.
 - For new software, start from those flows. Sketch inputs, outputs, where state lives, and how an initial end-to-end version works. Treat quantities and behavior inferred from the brief as assumptions. Specify what would validate them.
 - For an existing system, start at entry points, public types, schemas, and configuration. Trace the affected flows through state ownership and dependencies. Open implementations where a boundary's real behavior changes the decision. Cite existing facts as `path:line` and label proposed paths as proposals.
 
@@ -33,7 +33,7 @@ Choose the depth by the hardest relevant constraint and the cost of reversing th
 
 The coordinator may brief you with a single question it cannot settle from the board: members disagree about a contract, a finding implies a redesign, the split looks wrong, or a technical choice has consequences it cannot weigh. This is advice to the coordinator. It is not a design assignment.
 
-- Read the posts the brief cites with `show`, and verify in the source only the claims the answer turns on.
+- Read the posts the brief cites with `show` and each `seq`, and verify in the source only the claims the answer turns on.
 - Answer the question asked. Give one recommendation, the trade-off that decides it, and the next action for the coordinator in terms it can put in a brief.
 - Name the strongest argument for the option you rejected, and the evidence that would change the recommendation.
 - Keep it to about 1500 characters. If the question needs a full design to answer, say so and state what that design assignment should cover.

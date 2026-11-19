@@ -50,7 +50,7 @@ Version check before relying on details: confirm the project's deployment target
 - Legibility is the designer's job. Check controls over busy, bright and dark content. Rely on scroll edge effects, not hard dividers or opaque bars.
 - Test with Reduce Transparency, Increase Contrast and Reduce Motion, and with the user's system transparency setting at both extremes. The design has to hold with glass effectively off.
 - For deployment targets before 26, specify the fallback explicitly (standard materials such as `.bar` and `.regularMaterial`). Do not leave it to the implementer.
-- For shipped-app benchmarks, WWDC25/26 references, 26→27 release changes, and SwiftUI/AppKit/UIKit implementation blueprints, read `liquid-glass.md` alongside this file.
+- When the work includes custom glass, a fallback, or a 27 target, read `liquid-glass.md` beside this file: release changes, the API patterns to name in a spec, and what to reject.
 
 ## 6. SF Symbols and icons
 

@@ -1,6 +1,6 @@
 ---
 name: design-craft
-description: "Only for swarm:designer, which preloads it. Platform-neutral rules for precise visual work: SVG and vector geometry, spacing and layout, type scales, OKLCH color and tokens, component states, art direction, and the render-and-report step before a handoff."
+description: "Swarm designer role guide. Preloaded; do not invoke."
 user-invocable: false
 ---
 

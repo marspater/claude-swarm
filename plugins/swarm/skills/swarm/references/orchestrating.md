@@ -2,7 +2,7 @@
 
 You are the coordinator. The `swarm` skill is the procedure: the commands, the order of steps, verification. This reference is the judgement behind step 2 of that procedure: what shape the team should have.
 
-Each rule has one home. Commands and the order of steps are in the `swarm` skill; which agent for which piece is in `agent-types.md`; the roster, workspaces, replacement, shutdown and recovery are in `team-management.md`; post kinds and delivery are in `messaging.md`; content too large for one context is the `swarm:rlm` skill.
+Each rule has one home. Commands and the order of steps are in the `swarm` skill; which agent for which piece is in `agent-types.md`; the roster, workspaces, replacement, shutdown and recovery are in `team-management.md`; post kinds and delivery are in `messaging.md`; content too large for one context is in `rlm.md`.
 
 ## Is a swarm the right tool?
 
@@ -12,7 +12,7 @@ Each rule has one home. Commands and the order of steps are in the `swarm` skill
 | A side question whose answer only you need (where is X defined, what does this library do) | A one-shot subagent. Its answer comes back to you; post a summary if members need it |
 | Several pieces that can proceed without each other, across separate files, packages, suites or questions | A swarm |
 | One hard problem with tightly coupled parts | Not a swarm. Pieces that must change together belong to one worker |
-| A file or data set too large to read in one context | A swarm in the RLM shape: load `swarm:rlm` |
+| A file or data set too large to read in one context | A swarm in the RLM shape: read `rlm.md` |
 
 Every member is its own agent with its own context. Three members cost roughly three conversations. Add a member only when it has a piece of its own.
 
@@ -58,11 +58,11 @@ Not a team shape but a move available in any of them. When you cannot settle a d
 
 ### Review fan-out
 
-One change, several concerns: correctness, security, performance, test strength. Read-only reviewers, one concern each, all reading the same diff. This splits by concern because the content is small. For content that does not fit in one context, split the content instead (`swarm:rlm`).
+One change, several concerns: correctness, security, performance, test strength. Read-only reviewers, one concern each, all reading the same diff. This splits by concern because the content is small. For content that does not fit in one context, split the content instead (`rlm.md`).
 
 ### Large-content analysis (RLM)
 
-A log, export or codebase too large for one context. Partition the data, give every analyst the same question over its own slice, and have one member combine the reports. Load `swarm:rlm` for the procedure and the chunk sizes.
+A log, export or codebase too large for one context. Partition the data, give every analyst the same question over its own slice, and have one member combine the reports. Read `rlm.md` for the procedure and the slice sizes.
 
 ## A good brief
 
@@ -84,7 +84,7 @@ A member starts with nothing but its brief and the other briefs. Check each one:
 - A waiting member costs nothing. A member that polls or chats does. Briefs should make chatter unnecessary.
 - `@all` wakes everyone. Use it for a change every member must act on, such as a shared contract that moved.
 - If you need the user's decision, run `BOARD pause <reason>` so the monitor stops calling you, and `BOARD resume` when they answer.
-- If the run is clearly going wrong (members undoing each other, the same failure three times), stop and tell the user rather than adding members.
+- If the run is clearly going wrong (members undoing each other, the same defect failing verification twice), stop and tell the user rather than adding members.
 
 ## What goes wrong
 

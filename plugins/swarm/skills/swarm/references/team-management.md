@@ -40,7 +40,7 @@ The `swarm` skill's step 1 says how limits are recorded and what the board refus
 
 | | Shared (default) | Isolated |
 | --- | --- | --- |
-| How | Nothing extra | `isolation: "worktree"` on every code writer's Agent call, in a git repository |
+| How | Nothing extra | `isolation: "worktree"` on every writer's Agent call, a designer's included, in a git repository |
 | Use when | Pieces touch different files and do not build into the same output | Writers would break each other: one build directory, generated files, a lockfile |
 | A writer reports with | `BOARD ready <name>` | `BOARD ready <name> <full commit id>`, after committing on its branch |
 | Read-only members | No difference | Mark them `writes=0` so readiness does not expect a commit |
@@ -53,7 +53,7 @@ Do not mix: if one writer is isolated, all writers are. Never push, and never la
 Members run under this session's permission settings. A background member cannot answer a permission prompt the way you can, so a member that stops on one looks stuck.
 
 - If a member stalls at its first board command, the board command is not pre-approved. Tell the user which rule is missing, for example `Bash(python3 */skills/swarm/scripts/board.py *)`, and `Bash(python3 */skills/swarm/scripts/verify.py *)` for a verifier. Do not edit the user's settings yourself.
-- A designer on a macOS, iOS or iPadOS target reads its Apple rules from the plugin folder, outside the project. If it stalls there, the missing rule is a `Read` of the plugin's `skills/design-craft/references/` folder.
+- A designer reads its rules from the plugin folder, outside the project: its Apple rules for a macOS, iOS or iPadOS target, and its role skill in native mode. A verifier of design work reads there too. If one stalls on a read, the missing rule is a `Read` of the plugin's `skills/design-craft/` folder, and of `skills/verifying/` for the verifier.
 - Never ask a member to do something this session was refused, and never do for a member what it was refused.
 - A split-pane native teammate (a worker, designer or verifier) may need the board command approved in its own pane. Specialists use the board tool, which exists only in the coordinator's process, so they need in-process display.
 

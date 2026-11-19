@@ -65,7 +65,7 @@ The plugin watches the board. Workers, designers and verifiers get a nudge to re
 So:
 
 - Answer a question by citing its number: `@asker re #12: …`. Attention then clears that question and leaves the asker's other open ones listed.
-- A member that waits for an answer posts the question and ends its turn; it does not sleep, poll, or re-read in a loop. Before ending any turn it reads the board once more.
+- A member that waits for an answer posts the question and ends its turn; it does not sleep, poll, or re-read in a loop. It reads the board again before ending a turn only when its last board command printed `UNREAD:`.
 - You do not relay posts. If a member needs another member, it mentions that member; when one asks you to pass something on, tell it to mention the other.
 - If the hooks are not running, you deliver by hand with `BOARD wake`, `claim` and `woke`, as the `swarm` skill describes.
 

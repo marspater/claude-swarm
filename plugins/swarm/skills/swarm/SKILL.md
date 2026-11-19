@@ -1,10 +1,10 @@
 ---
 name: swarm
 description: "Run a team of named worker agents that split one task, work on the pieces at the same time, and coordinate on one shared message board, with a verifier that reviews the diffs and runs the tests. For broad tasks that divide cleanly across separate files, packages or questions. Every worker is its own agent, so a swarm uses quota much faster than one conversation. Usage: /swarm:swarm <task, and how to check it>."
-argument-hint: "[--native-teams] <task, and how to check it>"
+argument-hint: "[--native-teams (experimental)] <task, and how to check it>"
 disable-model-invocation: true
 model: opus
-effort: high
+effort: medium
 allowed-tools: Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/board.py *), Bash(python3 ${CLAUDE_PLUGIN_ROOT}/skills/swarm/scripts/board.py *), Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/verify.py *), Bash(python3 ${CLAUDE_PLUGIN_ROOT}/skills/swarm/scripts/verify.py *)
 ---
 
@@ -16,7 +16,7 @@ $ARGUMENTS
 
 If no task is given above, ask the user what the swarm should do and stop.
 
-The coordinator runs on Opus at high effort by default; if the user named another model or effort for the coordinator, tell them to switch this conversation's model or effort themselves, since a skill cannot change either once the turn has started.
+The coordinator runs on Opus at medium effort by default; if the user named another model or effort for the coordinator, tell them to switch this conversation's model or effort themselves, since a skill cannot change either once the turn has started.
 
 As coordinator, split the work, brief the workers, prepare the verification candidate, and report the result. Leave implementation and test execution to the workers and verifier. Carry the user's repository instructions into every brief, including any restriction on commit messages and attribution.
 
@@ -30,18 +30,17 @@ These references are yours alone, and each one costs you context, so read one on
 | `agent-types.md` | Before step 2, only when a piece may need something other than a worker and a verifier: a designer, a specialist, a built-in agent, or another plugin's agent |
 | `messaging.md` | When posts are not reaching members, or for a protocol edge case: `re #N`, `FINDING`, `NOT VERIFIED` |
 | `team-management.md` | When you add, replace or remove a member, when a member is stuck, after a restart or compaction, and when you close the run |
+| `rlm.md` | Only when a piece means reading, in full, content over about 5,000 lines or 50K tokens: a log, a data export, a long document or a whole codebase |
 
-One more is a skill of its own: load `swarm:rlm` when a piece means reading content over about 1500 lines in full, such as a log, a data export, a long document or a whole codebase. If the Skill tool does not offer it, read `${CLAUDE_PLUGIN_ROOT}/skills/rlm/SKILL.md` instead.
+Never paste these into a member's prompt or brief: everything a member needs is in its own instructions and its brief. Each member type preloads its own role skill (`implementing`, `verifying`, `design-craft`, `exploring`, `investigating`, `architecting`); those are not yours to load. In native mode Claude skips that preload: the member's agent definition carries the essential rules and names the file a designer or verifier must Read itself, so do not compensate in the brief.
 
-Never paste these into a member's prompt or brief: everything a member needs is in its own instructions and its brief. Each member type preloads its own role skill (`implementing`, `verifying`, `design-craft`, `exploring`, `investigating`, `architecting`); those are not yours to load. In native mode Claude skips that preload: the member's agent definition still carries the essential rules, so do not compensate in the brief.
-
-**Your own reading.** `BOARD read coordinator` shows in full only the posts that mention you, and the rest as one line each. That is deliberate: your context is the one the run cannot afford to fill. Open another post with `BOARD show <name>` when you need it.
+**Your own reading.** `BOARD read coordinator` shows in full only the posts that mention you, and the rest as one line each. That is deliberate: your context is the one the run cannot afford to fill. Open another post with `BOARD show --post=<n>` when you need it.
 
 ## The board
 
-One append-only message board holds everything the team says: briefs, questions between workers, diff summaries, test results. Members never message each other privately. A post reaches the members it mentions: `@name`, `@group` (a numbered pool such as `@fix`), or `@all`.
+One append-only message board holds everything the team says: briefs, questions between workers, diff summaries, test results. Members never message each other privately. A post reaches the members it mentions: `@name`, `@group` (a numbered pool such as `@fix`), or `@all`. `@all` wakes every member, working or waiting, and each wake is a paid turn: use it only for what every member must act on.
 
-The board script is `${CLAUDE_SKILL_DIR}/scripts/board.py`. If that placeholder was not filled in (the path before `/scripts` does not exist), use `${CLAUDE_PLUGIN_ROOT}/skills/swarm/scripts/board.py`; if that is unfilled too, Glob for `**/skills/swarm/scripts/board.py` under `~/.claude` and use the newest match. Run `python3 <script>` once with no arguments: it prints a line that begins `usage:`. If it does not, tell the user what came back and stop.
+The board script is `${CLAUDE_SKILL_DIR}/scripts/board.py`. If that placeholder was not filled in (the path before `/scripts` does not exist), use `${CLAUDE_PLUGIN_ROOT}/skills/swarm/scripts/board.py`; if that is unfilled too, Glob for `**/skills/swarm/scripts/board.py` under `~/.claude` and use the newest match.
 
 Below, **BOARD** means `python3 <script> <run>`, where `<run>` is the run folder that `init` prints. **VERIFY** means `python3 <scripts>/verify.py <run> <project>`, where `<scripts>` is the folder that holds `<script>`. Pass absolute paths and quote each path that needs it.
 
@@ -51,7 +50,7 @@ Below, **BOARD** means `python3 <script> <run>`, where `<run>` is the run folder
 | `BOARD member <name> [role=verifier] [group=<g>] [profile=<type>] [writes=0] [consult=1] [owns='<paths or question>'] [depends=<a,b>] [model=<m>] [effort=<e>] [id=<agent id>] [killed=1]` | Adds a member or updates one. Refused when it would break a limit. `effort` is `low`, `medium`, `high`, `xhigh` or `max`; `model` is a family (`haiku`, `sonnet`, `opus`, `fable`), an exact model id, or `inherit` for this conversation's model. `BOARD member coordinator backend=native` marks a run on native Agent Teams; nothing else is set on the coordinator |
 | `BOARD limit [max_workers=<n>] [max_members=<n>] [budget=<tokens>] [<model>=<types>]` | Sets the run's limits. `fable=architect` reserves a model for the listed types; `opus=none` forbids it |
 | `BOARD plan` | The team as a table: type, model, effort, what each waits for, what each owns |
-| `BOARD attention` | What needs someone, each item with its post number: a paused run, posts you have not read, findings to review, unanswered questions, unstarted, unreachable or ignored members, members waiting on a removed, unreachable or never-started member, and stale verification. A closed run lists nothing |
+| `BOARD attention` | What needs someone, each item with its post number: a paused run, posts you have not read, findings to review, unanswered questions, unstarted, unreachable or ignored members, a worker that failed verification twice in a row, one member holding most of the spend, members waiting on a removed, unreachable or never-started member, and stale verification. A closed run lists nothing |
 | `BOARD retry <name>` | Lets delivery try an unreachable member again |
 | `BOARD replace <old> <new> [key=value ...]` | Retires `<old>` and registers `<new>` with its brief, dependants and a pointer to its posts |
 | `BOARD post <name>` | Posts the text given on stdin |
@@ -75,13 +74,13 @@ BOARD post coordinator <<'EOF'
 EOF
 ```
 
-**Delivery.** The hooks dispatch mentions when board tools finish and reconcile every two seconds. One message tells a member to read all new posts through the claimed sequence. A failed send remains eligible for retry. When automation is available, leave delivery to it. When using the skill without the hooks module, use `BOARD wake` to inspect pending work and use the claim protocol in the coordinator loop.
+**Delivery.** The hooks deliver mentions and retry a failed send, so leave delivery to them. Without the hooks module, deliver by hand with `BOARD wake` and the claim protocol in the coordinator loop.
 
 ## Start the swarm
 
-1. **Create and bind the run.** Pick a short kebab-case name and run `init` with a title. Use the exact folder it prints as `<run>`. Run `BOARD read coordinator` in its own Bash call now so the hooks can bind this conversation and recover the same run on restart.
+1. **Create and bind the run.** Pick a short kebab-case name and run `init` with a title. Use the exact folder it prints as `<run>`. If `init` fails, tell the user what came back and stop. Run `BOARD read coordinator` in its own Bash call now so the hooks can bind this conversation and recover the same run on restart.
 
-   Use background subagents by default. If the invocation starts with `--native-teams`, remove that option from the task, check that this Claude session has Agent Teams enabled, and set `BOARD member coordinator backend=native`. If Agent Teams is unavailable, tell the user and ask whether to continue in the default mode. Native mode uses a shared workspace. For isolated work, use the default mode. Never change the session's global settings as part of a swarm.
+   Use background subagents by default. `--native-teams` is experimental: if the invocation starts with it, say so in the plan, remove that option from the task, check that this Claude session has Agent Teams enabled, and set `BOARD member coordinator backend=native`. If Agent Teams is unavailable, tell the user and ask whether to continue in the default mode. Native mode uses a shared workspace. For isolated work, use the default mode. Never change the session's global settings as part of a swarm.
 
    **Limits.** Read the task for limits the user set and record them before you register anyone: "at most three workers" is `BOARD limit max_workers=3`; "Fable only for architecture" is `BOARD limit fable=architect`; "no Opus" is `BOARD limit opus=none`; "stay under two million tokens" is `BOARD limit budget=2000000`. The board then refuses a member that breaks a limit, and the plugin pauses the run when the budget is spent. When a default model is not allowed for a type, register that member with an allowed `model=` and pass the same model on its Agent call. Set no limit the user did not ask for.
 
@@ -93,10 +92,10 @@ EOF
    | --- | --- | --- |
    | `swarm:explorer` | Locate symbols, call sites, entry points and tests quickly | Haiku, medium |
    | `swarm:investigator` | Trace subtle bugs, competing explanations and edge cases | Opus, high. Fable at medium effort is the escalation only, after an Opus investigator failed on the same question |
-   | `swarm:architect` | Design new software at any scale, review existing architecture, plan optimization and migration work, or advise you on a complex decision (a consultation) | Fable, high |
+   | `swarm:architect` | Design new software at any scale, review existing architecture, plan optimization and migration work, or advise you on a complex decision (a consultation) | Fable, high. Medium for a consultation |
    | `swarm:designer` | UI/UX and visual design within assigned paths: screens and component specs, design tokens, icons and vector assets, app-icon artwork. Hands workers a spec and assets; writes no production feature code | Opus, high |
    | `swarm:worker` | Implement within assigned paths | Sonnet, medium |
-   | `swarm:verifier` | Verify the integrated candidate | Opus, high |
+   | `swarm:verifier` | Verify the integrated candidate | Sonnet, medium. Register it with `model=opus effort=high` when the change crosses several components, touches security, or includes design work |
 
    Every member type runs on the newest model of its family. A family name you pass for a member (`model: "opus"`) starts that newest model, so name an exact older model only when the user asks for one.
 
@@ -106,7 +105,7 @@ EOF
 
    Register every member with what it owns, so the plan and the pane can show it: `BOARD member parser owns='src/utils/date.*'`. Add `model=` and `effort=` only when they differ from the type's defaults.
 
-   **Show the team before it starts.** When every member is registered, run `BOARD plan` and give the user its table: who owns what, on which model and effort, and who waits for whom. Then start, unless one of these holds, in which case ask and wait for the answer: the user asked to approve the plan first; the plan has more than five members; a member runs on a stronger model than its type's default; or any member runs on Fable and the user did not ask for that member or approve Fable earlier in this run. If `plan` prints `over limit`, fix the roster before anything else.
+   **Show the team before it starts.** When every member is registered, run `BOARD plan` and give the user its table: who owns what, on which model and effort, and who waits for whom. Name the token budget, or say that none was set. Then start, unless one of these holds, in which case ask and wait for the answer: the user asked to approve the plan first; the plan has more than five members; a member runs on a stronger model than its type's default; or any member runs on Fable and the user did not ask for that member or approve Fable earlier in this run. If `plan` prints `over limit`, fix the roster before anything else.
 
    Register all names before posting briefs. Record dependencies on the downstream member with `BOARD member NAME depends=upstream,other` and include them in both briefs. Keep dependencies acyclic. `BOARD ready` automatically notifies dependent workers except for investigator findings, which you confirm after review. In native mode, create one scoped Claude task per worker when Task tools are available, assign the owner on spawn, and mirror the dependencies with `TaskUpdate.addBlockedBy`. Mark the investigator's native task complete only after the board confirms the finding. The board remains the record of readiness and verification.
 
@@ -135,7 +134,7 @@ EOF
 6. **Spawn every member**, all in one message so they start together, each with the Agent tool in the background:
    - `subagent_type`: the selected `swarm:` profile
    - `description`: `@<name>: <its piece>`
-   - `model` and `effort`: leave both out to use the profile defaults. Pass a pair only for a model or effort the user explicitly requested, or for an investigator escalated to Fable. Register that model or effort on the roster first (`BOARD member <name> model=<m> effort=<e>`): a start that differs from the roster is refused.
+   - `model` and `effort`: leave both out to use the profile defaults. Pass one only where the roster differs from the default: a model or effort the user asked for, a raised verifier, a consulting architect, or an investigator escalated to Fable. Register it on the roster first (`BOARD member <name> model=<m> effort=<e>`): a start that differs from the roster is refused.
    - Default mode: omit `name` and record the returned background agent address. Native mode: pass the worker's roster name as `name`, omit call-level worktree isolation, and record the actual teammate address returned by Claude. If a native launch was refused, resolve the mode mismatch before proceeding.
    - `prompt`, in full (the worker starts with a clean context and reads the rest from the board):
 
@@ -158,20 +157,20 @@ EOF
 A member ended a turn, the monitor reported a stall, or the user wrote to you.
 
 1. Run `BOARD read coordinator`. Answer questions and steer through posts mentioning the relevant members.
-2. Run `BOARD attention`. It lists a paused run, posts you have not read, findings to review, unanswered questions, unstarted, unreachable or ignored members, members waiting on a removed, unreachable or never-started member, and stale verification, each with the post that shows it. Deal with every item or tell the user why it stands. For an unreachable member run `BOARD retry <name>` once; if it is listed again, replace it.
+2. Run `BOARD attention`. Deal with every item or tell the user why it stands. Spawn an unstarted member once and record its address. For an unreachable member run `BOARD retry <name>` once; if it is listed again, check that it has no live session and replace it.
    For a finding that needs review, read the full post and compare its evidence with the investigator's brief. If it meets the completion criteria, run `BOARD confirm NAME SEQ` for that exact post. If essential evidence is missing, ask for it on the board and keep the assignment pending. If an Opus investigator cannot settle the question (its finding fails your review twice, or it reports that the reasoning is beyond it), escalate with `BOARD replace <old> <new> model=fable effort=medium` and pass `model: "fable"` and `effort: "medium"` on the successor's Agent call. The board refuses an investigator on Fable any other way.
 
-   **Consult the architect** when you face a decision you cannot settle from the board: two members disagree about a contract, a finding implies a redesign, the split itself looks wrong, or the user asks a question about the system's structure. Register `BOARD member <name> profile=architect writes=0 consult=1 owns='consultation: <the question>'` (`consult=1` keeps it out of verification, so asking never blocks or voids a candidate), post a brief that states the question, the options you see, the board posts that hold the evidence, and what you will decide with the answer, then spawn it. It answers with a recommendation on the board; it changes nothing. One consultant per question, removed when it has answered (`killed=1`). A consultation on Fable follows the same ask-first rule as any Fable member, and a `fable=` limit that leaves out `architect` refuses it.
-3. Check `BOARD wake` for unstarted assignments, pending specialist wakes, and exhausted delivery attempts. If a member is unstarted, spawn it once and record the address. Replace an unreachable member after checking whether it no longer has a live session.
-   - With the hooks module active, relay each pending specialist wake through your own `SendMessage` tool. For a native teammate, use the bare teammate name before `@` in the recorded address. Copy the message exactly, substituting the board sequence for `N`: `Swarm board: call the board tool with action read for mentions through #N.` The hook claims the wake, deduplicates it, and records accepted delivery. The current Claude Code engine skips the specialist board hook when the plugin sends the wake itself.
+   **Consult the architect** when you face a decision you cannot settle from the board: two members disagree about a contract, a finding implies a redesign, the split itself looks wrong, or the user asks a question about the system's structure. Register `BOARD member <name> profile=architect writes=0 consult=1 effort=medium owns='consultation: <the question>'` (`consult=1` keeps it out of verification, so asking never blocks or voids a candidate), post a brief that states the question, the options you see, the board posts that hold the evidence, and what you will decide with the answer, then spawn it with `effort: "medium"`. It answers with a recommendation on the board; it changes nothing. One consultant per question, removed when it has answered (`killed=1`). A consultation on Fable follows the same ask-first rule as any Fable member, and a `fable=` limit that leaves out `architect` refuses it.
+3. Run `BOARD wake` only when the hooks module is not running. A Swarm relay notice already names each waiting specialist with its address and sequence.
+   - With the hooks module active, relay each pending specialist wake through your own `SendMessage` tool. For a native teammate, use the bare teammate name before `@` in the recorded address. Copy the message exactly, substituting the board sequence for `N`: `Swarm board: call the board tool with action read for mentions through #N.` The hook claims the wake and records delivery.
    - When the module is unavailable, use `BOARD claim NAME ADDRESS SEQ` for a pending entry. With the returned token, send one nudge containing the board read command for a worker, designer or verifier, or the board tool's `read` action for a specialist if its tool is available. Run `BOARD woke NAME SEQ TOKEN` only after Claude accepts delivery. An empty claim means the wake is no longer due or another delivery owns it.
-4. When the workers have reported ready, prepare the verification candidate for code changes and design work. Handle rework by preparing a fresh candidate after the affected workers report again. When you need a user's decision before the swarm can progress, run `BOARD pause <reason>`, explain what is needed, and run `BOARD resume` when they respond.
-5. Report current work or the blocking decision. The hooks notify you once when an open run is quiet and no member can advance. Ask for `BOARD status` when needed.
+4. When the workers have reported ready, prepare the verification candidate for code changes and design work. Handle rework by preparing a fresh candidate after the affected workers report again. After two failed verification cycles on the same defect, stop: run `BOARD pause <reason>` and ask the user. The board pauses the run itself when one worker gets a third `NOT PASSED` in a row. When a worker reports it stopped on its own failing check, decide or ask the user; do not send it back unchanged. When you need a user's decision before the swarm can progress, run `BOARD pause <reason>`, explain what is needed, and run `BOARD resume` when they respond. A pause refuses each member's next tool call, so a member in the middle of its work ends its turn there: after `BOARD resume`, post `@<name> continue` to each member that had not reported, or it waits until the stall notice.
+5. Report current work or the blocking decision. The hooks notify you once when an open run is quiet and no member can advance.
 
 ## Verify what will land
 
-1. Run `VERIFY prepare shared --check 'npm test'` or `VERIFY prepare isolated --check 'npm test'` with the commands requested for this run. Repeat `--check` for multiple commands. A candidate needs at least one check. For design deliverables with no test suite, give one that proves the files are well formed, such as `xmllint --noout assets/icons/*.svg` or a JSON parse of the token file; the verifier's rendering and measuring comes on top of it. For work across components, include a command that exercises the combined workflow and give the verifier its expected outcome. Prepare reads the workers' latest `READY` records. Isolated mode creates an integration worktree and merges their exact commits there. If merging conflicts, identify the colliding commits, ask the relevant worker to coordinate the fix, and prepare again after the relevant `READY` posts.
-2. Post the candidate identifier and its path to the verifier with a mention. The verifier reviews the changes and runs `VERIFY test <candidate> <verifier-name>`. It reports the command output and the resulting `VERIFIED` line. If checks fail, retain the candidate for diagnosis and request fixes. A verifier must never report a pass for skipped checks.
+1. Run `VERIFY prepare shared --check 'npm test'` or `VERIFY prepare isolated --check 'npm test'` with the commands requested for this run. Repeat `--check` for multiple commands. A candidate needs at least one check, except when a designer is the run's only writer and there is nothing to run: pass `--no-checks` in place of `--check` then, and the verifier's rendering and measuring is the check. The sources are fingerprinted either way. For work across components, include a command that exercises the combined workflow and give the verifier its expected outcome. Prepare reads the workers' latest `READY` records. Isolated mode creates an integration worktree and merges their exact commits there. If merging conflicts, identify the colliding commits, ask the relevant worker to coordinate the fix, and prepare again after the relevant `READY` posts.
+2. Post the candidate identifier, its path and the test command written out in full, `python3 <scripts>/verify.py <run> <project> test <candidate> <verifier-name>`, to the verifier with a mention. The verifier reviews the changes and runs that command. It reports the command output and the resulting `VERIFIED` line. If checks fail, retain the candidate for diagnosis and request fixes. A verifier must never report a pass for skipped checks.
 3. Run `VERIFY accept <candidate>` only after the verifier reports success. Acceptance rechecks worker readiness and the source fingerprint. For isolated runs it fast-forwards the user's clean checkout to the exact tested commit. If the user's checkout moved or has pending changes, report the gap and keep their files intact. A changed candidate requires fresh preparation and testing.
 
 ## Change the team

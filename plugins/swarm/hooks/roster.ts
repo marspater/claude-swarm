@@ -172,7 +172,7 @@ export function parse(
       role: member.role ?? 'worker',
       profile: member.profile,
       model: hint?.model ?? member.model ?? '',
-      effort: hint?.effort ?? '',
+      effort: hint?.effort ?? member.effort ?? '',
       type: hint?.type ?? (member.profile || member.role || 'worker'),
       depends: hint?.depends ?? [],
       owns: clean(hint?.owns ?? ''),
