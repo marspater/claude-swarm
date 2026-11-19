@@ -671,6 +671,97 @@ class VerifyRegressions(unittest.TestCase):
             time.sleep(2)
             assert not marker.exists(), "a descendant of the timed-out check kept running"
 
+    def test_accept_does_not_overwrite_an_ignored_file(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g = self._init_git(proj)
+            (proj / ".gitignore").write_text("*.cfg\n*.log\n.claude/\n")
+            (proj / "pkg").mkdir()
+            (proj / "pkg" / "item.txt").write_text("old")
+            g("add", ".gitignore", "pkg")
+            g("commit", "-m", "ignore")
+            g("switch", "-c", "w-work")
+            (proj / "local.cfg").write_text("W")
+            (proj / "dir.cfg").mkdir()
+            (proj / "dir.cfg" / "settings.txt").write_text("S")
+            g("rm", "-rq", "pkg")
+            (proj / "pkg").write_text("file")  # a tracked folder replaced by a file must not be taken for a local one
+            g("add", "-f", "local.cfg", "dir.cfg", "pkg")
+            g("commit", "-m", "add cfg")
+            commit = g("rev-parse", "HEAD")
+            g("switch", "main")
+            (proj / "local.cfg").write_text("X")  # the user's own, ignored
+            (proj / "dir.cfg").write_text("D")  # ignored, where the candidate puts a folder
+            (proj / "junk.log").write_text("noise")  # unrelated ignored output must not block
+            board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Ignored")
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            run(*post, "ready", "w", commit, text="done")
+            cand = json.loads(run(*gate, "prepare", "isolated", "--check", "true"))
+            run(*post, "post", "v", "@coordinator " + run(*gate, "test", cand["candidate"], "v").splitlines()[-1])
+            res = subprocess.run([*gate, "accept", cand["candidate"]], capture_output=True, text=True)
+            assert res.returncode != 0 and "local.cfg" in res.stderr and "dir.cfg" in res.stderr, res.stderr
+            assert (proj / "local.cfg").read_text() == "X" and (proj / "dir.cfg").read_text() == "D"
+            (proj / "local.cfg").unlink()
+            (proj / "dir.cfg").unlink()
+            run(*gate, "accept", cand["candidate"])
+            assert (proj / "local.cfg").read_text() == "W" and (proj / "junk.log").exists()
+            assert (proj / "dir.cfg" / "settings.txt").read_text() == "S" and (proj / "pkg").read_text() == "file"
+
+    def test_linked_worktrees_inside_the_project_are_not_source(self):
+        sys.path.insert(0, str(SCRIPTS))
+        import verify  # noqa: E402
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g = self._init_git(proj)
+            before = verify.source_digest(proj)
+            g("worktree", "add", "-q", "-b", "agent-x", str(proj / ".claude" / "worktrees" / "agent-x"))
+            (proj / ".claude" / "worktrees" / "agent-x" / "scratch").write_text("work")
+            assert g("status", "--porcelain", "--untracked-files=all")  # git itself lists the worktree
+            assert verify.pending_changes(proj) == []
+            assert verify.source_digest(proj) == before
+            # a user's own nested repository still counts
+            nested = proj / "vendor"
+            nested.mkdir()
+            self._init_git(nested)
+            assert verify.pending_changes(proj) == [b"vendor/"]
+            assert verify.source_digest(proj) != before
+
+    def test_check_environment_drops_git_variables(self):
+        sys.path.insert(0, str(SCRIPTS))
+        import verify  # noqa: E402
+        with tempfile.TemporaryDirectory() as t:
+            out = Path(t) / "out"
+            old = os.environ.get("GIT_DIR")
+            os.environ["GIT_DIR"] = "/nonexistent"
+            try:
+                verify.run_check('printf "%s" "${GIT_DIR-unset}" > ' + shlex.quote(str(out)), t, 10)
+            finally:
+                if old is None:
+                    os.environ.pop("GIT_DIR")
+                else:
+                    os.environ["GIT_DIR"] = old
+            assert out.read_text() == "unset"
+
+    def test_timeout_ends_descendants_in_their_own_group(self):
+        sys.path.insert(0, str(SCRIPTS))
+        import verify  # noqa: E402
+        import time
+        with tempfile.TemporaryDirectory() as t:
+            marker = Path(t) / "marker"
+            child = ("import os, time, pathlib; os.setpgid(0, 0); time.sleep(1.5); "
+                     "pathlib.Path(%r).write_text('late')" % str(marker))
+            check = "%s -c %s & sleep 30" % (shlex.quote(sys.executable), shlex.quote(child))
+            try:
+                verify.run_check(check, t, 0.4)
+                raise AssertionError("expected a timeout")
+            except subprocess.TimeoutExpired:
+                pass
+            time.sleep(2)
+            assert not marker.exists(), "a descendant in its own process group kept running"
+
     def test_ready_head_refuses_untracked_source(self):
         with tempfile.TemporaryDirectory() as t:
             proj = Path(t).resolve() / "main"

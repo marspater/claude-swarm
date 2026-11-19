@@ -14,19 +14,39 @@ export const wakeSequence = (text: string) => {
 /** The run folders a member's prompt names: its board command carries the one it belongs to. */
 export const runsNamed = (prompt: string) => {
   const matches: string[] = []
-  const re = /(?:^|[\s"'=`(])(?:[^\s"'=`(]*\/)?\.swarm\/([A-Za-z0-9_.-]+-\d{8}-\d{6}x*)(?![\w.-])/g
+  const re = /(?:^|[\s"'=`(])(?:[^\s"'=`(]*\/)?\.swarm\/([A-Za-z0-9_.-]+-\d{8}-\d{6}x*)(?![\w-]|\.\w)/g
   for (const m of prompt.matchAll(re)) {
     if (m[1]) matches.push(m[1])
   }
   return [...new Set(matches)].slice(0, 20)
 }
 
-/** Splits a shell command line into individual statements on unquoted `&&`, `||`, `|`, `;`, and `\n`, skipping heredoc bodies. */
-export function splitShellSegments(command: string): string[] {
-  const segments: string[] = []
+/** A statement and the operator after it: `;` also stands for a newline, `|` for `|&`, `''` for the end. */
+export type Statement = { text: string; piped: boolean; next: '&&' | '||' | ';' | '|' | '&' | '' }
+
+/** Index of the `))` closing the `$((` that opens at `i`, or -1. */
+const arithEnd = (command: string, i: number) => {
+  let depth = 0
+  for (let j = i + 2; j < command.length; j++) {
+    if (command[j] === '(') depth++
+    else if (command[j] === ')' && --depth < 0) return command[j + 1] === ')' ? j + 1 : -1
+  }
+  return -1
+}
+
+/** Splits a shell line into statements, flagging those whose stdout goes to a pipe or a redirect. */
+export function scanShell(command: string): Statement[] {
+  const segments: Statement[] = []
   const pendingHeredocs: Array<{ delim: string; stripTabs: boolean }> = []
   let quote: "'" | '"' | undefined
   let start = 0
+  let textEnd = -1
+  let redirected = false
+  const push = (end: number, piped: boolean, next: Statement['next']) => {
+    segments.push({ text: command.slice(start, textEnd >= 0 ? textEnd : end), piped: piped || redirected, next })
+    textEnd = -1
+    redirected = false
+  }
   for (let i = 0; i < command.length; i++) {
     const ch = command[i]!
     if (ch === '\\' && quote !== "'") {
@@ -41,7 +61,32 @@ export function splitShellSegments(command: string): string[] {
       quote = ch
       continue
     }
-    if (ch === '<' && command[i + 1] === '<' && command[i + 2] !== '<') {
+    if (ch === '#' && (i === 0 || /[\s;&|(]/.test(command[i - 1]!))) {
+      textEnd = i
+      const nl = command.indexOf('\n', i)
+      i = nl === -1 ? command.length : nl - 1
+      continue
+    }
+    if (ch === '$' && command[i + 1] === '(' && command[i + 2] === '(') {
+      const end = arithEnd(command, i + 1)
+      if (end > 0) {
+        i = end
+        continue
+      }
+    }
+    if (ch === '>') {
+      const prev = command[i - 1]
+      const fd = /(?:^|[\s;&|(])(\d)$/.exec(command.slice(Math.max(0, i - 2), i))?.[1]
+      // `>&2` and `1>&2` still reach the tool result; `>&file`, `1>&-` (closed) and `&>file` do not.
+      const toFd = command[i + 1] === '&' && /^&\s*\d/.test(command.slice(i + 1))
+      if (prev !== '>' && (fd === undefined || fd === '1') && !toFd) redirected = true
+      continue
+    }
+    if (ch === '<' && command[i + 1] === '<' && command[i + 2] === '<') {
+      i += 2
+      continue
+    }
+    if (ch === '<' && command[i + 1] === '<') {
       let j = i + 2
       let stripTabs = false
       if (command[j] === '-') {
@@ -73,9 +118,10 @@ export function splitShellSegments(command: string): string[] {
     const isAnd = ch === '&' && command[i + 1] === '&'
     const isOr = ch === '|' && command[i + 1] === '|'
     const isPipe = ch === '|' && !isOr && command[i - 1] !== '>'
-    if (ch === ';' || ch === '\n' || isAnd || isOr || isPipe) {
-      segments.push(command.slice(start, i))
-      if (isAnd || isOr) i++
+    const isBackground = ch === '&' && !isAnd && command[i + 1] !== '>' && command[i - 1] !== '>' && command[i - 1] !== '<'
+    if (ch === ';' || ch === '\n' || isAnd || isOr || isPipe || isBackground) {
+      push(i, isPipe, isAnd ? '&&' : isOr ? '||' : isPipe ? '|' : isBackground ? '&' : ';')
+      if (isAnd || isOr || (isPipe && command[i + 1] === '&')) i++
       start = i + 1
       if (ch === '\n' && pendingHeredocs.length > 0) {
         let pos = i + 1
@@ -95,9 +141,12 @@ export function splitShellSegments(command: string): string[] {
       }
     }
   }
-  segments.push(command.slice(start))
-  return segments.map(s => s.trim()).filter(Boolean)
+  push(command.length, false, '')
+  return segments.map(s => ({ ...s, text: s.text.trim() })).filter(s => s.text)
 }
+
+/** Splits a shell command line into individual statements on unquoted `&&`, `||`, `|`, `;`, `&`, and `\n`, skipping heredoc bodies and comments. */
+export const splitShellSegments = (command: string): string[] => scanShell(command).map(s => s.text)
 
 export type ParsedBoardCall = {
   dir: string
@@ -105,12 +154,14 @@ export type ParsedBoardCall = {
   subarg?: string
   /** The remainder of the matched board.py segment starting at `<action>` after `<dir>`. */
   rest: string
+  /** True when this segment's stdout goes to a pipe or is redirected (not `2>` or `2>&1`). */
+  piped: boolean
 }
 
 /** Parses every board.py invocation in a possibly multi-command shell line. */
 export function boardCalls(command: string): ParsedBoardCall[] {
   const results: ParsedBoardCall[] = []
-  for (const segment of splitShellSegments(command)) {
+  for (const { text: segment, piped } of scanShell(command)) {
     const match = BOARD_CALL.exec(segment)
     if (!match) continue
     const rawDir = match[1] ?? match[2] ?? match[3]?.replace(/\\(.)/g, '$1') ?? ''
@@ -119,7 +170,7 @@ export function boardCalls(command: string): ParsedBoardCall[] {
     const rest = segment.slice(match[0].length - action.length)
     const argument = /^[a-z]+[ \t]+(?:"@?([\w-]+)"|'@?([\w-]+)'|@?([\w-]+))(?=\s|$)/.exec(rest)
     const subarg = (argument?.[1] ?? argument?.[2] ?? argument?.[3])?.toLowerCase()
-    results.push({ dir, action, subarg, rest })
+    results.push({ dir, action, subarg, rest, piped })
   }
   return results
 }

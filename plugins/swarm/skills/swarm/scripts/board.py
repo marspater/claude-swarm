@@ -250,7 +250,7 @@ def assignments(args, allowed):
 
 
 def claims(member):
-    """The files and folders a member claims with paths=, as paths from the repository root."""
+    """The files and folders a member claims with paths=, as paths from the project folder."""
     return [path for path in (member.get("paths") or "").split(",") if path]
 
 
@@ -272,7 +272,8 @@ def claimed_twice(name, member, members):
         for mine in claims(member):
             for theirs in claims(entry):
                 # A folder claims everything under it.
-                if mine == theirs or mine.startswith(theirs + "/") or theirs.startswith(mine + "/"):
+                low, other_low = mine.casefold(), theirs.casefold()
+                if low == other_low or low.startswith(other_low + "/") or other_low.startswith(low + "/"):
                     return other, mine if len(mine) >= len(theirs) else theirs
     return None
 
@@ -285,12 +286,12 @@ def validate_member(name, member, changes, members):
             if not token:
                 continue
             if token.startswith("/") or any(c in token for c in ("\n", "\r", "\0", "\\")):
-                raise ValueError("paths= takes files and folders relative to the repository root, separated by commas")
+                raise ValueError("paths= takes files and folders relative to the project folder, separated by commas")
             parts = [seg for seg in token.split("/") if seg not in ("", ".")]
             if ".." in parts:
-                raise ValueError("paths= takes files and folders relative to the repository root, separated by commas")
+                raise ValueError("paths= takes files and folders relative to the project folder, separated by commas")
             if not parts:
-                raise ValueError("paths= must name specific files or folders relative to the repository root, not '.'")
+                raise ValueError("paths= must name specific files or folders relative to the project folder, not '.'")
             cleaned.append("/".join(parts))
         member["paths"] = ",".join(dict.fromkeys(cleaned))
     if "role" in changes and member["role"] not in ({COORDINATOR} if name == COORDINATOR else {"worker", "verifier"}):
@@ -494,14 +495,18 @@ def unanswered(members, posts):
             continue
         sender = post["agent"]
         responder = successor(sender, members)
-        # "re #4", and every number of "re #4, #7 and #9"
-        cited = [seq for run in re.findall(r"\bre\s+((?:#[0-9]+(?:\s*(?:,|and|&)\s*)?)+)", text, re.IGNORECASE)
+        # "re #4", and every number of "re #4, #7 and #9" or "re #4 #7 #9"
+        cited = [seq for run in re.findall(r"\bre\s+((?:#[0-9]+(?:\s*(?:,|and|&)?\s*))+)", text, re.IGNORECASE)
                  for seq in re.findall(r"#([0-9]+)", run)]
         for recipient in post["to"]:
             pair = (recipient, responder)
             if cited:
-                for seq in cited:
-                    pending.get(pair, {}).pop(seq.lstrip("0"), None)
+                # The coordinator's ruling on a question settles it for everyone it was put to: a member asked in the
+                # same post owes no second answer.
+                settled = [key for key in pending if key[0] == recipient] if sender == COORDINATOR else [pair]
+                for key in settled:
+                    for seq in cited:
+                        pending.get(key, {}).pop(seq.lstrip("0"), None)
             else:
                 pending.pop(pair, None)
             target = successor(recipient, members)
@@ -696,6 +701,7 @@ def prune(root, args):
     project = verify.Path(root).resolve().parent
     git_dir = verify.git(project, "rev-parse", "--absolute-git-dir", optional=True)
     removed = archived = 0
+    gone = set()  # worktrees a dry run reports it would remove: a real prune has removed them before it looks
     with open(os.path.join(root, ".adopt.lock"), "w") as choosing:
         fcntl.flock(choosing, fcntl.LOCK_EX)  # no run is adopted or bound while runs move
         runs = list(saved_runs(root))
@@ -718,6 +724,7 @@ def prune(root, args):
                             continue
                         if would or verify.git(project, "worktree", "remove", "--force", path, optional=True) is not None:
                             print("%sremove worktree %s" % (would, path))
+                            gone.add(os.path.realpath(path))
                             removed += 1
                         else:
                             print("kept %s: Git does not know it as a worktree" % path)
@@ -730,6 +737,7 @@ def prune(root, args):
                 for line in wt_out.decode(errors="replace").splitlines():
                     if line.startswith("worktree "):
                         worktrees.append(os.path.realpath(line[len("worktree "):].strip()))
+        worktrees = [wt for wt in worktrees if not would or wt not in gone]
         try:  # the run the pane shows when a conversation has none of its own stays where the pointer says
             with open(os.path.join(root, "current"), encoding="utf-8") as f:
                 shown = f.read().strip()
@@ -1157,7 +1165,6 @@ def main(argv):
                              and effort_of(entry) == "medium")):
                 sys.exit("Fable escalation requires replacing an Opus investigator with model=fable effort=medium")
             entry["last_read_seq"] = len(posts)
-            open_questions = [seq for seq, _, recip in unanswered(members, posts) if recip == old]
             members[old]["killed"] = "1"
             members[old]["replaced_by"] = new
             validate_member(new, entry, given, members)
@@ -1166,6 +1173,8 @@ def main(argv):
             if "depends" in given:
                 entry["depends"] = ",".join(dependencies(entry))
             members[new] = entry
+            # Resolved through the chain: a question put to an earlier, already retired member is the successor's too.
+            open_questions = [seq for seq, _, recip in unanswered(members, posts) if successor(recip, members) == new]
             for member in members.values():  # whoever waited for the old member now waits for the new one
                 if member.get("depends"):
                     member["depends"] = ",".join(dict.fromkeys(new if dep == old else dep for dep in dependencies(member)))
@@ -1186,7 +1195,11 @@ def main(argv):
                 print(f"note: @{new} has model=inherit, which cannot be checked against family limits here", file=sys.stderr)
             briefs = [p for p in posts if p["agent"] == COORDINATOR and old in p["to"]
                       and (word := REPORT_WORD.match(p["text"])) and word[1] == "BRIEF"]
-            body = "\n".join(briefs[-1]["text"].split("\n")[1:]) if briefs else "(@%s had no brief on the board)" % old
+            # A brief addressed to the old member in its first line, not one that only mentions it further down.
+            briefs = [p for p in briefs if old in targets(p["text"].split("\n")[0], members, include_killed=True)] or briefs
+            lines = briefs[-1]["text"].split("\n") if briefs else []
+            first = lines[0][REPORT_WORD.match(lines[0]).end():].strip() if lines else ""
+            body = "\n".join(([first] if first else []) + lines[1:]) if briefs else "(@%s had no brief on the board)" % old
             history = " ".join("#%d" % p["seq"] for p in posts if p["agent"] == old) or "none"
             # what the old member was sent and never read (or left unanswered) would otherwise be lost with it
             owed_seqs = sorted({p["seq"] for p in posts if old in p["to"] and p["seq"] > members[old]["last_read_seq"]}

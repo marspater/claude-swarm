@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -1253,8 +1254,8 @@ class BoardRegressions(unittest.TestCase):
                 clash = refused("member", "widgets", "paths=Sources/Widgets," + taken)
                 assert "@widgets and @feed both claim" in clash and "widgets" not in saved(d)["members"]
             run(d, "member", "widgets", "paths=Sources/Widgets,Sources/FeedKit")  # a name that only starts alike is another folder
-            assert "relative to the repository root" in refused("member", "other", "paths=/etc/hosts")
-            assert "relative to the repository root" in refused("member", "other", "paths=../outside")
+            assert "relative to the project folder" in refused("member", "other", "paths=/etc/hosts")
+            assert "relative to the project folder" in refused("member", "other", "paths=../outside")
             # a reader claims nothing, and a retired member's paths are free again
             run(d, "member", "scout", "profile=explorer", "paths=Sources/Feed")
             refused("member", "widgets", "paths=Sources/Feed")
@@ -1264,6 +1265,72 @@ class BoardRegressions(unittest.TestCase):
             assert "@widgets and @feed-2 both claim" in refused("member", "widgets", "paths=Sources/Feed")
             run(d, "member", "feed-2", "killed=1")
             run(d, "member", "widgets", "paths=Sources/Feed")
+
+    def test_coordinator_ruling_settles_a_question_put_to_several(self):
+        d = self.init_run()
+        for name in ("screens", "lead", "other"):
+            run(d, "member", name)
+        asked = lambda: [(i["member"], i["seq"]) for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]
+        run(d, "post", "screens", "@lead @coordinator which toolbar do the boards use?")
+        assert len(asked()) == 2
+        # a peer's reply answers for itself only
+        run(d, "post", "other", "@screens re #1 I would guess the Today one")
+        assert len(asked()) == 2
+        # the coordinator rules on it: the member asked in the same post owes no second answer
+        run(d, "post", "coordinator", "@screens re #1 ruling: Today's toolbar")
+        assert asked() == []
+        # a ruling on one question leaves another to the same member open, and numbers may be listed with spaces
+        run(d, "post", "screens", "@lead which band colours?")
+        run(d, "post", "screens", "@lead and which corner radius?")
+        run(d, "post", "coordinator", "@screens re #4 the app's colours")
+        assert [seq for _, seq in asked()] == [5]
+        run(d, "post", "lead", "@screens FROZEN (re #4 #5): colours and radius are in the spec")
+        assert asked() == []
+
+    def test_replace_brief_and_open_questions_follow_the_chain(self):
+        d = self.init_run()
+        for name in ("a", "asker", "other"):
+            run(d, "member", name)
+        run(d, "post", "coordinator", stdin="@other BRIEF\nSee also @a for the parser.")
+        run(d, "post", "coordinator", stdin="@a @other BRIEF | Owns: the parser\nDone when: it parses")
+        run(d, "post", "coordinator", stdin="@a BRIEF\nOwns: the lexer")
+        run(d, "post", "coordinator", stdin="@other BRIEF\nThe lexer is @a's.")
+        run(d, "post", "asker", "@a which grammar?")
+        run(d, "replace", "a", "b")
+        brief = run(d, "show", "b")
+        assert "Owns: the lexer" in brief and "The lexer is" not in brief
+        # a one-line brief keeps its text after BRIEF
+        run(d, "post", "coordinator", stdin="@b BRIEF Owns: one line")
+        run(d, "replace", "b", "c")
+        assert "Owns: one line" in run(d, "show", "c")
+        # a question the retired member read and never answered is listed for its successor
+        run(d, "member", "x")
+        seq = re.search(r"#(\d+)", run(d, "post", "asker", "@x which file?")).group(1)
+        run(d, "read", "x")
+        run(d, "member", "x", "killed=1")
+        run(d, "replace", "x", "y")
+        assert "yours to answer: #%s." % seq in run(d, "show", "y")
+
+    def test_claims_compare_case_insensitively(self):
+        d = self.init_run()
+        run(d, "member", "one", "paths=Sources/Feed")
+        r = subprocess.run([sys.executable, BOARD, d, "member", "two", "paths=sources/feed/x.swift"], capture_output=True, text=True)
+        assert r.returncode != 0 and "both claim" in r.stderr
+
+    def test_prune_dry_run_matches_a_real_prune_for_integration_worktrees(self):
+        git = lambda *a: subprocess.run(["git", "-C", self.root, *a], check=True, capture_output=True)
+        git("init", "-q")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x")
+        d = self.init_run()
+        run(d, "close")
+        wt = os.path.join(d, "integration-abc")
+        git("worktree", "add", "-q", "--detach", wt)
+        self.init_run("shown")  # the pointer moves on, so the closed run may be archived
+        plan = run(self.swarm, "prune", "--days=0", "--dry-run")
+        assert "would remove worktree" in plan and "would archive " + os.path.basename(d) in plan, plan
+        assert os.path.isdir(wt)
+        real = run(self.swarm, "prune", "--days=0")
+        assert "archive " + os.path.basename(d) in real and "kept" not in real, real
 
     def test_cli_int_validation_and_trailing_whitespace_truncation(self):
         d = self.init_run()

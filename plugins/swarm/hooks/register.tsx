@@ -3,7 +3,7 @@ import { atom, read, update } from 'claude-code'
 import type { AgentInfo, EngineInterface, ModelUsage, Register, SessionMessage, Timer } from 'claude-code'
 
 import type { Member, Post, Swarm, Tab } from '../types'
-import { COORDINATOR_READ, RUN, boardCalls, runsNamed, splitShellSegments, wakeMessage, wakeSequence } from './command'
+import { COORDINATOR_READ, RUN, boardCalls, runsNamed, scanShell, type Statement, wakeMessage, wakeSequence } from './command'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, LATEST, SPECIALISTS, SWARM_AGENTS, familyOf, latestOf } from './models'
 import { KEPT, budgetOf, findAgent, memberNamed, parse, parsePosts, targets, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
 import { CLIP, bodyOf, clean, clip, compact, head, kindOf, openedText, stripKind } from './text'
@@ -327,7 +327,10 @@ function parsePaths(raw?: string): string[] {
 
 function pathCovers(ownerPath: string, targetPath: string): boolean {
   if (ownerPath === '.') return true
-  return targetPath === ownerPath || targetPath.startsWith(`${ownerPath}/`)
+  // Case-insensitive, like the board's claimed_twice, so both sides agree on what overlaps.
+  const owner = ownerPath.toLowerCase()
+  const target = targetPath.toLowerCase()
+  return target === owner || target.startsWith(`${owner}/`)
 }
 
 function pathsOverlap(a: string[], b: string[]): boolean {
@@ -759,6 +762,100 @@ async function adopt($: EngineInterface, name: string | undefined, prompt = ''):
   }
 }
 
+async function commitsInSharedCheckout($: EngineInterface, command: string, cwd: string): Promise<boolean> {
+  const directoryAfter = (current: string | undefined, arg?: string) => {
+    if (arg === undefined) return undefined
+    const path = arg.replace(/^(['"])(.*)\1$/, '$2')
+    if (!path || path === '.' || path === './') return current
+    if (path.startsWith('/')) return normalizePath(path)
+    return current && normalizePath(`${current}/${path}`)
+  }
+  // Shell wrappers that may precede the real command: `(`, `{`, `!`, keywords, and env/time-style prefixes.
+  const WRAPPER = /^(?:[({!]|(?:then|do|else|time|command|exec|nohup|env)(?=\s|$)(?:\s+(?:-u\s+\S+|-\S+))*)\s*/
+  // A folder under .claude/worktrees counts as an isolated worktree only when git made it one: a plain
+  // folder there resolves to the main repository, so a commit from it lands in the shared checkout.
+  const insideCheckout = async (dir: string | undefined) => {
+    if (dir === undefined || (dir !== cwd && !dir.startsWith(`${cwd}/`))) return false
+    const name = /^\/\.claude\/worktrees\/([^/]+)/.exec(dir.slice(cwd.length))?.[1]
+    if (name === undefined) return true
+    const link = await $.fs.read(`${cwd}/.claude/worktrees/${name}/.git`).catch(() => '')
+    return !/^gitdir:\s*\S/.test(link.trim())
+  }
+  // Where the shell may be after the last statement succeeded (ok) or failed: `cd x || git commit` commits
+  // exactly when the cd failed. A subshell, a pipeline stage or a background list keeps its cd to itself.
+  type Dirs = Set<string | undefined>
+  let ok: Dirs = new Set([cwd])
+  let failed: Dirs = new Set()
+  let op: Statement['next'] = ';'
+  let listStart = ok
+  let pipeStart = ok
+  // A pipeline skipped by `&&` passes the failure on to a later `||`, and one skipped by `||` the success to `&&`.
+  let carryOk: Dirs = new Set()
+  let carryFailed: Dirs = new Set()
+  const subshells: Dirs[] = []
+  for (const { text, next } of scanShell(command)) {
+    const here: Dirs = op === '&&' ? ok : op === '||' ? failed : op === '|' ? pipeStart : new Set([...ok, ...failed])
+    if (op === ';') listStart = here
+    if (op !== '|') {
+      pipeStart = here
+      carryOk = op === '||' ? ok : new Set()
+      carryFailed = op === '&&' ? failed : new Set()
+    }
+    const bare = text.replace(/"[^"]*"|'[^']*'/g, '')
+    for (const _ of bare.matchAll(/\(/g)) subshells.push(here)
+    let segment = text.trim().replace(/[)}\s]+$/, '')
+    let negated = false
+    for (let prev = ''; prev !== segment;) {
+      prev = segment
+      if (segment.startsWith('!')) negated = !negated
+      segment = segment.replace(WRAPPER, '')
+    }
+    let okNext = here
+    let failedNext = here
+    const cd = /^cd\s+(?:--\s+)?("[^"]*"|'[^']*'|\S+)$/.exec(segment)
+    const gitMatch = /^(?:[A-Za-z_]\w*=(?:"[^"\n]*"|'[^'\n]*'|[^\s"'<>;]*)\s+)*(?:\S*\/)?git\b([\s\S]*)$/.exec(segment)
+    if (cd) {
+      okNext = new Set([...here].map(dir => directoryAfter(dir, cd[1])))
+    } else if (/^(?:exit|return)(?=\s|$)/.test(segment)) {
+      okNext = failedNext = new Set()
+    } else if (gitMatch) {
+      const tokens = gitMatch[1]?.match(/"[^"]*"|'[^']*'|\S+/g) ?? []
+      for (const dir of here) {
+        let gitDir = dir
+        for (let i = 0; i < tokens.length; i++) {
+          const tok = tokens[i]!
+          if (tok.startsWith('-C')) {
+            gitDir = directoryAfter(gitDir, tok === '-C' ? tokens[++i] : tok.slice(2))
+          } else if (['-c', '--git-dir', '--work-tree', '--namespace', '--super-prefix', '--config-env'].includes(tok)) {
+            i++
+          } else if (!tok.startsWith('-')) {
+            if (tok === 'commit' && await insideCheckout(gitDir)) return true
+            break
+          }
+        }
+      }
+    }
+    if (negated) [okNext, failedNext] = [failedNext, okNext]
+    if (op === '|' || next === '|') okNext = failedNext = here
+    for (const _ of bare.matchAll(/\)/g)) {
+      const outer = subshells.pop()
+      if (outer) okNext = failedNext = outer
+    }
+    if (next !== '|') {
+      okNext = new Set([...okNext, ...carryOk])
+      failedNext = new Set([...failedNext, ...carryFailed])
+    }
+    if (next === '&') {
+      okNext = listStart
+      failedNext = new Set()
+    }
+    ok = okNext
+    failed = failedNext
+    op = next === '&' ? ';' : next
+  }
+  return false
+}
+
 // What the coordinator is told when it makes a run. A run can be started from memory, with no /swarm:swarm in the
 // turn and so none of the skill's current rules; and every wake re-reads the whole conversation, so a run started
 // in a long one pays for that history each time.
@@ -892,7 +989,7 @@ async function deliver(
       if (told && member.last_read_seq < told.seq && told.seq === member.last_nudged_seq && told.times < WAKE_ATTEMPTS &&
           now - told.at * 1000 >= QUIET_MS && (!agent || !['running', 'pending', 'waiting', 'killed'].includes(agent.status))) {
         // A fast turn can end before the send is acknowledged. Recover a missed rearm once its loop is idle.
-        await boardCommand($, dir, ['rearm', '0', id])
+        await boardCommand($, dir, ['rearm', '0', id]).catch(() => undefined)
         results.pending = true
       }
       continue
@@ -1597,40 +1694,6 @@ export const register: Register = on => {
     { deny: 'The board tool ran out of time. End your turn and report this sentence to the coordinator.' }
   ))
 
-  function commitsInSharedCheckout(command: string, cwd: string): boolean {
-    const directoryAfter = (current: string | undefined, arg?: string) => {
-      if (arg === undefined) return undefined
-      const path = arg.replace(/^(['"])(.*)\1$/, '$2')
-      if (!path || path === '.' || path === './') return current
-      if (path.startsWith('/')) return normalizePath(path)
-      return current && normalizePath(`${current}/${path}`)
-    }
-    let shellDir: string | undefined = cwd
-    for (const segment of splitShellSegments(command)) {
-      const cd = /^cd\s+(?:--\s+)?("[^"]*"|'[^']*'|\S+)$/.exec(segment)
-      if (cd) {
-        shellDir = directoryAfter(shellDir, cd[1])
-        continue
-      }
-      const gitMatch = /^(?:[A-Za-z_]\w*=(?:"[^"\n]*"|'[^'\n]*'|[^\s"'<>;]*)\s+)*(?:\S*\/)?git\b(.*)$/.exec(segment)
-      if (!gitMatch) continue
-      const tokens = gitMatch[1]?.match(/"[^"]*"|'[^']*'|\S+/g) ?? []
-      let gitDir = shellDir
-      for (let i = 0; i < tokens.length; i++) {
-        const tok = tokens[i]!
-        if (tok.startsWith('-C')) {
-          gitDir = directoryAfter(gitDir, tok === '-C' ? tokens[++i] : tok.slice(2))
-        } else if (['-c', '--git-dir', '--work-tree', '--namespace', '--super-prefix', '--config-env'].includes(tok)) {
-          i++
-        } else if (!tok.startsWith('-')) {
-          if (tok === 'commit' && gitDir === cwd) return true
-          break
-        }
-      }
-    }
-    return false
-  }
-
   on('tool.call', async ($, e, next) => {
     // A tool call in the main conversation means the coordinator is mid-turn, even when this
     // module loaded after that turn began (a restart, a reload) and never saw it start.
@@ -1651,80 +1714,98 @@ export const register: Register = on => {
     const isCoordinatorBg = e.agentId === undefined && (e.tool === 'Monitor' || (e.tool === 'Bash' && e.run_in_background === true))
     const isMemberGuard = e.agentId !== undefined && (e.tool === 'Edit' || e.tool === 'Write' || e.tool === 'NotebookEdit' || e.tool === 'Bash')
     let bgWarning: string | undefined
-    if (isCoordinatorBg || isMemberGuard) {
-      const activeDir = await read($, run)
-      if (activeDir && (!ownedRoster || ownedRoster.dir !== activeDir)) {
-        await syncOwnedState($, activeDir).catch(() => undefined)
-      }
-      if (activeDir && ownedRoster && ownedRoster.dir === activeDir && !ownedRoster.closed) {
-        if (e.agentId === undefined) {
-          if (e.tool === 'Monitor') {
-            return { deny: 'Do not use Monitor while driving a Swarm run: each event wakes the coordinator and re-reads its whole conversation, and Swarm hooks already monitor the board.' }
-          }
-          if (e.tool === 'Bash' && e.run_in_background === true) {
-            if (WATCHER_BG_RE.test(command)) {
-              return { deny: 'Do not run background watcher, poll, or board commands while driving a Swarm run: Swarm hooks already monitor the board, and background completions wake the coordinator and re-read its whole conversation.' }
+    let guarded: string | undefined
+    try {
+      if (isCoordinatorBg || isMemberGuard) {
+        const activeDir = await read($, run)
+        if (activeDir && (!ownedRoster || ownedRoster.dir !== activeDir)) {
+          await syncOwnedState($, activeDir).catch(() => undefined)
+        }
+        if (activeDir && ownedRoster && ownedRoster.dir === activeDir && !ownedRoster.closed) {
+          if (e.agentId === undefined) {
+            if (e.tool === 'Monitor') {
+              return { deny: 'Do not use Monitor while driving a Swarm run: each event wakes the coordinator and re-reads its whole conversation, and Swarm hooks already monitor the board.' }
             }
-            bgWarning = 'Swarm: Running a background Bash command while driving a Swarm run will wake the coordinator and re-read its whole conversation when it finishes.'
-          }
-        } else {
-          const agents = await $.agent.list().catch(() => [])
-          const agent = agents.find(one => one.id === e.agentId)
-          const memberDir = agentRuns.get(e.agentId) ?? await agentRun($, e.agentId, agent)
-          if (memberDir === activeDir) {
+            if (e.tool === 'Bash' && e.run_in_background === true) {
+              if (WATCHER_BG_RE.test(command)) {
+                return { deny: 'Do not run background watcher, poll, or board commands while driving a Swarm run: Swarm hooks already monitor the board, and background completions wake the coordinator and re-read its whole conversation.' }
+              }
+              bgWarning = 'Swarm: Running a background Bash command while driving a Swarm run will wake the coordinator and re-read its whole conversation when it finishes.'
+            }
+          } else {
+            const agents = await $.agent.list().catch(() => [])
+            const agent = agents.find(one => one.id === e.agentId)
+            // A member the owned roster names is identified before any lookup that can throw, so a failure fails closed.
             const address = teammateOf($, e.agentId, agent)
             const found = Object.entries(ownedRoster.members).find(([, m]) =>
               m.id === e.agentId || (address !== undefined && m.id === address))
             const [memberName, member] = found ?? []
-            if (memberName && memberName !== 'coordinator' && member) {
-              if (e.tool === 'Edit' || e.tool === 'Write' || e.tool === 'NotebookEdit') {
-                const rawTarget = e.tool === 'NotebookEdit' ? String(e.notebook_path ?? '') : String(e.file_path ?? '')
-                const cwd = await $.session.cwd().catch(() => '')
-                if (rawTarget && cwd) {
-                  const normCwd = normalizePath(cwd)
-                  const realCwd = await resolveRealPath($, normCwd)
-                  const absTarget = rawTarget.startsWith('/') ? normalizePath(rawTarget) : normalizePath(`${normCwd}/${rawTarget}`)
-                  const realTarget = await resolveRealPath($, absTarget)
-                  const rel = realTarget === realCwd
-                    ? ''
-                    : realTarget.startsWith(`${realCwd}/`)
-                      ? realTarget.slice(realCwd.length + 1)
-                      : undefined
-                  if (rel !== undefined) {
-                    if (rel === '.swarm' || rel.startsWith('.swarm/')) {
-                      return { deny: 'Direct edits inside .swarm/ are not allowed. Use the board tool to read or post.' }
-                    }
-                    if (member.role === 'verifier' || member.writes === '0') {
-                      return { deny: `@${memberName} is read-only (${member.role === 'verifier' ? 'verifier' : 'writes=0'}), so it cannot edit files in the repository.` }
-                    }
-                    for (const [otherName, other] of Object.entries(ownedRoster.members)) {
-                      if (otherName === memberName || otherName === 'coordinator' || other.killed) continue
-                      if (other.role === 'verifier' || other.writes === '0') continue
-                      const claimed = parsePaths(other.paths).find(p => pathCovers(p, rel))
-                      if (claimed) {
-                        return { deny: `Path "${rel}" is claimed by @${otherName} (paths=${claimed}), so @${memberName} cannot edit it.` }
+            if (memberName && memberName !== 'coordinator' && member) guarded = memberName
+            // The owned roster naming this agent settles its run: a lookup that fails, by throwing or by an
+            // error exit, must not let a known member past the guard.
+            const memberDir = guarded ? activeDir : agentRuns.get(e.agentId) ?? await agentRun($, e.agentId, agent)
+            if (memberDir === activeDir) {
+              if (memberName && memberName !== 'coordinator' && member) {
+                if (e.tool === 'Edit' || e.tool === 'Write' || e.tool === 'NotebookEdit') {
+                  const rawTarget = e.tool === 'NotebookEdit' ? String(e.notebook_path ?? '') : String(e.file_path ?? '')
+                  const cwd = await $.session.cwd().catch(() => '')
+                  if (rawTarget && cwd) {
+                    const normCwd = normalizePath(cwd)
+                    const realCwd = await resolveRealPath($, normCwd)
+                    const absTarget = rawTarget.startsWith('/') ? normalizePath(rawTarget) : normalizePath(`${normCwd}/${rawTarget}`)
+                    const realTarget = await resolveRealPath($, absTarget)
+                    let rel = realTarget === realCwd
+                      ? ''
+                      : realTarget.startsWith(`${realCwd}/`)
+                        ? realTarget.slice(realCwd.length + 1)
+                        : undefined
+                    // An isolated writer's paths= are relative to its own worktree, not to the shared checkout.
+                    const inWorktree = rel === undefined ? null : /^\.claude\/worktrees\/[^/]+\/(.*)$/.exec(rel)
+                    if (inWorktree) rel = inWorktree[1]!
+                    if (rel !== undefined) {
+                      if (rel === '.swarm' || rel.startsWith('.swarm/')) {
+                        return { deny: 'Direct edits inside .swarm/ are not allowed. Use the board tool to read or post.' }
+                      }
+                      if (member.role === 'verifier' || member.writes === '0') {
+                        return { deny: `@${memberName} is read-only (${member.role === 'verifier' ? 'verifier' : 'writes=0'}), so it cannot edit files in the repository.` }
+                      }
+                      for (const [otherName, other] of Object.entries(ownedRoster.members)) {
+                        if (otherName === memberName || otherName === 'coordinator') continue
+                        // Exactly the members the board's claimed_twice ignores.
+                        if (other.role !== 'worker' || other.killed || other.writes === '0' || other.consult === '1' ||
+                            ['explorer', 'investigator', 'architect'].includes(other.profile ?? '')) continue
+                        const claimed = parsePaths(other.paths).find(p => pathCovers(p, rel))
+                        if (claimed) {
+                          return { deny: `Path "${rel}" is claimed by @${otherName} (paths=${claimed}), so @${memberName} cannot edit it.` }
+                        }
+                      }
+                      const ownPaths = parsePaths(member.paths)
+                      if (ownPaths.length > 0 && !ownPaths.some(p => pathCovers(p, rel))) {
+                        return { deny: `@${memberName} may only edit its claimed paths (${ownPaths.join(', ')}), not "${rel}".` }
                       }
                     }
-                    const ownPaths = parsePaths(member.paths)
-                    if (ownPaths.length > 0 && !ownPaths.some(p => pathCovers(p, rel))) {
-                      return { deny: `@${memberName} may only edit its claimed paths (${ownPaths.join(', ')}), not "${rel}".` }
-                    }
                   }
-                }
-              } else if (e.tool === 'Bash') {
-                const isIsolated = member.isolated === '1' || isolatedAgents.has(e.agentId)
-                const isShared = !isIsolated && (
-                  member.isolated === '0' ||
-                  sharedAgents.has(e.agentId) ||
-                  ownedRoster.members.coordinator?.backend === 'native'
-                )
-                if (isShared && commitsInSharedCheckout(command, activeDir.slice(0, activeDir.lastIndexOf('/.swarm/')))) {
-                  return { deny: `Shared-checkout writers must not run \`git commit\`: leave your edits in the working tree and report via \`BOARD ready ${memberName}\`.` }
+                } else if (e.tool === 'Bash') {
+                  const isIsolated = member.isolated === '1' || isolatedAgents.has(e.agentId)
+                  const isShared = !isIsolated && (
+                    member.isolated === '0' ||
+                    sharedAgents.has(e.agentId) ||
+                    ownedRoster.members.coordinator?.backend === 'native'
+                  )
+                  if (isShared && await commitsInSharedCheckout($, command, activeDir.slice(0, activeDir.lastIndexOf('/.swarm/')))) {
+                    return { deny: `Shared-checkout writers must not run \`git commit\`: leave your edits in the working tree and report via \`BOARD ready ${memberName}\`.` }
+                  }
                 }
               }
             }
           }
         }
+      }
+    } catch (error) {
+      // Fail closed for a known member of the owned run; board commands still pass so it can report.
+      if (guarded === undefined) throw error
+      if (e.tool !== 'Bash' || (/\bgit\b/.test(command) && /commit/.test(command))) {
+        return { deny: `Swarm could not check @${guarded}'s call against the run's roster (${error instanceof Error ? error.message : String(error)}), so it was refused. Report this sentence to the coordinator.` }
       }
     }
     const isCoordinatorRead = calls.some(c => c.action === 'read' && COORDINATOR_READ.test(c.rest))
@@ -1760,7 +1841,7 @@ export const register: Register = on => {
           }
         }
         for (const c of calls) {
-          if (c.action !== 'show' || !RUN.test(c.dir) || await resolveRunDir($, c.dir) !== dir) continue
+          if (c.action !== 'show' || c.piped || !RUN.test(c.dir) || await resolveRunDir($, c.dir) !== dir) continue
           // One post, the whole board, or one member's posts: only what was printed counts as seen.
           const one = /--post=(\d+)/.exec(c.rest)
           const who = c.rest.trim().split(/\s+/).slice(1).find(word => word !== '' && !word.startsWith('-'))?.replace(/^[@'"]+|['"]+$/g, '').toLowerCase()

@@ -25,10 +25,36 @@ GIT_ENV_STRIP = {
 }
 
 
+def clean_env():
+    return {k: v for k, v in os.environ.items() if k not in GIT_ENV_STRIP}
+
+
+def linked_worktrees(root):
+    """Registered linked worktrees inside the repository, as paths Git names them from its root: they are other
+    checkouts, not this one's source."""
+    out = git(root, "worktree", "list", "--porcelain", optional=True) or b""
+    top = Path(os.fsdecode(root)).resolve()
+    inside = []
+    for line in out.split(b"\n"):
+        if line.startswith(b"worktree "):
+            try:
+                rel = Path(os.fsdecode(line[9:])).resolve().relative_to(top)
+            except ValueError:
+                continue
+            if rel.parts:
+                inside.append(os.fsencode(rel.as_posix()).split(b"/"))
+    return inside
+
+
+def in_worktree(name, worktrees):
+    parts = name.rstrip(b"/").split(b"/")
+    return any(parts[:len(w)] == w for w in worktrees)
+
+
 def git(path, *args, optional=False):
     try:
         # Git translates its messages; toplevel() reads one, so they are asked for untranslated.
-        env = {k: v for k, v in os.environ.items() if k not in GIT_ENV_STRIP}
+        env = clean_env()
         env["LC_ALL"] = "C"
         result = subprocess.run(["git", "-C", str(path), *args], capture_output=True, env=env)
     except FileNotFoundError:
@@ -134,8 +160,9 @@ def source_digest(project, nested=False, seen_roots=None):
             entry.partition(b"\t") for entry in git(root, "ls-files", "-z", "--stage").split(b"\0") if entry)}
         gitlinks = {name: meta[1] for name, meta in tracked.items() if meta[0] == b"160000"}
         # Run data is never source, whatever the project's .swarm/.gitignore says.
+        worktrees = linked_worktrees(root)
         files = (file for file in [*tracked, *git(root, "ls-files", "-z", "--others", "--exclude-standard").split(b"\0")]
-                 if file and (nested or not is_run_data(file, run_data)))
+                 if file and (nested or not is_run_data(file, run_data)) and not in_worktree(file, worktrees))
         head = git(root, "rev-parse", "HEAD", optional=True) or b"unborn"
     digest = hashlib.sha256(head + b"\0")
     for name in sorted(set(files)):
@@ -278,7 +305,8 @@ def pending_changes(project):
     found = repository(project)
     if found is None:
         raise ValueError("not a git repository")
-    _, run_data = found
+    top, run_data = found
+    worktrees = linked_worktrees(top)
     entries = git(project, "status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=none").split(b"\0")
     pending, index = [], 0
     while index < len(entries):
@@ -290,7 +318,7 @@ def pending_changes(project):
         if any(letter in entry[:2] for letter in (b"R", b"C")):
             paths.append(entries[index])  # the other side of a rename can cross the .swarm boundary
             index += 1
-        pending.extend(path for path in paths if not is_run_data(path, run_data))
+        pending.extend(path for path in paths if not is_run_data(path, run_data) and not in_worktree(path, worktrees))
     return pending
 
 
@@ -396,44 +424,73 @@ def prepare(run, project, mode, checks, onto=None):
 
 def run_check(command, cwd, timeout):
     """One check in its own process group: whatever it started ends with it, on a timeout or an interruption too."""
-    process = subprocess.Popen(["/bin/sh", "-c", command], cwd=cwd, stdin=subprocess.DEVNULL, start_new_session=True)
-
-    def gone():
-        process.poll()
-        try:
-            os.killpg(process.pid, 0)
-        except (ProcessLookupError, PermissionError):  # macOS answers EPERM for a group of exited processes
-            return True
-        return False
-
     def interrupted(number, _frame):
         raise SystemExit(128 + number)
 
-    # The group no longer dies with this process, so a signal sent to it has to reach the cleanup below.
+    # The group no longer dies with this process, so a signal sent to it has to reach the cleanup below,
+    # and the handlers are in place before the check can start.
     previous = {number: signal.signal(number, interrupted) for number in (signal.SIGTERM, signal.SIGHUP)}
+    previous[signal.SIGINT] = signal.getsignal(signal.SIGINT)  # cleanup ignores it; the finally restores it
+    process = None
     try:
+        process = subprocess.Popen(["/bin/sh", "-c", command], cwd=cwd, stdin=subprocess.DEVNULL,
+                                   env=clean_env(), start_new_session=True)
         return process.wait(timeout=timeout)
     except BaseException:
-        # A check that ends on its own may leave what it started for the next check; one that is cut short may not.
-        # A second signal must not cut the cleanup short: they are ignored until the group is gone.
-        previous[signal.SIGINT] = signal.signal(signal.SIGINT, signal.SIG_IGN)
-        for number in (signal.SIGTERM, signal.SIGHUP):
-            signal.signal(number, signal.SIG_IGN)
-        for number in (signal.SIGTERM, signal.SIGKILL):
-            if gone():
-                break
-            try:
-                os.killpg(process.pid, number)
-            except (ProcessLookupError, PermissionError):
-                break
-            deadline = time.monotonic() + 0.5
-            while not gone() and time.monotonic() < deadline:
-                time.sleep(0.02)
-        process.wait()
+        if process is not None:
+            cleanup(process)
         raise
     finally:
         for number, handler in previous.items():
             signal.signal(number, handler)
+
+
+def descendant_groups(pid):
+    """Process groups of everything below pid, found from one ps snapshot."""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid="], capture_output=True, text=True).stdout
+    except OSError:
+        return set()
+    rows = [tuple(map(int, line.split())) for line in out.splitlines() if len(line.split()) == 3]
+    below, grew = {pid}, True
+    while grew:
+        grew = False
+        for child, parent, _ in rows:
+            if parent in below and child not in below:
+                below.add(child)
+                grew = True
+    return {group for child, _, group in rows if child in below} - {os.getpgrp()}
+
+
+def cleanup(process):
+    # ponytail: descendants that left the group are found by a snapshot taken now; one already orphaned
+    # to init, or started after the snapshot, is not reached.
+    # A second signal must not cut the cleanup short, the snapshot below included: they are ignored until the
+    # groups are gone. The caller's finally restores the previous handlers.
+    for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(number, signal.SIG_IGN)
+    groups = {process.pid} | descendant_groups(process.pid)
+
+    def gone(group):
+        if group == process.pid:
+            process.poll()
+        try:
+            os.killpg(group, 0)
+        except (ProcessLookupError, PermissionError):  # macOS answers EPERM for a group of exited processes
+            return True
+        return False
+
+    for number in (signal.SIGTERM, signal.SIGKILL):
+        for group in groups:
+            if not gone(group):
+                try:
+                    os.killpg(group, number)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        deadline = time.monotonic() + 0.5
+        while not all(gone(g) for g in groups) and time.monotonic() < deadline:
+            time.sleep(0.02)
+    process.wait()
 
 
 def test_candidate(run, project, identifier, verifier, timeout_arg=None):
@@ -548,7 +605,12 @@ def accept(run, project, identifier):
                 raise ValueError("the user checkout has pending changes; keep the verified candidate and report the blocker")
             moved = head != candidate["commit"]
             if moved:
-                git(project, "merge", "--ff-only", "--no-autostash", candidate["commit"])
+                # By default a fast-forward overwrites an ignored file in the way of the new commit, a parent
+                # folder's name included; refused, git names each one and the checkout stays as it was.
+                try:
+                    git(project, "merge", "--ff-only", "--no-autostash", "--no-overwrite-ignore", candidate["commit"])
+                except ValueError as error:
+                    raise ValueError(f"{error}\nmove them aside and accept again") from None
             try:
                 if git(project, "rev-parse", "HEAD").decode().strip() != candidate["commit"]:
                     raise ValueError("the checkout did not reach the verified commit")

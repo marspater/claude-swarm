@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import type { Post } from '../types'
-import { BOARD_CALL, COORDINATOR_READ, RUN, boardCalls, runsNamed, splitShellSegments, wakeMessage, wakeSequence } from './command'
+import { BOARD_CALL, COORDINATOR_READ, RUN, boardCalls, runsNamed, scanShell, splitShellSegments, wakeMessage, wakeSequence } from './command'
 import { edgesOf, graphSvg, isBroadcast } from './graph'
 import { toolMood, toolSummary } from './hive'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, SWARM_AGENTS, familyOf, latestOf } from './models'
@@ -249,4 +249,33 @@ test('heredoc bodies, escaped board.py paths, and zombie retired-running attenti
     seq: 0,
     text: '@parser was retired, but agent old-1 is still waiting. Stop it before reusing its files.',
   })
+})
+
+test('shell splitting: here-strings, arithmetic, comments, background, piped, trailing period', () => {
+  expect(splitShellSegments('cat <<< "x"\ngit commit -m wip')).toEqual(['cat <<< "x"', 'git commit -m wip'])
+  expect(splitShellSegments('echo $((1<<4))\ngit commit -m wip')).toEqual(['echo $((1<<4))', 'git commit -m wip'])
+  expect(splitShellSegments("# don't push yet\ngit add -A\ngit commit -m wip")).toEqual(['git add -A', 'git commit -m wip'])
+  expect(splitShellSegments('git add -A # note; git push\ngit commit -m wip')).toEqual(['git add -A', 'git commit -m wip'])
+  expect(splitShellSegments('echo $# ${#x} a#b')).toEqual(['echo $# ${#x} a#b'])
+  expect(splitShellSegments('sleep 1 & git push')).toEqual(['sleep 1', 'git push'])
+  expect(splitShellSegments('a >&2; b 2>&1; c &> f; d <&3; e |& f')).toEqual(['a >&2', 'b 2>&1', 'c &> f', 'd <&3', 'e', 'f'])
+
+  const call = (c: string) => boardCalls(`python3 board.py /r/.swarm/x-20261116-101010 ${c}`)[0]?.piped
+  expect(call('show | tail -1')).toBe(true)
+  expect(call('show')).toBe(false)
+  expect(call('show || true')).toBe(false)
+  expect(call('show > out.txt')).toBe(true)
+  expect(call('show >> out.txt')).toBe(true)
+  expect(call('show 1> out.txt')).toBe(true)
+  expect(call('show &> out.txt')).toBe(true)
+  expect(call('show 2> err.txt')).toBe(false)
+  expect(call('show 2>&1')).toBe(false)
+  expect(call('show >& out.txt')).toBe(true)
+  expect(call('show >&out.txt')).toBe(true)
+  expect(call('show 1>&-')).toBe(true)
+  expect(call('show >&2')).toBe(false)
+  expect(scanShell('a && b || c; d | e & f').map(s => s.next)).toEqual(['&&', '||', ';', '|', '&', ''])
+
+  expect(runsNamed('see .swarm/demo-20261116-101010.')).toEqual(['demo-20261116-101010'])
+  expect(runsNamed('see .swarm/demo-20261116-101010.log')).toEqual([])
 })

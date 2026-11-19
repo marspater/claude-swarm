@@ -2249,6 +2249,13 @@ test('a post already opened is not announced again, a run made from memory is po
   // one member's posts were shown: the other member's post is still owed, and said so on that very result
   const some = await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py ${RUN} show parser` })
   expect(some.context?.join(' ')).toContain('1 board post addresses you from #3')
+  // a show piped to `head` or redirected to a file was not seen: the post stays owed
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py ${RUN} show --post=3 | head -1` })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py ${RUN} show --post=3 > /tmp/x` })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't0', reason: 'answer' })
+  await clock.advance(30000)
+  expect(prompts.filter(text => text.includes('addresses you')).length).toBeGreaterThan(0)
+  prompts.length = 0
   // opening that post is reading it: no reminder then, and no prompt when idle
   const shown = await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py ${RUN} show --post=3` })
   expect(shown.context).toBeUndefined()
@@ -2774,6 +2781,116 @@ test('hardening: runtime file edit guards, shared git commit guard, coordinator 
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'coord-turn', reason: 'answer' })
   await clock.advance(12_000)
   expect(seen.prompts.some(t => t.includes('board post'))).toBe(true)
+})
+
+test('guard regressions: commit wrappers, worktree paths, ignored claims, case, and fail-closed', async ($, on) => {
+  const state = {
+    title: 'Guard swarm',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 },
+      alice: { role: 'worker', id: 'alice-1', paths: 'src/alice,notes,Shared', isolated: '0', last_read_seq: 1 },
+      bob: { role: 'worker', id: 'bob-1', paths: 'src/bob', isolated: '1', last_read_seq: 1 },
+      dan: { role: 'worker', id: 'dan-1', paths: 'Docs', isolated: '0', last_read_seq: 1 },
+      exp: { role: 'worker', id: 'exp-1', paths: 'notes', profile: 'explorer', writes: '0', last_read_seq: 1 },
+      cons: { role: 'worker', id: 'cons-1', paths: 'src/alice/c', consult: '1', last_read_seq: 1 },
+    },
+  }
+  let lookupFails = false
+  let lookupExits = false
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['alice'], text: '@alice BRIEF' }),
+    read: path => (path === '/project/.claude/worktrees/w/.git' ? 'gitdir: /project/.git/worktrees/w\n' : undefined),
+    roster: () => {
+      if (lookupFails) throw new Error('roster unreadable')
+      return JSON.stringify(state)
+    },
+  })
+  on('process.run', async (_, e) => {
+    if (lookupFails && e.argv.includes('agent-run')) throw new Error('lookup failed')
+    if (lookupExits && e.argv.includes('agent-run')) return { value: { exitCode: 1, stdout: '', stderr: 'roster unreadable', isStdoutTruncated: false, isStderrTruncated: false } }
+    return answer(board(e))
+  })
+  on('agent.list', () => ({
+    value: ['alice', 'bob', 'dan', 'exp', 'cons'].map(n => ({ id: `${n}-1`, description: `@${n}`, type: 'swarm:worker', status: 'running' })) as never,
+  }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const bash = (command: string, agentId = 'alice-1') => $.tool.call({ tool: 'Bash', command, agentId })
+  const edit = (file_path: string, agentId = 'alice-1') => $.tool.call({ tool: 'Edit', file_path, old_string: 'a', new_string: 'b', agentId })
+
+  // R1/R8: commit guard sees through wrappers, multi-line commands, subdirectories and background operators.
+  for (const command of [
+    'git commit -m "$(cat <<\'EOF\'\nmsg\nEOF\n)"',
+    'cat <<< "x"\ngit commit -m wip',
+    "# don't push\ngit commit -m wip",
+    'sleep 1 & git commit -m x',
+    'cd src && git commit -m x',
+    'git -C src commit',
+    '(cd src && git commit -m x)',
+    'env git commit -m x',
+    'if true; then git commit -m x; fi',
+    'time git commit -m x',
+  ]) {
+    expect((await bash(command)).deny, command).toContain('Shared-checkout writers')
+  }
+  expect((await bash('git -C /tmp/wt commit -m x')).deny).toBeUndefined()
+  expect((await bash('cd /tmp/wt && git commit -m x')).deny).toBeUndefined()
+  expect((await bash('git -C /project/.claude/worktrees/w commit -m x')).deny).toBeUndefined()
+  expect((await bash('cd .claude/worktrees/w/src && git commit -m x')).deny).toBeUndefined()
+  // A plain folder under .claude/worktrees is not a worktree: git commits to the main checkout from it.
+  expect((await bash('cd .claude/worktrees/plain && git commit -m x')).deny).toContain('Shared-checkout writers')
+  // A cd that failed, or one kept inside a subshell, pipeline or background job, leaves the commit in the checkout.
+  for (const command of [
+    'command cd /tmp/swarm-missing || git commit -m wip',
+    'cd /tmp/wt && git commit -m x || git commit -m y',
+    'cd /tmp/wt; git commit -m x',
+    '(cd /tmp/wt); git commit -m wip',
+    '(cd /tmp/wt) && git commit -m wip',
+    'cd /tmp/wt | true; git commit -m wip',
+    'cd /tmp/wt & git commit -m wip',
+    '! cd /tmp/wt && git commit -m wip',
+  ]) {
+    expect((await bash(command)).deny, command).toContain('Shared-checkout writers')
+  }
+  for (const command of ['(cd /tmp/wt && git commit -m x)', 'cd /tmp/wt || exit 1; git commit -m x', '{ cd /tmp/wt && git commit -m x; }']) {
+    expect((await bash(command)).deny, command).toBeUndefined()
+  }
+  expect((await bash('git -C /project/.claude/worktrees/plain/sub commit -m x')).deny).toContain('Shared-checkout writers')
+  expect((await bash('git commit -m x', 'bob-1')).deny).toBeUndefined()
+
+  // R2: an isolated writer's paths= match inside its own worktree.
+  expect((await edit('/project/.claude/worktrees/bob/src/bob/b.ts', 'bob-1')).deny).toBeUndefined()
+  expect((await edit('/project/.claude/worktrees/bob/src/alice/a.ts', 'bob-1')).deny).toContain('claimed by @alice')
+  expect((await edit('/project/.claude/worktrees/bob/.swarm/x', 'bob-1')).deny).toContain('.swarm/')
+
+  // R3: read-only, consult and other ignored members hold no claim.
+  expect((await edit('/project/notes/n.md')).deny).toBeUndefined()
+  expect((await edit('/project/src/alice/c/x.ts')).deny).toBeUndefined()
+  // R7: path claims compare case-insensitively.
+  expect((await edit('/project/docs/d.md')).deny).toContain('claimed by @dan')
+  expect((await edit('/project/shared/s.md', 'dan-1')).deny).toContain('claimed by @alice')
+
+  // R4: a guard that throws (a malformed roster entry) refuses edits but lets board commands through.
+  const alice = state.members.alice as Record<string, unknown>
+  alice.paths = 5
+  await bash(`python3 /p/board.py "${OWNED}" read alice`)
+  await clock.advance(5000)
+  expect((await edit('/project/src/alice/a.ts')).deny).toContain('could not check')
+  expect((await bash(`python3 /p/board.py "${OWNED}" read alice`)).deny).toBeUndefined()
+  alice.paths = 'src/alice,notes,Shared'
+
+  // R4: a failed run lookup for a member the roster names (not yet cached) also fails closed.
+  // A member the owned roster names keeps its guard when the run lookup throws or exits with an error.
+  for (const fail of [() => { lookupFails = true }, () => { lookupExits = true }]) {
+    fail()
+    expect((await edit('/project/src/bob/b.ts', 'exp-1')).deny).toContain('read-only')
+    expect((await bash('git commit -m x')).deny).toContain('Shared-checkout writers')
+    expect((await bash(`python3 /p/board.py "${OWNED}" read exp`, 'exp-1')).deny).toBeUndefined()
+    lookupFails = lookupExits = false
+  }
 })
 
 test('a retired member whose build is still running in its worktree is reported with the processes to stop', async ($, on) => {

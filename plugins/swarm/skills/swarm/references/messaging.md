@@ -48,7 +48,7 @@ The first line says what the post is. Keep it to one line that makes sense alone
 | `@coordinator NOT VERIFIED` | verifier | The candidate could not be tested or failed as a whole: the candidate, the command, the decisive output, and what would unblock it |
 | `@<name> SHUTDOWN` | coordinator | The reason. The member answers with the state it left, then stops |
 
-`ready` reports a piece done. It and `revise` are for workers, designers and specialists; the board refuses them from you and from a verifier, which report with a post. It records readiness and notifies you and the members that depend on the sender; the verifiers are notified once the last worker is ready, or at once when a candidate already holds the sender's work. An investigator's `ready` submits a finding to the coordinator. `BOARD confirm NAME SEQ` makes the exact reviewed finding ready and notifies dependents. Any change after a report needs `revise` first and a new `ready` after, because verification covers only what was reported.
+`ready` reports a piece done. It and `revise` are for workers, designers and specialists; the board refuses them from you and from a verifier, which report with a post. It records readiness and notifies you and the members that depend on the sender; the verifiers are notified once the last worker is ready; the coordinator mentions a verifier when one piece needs it sooner. An investigator's `ready` submits a finding to the coordinator. `BOARD confirm NAME SEQ` makes the exact reviewed finding ready and notifies dependents. Any change after a report needs `revise` first and a new `ready` after, because verification covers only what was reported.
 
 ## Writing a post
 
