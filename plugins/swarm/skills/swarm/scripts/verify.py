@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -140,7 +141,7 @@ def source_digest(project, nested=False, seen_roots=None):
         digest.update(len(name).to_bytes(8, "big") + name)
         try:
             mode = path.lstat().st_mode
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
             digest.update(b"missing\0")
             continue
         if stat.S_ISLNK(mode) or stat.S_ISREG(mode):
@@ -149,7 +150,8 @@ def source_digest(project, nested=False, seen_roots=None):
             sub_top = toplevel(path) if (path / ".git").exists() else None
             is_sub_repo = sub_top is not None and Path(os.fsdecode(sub_top.rstrip(b"\n"))).resolve() == path.resolve()
             if is_sub_repo:
-                if git(path, "rev-parse", "HEAD").strip() == gitlinks[name] and not git(
+                sub_head = git(path, "rev-parse", "HEAD", optional=True)
+                if sub_head and sub_head.strip() == gitlinks[name] and not git(
                         path, "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none"):
                     # A submodule's recorded commit stands for it when checked out clean at that commit.
                     digest.update(b"gitlink\0" + gitlinks[name])
@@ -402,7 +404,15 @@ def test_candidate(run, project, identifier, verifier):
         save_candidate(run, candidate)
 
     raw_timeout = os.environ.get("SWARM_VERIFY_TIMEOUT", "").strip()
-    timeout = float(raw_timeout) if raw_timeout else None
+    if raw_timeout:
+        try:
+            timeout = float(raw_timeout)
+        except ValueError:
+            raise ValueError("SWARM_VERIFY_TIMEOUT must be a positive number") from None
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("SWARM_VERIFY_TIMEOUT must be a positive number")
+    else:
+        timeout = None
     for command in candidate["checks"]:
         print(f"$ {command}", flush=True)
         try:
@@ -431,6 +441,10 @@ def accept(run, project, identifier):
             raise ValueError("no passing verification for this candidate")
         if candidate.get("accepted"):
             check_current(run, candidate)
+            state, posts = load(run)
+            if "accepted_seq" not in state:
+                state["accepted_seq"] = len(posts)
+                save(run, state)
             print(f"Already accepted {identifier}")
             return
         active_verifier(run, candidate["verified_by"])
@@ -474,11 +488,11 @@ def accept(run, project, identifier):
                 if moved and git(project, "reset", "--keep", head, optional=True) is None:
                     raise ValueError(f"{error}; the checkout could not be rolled back safely") from error
                 raise
-        candidate["accepted"] = True
-        save_candidate(run, candidate)
         state, posts = load(run)
         state["accepted_seq"] = len(posts)  # the board counts failed verification cycles from here again
         save(run, state)
+        candidate["accepted"] = True
+        save_candidate(run, candidate)
     print(f"ACCEPTED {identifier} {candidate['commit'] or candidate['digest']}")
     integration = candidate.get("worktree") or candidate["path"]
     if candidate["mode"] == "isolated" and git(project, "worktree", "remove", integration, optional=True) is None:

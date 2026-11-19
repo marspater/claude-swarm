@@ -9,7 +9,7 @@ You are the coordinator. The roster in `<run>/members.json` is the team: who exi
 | `role` | `worker` (default), `verifier`, `coordinator` | `role=verifier` when registering a verifier |
 | `profile` | The agent type behind a specialist (`explorer`, `investigator`, `architect`) or a `designer` | `profile=<type>` with `writes=0` for a specialist; `profile=designer` for a designer, which writes files |
 | `backend` | `native` on the coordinator's own entry when the run uses native Agent Teams; the plugin then expects named teammates | `BOARD member coordinator backend=native`, before any member starts |
-| `consult` | Marks an architect that advises you on one question. Verification ignores it, so it never blocks or voids a candidate | `consult=1` at registration; `killed=1` once it has answered (in native mode, request teammate shutdown too) |
+| `consult` | Marks an architect that advises you on one question. Verification ignores it, so it never blocks or voids a candidate | `consult=1 effort=medium` at registration (with `effort: "medium"` on `Agent`); `killed=1` once it has answered (in native mode, request teammate shutdown too) |
 | `writes` | `0` for a member that changes no files | You, for read-only members |
 | `group` | A numbered pool's name, reached with `@<group>` | `group=fix` |
 | `depends` | Members whose `READY` this one waits for | `depends=a,b`; must stay acyclic |
@@ -42,7 +42,7 @@ The `swarm` skill's step 1 says how limits are recorded and what the board refus
 | --- | --- | --- |
 | How | Nothing extra | `isolation: "worktree"` on every writer's Agent call, a designer's included, in a git repository |
 | Use when | Pieces touch different files and do not build into the same output | Writers would break each other: one build directory, generated files, a lockfile |
-| A writer reports with | `BOARD ready <name>` | `BOARD ready <name> <full commit id>`, after committing on its branch; a downstream isolated writer inspects (`git show <commit>:<path>`) or merges (`git merge --no-ff <commit>`) upstream `READY <commit>`s before building/testing |
+| A writer reports with | `BOARD ready <name>` | `BOARD ready <name> HEAD` from its worktree (or `<full commit id>`), after committing on its branch; a downstream isolated writer inspects (`git show <commit>:<path>`) or merges (`git merge --no-ff <commit>`) upstream `READY <commit>`s before building/testing |
 | Read-only members | No difference | Mark them `writes=0` so readiness does not expect a commit |
 | Verification | `VERIFY prepare shared` | `VERIFY prepare isolated` merges the exact commits into an integration worktree |
 

@@ -33,7 +33,7 @@ Report a piece's problems to its owner in one post that begins `@<name> NOT PASS
 
 When a `READY` comes from a `swarm:designer`, or a worker built UI from a designer's spec, Read `references/design-verification.md` beside this skill before you review the piece, and follow it. Skip it otherwise.
 Your BOARD command names `<plugin>/skills/swarm/scripts/board.py`; the file is `<plugin>/skills/verifying/references/design-verification.md`.
-The Apple and glass rules its redline checks are in `<plugin>/skills/design-craft/references/apple-design.md`. Read that only for a macOS, iOS or iPadOS target.
+The Apple and glass rules its redline checks are in `<plugin>/skills/design-craft/references/apple-design.md` and `<plugin>/skills/design-craft/references/liquid-glass.md`. Read them only for a macOS, iOS or iPadOS target.
 
 ## Verify the integrated behavior
 

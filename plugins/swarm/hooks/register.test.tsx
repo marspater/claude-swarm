@@ -2301,7 +2301,8 @@ test('a READY is held while others still work, and a run made inside a command s
   on('process.run', (_, e) => {
     const [, , directory, action] = e.argv
     commands.push(`${action} ${directory}`)
-    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    const stdout = action === 'attention' ? JSON.stringify({ items: [], members: {}, limits: {} }) : ''
+    return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('prompt.submit', (_, e) => {
     prompts.push(e.text)
@@ -2327,4 +2328,113 @@ test('a READY is held while others still work, and a run made inside a command s
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' })
   await clock.advance(16000)
   expect(prompts.filter(text => /address(es)? you/.test(text)).length).toBe(2)
+})
+
+test('wave 3 fixes: multi-word kind filter, non-round budget pause dedup, specialistBoard guards, conflicting exact model IDs', async ($, on) => {
+  const run = '/project/.swarm/demo-20261116-101010'
+  const state: {
+    title: string
+    members: Record<string, unknown>
+    paused?: string
+    closed?: boolean
+    limits: Record<string, string>
+    usage: { tokens: Record<string, number> }
+  } = {
+    title: 'Demo',
+    limits: { budget: '1000' },
+    usage: { tokens: { coordinator: 950 } },
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 0 },
+      exact: { role: 'worker', model: 'claude-opus-4-6', last_read_seq: 0 },
+      scout: { role: 'worker', profile: 'explorer', writes: '0', id: 's1', last_read_seq: 0 },
+      fix: { role: 'worker', last_read_seq: 0 },
+    },
+  }
+  const prompts: string[] = []
+  const board = [
+    JSON.stringify({ seq: 1, agent: 'fix', to: ['coordinator'], text: '@coordinatorVERIFIED', time: '2026-11-16T10:00:00Z' }).replace('@coordinatorVERIFIED', '@coordinator VERIFIED'),
+    JSON.stringify({ seq: 2, agent: 'fix', to: ['coordinator'], text: '@coordinator NOT PASSED: line 1', time: '2026-11-16T10:01:00Z' }),
+    JSON.stringify({ seq: 3, agent: 'fix', to: ['coordinator'], text: '@coordinator NOT VERIFIED: check failed', time: '2026-11-16T10:02:00Z' }),
+  ].join('\n')
+  on('command.register', (_, spec) => ({ value: { command: spec.name } }))
+  on('tool.register', (_, spec) => ({ value: { tool: `mcp__swarm__${spec.name}` } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 'fixture-conversation' }))
+  on('session.cwd', () => ({ value: '/project' }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.close', () => ({ value: undefined }))
+  on('prompt.submit', (_, e) => { prompts.push(e.text); return { text: e.text } })
+  on('turn.complete', () => ({ text: '' }))
+  on('fs.read', (_, e) => ({ value: e.path.endsWith('members.json') ? JSON.stringify(state) : board }))
+  on('agent.list', () => ({ value: [{ id: 's1', description: '@scout: explore', type: 'swarm:explorer', status: 'running' }] as never }))
+  on('agent.spawn', (_, e) => ({ model: e.model ?? 'sonnet', agentId: 'spawned' }))
+  const usage = (fresh: number) => ({ model: 'm', input_tokens: fresh, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 })
+  let answered = usage(0)
+  on('turn.step', async function* (_, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'tool_use' as const, usage: answered }
+  })
+  let failReady = false
+  on('process.run', (_, e) => {
+    const args = e.argv.slice(3)
+    if (args[0] === 'restore') return { value: { exitCode: 0, stdout: run, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (args[0] === 'account') {
+      const amt = Number(args[3])
+      state.usage.tokens.coordinator = (state.usage.tokens.coordinator ?? 0) + amt
+      const paused = state.usage.tokens.coordinator >= 1000
+      if (paused) state.paused = 'token budget of 1000 spent'
+      return { value: { exitCode: 0, stdout: JSON.stringify({ title: 'Demo', total: state.usage.tokens.coordinator, budget: 1000, paused }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    if (args[0] === 'ready' && failReady) {
+      return { value: { exitCode: 1, stdout: '', stderr: 'usage: board.py <dir> ready <agent> <text>\n', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    if (args[0] === 'show') {
+      return { value: { exitCode: 0, stdout: `shown:${args.slice(1).join(' ')}`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    if (args[0] === 'attention') return { value: { exitCode: 0, stdout: JSON.stringify({ items: [], members: {}, limits: state.limits }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  const clock = mock.clock(on)
+
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+
+  // 1. Conflicting exact model ID of the same family on agent.spawn is denied rather than silently overwritten
+  const baseSpawn = {
+    tool_use_id: 't1', prompt: 'Use the board.', subagentType: 'swarm:worker',
+    provider: { plugin: 'swarm', tier: 'core' as const }, parentModel: 'claude-sonnet-5-5', background: false, fork: false,
+  }
+  const conflict = await $.agent.spawn({ ...baseSpawn, description: '@exact: test', model: 'claude-opus-4-5' })
+  expect(conflict.deny).toContain('The roster has @exact on claude-opus-4-6, but this call would start it on claude-opus-4-5')
+
+  // 2. specialistBoard treats empty member="" as undefined when seq is passed, and translates ready/revise usage errors
+  const showSeq = await $.tool.call({ tool: 'mcp__swarm__board', tool_use_id: 'b1', agentId: 's1', action: 'show', member: '  ', seq: 2 } as never)
+  expect(showSeq.result).toBe('shown:--post=2')
+  failReady = true
+  const readyErr = await $.tool.call({ tool: 'mcp__swarm__board', tool_use_id: 'b2', agentId: 's1', action: 'ready', text: 'done' } as never)
+  expect(readyErr.deny).toContain('action "ready" with text')
+  failReady = false
+
+  // 3. Budget pause with 1000 tokens (compact = 1k vs raw = 1000) fires only once across account() and subsequent refresh() polls
+  answered = usage(60)
+  for await (const _ of $.turn.step({ turnId: 'b-1000', index: 0, model: 'm', messageCount: 1 })) { /* no chunks */ }
+  await clock.advance(1)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'b-1000', usage: usage(60) })
+  await clock.advance(15000)
+  expect(prompts.filter(p => p.includes('paused')).length).toBe(1)
+
+  // 4. specialistBoard refuses calls when the run is paused or over budget even if halted was not pre-populated
+  const pausedCall = await $.tool.call({ tool: 'mcp__swarm__board', tool_use_id: 'b3', agentId: 's1', action: 'read' } as never)
+  expect(pausedCall.deny).toContain('paused')
+
+  // 5. Board search filter matches multi-word negative kinds (`not passed`, `kind:not passed`, `kind:not-verified`)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.input({ key: 'board-search', text: 'not passed' })
+  expect(await ui.find({ type: 'Text', text: /#2 ·/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /#1 ·/ })).toBeUndefined()
+  await ui.input({ key: 'board-search', text: 'kind:not-verified' })
+  expect(await ui.find({ type: 'Text', text: /#3 ·/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /#1 ·/ })).toBeUndefined()
+  await ui.input({ key: 'board-search', text: 'verified' })
+  expect(await ui.find({ type: 'Text', text: /#1 ·/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /#3 ·/ })).toBeUndefined()
+  await ui.unmount()
 })

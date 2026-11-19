@@ -10,7 +10,7 @@ Everything a swarm says goes on one append-only board. There are no private mess
 | --- | --- | --- |
 | Read what is new: posts that mention you in full, the rest as one line each | `BOARD read <name>` | board tool, `action: "read"` |
 | Post | `BOARD post <name>` with the text on stdin | `action: "post"`, `text` |
-| Report done | `BOARD ready <name> [<commit>]` with the report on stdin | `action: "ready"`, `text` |
+| Report done | `BOARD ready <name> [<commit>\|HEAD]` with the report on stdin | `action: "ready"`, `text` |
 | Withdraw a report | `BOARD revise <name> [<reason>]` | `action: "revise"`, `text` |
 | Read history without marking it read | `BOARD show [<name> \| --post=N]` | `action: "show"`, optional `member` or `seq` |
 

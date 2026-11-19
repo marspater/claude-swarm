@@ -1,11 +1,11 @@
 import { expect, test } from 'claude-code/testing'
 import type { Post } from '../types'
-import { BOARD_CALL, COORDINATOR_READ, RUN, boardCalls, runsNamed, wakeMessage, wakeSequence } from './command'
-import { graphSvg } from './graph'
+import { BOARD_CALL, COORDINATOR_READ, RUN, boardCalls, runsNamed, splitShellSegments, wakeMessage, wakeSequence } from './command'
+import { edgesOf, graphSvg, isBroadcast } from './graph'
 import { toolMood, toolSummary } from './hive'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, SWARM_AGENTS, familyOf, latestOf } from './models'
 import { statusCss, statusDot, statusKey } from './palette'
-import { detailOf, findAgent, parse, statusOf, tokensUsed } from './roster'
+import { detailOf, findAgent, parse, statusOf, targets, tokensUsed } from './roster'
 import { bodyOf, clean, clip, compact, head, kindOf, openedText, stripKind } from './text'
 
 const post = (text: string, to: string[] = []): Post => ({ seq: 1, agent: 'parser', to, text, time: '2026-11-16T14:03:22+0100' })
@@ -150,4 +150,54 @@ test('wave 1/2 design, text, hive and palette helpers', async () => {
   expect(statusDot('failed')).toContain('<path d="M2.8 2.8L9.2 9.2M9.2 2.8L2.8 9.2"')
   expect(statusDot('waiting')).toContain('stroke-width="1.5"')
   expect(statusDot('inactive')).toContain('fill="none"')
+})
+
+test('wave 3 command, graph, roster, text and hive edge cases', async () => {
+  // multi-space separator between action and subarg preserves full action in rest
+  const multiSpace = boardCalls('python3 /p/board.py /project/.swarm/demo-20261116-101010 read   coordinator')
+  expect(multiSpace[0]?.rest).toBe('read   coordinator')
+  expect(COORDINATOR_READ.test(multiSpace[0]!.rest)).toBe(true)
+  // a run folder ending in a letter is not taken for part of the subcommand
+  expect(boardCalls('python3 /p/board.py /project/.swarm/demo-20261116-101010x show --post=3')[0]?.rest).toBe('show --post=3')
+  expect(boardCalls('python3 /p/board.py /tmp/rundir show')[0]?.rest).toBe('show')
+  expect(boardCalls('python3 /p/board.py /tmp/rundir read\t "@coordinator"')[0]?.rest).toBe('read\t "@coordinator"')
+
+  // splitShellSegments splits on single pipe | while ignoring || and >|
+  expect(splitShellSegments('python3 board.py /r show | head -n 5 && echo a >| out || true')).toEqual([
+    'python3 board.py /r show',
+    'head -n 5',
+    'echo a >| out',
+    'true',
+  ])
+  expect(boardCalls('echo hi | python3 /p/board.py /project/.swarm/demo-20261116-101010 read coordinator').map(c => c.action)).toEqual(['read'])
+
+  // runsNamed matches inside backticks and parentheses
+  expect(runsNamed('Run `python3 board.py /project/.swarm/backtick-20261116-101010 read a` or (.swarm/paren-20261116-101011)')).toEqual([
+    'backtick-20261116-101010',
+    'paren-20261116-101011',
+  ])
+
+  // graph.ts stripCode strips multi-backtick inline spans like ``@all``
+  expect(isBroadcast(post('Note about ``@all`` in code', ['coordinator']))).toBe(false)
+  expect(edgesOf([post('Note about ``@all`` in code', ['coordinator'])])).toEqual({ 'parser>coordinator': 1 })
+
+  // roster.ts targets() ignores @mentions inside code blocks, inline code, and URLs
+  const roster = {
+    coordinator: { role: 'coordinator', last_read_seq: 0 },
+    parser: { role: 'worker', last_read_seq: 0 },
+    all: { role: 'worker', last_read_seq: 0 },
+  }
+  expect(targets('See https://github.com/@parser and ``@all`` or ```\n@coordinator\n```', roster)).toEqual([])
+
+  // stripKind handles optional leading @mention tokens, bodyOf preserves line 2 indentation, clip tracks tilde/4-backtick fences
+  expect(stripKind('@coordinator, @parser READY: all good')).toBe('all good')
+  expect(bodyOf(post('@coordinator\n  indented line', ['coordinator']))).toBe('  indented line')
+  const tildeClip = clip(`~~~py\n${'x'.repeat(480)}\n~~~`)
+  expect(tildeClip.endsWith('\n~~~\n…')).toBe(true)
+  const inlineTicks = clip(`Here is \`\`\`inline\`\`\` text ${'x'.repeat(480)}`)
+  expect(inlineTicks.endsWith(' …')).toBe(true)
+
+  // toolMood handles quoted board.py paths and run dirs with spaces via boardCalls
+  expect(toolMood('Bash', 'python3 "/path with spaces/board.py" "/my project/.swarm/demo-20261116-101010" read coordinator')).toBe('inspect')
+  expect(toolMood('Bash', 'python3 "/path with spaces/board.py" "/my project/.swarm/demo-20261116-101010" post coordinator')).toBe('relay')
 })

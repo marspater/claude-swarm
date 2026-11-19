@@ -14,14 +14,14 @@ export const wakeSequence = (text: string) => {
 /** The run folders a member's prompt names: its board command carries the one it belongs to. */
 export const runsNamed = (prompt: string) => {
   const matches: string[] = []
-  const re = /(?:^|[\s"'=])(?:[^\s"'=]*\/)?\.swarm\/([A-Za-z0-9_.-]+-\d{8}-\d{6}x*)(?![\w.-])/g
+  const re = /(?:^|[\s"'=`(])(?:[^\s"'=`(]*\/)?\.swarm\/([A-Za-z0-9_.-]+-\d{8}-\d{6}x*)(?![\w.-])/g
   for (const m of prompt.matchAll(re)) {
     if (m[1]) matches.push(m[1])
   }
   return [...new Set(matches)].slice(0, 20)
 }
 
-/** Splits a shell command line into individual statements on unquoted `&&`, `||`, `;`, and `\n`. */
+/** Splits a shell command line into individual statements on unquoted `&&`, `||`, `|`, `;`, and `\n`. */
 export function splitShellSegments(command: string): string[] {
   const segments: string[] = []
   let quote: "'" | '"' | undefined
@@ -40,9 +40,12 @@ export function splitShellSegments(command: string): string[] {
       quote = ch
       continue
     }
-    if (ch === ';' || ch === '\n' || (ch === '&' && command[i + 1] === '&') || (ch === '|' && command[i + 1] === '|')) {
+    const isAnd = ch === '&' && command[i + 1] === '&'
+    const isOr = ch === '|' && command[i + 1] === '|'
+    const isPipe = ch === '|' && !isOr && command[i - 1] !== '>'
+    if (ch === ';' || ch === '\n' || isAnd || isOr || isPipe) {
       segments.push(command.slice(start, i))
-      if (ch === '&' || ch === '|') i++
+      if (isAnd || isOr) i++
       start = i + 1
     }
   }
@@ -68,8 +71,9 @@ export function boardCalls(command: string): ParsedBoardCall[] {
     const dir = rawDir.replace(/\/+$/, '')
     const action = match[4]!
     const subarg = match[5]
-    const tailLen = action.length + (subarg ? 1 + subarg.length : 0)
-    const rest = segment.slice(Math.max(0, match[0].length - tailLen))
+    // The gap before the subarg may be several spaces or tabs; the folder may itself end in a letter.
+    const tailLen = action.length + (subarg ? /[ \t]+[a-z-]+$/.exec(match[0])![0].length : 0)
+    const rest = segment.slice(match[0].length - tailLen)
     results.push({ dir, action, subarg, rest })
   }
   return results

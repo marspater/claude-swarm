@@ -1109,6 +1109,98 @@ class BoardRegressions(unittest.TestCase):
         rep = json.loads(run(d, "attention", "--json"))
         assert not rep["members"]["w"]["unreachable"] and rep["members"]["w"]["blocked_on"] == []
 
+    def test_quoted_and_question_regex_edge_cases(self):
+        d = self.init_run()
+        run(d, "member", "other")
+        run(d, "member", "asker")
+        run(d, "post", "asker", "@other see `a?.b` and https://example.invalid/?q=1 where retries?: number")
+        assert not [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]
+        run(d, "post", "asker", "@other did you check http://localhost:8080?")
+        qs = [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]
+        assert len(qs) == 1
+        run(d, "post", "other", "@asker yes")
+        run(d, "post", "asker", stdin="@other should we use A?\nOption A : yes")
+        qs = [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]
+        assert len(qs) == 1
+
+    def test_resume_after_not_passed_and_worker_told_ended(self):
+        d = self.init_run()
+        run(d, "member", "w", "id=id-w")
+        run(d, "member", "w2", "id=id-w2")
+        run(d, "member", "v", "role=verifier", "id=id-v")
+        run(d, "ready", "w", stdin="done")
+        run(d, "ready", "w2", stdin="done")
+        for _ in range(3):
+            run(d, "post", "v", "@w NOT PASSED: fails")
+        assert saved(d).get("paused")
+        # Both w and w2 are ready (with seq < verified_seq of NOT PASSED), so resuming after NOT PASSED must not wake v
+        out1 = run(d, "resume")
+        assert "@v" not in out1
+        # w withdraws readiness and has an unread mention, but its turn ended with told.ended == True during a pause
+        run(d, "revise", "w", "fixing")
+        state = saved(d)
+        state["members"]["w"]["told"] = {"seq": 5, "at": 1.0, "times": 1, "ended": True}
+        with open(os.path.join(d, "members.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        run(d, "pause", "hold")
+        out2 = run(d, "resume")
+        assert "@w" in out2 and "@v" not in out2
+
+    def test_ready_consultant_mentions_and_verifier_prose_mention(self):
+        d = self.init_run()
+        run(d, "member", "w1")
+        run(d, "member", "w2")
+        run(d, "member", "v", "role=verifier")
+        run(d, "member", "adv", "profile=architect", "writes=0", "consult=1")
+        # w1 ready mentioning @v while w2 is still working must not wake @v early
+        out_w1 = run(d, "ready", "w1", stdin="Ready for @v once @w2 finishes")
+        assert "@v" not in out_w1 and "@w2" in out_w1
+        # consultant ready mentioning @w2 or @v only notifies @coordinator
+        out_adv = run(d, "ready", "adv", stdin="Recommendation for @w2 and @v")
+        assert out_adv.splitlines()[0].endswith("-> @coordinator")
+
+    def test_rework_attributes_first_line_workers_only(self):
+        d = self.init_run()
+        run(d, "member", "w1")
+        run(d, "member", "des", "profile=designer")
+        run(d, "member", "v", "role=verifier")
+        for i in range(3):
+            out = run(d, "post", "v", stdin=f"@w1 NOT PASSED: failure {i}\nCompared against @des spec")
+        assert saved(d).get("paused") == "@w1 failed verification 3 times in a row"
+        items = [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "rework"]
+        assert [i["member"] for i in items] == ["w1"]
+
+    def test_fable_investigator_validation_bypass_closed(self):
+        d = self.init_run()
+        run(d, "member", "inv", "profile=investigator")
+        # Setting model=fable with profile=investigator on new or existing Opus investigator is rejected
+        run(d, "member", "inv", "model=fable", "effort=medium", ok=False)
+        run(d, "member", "w", "model=fable")
+        run(d, "member", "w", "profile=investigator", ok=False)
+        run(d, "replace", "inv", "inv2", "model=fable", "effort=medium")
+        # Once escalated via replace, updating other fields works, but changing effort away from medium is rejected
+        run(d, "member", "inv2", "id=id-inv2")
+        run(d, "member", "inv2", "effort=high", ok=False)
+        run(d, "member", "inv2", "id=id-inv2b", "effort=high", ok=False)
+
+    def test_cli_int_validation_and_trailing_whitespace_truncation(self):
+        d = self.init_run()
+        run(d, "member", "w", "id=id-w")
+        run(d, "post", "coordinator", "@w hello")
+        run(d, "read", "w", "--max-bytes=abc", ok=False)
+        run(d, "read", "w", "--max-bytes=100", ok=False)
+        assert run(d, "claim", "w", "id-w", "abc") == ""
+        run(d, "woke", "w", "abc", "tok", ok=False)
+        run(d, "tail", "0", ok=False)
+        board_path = os.path.join(d, "board.jsonl")
+        size_before = os.path.getsize(board_path)
+        with open(board_path, "ab") as f:
+            f.write(b"   ")
+        run(d, "status")
+        assert os.path.getsize(board_path) == size_before
+        run(d, "post", "coordinator", "@w second")
+        assert "#2" in run(d, "show", "--post=2")
+
 
 if __name__ == "__main__":
     scenario()

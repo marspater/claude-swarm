@@ -69,8 +69,8 @@ BIND_KEY = re.compile(r"[a-f0-9]{64}")
 # The first line says what a post is. Mentions before the word stay on that line: a word on line two is prose.
 REPORT_WORD = re.compile(r"^(?:@[\w-]+[ \t,:]*)*(READY|REVISE|BRIEF|SHUTDOWN|FINDING|VERIFIED|NOT (?:PASSED|VERIFIED))\b")
 # Code spans and URLs carry question marks that ask nothing, as do `name?: type` and `a?.b` left outside a span.
-QUOTED = re.compile(r"```.*?```|(`+)[^\n]*?\1|\w+://\S+", re.DOTALL)
-QUESTION = re.compile(r"(?<!\?)\?(?!\?|\.?\w|:|\s+[^\n?]*\s+:)")
+QUOTED = re.compile(r"```.*?```|(`+)[^\n]*?\1|\w+://\S+?(?=[.,;:!)]*(?:\?(?=\s|$))?(?:\s|$))", re.DOTALL)
+QUESTION = re.compile(r"(?<!\?)\?(?!\?|\.?\w|:|[ \t]+[^\n?]*[ \t]+:)")
 SUMMARY_CHARS = 200
 ARG_COUNTS = {
     "init": (1, None), "restore": (1, 1), "adopt": (2, None), "locate": (2, None),
@@ -123,6 +123,10 @@ def load(d):
     with f:
         while line := f.readline():
             if not line.strip():
+                if not line.endswith(b"\n"):
+                    if writable:
+                        f.truncate(f.tell() - len(line))
+                    break
                 continue
             try:
                 post = json.loads(line)
@@ -432,9 +436,10 @@ def rework(state, posts):
         if word[1] == "VERIFIED":
             failed = {}
         elif word[1] == "NOT PASSED":
-            for name in post["to"]:
-                if members.get(name, {}).get("role") == "worker":
-                    failed.setdefault(name, []).append(post["seq"])
+            first_workers = [name for name in targets(post["text"].split("\n", 1)[0], members)
+                             if name in post["to"] and members.get(name, {}).get("role") == "worker"]
+            for name in (first_workers or [name for name in post["to"] if members.get(name, {}).get("role") == "worker"]):
+                failed.setdefault(name, []).append(post["seq"])
     return failed
 
 
@@ -805,7 +810,7 @@ def main(argv):
 
     if cmd == "tail":
         # For a reader with a size limit (the pane reads at most 4 MiB): whole lines only, newest last. Takes no lock.
-        if args and not re.fullmatch(r"[0-9]{1,9}", args[0]):
+        if args and not re.fullmatch(r"[1-9][0-9]{0,8}", args[0]):
             sys.exit("tail takes a byte count")
         budget = int(args[0]) if args else 3_000_000
         with open(os.path.join(d, "board.jsonl"), "rb") as f:
@@ -897,6 +902,8 @@ def main(argv):
             if name not in members and not usable_name(name, members):
                 sys.exit("bad member name %r: use lowercase letters, digits, underscores and hyphens, ending in a letter or digit, and not a group's name" % name)
             before_counts, before_family = roster_counts(state), set(family_limit_errors(state))
+            was_fable_inv = (name in members and kind_of(members[name]) == "investigator"
+                             and family(model_of(members[name])) == "fable")
             member = members.setdefault(name, {"role": "worker", "last_read_seq": len(posts)})
             changes = assignments(args[1:], MEMBER_FIELDS)
             if "id" in changes and changes["id"] != member.get("id"):
@@ -908,12 +915,12 @@ def main(argv):
             validate_member(name, member, changes, members)
             if "role" in changes or "consult" in changes:
                 stranded(name, members)
-            if kind_of(member) == "investigator" and family(model_of(member)) == "fable" and "effort" in changes \
-                    and not {"model", "profile"} & set(changes) and effort_of(member) != "medium":
-                sys.exit("a Fable investigator runs at medium effort")
-            if {"model", "profile"} & set(changes) and kind_of(member) == "investigator" and family(model_of(member)) == "fable":
-                sys.exit("an investigator starts on Opus. Fable is the escalation after an Opus investigator fails: "
-                         "board.py DIR replace OLD NEW model=fable effort=medium")
+            if kind_of(member) == "investigator" and family(model_of(member)) == "fable":
+                if not was_fable_inv:
+                    sys.exit("an investigator starts on Opus. Fable is the escalation after an Opus investigator fails: "
+                             "board.py DIR replace OLD NEW model=fable effort=medium")
+                if effort_of(member) != "medium":
+                    sys.exit("a Fable investigator runs at medium effort")
             if "depends" in changes:
                 deps = dependencies(member)
                 member["depends"] = ",".join(deps)
@@ -1082,8 +1089,11 @@ def main(argv):
             if word == "NOT PASSED" and members[sender].get("role") == "verifier" and not state.get("paused"):
                 # Paused by the verdict itself, so a resumed run is stopped again only by a further one.
                 failed = rework(state, posts)
-                stuck = next(("@%s failed verification %d times in a row" % (name, len(failed.get(name, [])) + 1) for name in recipients
-                              if members[name].get("role") == "worker" and len(failed.get(name, [])) + 1 >= REWORK_PAUSE), "")
+                first_workers = [name for name in targets(first, members)
+                                 if name in recipients and members.get(name, {}).get("role") == "worker"]
+                charged = first_workers or [name for name in recipients if members[name].get("role") == "worker"]
+                stuck = next(("@%s failed verification %d times in a row" % (name, len(failed.get(name, [])) + 1) for name in charged
+                              if len(failed.get(name, [])) + 1 >= REWORK_PAUSE), "")
                 if stuck:
                     state["paused"] = stuck
             post_message(sender, text, recipients, save_roster=bool(stuck))
@@ -1146,6 +1156,8 @@ def main(argv):
                 # A member waiting on this one always hears, as does the coordinator when a finding it may confirm is withdrawn.
                 recipients = [name for name in recipients if sender in dependencies(members[name])
                               or (name == COORDINATOR and kind_of(member) == "investigator")]
+            if cmd == "ready" and kind_of(member) != "investigator" and not is_consultant:
+                recipients.extend(name for name in targets(report, members) if name != sender and name not in recipients)
             if cmd == "ready":
                 # A verifier reviews when there is something whole to review. Woken for each READY of five it spends
                 # a turn per piece and is mid-review when the candidate arrives; it hears once the last worker is ready.
@@ -1155,8 +1167,6 @@ def main(argv):
                            and entry.get("consult") != "1" and name != sender and name not in through]
                 if waiting:
                     recipients = [name for name in recipients if members[name].get("role") != "verifier"]
-            if cmd == "ready" and kind_of(member) != "investigator":
-                recipients.extend(name for name in targets(report, members) if name != sender and name not in recipients)
             post_message(sender, text, recipients, kind=cmd, revision=revision)
 
         elif cmd == "confirm":
@@ -1183,6 +1193,8 @@ def main(argv):
             limits = [a for a in args if a.startswith("--max-bytes=")]
             if (headers and everything) or len(readers) != 1 or len(limits) > 1 or len(set(args)) != len(args) or set(args) - {*readers, *limits, "--headers", "--all"}:
                 sys.exit("read requires one member and accepts --all, --headers or --max-bytes=N")
+            if limits and not re.fullmatch(r"--max-bytes=[0-9]{1,9}", limits[0]):
+                sys.exit("--max-bytes must be between 256 and 1000000")
             maximum = int(limits[0].partition("=")[2]) if limits else None
             if maximum is not None and not 256 <= maximum <= 1_000_000:
                 sys.exit("--max-bytes must be between 256 and 1000000")
@@ -1256,6 +1268,8 @@ def main(argv):
         elif cmd == "claim":
             name = known(args[0])
             member = members[name]
+            if not re.fullmatch(r"[0-9]{1,9}", args[2]):
+                return
             seq = int(args[2])
             previous = member.get("wake_claim", {})
             now = time.time()
@@ -1284,6 +1298,8 @@ def main(argv):
             member = members[name]
             if member.get("killed"):
                 sys.exit(f"@{name} has been retired")
+            if not re.fullmatch(r"[0-9]{1,9}", args[1]):
+                sys.exit("wake claim no longer matches")
             seq = int(args[1])
             claim = member.get("wake_claim", {})
             if claim.get("token") != args[2] or claim.get("seq") != seq:
@@ -1348,14 +1364,14 @@ def main(argv):
                 ready, reports = readiness(members, posts), latest_reports(posts)
                 asking = {asker for _, asker, _ in unanswered(members, posts)}
                 verified_seq = max((p["seq"] for p in posts if members.get(p["agent"], {}).get("role") == "verifier"
-                                    and (w := REPORT_WORD.match(p["text"])) and w[1] == "VERIFIED"), default=0)
+                                    and (w := REPORT_WORD.match(p["text"])) and w[1] in {"VERIFIED", "NOT PASSED", "NOT VERIFIED"}), default=0)
                 # A verifier is told of the work once every worker is ready (see `ready`): before that it was not
                 # reviewing anything a pause could have stopped.
                 unverified = any(p["seq"] > verified_seq for n, p in ready.items() if members.get(n, {}).get("consult") != "1") and all(
                     name in ready for name, entry in team_of(members).items() if entry.get("role") == "worker" and entry.get("consult") != "1")
                 halted = [name for name, member in team_of(members).items() if member.get("id") and name not in asking and (
                     (member.get("role") == "worker" and name not in ready and all(dep in ready for dep in dependencies(member))
-                     and reports.get(name, {}).get("kind") != "finding" and not unread(name))
+                     and reports.get(name, {}).get("kind") != "finding" and (not unread(name) or bool(member.get("told", {}).get("ended"))))
                     or (member.get("role") == "verifier" and (bool(member.get("told", {}).get("ended")) or (not unread(name) and unverified)))
                 )]
                 if state.pop("paused", None) and halted:

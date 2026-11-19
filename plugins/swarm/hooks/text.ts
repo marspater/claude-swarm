@@ -21,13 +21,13 @@ export function kindOf(text: string): { label: string; color: 'suggestion' | 'su
 
 // Removes a leading kind token when the caller already renders it as a header chip.
 export function stripKind(text: string): string {
-  return text.replace(/^(BRIEF|NOT PASSED|NOT VERIFIED|VERIFIED|READY|REVISE|FINDING|SHUTDOWN)\b[ \t:,-]*(?:\n|$)?/, '')
+  return text.replace(/^(?:@[\w-]+[ \t,:]*)*(BRIEF|NOT PASSED|NOT VERIFIED|VERIFIED|READY|REVISE|FINDING|SHUTDOWN)\b[ \t:,-]*(?:\n|$)?/, '')
 }
 
 // A post as the feed shows it: the header already names the recipients and the kind, and a full
 // commit id is noise, so the body starts at what the post says.
 export function bodyOf(post: Post): string {
-  const text = post.to.length > 0 ? post.text.replace(/^(?:@[\w-]+[\s,:]*)+/, '') : post.text
+  const text = post.to.length > 0 ? post.text.replace(/^(?:@[\w-]+[ \t,:]*)+(?:\n)?/, '') : post.text
 
   return text.replace(/\b([0-9a-f]{8})[0-9a-f]{32}\b/g, '$1')
 }
@@ -77,6 +77,21 @@ export function clip(text: string, length = CLIP): string {
   const cut = head(text, length)
   const space = cut.search(/\s\S*$/)
   const trimmed = (space > length / 2 ? cut.slice(0, space) : cut).trimEnd()
-  const fences = (trimmed.match(/```/g) ?? []).length
-  return fences % 2 === 1 ? `${trimmed}\n\`\`\`\n…` : `${trimmed} …`
+  let fence: '`' | '~' | null = null
+  let fenceLen = 0
+  for (const line of trimmed.split('\n')) {
+    const start = line.trimStart()
+    const m = /^(`{3,}|~{3,})/.exec(start)
+    if (!m) continue
+    const ch = m[1]![0] as '`' | '~'
+    const len = m[1]!.length
+    if (fence === null) {
+      fence = ch
+      fenceLen = len
+    } else if (fence === ch && len >= fenceLen && start.slice(len).trim() === '') {
+      fence = null
+      fenceLen = 0
+    }
+  }
+  return fence !== null ? `${trimmed}\n${fence.repeat(fenceLen)}\n…` : `${trimmed} …`
 }

@@ -511,6 +511,60 @@ class VerifyRegressions(unittest.TestCase):
             out = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm", "prune", "--days=0")
             assert "contains active git worktree" in out and wt.exists()
 
+    def test_source_digest_dir_replaced_by_file_and_unborn_submodule_head(self):
+        sys.path.insert(0, str(SCRIPTS))
+        import verify  # noqa: E402
+        with tempfile.TemporaryDirectory() as t_sub, tempfile.TemporaryDirectory() as t_proj:
+            sub, proj = Path(t_sub).resolve(), Path(t_proj).resolve()
+            gs = self._init_git(sub)
+            gp = self._init_git(proj)
+            (proj / "dir").mkdir()
+            (proj / "dir" / "child.txt").write_text("hello")
+            gp("add", "dir/child.txt")
+            gp("commit", "-m", "add dir")
+            # Replace tracked directory with regular file without staging
+            (proj / "dir" / "child.txt").unlink()
+            (proj / "dir").rmdir()
+            (proj / "dir").write_text("now a file")
+            d1 = verify.source_digest(proj)
+            assert d1
+            (proj / "dir").unlink()
+            # Initialized submodule with unborn HEAD
+            subprocess.run(["git", "-C", str(proj), "-c", "protocol.file.allow=always", "submodule", "add", str(sub), "vendor/lib"],
+                           check=True, capture_output=True)
+            gp("commit", "-m", "add sub")
+            subprocess.run(["git", "-C", str(proj / "vendor" / "lib"), "checkout", "--orphan", "unborn"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(proj / "vendor" / "lib"), "rm", "-rf", "."],
+                           check=True, capture_output=True)
+            assert verify.source_digest(proj)
+
+    def test_timeout_validation_and_accept_idempotent_accepted_seq(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            (proj / "app.txt").write_text("ok")
+            board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Timeout & accept_seq")
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            run(*post, "ready", "w", text="done")
+            cand = json.loads(run(*gate, "prepare", "shared", "--check", "test -s app.txt"))
+            for bad_timeout in ("0", "-5", "nan", "inf", "abc"):
+                env = dict(os.environ, SWARM_VERIFY_TIMEOUT=bad_timeout)
+                res = subprocess.run([*gate, "test", cand["candidate"], "v"], capture_output=True, text=True, env=env)
+                assert res.returncode != 0 and "SWARM_VERIFY_TIMEOUT must be a positive number" in res.stderr
+            line = run(*gate, "test", cand["candidate"], "v").splitlines()[-1]
+            run(*post, "post", "v", "@coordinator " + line)
+            run(*gate, "accept", cand["candidate"])
+            members_path = Path(board) / "members.json"
+            state = json.loads(members_path.read_text())
+            assert "accepted_seq" in state
+            del state["accepted_seq"]
+            members_path.write_text(json.dumps(state))
+            run(*gate, "accept", cand["candidate"])
+            assert "accepted_seq" in json.loads(members_path.read_text())
+
 
 if __name__ == "__main__":
     scenario()

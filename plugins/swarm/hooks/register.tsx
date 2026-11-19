@@ -414,10 +414,11 @@ async function refreshTalk($: EngineInterface): Promise<void> {
     if (isOver && open.isOver) return
     const messages = await $.session.messages({ agentId: open.agentId })
     // An agent whose conversation can no longer be read keeps the rows last read.
-    if (talk !== open) return
-    const next = Array.isArray(messages) ? talkRows(messages) : open
-    talk = { ...open, ...next, isOver }
-    if (next.key !== open.key) $.ui.invalidate('ui.render')
+    if (!talk || talk.dir !== open.dir || talk.agentId !== open.agentId || talk.name !== open.name) return
+    const next = Array.isArray(messages) ? talkRows(messages) : talk
+    const changed = next.key !== talk.key
+    talk = { ...talk, ...next, isOver }
+    if (changed) $.ui.invalidate('ui.render')
   } catch {
     // The next poll reads it again.
   } finally {
@@ -428,7 +429,7 @@ async function refreshTalk($: EngineInterface): Promise<void> {
 function resetMonitoring(): void {
   moods.clear()
   generation++
-  seen = seenBoard = seenRoster = activity = stalled = ''
+  seen = seenBoard = seenRoster = activity = stalled = heavyTold = ''
   boardStat = undefined
   snapshot = undefined
   attentionRetry = noticeFailures = noticeRetry = 0
@@ -822,9 +823,19 @@ async function refresh($: EngineInterface): Promise<void> {
   }
   isPolling = true
   const poll = ++polls
+  const sEpoch = sessionEpoch
   if (isRestoreOwed) {
     isRestoreOwed = false
     await restore($, await $.session.cwd().catch(() => ''))
+    if (sEpoch !== sessionEpoch || isEnding) {
+      isPolling = false
+      // A refresh asked for during the restore belongs to the session that is live now.
+      if (isRefreshOwed) {
+        isRefreshOwed = false
+        $.clock.after(0, () => void refresh($))
+      }
+      return
+    }
   }
   const epoch = generation
   try {
@@ -937,7 +948,7 @@ async function refresh($: EngineInterface): Promise<void> {
     owed = last === 0 ? NONE : { count: unread.length, first: unread[0]?.seq ?? last, last, since: last === owed.last ? owed.since : now }
     owedSeqs = unread.map(post => post.seq)
     // A consultant's READY is the answer the coordinator asked for, and a READY that asks something is a question.
-    isOwedRoutine = unread.length > 0 && unread.every(post => kindOf(post.text)?.label === 'READY' &&
+    isOwedRoutine = !full.attentionUnavailable && unread.length > 0 && unread.every(post => kindOf(post.text)?.label === 'READY' &&
       state.members[post.agent]?.consult !== '1' && !full.attention.some(item => item.kind === 'question' && item.seq === post.seq)) &&
       full.members.some(member => member.role !== 'coordinator' && member.status === 'working')
     if (owned) {
@@ -1080,9 +1091,10 @@ async function account($: EngineInterface, report: string, agentId: string | und
   const entry = JSON.parse(result.stdout) as { title: string; total: number; budget: number; paused: boolean }
   if (!entry.paused || dir !== await read($, run)) return true
   const reason = `token budget of ${compact(entry.budget)} spent`
-  const isTold = budgetPauseNotifiedFor === reason
-  budgetPauseNotifiedFor = reason
-  pauseSeen = reason
+  const rawReason = `token budget of ${entry.budget} spent`
+  const isTold = budgetPauseNotifiedFor === rawReason || budgetPauseNotifiedFor === reason
+  budgetPauseNotifiedFor = rawReason
+  pauseSeen = rawReason
   pauseExpected()
   // Known at once, not a poll later: the members' next tool calls are refused from here.
   halted = { dir, why: `paused (${reason})` }
@@ -1092,7 +1104,7 @@ async function account($: EngineInterface, report: string, agentId: string | und
   noticeHold = (await $.clock.now()) + NOTICE_HOLD_MS
   void $.prompt.submit({
     text: `Swarm: Run paused at token budget\n${entry.title} spent ${compact(entry.total)} tokens and reached its budget of ${compact(entry.budget)}. Tell the user what is done and ask whether to raise the budget with limit and then resume, or close the run.`,
-  }).then(result => { if (result.drop) unheard() }).catch(unheard)
+  }).then(result => { if (result.drop) { noticeHold = 0; unheard() } }).catch(() => { noticeHold = 0; unheard() })
   return true
 }
 
@@ -1220,10 +1232,12 @@ async function specialistBoard($: EngineInterface, e: {
     return { deny: 'No Swarm run is bound to the conversation that started you, so the board cannot tell which run you belong to. End your turn and report this to the coordinator: it must register you with the board\'s member command, start you with a description that begins "@<your name>: ", and then send you a message to retry.' }
   }
 
-  const { members, closed } = JSON.parse(await $.fs.read(`${dir}/members.json`)) as {
+  const state = JSON.parse(await $.fs.read(`${dir}/members.json`)) as {
     members: Roster
     closed?: boolean
-  }
+    paused?: string
+  } & BudgetState
+  const { members, closed, paused } = state
   const assigned = Object.entries(members).find(([, member]) =>
     member.id !== undefined && (member.id === e.agentId || member.id === agent?.teammateId),
   )
@@ -1252,13 +1266,20 @@ async function specialistBoard($: EngineInterface, e: {
 
   const [name] = assignment
   agentRuns.set(e.agentId, dir)
+  const isSpent = budgetOf(state) > 0 && tokensUsed(state.usage?.tokens) >= budgetOf(state)
+  if (!closed && (paused || isSpent)) {
+    const why = paused ? `paused (${paused})` : 'over its token budget'
+    if (dir === await read($, run)) halted = { dir, why }
+    return { deny: `This Swarm run is ${why}, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped. The coordinator decides what happens when the run resumes.` }
+  }
   const { action } = e
   // A name as a member would write it: with its @, in any case.
-  const who = e.member?.trim().replace(/^@/, '').toLowerCase()
+  const rawMember = typeof e.member === 'string' ? e.member.trim() : ''
+  const who = rawMember ? rawMember.replace(/^@/, '').toLowerCase() : undefined
   if (who !== undefined && (action !== 'show' || !/^[a-z][a-z0-9_-]*$/.test(who))) {
     return { deny: action === 'show' ? 'The member filter is a member\'s name, such as "parser".' : 'A member filter is only valid for show.' }
   }
-  if (e.seq !== undefined && (action !== 'show' || e.member !== undefined || !Number.isSafeInteger(e.seq) || e.seq < 1)) {
+  if (e.seq !== undefined && (action !== 'show' || who !== undefined || !Number.isSafeInteger(e.seq) || e.seq < 1)) {
     return { deny: 'Use a positive post number with show, without a member filter.' }
   }
   if (!['read', 'show', 'post', 'ready', 'revise'].includes(action)) {
@@ -1277,7 +1298,9 @@ async function specialistBoard($: EngineInterface, e: {
   if (action === 'revise') args.push(text)
   const result = await boardCommand($, dir, args, action === 'post' || action === 'ready' ? text : undefined)
   if (result.exitCode !== 0) {
-    const err = result.stderr.trim().replace(/show --post=(\d+)/g, 'action "show" with seq $1')
+    const err = result.stderr.trim()
+      .replace(/show --post=(\d+)/g, 'action "show" with seq $1')
+      .replace(/board\.py \S+ (ready|revise)\b[^\n]*/g, 'action "$1" with text')
     return { deny: err || 'The board action failed.' }
   }
   if (result.isStdoutTruncated) return { deny: 'The board response exceeded the tool limit. Use show with a post number, or ask the coordinator for help if it is a single long post.' }
@@ -1694,7 +1717,7 @@ export const register: Register = on => {
       if (memberModel === 'inherit' && (e.model === undefined || e.model === 'inherit')) {
         actual = e.parentModel
         modelToUse = e.parentModel
-      } else if (memberModel && isExactModel(memberModel) && (e.model === undefined || familyOf(latestOf(e.model) ?? '') === familyOf(memberModel))) {
+      } else if (memberModel && isExactModel(memberModel) && (e.model === undefined || (!isExactModel(e.model) && familyOf(latestOf(e.model) ?? '') === familyOf(memberModel)))) {
         actual = memberModel
         modelToUse = memberModel
       } else {
@@ -2107,6 +2130,8 @@ export const register: Register = on => {
         }
         if ((await shownSwarm($)).dir !== shown.dir) return
       }
+      await stop($)
+      await stopLive($)
       await update($, inspected, () => older ?? null)
       await update($, query, () => '')  // a filter left on the Board would hide the post
       await update($, latestOnly, () => false)
@@ -2126,7 +2151,7 @@ export const register: Register = on => {
       const wanted = rawQuery.trim().toLowerCase()
       const inspectedPost = await read($, inspected)
       const available = inspectedPost && !shown.posts.some(post => post.seq === inspectedPost.seq) ? [inspectedPost, ...shown.posts] : shown.posts
-      const terms = wanted.split(/\s+/).filter(term => term !== '')
+      const terms = (wanted.match(/(?:kind:)?not\s+(?:passed|verified)|\S+/g) ?? []).map(t => t.replace(/\s+/g, ' '))
       const matchesTerm = (post: Post, term: string): boolean => {
         if (term.startsWith('from:')) {
           const who = term.slice(5).replace(/^@/, '')
@@ -2145,13 +2170,11 @@ export const register: Register = on => {
         }
         const kind = kindOf(post.text)?.label.toLowerCase()
         if (term.startsWith('kind:')) {
-          const k = term.slice(5)
+          const k = term.slice(5).replace(/[-_]/g, ' ')
           return k !== '' && kind === k
         }
-        if (kind && (kind === term || kind.split(/\s+/).includes(term))) {
-          return kind === term
-        }
         if ((term === 'passed' || term === 'verified') && kind === `not ${term}`) return false
+        if (kind && kind === term) return true
         return post.text.toLowerCase().includes(term) || post.agent.toLowerCase().includes(term) ||
           post.to.some(name => name.toLowerCase().includes(term))
       }
@@ -2172,20 +2195,22 @@ export const register: Register = on => {
           )}
         </Box>
       )
+      const selected = !collapsed && open > 0 ? matching.find(post => post.seq === open) : undefined
+      const selectedCost = selected ? 4 + estimateRows(stripKind(openedText(selected)), columns) : 0
       const fitted: Post[] = []
       let used = 0
       for (const post of [...matching].reverse()) {
         // The opened post takes the rows it really draws, so the posts around it are fitted to what is left.
         const text = post.seq === open ? stripKind(openedText(post)) : preview(post)
         const cost = 4 + estimateRows(text, columns)
-        if (fitted.length > 0 && used + cost > rows) break
+        const reserve = selected && !fitted.some(p => p.seq === open) && post.seq !== open ? selectedCost : 0
+        if (fitted.length > 0 && used + cost + reserve > rows) break
         fitted.unshift(post)
         used += cost
       }
       const visible = matching.slice(collapsed && terms.length === 0 ? -1 : -Math.max(1, fitted.length + more))
-      if (!collapsed && open > 0 && !visible.some(post => post.seq === open)) {
-        const selected = matching.find(post => post.seq === open)
-        if (selected) visible.unshift(selected)
+      if (selected && !visible.some(post => post.seq === open)) {
+        visible.unshift(selected)
       }
       const older = matching.length - visible.length
       body =

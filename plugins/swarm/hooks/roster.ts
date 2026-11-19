@@ -78,8 +78,9 @@ export function detailOf(status: string, hint: Report['members'][string] | undef
 }
 
 export function targets(text: string, roster: Roster): string[] {
+  const stripped = text.replace(/```[\s\S]*?```|(`+)[^\n]*?\1|\w+:\/\/\S+/g, ' ')
   const mentioned = new Set(
-    [...text.matchAll(MENTION)].map(m =>
+    [...stripped.matchAll(MENTION)].map(m =>
       (m[1] ?? '').toLowerCase(),
     ).flatMap(name => [name, name.replace(/[-_]+$/, '')]),
   )

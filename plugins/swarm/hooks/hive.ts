@@ -1,7 +1,9 @@
+import { boardCalls } from './command'
+
 export type Mood = 'sleep' | 'forage' | 'inspect' | 'build' | 'verify' | 'relay'
 export function toolMood(tool: string, command = ''): Mood {
   // The board first, by its subcommand: a post that mentions tests or reading is still a post.
-  const board = tool === 'Bash' ? /\bboard\.py\S*\s+\S+\s+([a-z-]+)/.exec(command)?.[1] : undefined
+  const board = tool === 'Bash' ? boardCalls(command)[0]?.action ?? /\bboard\.py\S*\s+\S+\s+([a-z-]+)/.exec(command)?.[1] : undefined
   if (board) return ['read', 'show', 'status', 'plan', 'attention', 'wake', 'tail'].includes(board) ? 'inspect' : 'relay'
   if (tool === 'Bash' && /\bverify\.py\b|\b(test|pytest|vitest|jest|unittest|check|verify)\b/.test(command)) return 'verify'
   if (tool === 'Bash' && /^(?:git (?:diff|log|show|status)|cat|rg|ls|find|grep)\b/.test(command.trim())) return 'inspect'
