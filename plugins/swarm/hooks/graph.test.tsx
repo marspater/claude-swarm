@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 import type { Post, Swarm } from '../types'
-import { edgesOf, graphSvg } from './graph'
+import { edgesOf, graphSvg, isBroadcast } from './graph'
+import { statusDot } from './palette'
 
 test('the graph counts posts the pane no longer keeps', async () => {
   const posts: Post[] = Array.from({ length: 10 }, (_, index) => ({
@@ -173,4 +174,121 @@ test('a member level with the coordinator leaves room for its arrow, and every h
     expect(outside).toBeGreaterThan(0)
     expect(outside).toBeLessThan(9)
   }
+})
+
+test('arrowheads point into destination pills without overlap or clipping across N=4..12', async () => {
+  const baseMember = { id: undefined, profile: undefined, model: '', effort: '', depends: [], owns: '', detail: '', unread: 0, posts: 1, status: 'working' }
+  const halfOf = (name: string) => Math.max(38, 22 + Math.min(15, name.length) * 4.7)
+  for (const withCoord of [true, false]) {
+    for (const n of [4, 5, 6, 8, 9, 10, 12]) {
+      const names = Array.from({ length: withCoord ? n - 1 : n }, (_, i) => `worker-node-${String(i).padStart(2, '0')}x`)
+      const members = [
+        ...(withCoord ? [{ ...baseMember, name: 'coordinator', role: 'coordinator', type: 'coordinator' }] : []),
+        ...names.map(name => ({ ...baseMember, name, role: 'worker', type: 'worker' })),
+      ]
+      const posts: Post[] = []
+      let seq = 1
+      for (let i = 0; i < members.length; i++) {
+        const from = members[i]!.name
+        const to = members[(i + 1) % members.length]!.name
+        posts.push({ seq: seq++, agent: from, to: [to], text: `@${to} ping`, time: '' })
+        if (withCoord && i > 0) {
+          posts.push({ seq: seq++, agent: 'coordinator', to: [from], text: `@${from} task`, time: '' })
+        }
+      }
+      const swarm: Swarm = {
+        title: 'Scale', dir: '/project/.swarm/scale-20261116-101010', isClosed: false, attention: [], budget: 0, tokens: {},
+        total: posts.length, earlierEdges: {}, posts, members,
+      }
+      const svg = graphSvg(swarm, posts[posts.length - 1]!.seq, new Set(), false, true)
+      const vb = svg.match(/viewBox="0 0 ([\d.]+) ([\d.]+)"/)!
+      const vw = Number(vb[1]), vh = Number(vb[2]) - 50
+      const boxes = members.map(m => {
+        const [x, y] = svg.match(new RegExp(`translate\\(([\\d.]+) ([\\d.]+)\\)"><title>${m.name}`))!.slice(1).map(Number) as [number, number]
+        const half = halfOf(m.name)
+        // Zero viewBox clipping (including 2px outer half of 4px .arrival stroke)
+        expect(x - half - 2).toBeGreaterThanOrEqual(0)
+        expect(x + half + 2).toBeLessThanOrEqual(vw)
+        expect(y - 19 - 2).toBeGreaterThanOrEqual(0)
+        expect(y + 19 + 2).toBeLessThanOrEqual(vh)
+        return { name: m.name, x, y, half }
+      })
+      // Zero pill-to-pill overlaps
+      for (let i = 0; i < boxes.length; i++) {
+        for (let j = i + 1; j < boxes.length; j++) {
+          const a = boxes[i]!, b = boxes[j]!
+          const overlapX = Math.abs(a.x - b.x) < a.half + b.half
+          const overlapY = Math.abs(a.y - b.y) < 38
+          expect(overlapX && overlapY).toBe(false)
+        }
+      }
+      // Every arrowhead points toward its destination center (dot > 0)
+      const posMap = new Map(boxes.map(b => [b.name, b]))
+      const tipRegex = /<title>([^<]+) to ([^<]+) · [^<]+<\/title><\/path><path class="tip[^"]*" d="M([\d.]+) ([\d.]+)L([\d.]+) ([\d.]+)L([\d.]+) ([\d.]+)z"\/>/g
+      let match: RegExpExecArray | null
+      let checked = 0
+      while ((match = tipRegex.exec(svg)) !== null) {
+        const toName = match[2]!
+        const dest = posMap.get(toName)!
+        const x2 = Number(match[3]), y2 = Number(match[4])
+        const bx = (Number(match[5]) + Number(match[7])) / 2
+        const by = (Number(match[6]) + Number(match[8])) / 2
+        const dot = (x2 - bx) * (dest.x - x2) + (y2 - by) * (dest.y - y2)
+        expect(dot).toBeGreaterThan(0)
+        checked++
+      }
+      expect(checked).toBeGreaterThan(0)
+    }
+  }
+})
+
+test('peer detours separate solid and @all edges, badges expand for 3 digits and render after nodes, backticks are ignored, and statuses have distinct shapes', async () => {
+  const member = { id: undefined, profile: undefined, model: '', effort: '', depends: [], owns: '', detail: '', unread: 0, posts: 1 }
+  const members = [
+    { ...member, name: 'coordinator', role: 'coordinator', type: 'coordinator', status: 'coordinating' },
+    { ...member, name: 'parser', role: 'worker', type: 'worker', status: 'working' },
+    { ...member, name: 'verifier', role: 'worker', type: 'worker', status: 'waiting' },
+    { ...member, name: 'checker', role: 'worker', type: 'worker', status: 'failed' },
+    { ...member, name: 'idler', role: 'worker', type: 'worker', status: 'not started' },
+  ]
+  const posts: Post[] = [
+    { seq: 1, agent: 'parser', to: ['verifier'], text: '`@all` and `@checker` in backticks\n```\n@all\n```\nreal @verifier_', time: '' },
+    { seq: 2, agent: 'parser', to: ['verifier', 'checker'], text: '@all @verifier check', time: '' },
+  ]
+  expect(isBroadcast(posts[0]!)).toBe(false)
+  expect(isBroadcast(posts[1]!)).toBe(true)
+  expect(edgesOf(posts)).toEqual({
+    'parser>verifier': 2,
+    'parser>@all': 1,
+    'parser>checker>all': 1,
+  })
+  // Test 3-digit badge width & z-order + peer detour separation
+  const swarm: Swarm = {
+    title: 'Shapes', dir: '/project/.swarm/shapes-20261116-101010', isClosed: false, attention: [], budget: 0, tokens: {},
+    total: 120,
+    earlierEdges: { 'parser>verifier': 118, 'parser>verifier>all': 5 },
+    posts,
+    members,
+  }
+  const svg = graphSvg(swarm, 2, new Set(), false, true, false, 0, true)
+  const solidPath = svg.match(/d="([^"]+)"[^>]*><title>parser to verifier · 120 mentions/)?.[1]
+  const dashedPath = svg.match(/d="([^"]+)"[^>]*><title>parser to verifier · 5 via @all/)?.[1]
+  expect(solidPath).toBeDefined()
+  expect(dashedPath).toBeDefined()
+  expect(solidPath).not.toBe(dashedPath)
+  // 3-digit badge uses rect wider than 20 and renders after nodes
+  const badgeMatch = svg.match(/<rect class="badge" x="([^"]+)" y="-10" width="([^"]+)" height="20" rx="10"\/><text class="count"[^>]*>120</)
+  expect(badgeMatch).not.toBeNull()
+  expect(Number(badgeMatch![2])).toBeGreaterThan(20)
+  expect(svg.indexOf('class="badge"')).toBeGreaterThan(svg.indexOf('<title>idler'))
+  // Colorblind distinct shapes in graphSvg & statusDot
+  expect(svg).toContain('class="presence working"')
+  expect(svg).toContain('class="presence-ring waiting"')
+  expect(svg).toContain('class="presence coordinating"')
+  expect(svg).toContain('class="presence-x failed"')
+  expect(svg).toContain('class="presence not-started"')
+  expect(statusDot('coordinating')).toContain('<path')
+  expect(statusDot('waiting')).toContain('r="1.6"')
+  expect(statusDot('failed')).toContain('stroke-linecap="round"')
+  expect(statusDot('not started')).toContain('stroke-width="1.5"')
 })

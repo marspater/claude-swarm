@@ -42,7 +42,7 @@ Write every render and measurement to a directory outside the project, such as o
 - **Type:** only defined styles; line-heights on grid; measure in range; tabular numerals where numbers align or update.
 - **Colour:** only semantic roles; contrast table complete; dark and high-contrast variants present; no meaning by colour alone.
 - **Components:** state matrix complete; stress cases rendered (long text, RTL, 0/1/many, large numbers, missing media, largest text size); focus visible.
-- **Apple targets:** text styles and not sizes; Dynamic Type reflow; hit targets; symbols valid for the deployment target; glass rules (`skills/design-craft/references/apple-design.md` in the plugin folder); Reduce Transparency, Increase Contrast, and Reduce Motion; VoiceOver labels and order.
+- **Apple targets:** text styles and not sizes; Dynamic Type reflow; hit targets; symbols valid for the deployment target; glass rules (`skills/design-craft/references/apple-design.md` and `skills/design-craft/references/liquid-glass.md` in the plugin folder); Reduce Transparency, Increase Contrast, and Reduce Motion; VoiceOver labels and order.
 - **Assets:** names, formats, scales, and variants; clean alpha; layers separate.
 
 **Report** defects in one `NOT PASSED` post to the owner, ordered by severity. Each finding gives the location, the expected value with its spec reference, the measured value, and the suggested change. A defect in a deliverable goes to the designer; drift between the spec and the build goes to the worker that built it. When they disagree about which is right, mention the coordinator.

@@ -38,7 +38,7 @@ Many similar small jobs: failing tests grouped by package, lint fixes by directo
 
 ### Pipeline
 
-Stages that need the previous result: locate, then implement, then verify. Register the order with `BOARD member <later> depends=<earlier>` and name it in both briefs. `BOARD ready` wakes dependents for ordinary assignments. For an investigator, you review the finding and use `BOARD confirm NAME SEQ` to release dependents. Keep the chain short so workers spend their turns on independent work where possible.
+Stages that need the previous result: locate, then implement, then verify. Register the order with `BOARD member <later> depends=<earlier>` and name it in both briefs. `BOARD ready` wakes dependents for ordinary assignments. For an investigator, you review the finding and use `BOARD confirm NAME SEQ` to release dependents. In an isolated-worktree pipeline between writers, either instruct the downstream writer to inspect (`git show <commit>:<path>`) or merge (`git merge --no-ff <commit>`) the upstream `READY <commit>` before building/testing, or land upstream stages before spawning dependent isolated writers. Keep the chain short so workers spend their turns on independent work where possible.
 
 ### Investigate, then fix
 
@@ -66,7 +66,7 @@ A log, export or codebase too large for one context. Partition the data, give ev
 
 ## A good brief
 
-A member starts with nothing but its brief and the other briefs. Check each one:
+A member starts with nothing but its brief and the first two lines (`@name BRIEF` and `Owns: ...`) of other briefs, so put full neighbour details in `Must not touch:`. Check each one:
 
 - **Owns:** exact paths, or the exact question.
 - **Must not touch:** everything else, and who owns the neighbouring pieces.

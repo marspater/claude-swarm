@@ -72,6 +72,19 @@ def scenario():
         fixed = commit_change("right-work", "right", "2", right)
         git("switch", "main")
         post("ready", "right", fixed, text="right changed to 2")
+        # A candidate can be built on a ref other than the checkout's HEAD. A member that did not branch from the
+        # base is named, and such a candidate is not fast-forwarded into a checkout that sits elsewhere.
+        gate("prepare", "shared", "--check", check, "--base", "main", ok=False)
+        onto = subprocess.run([sys.executable, SCRIPTS / "verify.py", board, project, "prepare", "isolated", "--check", "true",
+                               "--base", "left-work"], capture_output=True, text=True)
+        assert onto.returncode == 0, onto.stderr
+        assert "@right did not branch from the candidate's base" in onto.stderr and "@left" not in onto.stderr
+        elsewhere = json.loads(onto.stdout)
+        post("post", "verifier", "@coordinator " + gate("test", elsewhere["candidate"], "verifier").splitlines()[-1])
+        refused = subprocess.run([sys.executable, SCRIPTS / "verify.py", board, project, "accept", elsewhere["candidate"]],
+                                 capture_output=True, text=True)
+        assert refused.returncode != 0 and "was built on left-work, not on the checkout" in refused.stderr, refused.stderr
+        assert git("rev-parse", "HEAD") == base
         good = json.loads(gate("prepare", "isolated", "--check", check))
         # The integration merges are the repository's own commits: its identity, never one of Swarm's.
         assert git("log", "-1", "--format=%an <%ae>", good["commit"]) == "Swarm Test <swarm@example.invalid>"
@@ -141,7 +154,8 @@ def scenario():
         nested_gate = [sys.executable, SCRIPTS / "verify.py", nested_run, package]
         nested = json.loads(run(*nested_gate, "prepare", "isolated", "--check", 'test "$(cat flag)" = yes'))
         assert Path(nested["path"]).name == "package"
-        run(*nested_gate, "test", nested["candidate"], "verifier")
+        line = run(*nested_gate, "test", nested["candidate"], "verifier").splitlines()[-1]
+        run(sys.executable, SCRIPTS / "board.py", nested_run, "post", "verifier", "@coordinator " + line)
         run(*nested_gate, "accept", nested["candidate"])
         assert (package / "flag").read_text() == "yes"
 
@@ -173,7 +187,8 @@ def scenario():
         gate("prepare", "shared", "--check", check, ok=False)
         post("confirm", "investigator", finding)
         reviewed = json.loads(gate("prepare", "shared", "--check", check))
-        gate("test", reviewed["candidate"], "verifier")
+        line = gate("test", reviewed["candidate"], "verifier").splitlines()[-1]
+        post("post", "verifier", "@coordinator " + line)
         # a consultant asked mid-verification neither blocks nor voids the candidate
         post("member", "advisor", "profile=architect", "writes=0", "consult=1")
         gate("accept", reviewed["candidate"])
@@ -238,7 +253,8 @@ def scenario():
         run(*post, "ready", "worker", text="done")
         env = dict(os.environ, PATH="")
         candidate = json.loads(run(*gate, "prepare", "shared", "--check", "test -s input", env=env))
-        run(*gate, "test", candidate["candidate"], "verifier", env=env)
+        line = run(*gate, "test", candidate["candidate"], "verifier", env=env).splitlines()[-1]
+        run(*post, "post", "verifier", "@coordinator " + line, env=env)
         run(*gate, "accept", candidate["candidate"], env=env)
         # A run with nothing a command could test says so. An empty list it did not ask for is still refused.
         run(*gate, "prepare", "shared", ok=False)
@@ -247,6 +263,7 @@ def scenario():
         run(*post, "member", "worker", "profile=designer")
         bare = json.loads(run(*gate, "prepare", "shared", "--no-checks", env=env))
         assert run(*gate, "test", bare["candidate"], "verifier", env=env) == "VERIFIED %s %s" % (bare["candidate"], bare["digest"])
+        run(*post, "post", "verifier", "@coordinator VERIFIED %s %s" % (bare["candidate"], bare["digest"]), env=env)
         record = Path(board) / "verification.json"
         passed = record.read_text()
         record.write_text(json.dumps(dict(json.loads(passed), no_checks=False)))
@@ -330,7 +347,8 @@ def scenario():
         # the candidate it replaced leaves no checkout behind, in the run folder or in Git's list
         assert not Path(superseded["path"]).exists() and Path(candidate["path"]).exists()
         assert superseded["candidate"] not in git("worktree", "list")
-        run(*gate, "test", candidate["candidate"], "verifier")
+        line = run(*gate, "test", candidate["candidate"], "verifier").splitlines()[-1]
+        run(*board, "post", "verifier", "@coordinator " + line)
         (project / "vendor" / "lib" / "stray").write_text("local edit")  # a dirty submodule is still a difference
         dirty = verify.source_digest(project)
         run(*gate, "accept", candidate["candidate"], ok=False)
@@ -338,7 +356,7 @@ def scenario():
         assert verify.source_digest(project) != dirty
         run(*gate, "accept", candidate["candidate"])
         assert git("rev-parse", "HEAD") == candidate["commit"]
-        assert json.loads((Path(board[2]) / "members.json").read_text())["accepted_seq"] == 1  # failed cycles count from here
+        assert json.loads((Path(board[2]) / "members.json").read_text())["accepted_seq"] == 2  # failed cycles count from here
 
         # prune removes an integration checkout no candidate needs, and nothing else in a run folder
         swarm = [sys.executable, SCRIPTS / "board.py", project / ".swarm", "prune"]
@@ -356,6 +374,137 @@ class VerifyScenario(unittest.TestCase):
 
     def test_scenario(self):
         scenario()
+
+
+class VerifyRegressions(unittest.TestCase):
+    """Focused regression tests for verify.py fixes."""
+
+    def _init_git(self, path, name="proj"):
+        def g(*args, cwd=path):
+            return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True).stdout.strip()
+        g("init", "-b", "main")
+        g("config", "user.name", "Test")
+        g("config", "user.email", "test@example.com")
+        g("config", "commit.gpgsign", "false")
+        (path / "file.txt").write_text("v1")
+        g("add", "file.txt")
+        g("commit", "-m", "init")
+        return g
+
+    def test_git_strips_inherited_env_vars(self):
+        sys.path.insert(0, str(SCRIPTS))
+        import verify  # noqa: E402
+        with tempfile.TemporaryDirectory() as t1, tempfile.TemporaryDirectory() as t2:
+            p1, p2 = Path(t1).resolve(), Path(t2).resolve()
+            g1 = self._init_git(p1)
+            self._init_git(p2)
+            (p1 / "only1.txt").write_text("1")
+            g1("add", "only1.txt")
+            g1("commit", "-m", "second")
+            old_git_dir = os.environ.get("GIT_DIR")
+            old_work_tree = os.environ.get("GIT_WORK_TREE")
+            try:
+                os.environ["GIT_DIR"] = str(p1 / ".git")
+                os.environ["GIT_WORK_TREE"] = str(p1)
+                assert verify.source_digest(p2) != verify.source_digest(p1)
+            finally:
+                if old_git_dir is None:
+                    os.environ.pop("GIT_DIR", None)
+                else:
+                    os.environ["GIT_DIR"] = old_git_dir
+                if old_work_tree is None:
+                    os.environ.pop("GIT_WORK_TREE", None)
+                else:
+                    os.environ["GIT_WORK_TREE"] = old_work_tree
+
+    def test_source_digest_uninit_submodule_and_fake_git_and_nongit(self):
+        sys.path.insert(0, str(SCRIPTS))
+        import verify  # noqa: E402
+        with tempfile.TemporaryDirectory() as t_sub, tempfile.TemporaryDirectory() as t_main, tempfile.TemporaryDirectory() as t_ng:
+            sub, proj, ng = Path(t_sub).resolve(), Path(t_main).resolve(), Path(t_ng).resolve()
+            gs = self._init_git(sub)
+            sub_head = gs("rev-parse", "HEAD")
+            gp = self._init_git(proj)
+            subprocess.run(["git", "-C", str(proj), "-c", "protocol.file.allow=always", "submodule", "add", str(sub), "vendor/lib"],
+                           check=True, capture_output=True)
+            gp("commit", "-m", "add sub")
+            gp("submodule", "deinit", "-f", "vendor/lib")
+            before = verify.source_digest(proj)
+            (proj / "vendor" / "lib" / "evil.txt").write_text("sneaky")
+            assert verify.source_digest(proj) != before
+            (proj / "vendor" / "lib" / "evil.txt").unlink()
+            assert verify.source_digest(proj) == before
+            # Empty/fake .git dir must not cause RecursionError
+            fake_dir = proj / "fake"
+            (fake_dir / ".git").mkdir(parents=True)
+            (fake_dir / "a.txt").write_text("hi")
+            assert verify.source_digest(proj)
+            # Non-git os.walk prunes .swarm and .git
+            (ng / "src.txt").write_text("ok")
+            d1 = verify.source_digest(ng)
+            (ng / ".swarm" / "run").mkdir(parents=True)
+            (ng / ".swarm" / "run" / "noise").write_text("ignored")
+            (ng / ".git").mkdir()
+            (ng / ".git" / "noise").write_text("ignored")
+            assert verify.source_digest(ng) == d1
+
+    def test_accept_requires_verified_board_post_and_normalizes_verifier(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            (proj / "app.txt").write_text("ok")
+            board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Verify reg")
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            run(*post, "ready", "w", text="done")
+            cand = json.loads(run(*gate, "prepare", "shared", "--check", "test -s app.txt"))
+            line = run(*gate, "test", cand["candidate"], "@V").splitlines()[-1]
+            # Without VERIFIED post on board.jsonl, accept must fail
+            run(*gate, "accept", cand["candidate"], ok=False)
+            run(*post, "post", "v", "@coordinator " + line)
+            run(*gate, "accept", cand["candidate"])
+
+    def test_nochecks_revalidation_and_moved_submodule_fail_fast_and_prune_worktree(self):
+        with tempfile.TemporaryDirectory() as t_sub, tempfile.TemporaryDirectory() as t_proj:
+            sub, proj = Path(t_sub).resolve(), Path(t_proj).resolve()
+            gs = self._init_git(sub)
+            gp = self._init_git(proj)
+            subprocess.run(["git", "-C", str(proj), "-c", "protocol.file.allow=always", "submodule", "add", str(sub), "vendor/lib"],
+                           check=True, capture_output=True)
+            gp("commit", "-m", "add sub")
+            board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Submodule reg")
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "d", "profile=designer")
+            run(*post, "member", "v", "role=verifier")
+            run(*post, "ready", "d", text="spec")
+            cand = json.loads(run(*gate, "prepare", "shared", "--no-checks"))
+            run(*post, "member", "d", "profile=")  # designer -> plain worker invalidates --no-checks
+            run(*gate, "test", cand["candidate"], "v", ok=False)
+            # Isolated mode fails fast when worker commit moves a checked-out submodule gitlink
+            run(*post, "member", "w")
+            gp("switch", "-c", "work")
+            (sub / "file.txt").write_text("v2")
+            gs("add", "file.txt")
+            gs("commit", "-m", "v2")
+            subprocess.run(["git", "-C", str(proj / "vendor" / "lib"), "pull"], check=True, capture_output=True)
+            gp("add", "vendor/lib")
+            gp("commit", "-m", "bump sub")
+            rev = gp("rev-parse", "HEAD")
+            gp("switch", "main")
+            run(*post, "ready", "d", text="spec2")
+            run(*post, "ready", "w", rev, text="bumped")
+            run(*gate, "prepare", "isolated", "--check", "true", ok=False)
+            # Prune skips closed run containing active registered git worktree
+            wt = Path(board) / "worker-wt"
+            gp("worktree", "add", "--detach", str(wt), "HEAD")
+            run(*post, "read", "coordinator")
+            run(*post, "close")
+            b2 = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "cur", "init", "Current")
+            assert b2
+            out = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm", "prune", "--days=0")
+            assert "contains active git worktree" in out and wt.exists()
 
 
 if __name__ == "__main__":

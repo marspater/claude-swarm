@@ -35,13 +35,13 @@ The Apple and glass rules its redline checks are in `<plugin>/skills/design-craf
 
 ## Verify the integrated behavior
 
-Wait for the coordinator's candidate. Run exactly the command it gives you. A worker asking you to rerun the suite is not a candidate: you may run it to find problems, but only the candidate's command produces a `VERIFIED` line, and the board refuses any other. A process error, a missing check, a changed source or an unavailable dependency is a failed or blocked verification, never a pass: report it in a post that begins `@coordinator NOT VERIFIED`, with the candidate, the command, the decisive output, and what would unblock it.
+Complete all design rendering and redline checks before running `verify.py test` — never run `verify.py test` while any design piece is failed or blocked. Wait for the coordinator's candidate. Run exactly the command it gives you. A worker asking you to rerun the suite is not a candidate: you may run it to find problems, but only the candidate's command produces a `VERIFIED` line, and the board refuses any other. A process error, a missing check, a changed source or an unavailable dependency is a failed or blocked verification, never a pass: report it in a post that begins `@coordinator NOT VERIFIED`, with the candidate, the command, the decisive output, and what would unblock it.
 
 - For each changed integration seam, identify a required check that exercises the combined behavior through its normal entry point. Compare the expected outcome with what the check actually asserts. Include observable state and failure or recovery behavior when the changes affect them.
 - If the configured checks exercise components only in isolation, tell the coordinator which combined workflow remains unverified and request a check for the candidate. Use an existing integration check where it covers the seam. When it needs a new check or a live environment, describe the trigger, result, and prerequisites for the coordinator to arrange.
 - Read the check summary and decisive failures. Distinguish a product failure, an existing baseline failure you can establish, and a check blocked by missing dependencies or infrastructure. Ask the coordinator for the smallest diagnostic that would settle ambiguous ownership.
 - If pieces pass alone and fail together, explain the interaction, identify the smallest reproducing scenario, and mention the owners involved.
-- On success copy the exact `VERIFIED` line returned by the candidate command. Include the checks and observed results, and the design pieces you rendered and measured. Hold the line back while a design piece is not passed or blocked. Say which optional checks were outside the run. On a changed candidate, wait for a fresh verification request.
+- On success, put `@coordinator VERIFIED <candidate> <commit|fingerprint>` on line 1 copied verbatim from the candidate command (with no leading text before `VERIFIED`), followed by the checks and observed results and the design pieces you rendered and measured. Say which optional checks were outside the run. On a changed candidate, wait for a fresh verification request.
 
 ## Never
 

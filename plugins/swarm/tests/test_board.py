@@ -84,7 +84,7 @@ def scenario():
         status = run(d, "status")
         assert "@fix-1 -> @fix-2 x1" in status and "@verifier -> @fix-2" not in status
         assert "#23" in run(d, "show", "fix-2") and "#24" not in run(d, "show", "fix-2")
-        assert "no new posts" in run(d, "read", "late").splitlines()[-1] or "#25" in run(d, "show", "late")
+        assert "#25" in run(d, "read", "late") and "#25" in run(d, "show", "late")
         run(d, "post", "nobody", "hi", ok=False)
         run(d, "post", "parser", "@coordinator @verifier READY parser. all done", ok=False)  # must use the ready command
         run(d, "post", "parser", "@coordinator not READY yet, one test left")
@@ -116,7 +116,7 @@ def scenario():
         # attention: an unanswered question is listed with its post until the recipient answers the asker
         run(d, "post", "late", "@parser which format do you emit?")
         report = json.loads(run(d, "attention", "--json"))
-        assert [i["member"] for i in report["items"] if i["kind"] == "unread"] in ([], ["coordinator"])
+        assert [i["member"] for i in report["items"] if i["kind"] == "unread"] == ["coordinator"]
         question = [i for i in report["items"] if i["kind"] == "question"]
         assert question and question[0]["member"] == "parser" and report["members"]["late"]["asked"] == question[0]["seq"]
         assert report["members"]["late"]["type"] == "worker" and report["members"]["late"]["model"] == "sonnet"
@@ -683,6 +683,28 @@ def audit(name):
     run(team, "member", "probe", "profile=investigator", "writes=0")
     run(team, "ready", "probe", stdin="a first idea")
     assert "-> @coordinator\n" in run(team, "revise", "probe", "not yet")
+    # a worker taking its report back before anything is verified costs nobody a turn; a member waiting on it hears
+    quiet = fresh("Quiet revise")
+    for who, extra in (("first", []), ("second", ["depends=first"]), ("v", ["role=verifier"])):
+        run(quiet, "member", who, *extra)
+    run(quiet, "ready", "first", stdin="done")
+    assert run(quiet, "revise", "first", "one more thing").splitlines()[0].endswith("-> @second")
+    run(quiet, "member", "second", "depends=")
+    run(quiet, "ready", "first", stdin="done again")
+    assert run(quiet, "revise", "first", "and another").splitlines()[0].endswith("-> nobody")
+    # `ready NAME HEAD` takes the commit from the checkout it runs in, so an isolated member needs no command substitution
+    refused = subprocess.run([sys.executable, BOARD, quiet, "ready", "first", "HEAD"], input="done", text=True,
+                             capture_output=True, cwd=os.path.dirname(quiet))
+    assert refused.returncode != 0 and "HEAD is no commit here" in refused.stderr
+    repo = os.path.join(os.path.dirname(os.path.dirname(quiet)), "head-repo")
+    os.makedirs(repo)
+    for args in (["init", "-q"], ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false",
+                                  "commit", "-q", "--allow-empty", "-m", "one"]):
+        subprocess.run(["git", "-C", repo, *args], check=True, capture_output=True)
+    head = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    took = subprocess.run([sys.executable, BOARD, quiet, "ready", "first", "HEAD"], input="done", text=True, capture_output=True, cwd=repo)
+    assert took.returncode == 0, took.stderr
+    assert json.loads(open(os.path.join(quiet, "board.jsonl")).read().splitlines()[-1])["revision"] == head
     # the plan says what the run has no guard against
     plan = run(team, "plan")
     assert "no token budget" in plan and "@all wakes all" in plan
@@ -714,7 +736,9 @@ def audit(name):
     run(halt, "ready", "done", stdin="finished")
     run(halt, "post", "asker", "@coordinator which API version do you want?")
     run(halt, "post", "coordinator", "@owed take the second file too")
-    posted = lambda: sum(1 for _ in open(os.path.join(halt, "board.jsonl"), encoding="utf-8"))
+    def posted():
+        with open(os.path.join(halt, "board.jsonl"), encoding="utf-8") as f:
+            return sum(1 for _ in f)
     count = posted()
     run(halt, "resume")
     assert posted() == count  # a run that was not paused stopped nobody
@@ -750,7 +774,7 @@ def audit(name):
             json.dump(state, f)
         share = [item for item in json.loads(run(loop, "attention", "--json"))["items"] if item["kind"] == "spend"]
         assert [(item["member"], item["text"]) for item in share] == (
-            [("a", "@a has used 150000 of the run's 260000 tokens (57%)")] if actors == 3 else []), share
+            [("a", "@a has used 150,000 of the run's 260,000 tokens (57%)")] if actors == 3 else []), share
         state["usage"]["tokens"]["c" * 64] = 10000
 
     # prune archives closed runs nobody has touched, and only those
@@ -762,7 +786,11 @@ def audit(name):
     assert os.path.isdir(loop) and run(parent, "prune", "--days=0").strip() == "remove 0 worktree(s) and archive 0 run(s)"
     run(parent, "prune", "--weeks=2", ok=False)
     # the run the `current` pointer names stays, closed or not: the pane of a conversation without a run shows it
-    run(loop, "close")
+    # closing with a candidate that passed and was never accepted says so
+    with open(os.path.join(loop, "verification.json"), "w") as f:
+        json.dump({"candidate": "abc", "verified_by": "v"}, f)
+    run(loop, "read", "coordinator")
+    assert "passed verification and was never accepted" in run(loop, "close")
     with open(os.path.join(parent, "current")) as f:
         assert f.read().strip() == os.path.basename(loop)
     assert os.path.isdir(loop) and "archive 0 run(s)" in run(parent, "prune", "--days=0")
@@ -773,6 +801,270 @@ class BoardScenario(unittest.TestCase):
 
     def test_scenario(self):
         scenario()
+
+
+class BoardRegressions(unittest.TestCase):
+    """Focused regression tests for board.py fixes."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        self.swarm = os.path.join(self.root, ".swarm")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def init_run(self, name="reg"):
+        return run(os.path.join(self.swarm, name), "init", "Regression").strip()
+
+    def test_family_inherit_warns_when_limit_active(self):
+        d = self.init_run()
+        run(d, "limit", "opus=architect")
+        res = subprocess.run([sys.executable, BOARD, d, "member", "w", "model=inherit"],
+                             capture_output=True, text=True, check=True)
+        assert "note: @w has model=inherit" in res.stderr
+
+    def test_bind_validates_before_lock_and_prints_path(self):
+        fake = os.path.join(self.root, "not-swarm")
+        os.makedirs(fake)
+        with open(os.path.join(fake, "members.json"), "w", encoding="utf-8") as f:
+            json.dump({"title": "x", "members": {"coordinator": {"role": "coordinator", "last_read_seq": 0}}}, f)
+        run(fake, "bind", "a" * 64, ok=False)
+        assert not os.path.exists(os.path.join(self.root, ".adopt.lock"))
+        assert not os.path.exists(os.path.join(fake, ".lock"))
+        d = self.init_run()
+        assert run(d, "bind", "a" * 64).strip() == os.path.abspath(d)
+
+    def test_tail_exact_boundary_and_oversized_final_line(self):
+        d = self.init_run()
+        board_path = os.path.join(d, "board.jsonl")
+        line1 = b'{"seq":1,"agent":"a","text":"first","time":"2026-01-01T00:00:00+0000"}\n'
+        line2 = b'{"seq":2,"agent":"a","text":"second","time":"2026-01-01T00:00:01+0000"}\n'
+        with open(board_path, "wb") as f:
+            f.write(line1 + line2)
+        out = subprocess.run([sys.executable, BOARD, d, "tail", str(len(line2))],
+                             capture_output=True, check=True).stdout
+        assert out == line2
+        res = subprocess.run([sys.executable, BOARD, d, "tail", str(len(line2) - 1)],
+                             capture_output=True, text=True)
+        assert res.returncode != 0 and "exceeds byte budget" in res.stderr
+
+    def test_show_post_json(self):
+        d = self.init_run()
+        run(d, "member", "w")
+        run(d, "post", "coordinator", "@w hello")
+        raw = json.loads(run(d, "show", "--post=1", "--json"))
+        assert raw["seq"] == 1 and raw["agent"] == "coordinator" and raw["text"] == "@w hello"
+        run(d, "show", "--json", ok=False)
+
+    def test_retire_and_rerole_under_over_limits(self):
+        d = self.init_run()
+        for name in ("w1", "w2", "w3", "w4"):
+            run(d, "member", name)
+        run(d, "limit", "max_workers=2", "max_members=3")
+        run(d, "member", "w5", ok=False)
+        run(d, "member", "w4", "killed=1")
+        run(d, "member", "w3", "role=verifier")
+        run(d, "replace", "w2", "w2v", "role=verifier")
+        assert saved(d)["members"]["w4"]["killed"] == "1"
+        assert saved(d)["members"]["w2v"]["role"] == "verifier"
+
+    def test_mentions_strip_quoted_and_ascii_boundaries(self):
+        d = self.init_run()
+        run(d, "member", "worker")
+        assert "nobody" in run(d, "post", "coordinator", "Do not use ``@all`` or `@worker` or ```\n@worker\n```")
+        assert "-> @worker" in run(d, "post", "coordinator", "请@worker看 @worker请看")
+        run(d, "post", "coordinator", "@worker a ?? b and x ? y : z")
+        assert not [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]
+
+    def test_stale_includes_readonly_and_confirmed_subject(self):
+        d = self.init_run()
+        run(d, "member", "exp", "profile=explorer", "writes=0")
+        run(d, "member", "inv", "profile=investigator", "writes=0")
+        run(d, "member", "v", "role=verifier")
+        run(d, "ready", "exp", stdin="explored")
+        seq = run(d, "ready", "inv", stdin="found").split()[1].lstrip("#")
+        run(d, "confirm", "inv", seq)
+        with open(os.path.join(d, "verification.json"), "w", encoding="utf-8") as f:
+            json.dump({"candidate": "abc", "project": self.root, "path": self.root, "mode": "shared",
+                       "commit": None, "checks": ["true"], "no_checks": False,
+                       "inputs": {"exp": [1, None], "inv": [3, None]}, "digest": "deadbeef",
+                       "verified_by": "v", "accepted": True}, f)
+        with open(os.path.join(d, "board.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"seq": 4, "agent": "v", "text": "@coordinator VERIFIED abc deadbeef",
+                                "time": "2026-01-01T00:00:00+0000", "to": ["coordinator"]}) + "\n")
+        run(d, "revise", "exp", "missed a file")
+        stale = [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "stale"]
+        assert stale and "@exp's change" in stale[0]["text"]
+
+    def test_resume_wakes_consultant_and_verifier(self):
+        d = self.init_run()
+        run(d, "member", "adv", "profile=architect", "writes=0", "consult=1", "id=id-adv")
+        run(d, "member", "v", "role=verifier", "id=id-v")
+        state = saved(d)
+        state["members"]["v"]["told"] = {"seq": 1, "at": 1.0, "times": 1, "ended": True}
+        with open(os.path.join(d, "members.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        run(d, "pause", "hold")
+        out = run(d, "resume")
+        assert "@adv" in out and "@v" in out
+
+    def test_native_agent_run_and_started_clears_state(self):
+        d1 = self.init_run("job")
+        key = "c" * 64
+        run(d1, "bind", key)
+        run(d1, "member", "w", "id=teammate-1")
+        run(d1, "close")
+        d2 = self.init_run("job")
+        run(d2, "bind", key)
+        run(d2, "member", "w", "id=teammate-1")
+        assert run(self.swarm, "agent-run", key, "teammate-1").strip() == os.path.abspath(d2)
+        state = saved(d2)
+        state["members"]["w"]["wake_claim"] = {"token": "t", "seq": 1, "attempts": 3, "until": 9999999999}
+        state["members"]["w"]["last_nudged_seq"] = 1
+        state["members"]["w"]["told"] = {"seq": 1, "at": 1.0, "times": 3}
+        with open(os.path.join(d2, "members.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        run(d2, "started", "w", "teammate-1", "teammate-1")
+        w = saved(d2)["members"]["w"]
+        assert "wake_claim" not in w and "last_nudged_seq" not in w and "told" not in w
+
+    def test_ready_targets_report_mentions_and_consultant_skips_verifier(self):
+        d = self.init_run()
+        run(d, "member", "des", "profile=designer")
+        run(d, "member", "ui")
+        run(d, "member", "v", "role=verifier")
+        run(d, "member", "adv", "profile=architect", "writes=0", "consult=1")
+        out_des = run(d, "ready", "des", stdin="Spec ready.\nNeeds from others: @ui wire button")
+        assert "@ui" in out_des and "@v" in out_des
+        out_adv = run(d, "ready", "adv", stdin="Advice ready")
+        assert "@v" not in out_adv and "@coordinator" in out_adv
+
+    def test_blocked_skips_ready_dep_and_flags_ignored(self):
+        d = self.init_run()
+        run(d, "member", "a", "id=id-a")
+        run(d, "member", "b", "depends=a", "id=id-b")
+        run(d, "post", "coordinator", "@a start")
+        state = saved(d)
+        state["members"]["a"]["told"] = {"seq": 1, "at": 1.0, "times": 3}
+        with open(os.path.join(d, "members.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        blocked = [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "blocked"]
+        assert blocked and "ignoring its mentions" in blocked[0]["text"]
+        run(d, "ready", "a", stdin="done")
+        assert not [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "blocked"]
+
+    def test_nondict_json_guards_and_broken_symlink_prune(self):
+        d = self.init_run()
+        key = "d" * 64
+        run(d, "bind", key)
+        run(d, "close")
+        with open(os.path.join(d, "verification.json"), "w", encoding="utf-8") as f:
+            f.write("null")
+        os.symlink("/nonexistent/target", os.path.join(d, "broken"))
+        self.init_run("cur")
+        assert "archive 1 run(s)" in run(self.swarm, "prune", "--days=0", "--dry-run")
+        d2 = self.init_run()
+        run(d2, "bind", key)
+        with open(os.path.join(d2, "members.json"), "w", encoding="utf-8") as f:
+            f.write("[]")
+        assert run(self.swarm, "restore", key).strip() == ""
+
+    def test_adopt_hint_closed_run_and_locate_readonly(self):
+        d1 = self.init_run("job")
+        run(d1, "member", "w")
+        run(d1, "close")
+        d2 = self.init_run("job")
+        run(d2, "member", "w")
+        key = "e" * 64
+        hint = f"Run {os.path.basename(d2)} replaces {os.path.basename(d1)}"
+        os.chmod(self.swarm, 0o555)
+        try:
+            assert run(self.swarm, "locate", key, "w", hint).strip() == os.path.abspath(d2)
+        finally:
+            os.chmod(self.swarm, 0o755)
+        assert run(self.swarm, "adopt", key, "w", hint).strip() == os.path.abspath(d2)
+
+    def test_clear_specialist_profile_and_depends_dedup_consult(self):
+        d = self.init_run()
+        run(d, "member", "e", "profile=explorer")
+        assert saved(d)["members"]["e"]["writes"] == "0"
+        run(d, "member", "e", "profile=")
+        assert "writes" not in saved(d)["members"]["e"]
+        run(d, "member", "adv", "profile=architect", "writes=0", "consult=1")
+        run(d, "member", "w", "depends=e,e")
+        assert saved(d)["members"]["w"]["depends"] == "e"
+        run(d, "member", "w", "depends=adv", ok=False)
+        run(d, "member", "e", "profile=architect", "writes=0", "consult=1", ok=False)
+
+    def test_replace_preserves_unanswered_and_checks_self_group(self):
+        d = self.init_run()
+        run(d, "member", "a")
+        run(d, "member", "b")
+        run(d, "post", "a", "@b which port?")
+        run(d, "read", "b")  # b read #1 without answering
+        run(d, "replace", "b", "c", "group=c", ok=False)
+        run(d, "replace", "b", "c")
+        assert "#1" in run(d, "show", "--post=2")
+        qs = [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]
+        assert qs and qs[0]["member"] == "c"
+        run(d, "post", "c", "@a 8080")
+        assert not [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]
+
+    def test_wake_lease_woke_rearm_closed_and_overflow(self):
+        d = self.init_run()
+        run(d, "member", "w", "id=id-w")
+        run(d, "post", "coordinator", "@w go")
+        for _ in range(3):
+            tok = run(d, "claim", "w", "id-w", "1").strip()
+            if _ < 2:
+                state = saved(d)
+                state["members"]["w"]["wake_claim"]["until"] = 0
+                with open(os.path.join(d, "members.json"), "w", encoding="utf-8") as f:
+                    json.dump(state, f)
+        assert "(attempts exhausted)" not in run(d, "wake")
+        run(d, "rearm", "9" * 400, "id-w", ok=False)
+        run(d, "read", "coordinator")
+        run(d, "read", "w")
+        run(d, "close")
+        run(d, "woke", "w", "1", tok)  # no-op on closed run
+        run(d, "rearm", "1000", "id-w")  # no-op on closed run
+
+    def test_read_brief_two_lines_and_all_headers_conflict(self):
+        d = self.init_run()
+        run(d, "member", "a")
+        run(d, "member", "b")
+        run(d, "post", "coordinator", stdin="@a BRIEF\nOwns: src/a.py")
+        out = run(d, "read", "b")
+        assert "@a BRIEF | Owns: src/a.py" in out
+        run(d, "read", "b", "--all", "--headers", ok=False)
+
+    def test_post_finding_guard_and_revise_error(self):
+        d = self.init_run()
+        run(d, "member", "inv", "profile=investigator")
+        run(d, "post", "inv", "@coordinator FINDING it broke", ok=False)
+        run(d, "member", "w")
+        run(d, "post", "w", "@coordinator FINDING prose note")
+        err = subprocess.run([sys.executable, BOARD, d, "post", "w", "@coordinator REVISE nope"],
+                             capture_output=True, text=True).stderr
+        assert "revise w <reason>" in err
+
+    def test_low_polish_closed_view_model_retry_limit_clear(self):
+        d = self.init_run()
+        run(d, "member", "w", "model=opsu", ok=False)
+        run(d, "member", "w")
+        run(d, "limit", "fable=architect")
+        assert "fable" in saved(d)["limits"]
+        run(d, "limit", "fable=")
+        assert "fable" not in saved(d)["limits"]
+        run(d, "limit", "fable=none")
+        assert saved(d)["limits"]["fable"] == "none"
+        run(d, "retry", "coordinator", ok=False)
+        run(d, "member", "w", "killed=1")
+        run(d, "retry", "w", ok=False)
+        run(d, "close")
+        rep = json.loads(run(d, "attention", "--json"))
+        assert not rep["members"]["w"]["unreachable"] and rep["members"]["w"]["blocked_on"] == []
 
 
 if __name__ == "__main__":

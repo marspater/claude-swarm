@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -15,11 +16,18 @@ import uuid
 sys.dont_write_bytecode = True
 from board import atomic_write, load, load_state, readiness, save
 
+GIT_ENV_STRIP = {
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX",
+}
+
 
 def git(path, *args, optional=False):
     try:
         # Git translates its messages; toplevel() reads one, so they are asked for untranslated.
-        result = subprocess.run(["git", "-C", str(path), *args], capture_output=True, env={**os.environ, "LC_ALL": "C"})
+        env = {k: v for k, v in os.environ.items() if k not in GIT_ENV_STRIP}
+        env["LC_ALL"] = "C"
+        result = subprocess.run(["git", "-C", str(path), *args], capture_output=True, env=env)
     except FileNotFoundError:
         if optional:
             return None
@@ -51,15 +59,70 @@ def repository(project):
     return root, os.fsencode((project.resolve() / ".swarm").relative_to(root).as_posix()).split(b"/")
 
 
-def source_digest(project, nested=False):
+def _hash_entry(digest, path, mode):
+    if stat.S_ISLNK(mode):
+        content = hashlib.sha256(os.fsencode(os.readlink(path)))
+        digest.update(b"link\0" + content.digest())
+    elif stat.S_ISREG(mode):
+        # A concurrent replacement with a pipe must never block the fingerprint.
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW), "rb") as f:
+            before = os.fstat(f.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError(f"source changed while fingerprinting {path}")
+            digest.update(b"x" if before.st_mode & stat.S_IXUSR else b"f")
+            content = hashlib.sha256()
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                content.update(chunk)
+            after = path.lstat()
+            if any(getattr(before, key) != getattr(after, key) for key in (
+                    "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")):
+                raise ValueError(f"source changed while fingerprinting {path}")
+            digest.update(content.digest())
+    else:
+        raise ValueError(f"cannot fingerprint {path}")
+
+
+def _hash_dir(digest, root_dir):
+    entries = []
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        for d in dirnames:
+            p = Path(dirpath) / d
+            if p.is_symlink():
+                entries.append(p.relative_to(root_dir))
+        for fn in filenames:
+            entries.append((Path(dirpath) / fn).relative_to(root_dir))
+    for rel in sorted(entries):
+        name = os.fsencode(rel)
+        digest.update(len(name).to_bytes(8, "big") + name)
+        _hash_entry(digest, root_dir / rel, (root_dir / rel).lstat().st_mode)
+
+
+def source_digest(project, nested=False, seen_roots=None):
     """Fingerprint the sources. The project's own .swarm folder holds run data and is left out; a folder of that
     name anywhere else, a nested repository's included, is the user's and counts as source."""
+    if seen_roots is None:
+        seen_roots = set()
+    resolved_project = project.resolve()
+    if resolved_project in seen_roots:
+        raise ValueError(f"cyclic repository at {project}")
+    seen_roots = seen_roots | {resolved_project}
     found = repository(project)
     if found is None:
-        root = project
-        files = (os.fsencode(path.relative_to(root)) for path in root.rglob("*")
-                 if ".git" not in (parts := path.relative_to(root).parts) and (nested or parts[0] != ".swarm")
-                 and (path.is_symlink() or not path.is_dir()))
+        root = resolved_project
+        found_files = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            rel_dir = Path(dirpath).relative_to(root)
+            dirnames[:] = [
+                d for d in dirnames
+                if d != ".git" and (nested or rel_dir != Path(".") or d != ".swarm")
+            ]
+            for d in dirnames:
+                p = Path(dirpath) / d
+                if p.is_symlink():
+                    found_files.append(os.fsencode(p.relative_to(root)))
+            for fn in filenames:
+                found_files.append(os.fsencode((Path(dirpath) / fn).relative_to(root)))
+        files = found_files
         head = b"non-git"
     else:
         root, run_data = found
@@ -80,32 +143,32 @@ def source_digest(project, nested=False):
         except FileNotFoundError:
             digest.update(b"missing\0")
             continue
-        if stat.S_ISLNK(mode):
-            content = hashlib.sha256(os.fsencode(os.readlink(path)))
-            digest.update(b"link\0" + content.digest())
-        elif stat.S_ISREG(mode):
-            # A concurrent replacement with a pipe must never block the fingerprint.
-            with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW), "rb") as f:
-                before = os.fstat(f.fileno())
-                if not stat.S_ISREG(before.st_mode):
-                    raise ValueError(f"source changed while fingerprinting {path}")
-                digest.update(b"x" if before.st_mode & stat.S_IXUSR else b"f")
-                content = hashlib.sha256()
-                for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                    content.update(chunk)
-                after = path.lstat()
-                if any(getattr(before, key) != getattr(after, key) for key in (
-                        "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")):
-                    raise ValueError(f"source changed while fingerprinting {path}")
-                digest.update(content.digest())
-        elif stat.S_ISDIR(mode) and found is not None and name in gitlinks and not ((path / ".git").exists() and (
-                git(path, "rev-parse", "HEAD").strip() != gitlinks[name]
-                or git(path, "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none"))):
-            # A submodule's recorded commit stands for it, whether it is absent, as in a fresh worktree, or
-            # checked out clean at that commit: the integration worktree and the user's checkout then agree.
-            digest.update(b"gitlink\0" + gitlinks[name])
-        elif stat.S_ISDIR(mode) and (path / ".git").exists():  # a nested repository, or a submodule that moved or is dirty
-            digest.update(b"repo\0" + bytes.fromhex(source_digest(path, nested=True)))
+        if stat.S_ISLNK(mode) or stat.S_ISREG(mode):
+            _hash_entry(digest, path, mode)
+        elif stat.S_ISDIR(mode) and found is not None and name in gitlinks:
+            sub_top = toplevel(path) if (path / ".git").exists() else None
+            is_sub_repo = sub_top is not None and Path(os.fsdecode(sub_top.rstrip(b"\n"))).resolve() == path.resolve()
+            if is_sub_repo:
+                if git(path, "rev-parse", "HEAD").strip() == gitlinks[name] and not git(
+                        path, "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none"):
+                    # A submodule's recorded commit stands for it when checked out clean at that commit.
+                    digest.update(b"gitlink\0" + gitlinks[name])
+                else:
+                    digest.update(b"repo\0" + bytes.fromhex(source_digest(path, nested=True, seen_roots=seen_roots)))
+            elif not any(path.iterdir()):
+                digest.update(b"gitlink\0" + gitlinks[name])
+            else:
+                digest.update(b"dir\0")
+                _hash_dir(digest, path)
+        elif stat.S_ISDIR(mode) and (path / ".git").exists():  # a nested repository, or a dir with a non-repo .git
+            sub_top = toplevel(path)
+            if sub_top is not None and Path(os.fsdecode(sub_top.rstrip(b"\n"))).resolve() == path.resolve() and path.resolve() not in seen_roots:
+                digest.update(b"repo\0" + bytes.fromhex(source_digest(path, nested=True, seen_roots=seen_roots)))
+            elif found is not None and name in tracked:
+                digest.update(b"dir\0")
+            else:
+                digest.update(b"dir\0")
+                _hash_dir(digest, path)
         elif stat.S_ISDIR(mode) and found is not None and name in tracked:
             digest.update(b"dir\0")  # a tracked file replaced by a folder; the files in it are listed on their own
         else:
@@ -168,12 +231,28 @@ def candidate_for(run, project, identifier):
     return candidate
 
 
-def check_inputs(run, candidate):
+def check_no_checks(run, recorded):
+    coders = sorted(name for name, member in load_state(run)["members"].items()
+                    if name in recorded and member.get("writes") != "0" and member.get("profile") != "designer")
+    if coders:
+        raise ValueError("--no-checks is for a run whose only writers are designers; give --check commands that test the work of "
+                         + ", ".join("@" + name for name in coders))
+
+
+def check_checks_field(run, candidate, recorded):
     # An empty list passes only when `prepare --no-checks` asked for it: a candidate that lost its commands does not.
-    deliberate = candidate.get("no_checks") is True and candidate["checks"] == []
-    if not deliberate and (not isinstance(candidate["checks"], list) or not candidate["checks"] or any(not isinstance(check, str) or not check.strip() for check in candidate["checks"])):
+    deliberate = candidate.get("no_checks") is True and candidate.get("checks") == []
+    if deliberate:
+        check_no_checks(run, recorded)
+    elif (not isinstance(candidate.get("checks"), list) or not candidate["checks"]
+          or any(not isinstance(check, str) or not check.strip() for check in candidate["checks"])):
         raise ValueError("the candidate is missing verification commands; prepare a new candidate")
-    if candidate["inputs"] != inputs(run, candidate["mode"]):
+
+
+def check_inputs(run, candidate):
+    recorded = inputs(run, candidate["mode"])
+    check_checks_field(run, candidate, recorded)
+    if candidate["inputs"] != recorded:
         raise ValueError("worker readiness changed; prepare and test a new candidate")
     work = Path(candidate["path"])
     if candidate["mode"] == "isolated" and git(work, "rev-parse", "HEAD").decode().strip() != candidate["commit"]:
@@ -190,7 +269,7 @@ def is_run_data(name, run_data):
 def pending_changes(project):
     """Paths git reports as changed or untracked, other than Swarm's own run data."""
     _, run_data = repository(project)
-    entries = git(project, "status", "--porcelain", "-z", "--untracked-files=all").split(b"\0")
+    entries = git(project, "status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=none").split(b"\0")
     pending, index = [], 0
     while index < len(entries):
         entry = entries[index]
@@ -211,7 +290,9 @@ def check_current(run, candidate):
         return check_inputs(run, candidate)
     # Accepted: its checkout may be gone, and the project itself now holds what was tested.
     project = Path(candidate["project"])
-    if candidate["inputs"] != inputs(run, candidate["mode"]):
+    recorded = inputs(run, candidate["mode"])
+    check_checks_field(run, candidate, recorded)
+    if candidate["inputs"] != recorded:
         raise ValueError("worker readiness changed after acceptance")
     if candidate["mode"] == "isolated" and git(project, "rev-parse", "HEAD").decode().strip() != candidate["commit"]:
         raise ValueError("the project moved off the accepted commit")
@@ -220,6 +301,7 @@ def check_current(run, candidate):
 
 
 def active_verifier(run, verifier):
+    verifier = verifier.lstrip("@").lower()
     if not verifier:
         raise ValueError("no passing verification for this candidate")
     member = load_state(run)["members"].get(verifier, {})
@@ -227,25 +309,30 @@ def active_verifier(run, verifier):
         raise ValueError("an active verifier must run the checks")
 
 
-def prepare(run, project, mode, checks):
-    """CHECKS is None for a candidate with nothing a command could test, such as a designer's assets."""
+def prepare(run, project, mode, checks, onto=None):
+    """CHECKS is None for a candidate with nothing a command could test, such as a designer's assets.
+    ONTO names the commit an isolated candidate is built on when that is not the checkout's own HEAD."""
     identifier = uuid.uuid4().hex[:16]
     with board_lock(run):
         recorded = inputs(run, mode)
         if checks is None:
-            coders = sorted(name for name, member in load_state(run)["members"].items()
-                            if name in recorded and member.get("writes") != "0" and member.get("profile") != "designer")
-            if coders:
-                raise ValueError("--no-checks is for a run whose only writers are designers; give --check commands that test the work of "
-                                 + ", ".join("@" + name for name in coders))
+            check_no_checks(run, recorded)
     work = project
     integration = None
     base = commit = branch = None
     try:
         if mode == "isolated":
-            base = git(project, "rev-parse", "HEAD").decode().strip()
+            base = git(project, "rev-parse", "--verify", (onto or "HEAD") + "^{commit}").decode().strip()
             branch = git(project, "symbolic-ref", "-q", "HEAD", optional=True)
-            root = Path(os.fsdecode(git(project, "rev-parse", "--show-toplevel").rstrip(b"\n")))
+            # A member that branched from somewhere else brings that history into the candidate with it: what is
+            # tested is then neither the base nor the member's own branch. Said, not refused: it can be meant.
+            astray = [name for name, (_, revision) in recorded.items() if revision
+                      and git(project, "merge-base", "--is-ancestor", base, revision, optional=True) is None]
+            if astray:
+                print("note: %s did not branch from the candidate's base %s%s. If the members branched from another "
+                      "ref, prepare again with --base <that ref>" % (", ".join("@" + name for name in astray), base[:12],
+                                                                    "" if onto else " (the checkout's HEAD)"), file=sys.stderr)
+            root = Path(os.fsdecode(git(project, "rev-parse", "--show-toplevel").rstrip(b"\n"))).resolve()
             integration = run / f"integration-{identifier}"
             git(project, "worktree", "add", "--detach", str(integration), base)
             for name, (_, revision) in recorded.items():
@@ -258,12 +345,24 @@ def prepare(run, project, mode, checks):
                         raise ValueError(f"could not merge @{name}'s commit {revision[:12]}: {error}. If Git asks for an identity "
                                          "or a signing key, configure it for this repository, then prepare again") from None
             commit = git(integration, "rev-parse", "HEAD").decode().strip()
+            diff = git(integration, "diff", "--raw", "-z", base, commit).split(b"\0")
+            idx = 0
+            while idx + 1 < len(diff):
+                meta, sub_name = diff[idx], diff[idx + 1]
+                idx += 2
+                parts = meta.lstrip(b":").split()
+                if len(parts) >= 5 and parts[4][:1] in (b"R", b"C"):
+                    idx += 1
+                if len(parts) >= 4 and b"160000" in parts[:2] and parts[2] != parts[3]:
+                    sub_rel = os.fsdecode(sub_name)
+                    if (root / sub_rel / ".git").exists():
+                        raise ValueError(f"cannot verify submodule update at {sub_rel} in isolated mode; land submodule pointer changes by hand")
             work = integration / project.relative_to(root)
             if not work.is_dir():
                 raise ValueError("the requested project directory is missing in the candidate")
         candidate = {
             "candidate": identifier, "project": str(project), "path": str(work),
-            "mode": mode, "base": base, "commit": commit, "checks": checks or [], "no_checks": checks is None,
+            "mode": mode, "base": base, "onto": onto, "commit": commit, "checks": checks or [], "no_checks": checks is None,
             "branch": os.fsdecode(branch).strip() if branch else None,
             "worktree": str(integration) if integration else None,
             "inputs": recorded, "digest": source_digest(work),
@@ -290,6 +389,7 @@ def prepare(run, project, mode, checks):
 
 
 def test_candidate(run, project, identifier, verifier):
+    verifier = verifier.lstrip("@").lower()
     attempt = uuid.uuid4().hex
     with board_lock(run):
         candidate = candidate_for(run, project, identifier)
@@ -301,9 +401,14 @@ def test_candidate(run, project, identifier, verifier):
         candidate["attempt"] = attempt
         save_candidate(run, candidate)
 
+    raw_timeout = os.environ.get("SWARM_VERIFY_TIMEOUT", "").strip()
+    timeout = float(raw_timeout) if raw_timeout else None
     for command in candidate["checks"]:
         print(f"$ {command}", flush=True)
-        result = subprocess.run(["/bin/sh", "-c", command], cwd=candidate["path"])
+        try:
+            result = subprocess.run(["/bin/sh", "-c", command], cwd=candidate["path"], stdin=subprocess.DEVNULL, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise ValueError(f"verification command timed out after {timeout}s: {command}") from None
         print(f"Exit {result.returncode}", flush=True)
         if result.returncode:
             raise ValueError("verification failed")
@@ -330,12 +435,26 @@ def accept(run, project, identifier):
             return
         active_verifier(run, candidate["verified_by"])
         check_inputs(run, candidate)
+        state, posts = load(run)
+        verifier = candidate["verified_by"]
+        expected_line = f"VERIFIED {identifier} {candidate.get('commit') or candidate.get('digest')}"
+        latest_input_seq = max((seq for seq, _ in candidate["inputs"].values()), default=0)
+        if not any(
+            p["seq"] > latest_input_seq
+            and p["agent"] == verifier
+            and re.search(rf"(?<!\w){re.escape(expected_line)}(?!\w)", p["text"].split("\n")[0])
+            for p in posts
+        ):
+            raise ValueError(f"@{verifier} has not posted {expected_line} on the board")
         if candidate["mode"] == "isolated":
             if "branch" in candidate:
                 branch = git(project, "symbolic-ref", "-q", "HEAD", optional=True)
                 if (os.fsdecode(branch).strip() if branch else None) != candidate["branch"]:
                     raise ValueError("the user checkout switched branches; rebuild and reverify")
             head = git(project, "rev-parse", "HEAD").decode().strip()
+            if candidate.get("onto") and head not in {candidate["base"], candidate["commit"]}:
+                raise ValueError("this candidate was built on %s, not on the checkout: deliver the verified commits from "
+                                 "the members' branches, or check out that base and accept again" % candidate["onto"])
             if head not in {candidate["base"], candidate["commit"]}:
                 raise ValueError("the user checkout moved; rebuild and reverify")
             if pending_changes(project):
@@ -374,6 +493,7 @@ def main():
     checks = prep.add_mutually_exclusive_group(required=True)
     checks.add_argument("--check", action="append")
     checks.add_argument("--no-checks", action="store_true")
+    prep.add_argument("--base", help="build an isolated candidate on this ref instead of the checkout's HEAD")
     test = actions.add_parser("test")
     test.add_argument("candidate")
     test.add_argument("verifier")
@@ -389,7 +509,9 @@ def main():
         if args.action == "prepare":
             if any(not check.strip() for check in args.check or []):
                 raise ValueError("each verification check must be a nonempty command")
-            prepare(run, project, args.mode, None if args.no_checks else args.check)
+            if args.base and args.mode != "isolated":
+                raise ValueError("--base is for an isolated candidate; a shared one is the checkout as it stands")
+            prepare(run, project, args.mode, None if args.no_checks else args.check, args.base)
         elif args.action == "test":
             test_candidate(run, project, args.candidate, args.verifier)
         else:

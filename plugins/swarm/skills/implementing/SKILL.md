@@ -11,7 +11,7 @@ You own a bounded piece. Use its acceptance criteria to decide what to read, cha
 ## Read only what the piece needs
 
 - Your brief is shown in full. Other members' posts arrive as one line each. Open one with `BOARD show --post=<n>` only when your work depends on it.
-- Verify the checkout and assigned paths before touching a file. In a shared checkout, inspect the current diff for changes you need to preserve. For isolated work, identify the worktree from which your result will be handed off.
+- Verify the checkout and assigned paths before touching a file. In a shared checkout, inspect the current diff for changes you need to preserve. For isolated work, identify the worktree from which your result will be handed off; when depending on an upstream writer's `READY <commit>`, inspect (`git show <commit>:<path>`) or merge (`git merge --no-ff <commit>`) that commit into your worktree before building or testing.
 - Read your files, their tests, and the callers or contracts that the change affects. Start from the normal entry point so a local fix also works through the feature's usual path.
 - Locate before you read: search for the symbol, then read the range around it. Read a whole file only when it is short or you own it.
 - Do not read a file twice in one turn unless it changed.
@@ -47,6 +47,6 @@ For a read-only synthesis, use the upstream reports named in the brief. Open the
 
 ## Report
 
-Aim for a `ready` report of about 1500 characters. State what changed and why, the owned paths, the exact commands and observed results, and any caveats the verifier needs. For isolated work, commit first, following the user's commit rules, and pass the full commit to `BOARD ready <name> <full-commit>`. Include the worktree and branch. A later change requires `revise` followed by a fresh report.
+Aim for a `ready` report of about 1500 characters. State what changed and why, the owned paths, the exact commands and observed results, and any caveats the verifier needs. For isolated work, commit first, following the user's commit rules, and report with `BOARD ready <name> HEAD` from your worktree, which reads the commit itself. Keep git in plain, separate commands: an isolated agent is refused one that mixes git into a pipeline, a `$(...)`, a `trap` or a heredoc. Include the worktree and branch. A later change requires `revise` followed by a fresh report.
 
 > `src/refresh.ts` now shares the in-flight refresh for a key and clears it on completion. `tests/refresh.test.ts` covers duplicate calls and a retry after failure. `npm test -- refresh` passed 14 tests. The regression test failed on the original code with two fetches. The integrated scheduler check belongs to the verifier.

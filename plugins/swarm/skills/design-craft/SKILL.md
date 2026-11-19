@@ -108,3 +108,5 @@ Assumptions: <anything decided without being told>
 Open: <what you could not settle or render>
 Needs from others: <@owner: what>
 ```
+
+`Needs from others: @owner` on `ready` directly wakes `@owner`; send a separate `BOARD post` for follow-up discussion.

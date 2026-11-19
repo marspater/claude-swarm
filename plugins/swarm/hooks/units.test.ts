@@ -1,12 +1,12 @@
 import { expect, test } from 'claude-code/testing'
 import type { Post } from '../types'
-import { BOARD_CALL, COORDINATOR_READ, RUN, runsNamed, wakeMessage, wakeSequence } from './command'
+import { BOARD_CALL, COORDINATOR_READ, RUN, boardCalls, runsNamed, wakeMessage, wakeSequence } from './command'
 import { graphSvg } from './graph'
 import { toolMood, toolSummary } from './hive'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, SWARM_AGENTS, familyOf, latestOf } from './models'
-import { statusKey } from './palette'
-import { parse, tokensUsed } from './roster'
-import { bodyOf, clean, clip, kindOf, openedText } from './text'
+import { statusCss, statusDot, statusKey } from './palette'
+import { detailOf, findAgent, parse, statusOf, tokensUsed } from './roster'
+import { bodyOf, clean, clip, compact, head, kindOf, openedText, stripKind } from './text'
 
 const post = (text: string, to: string[] = []): Post => ({ seq: 1, agent: 'parser', to, text, time: '2026-11-16T14:03:22+0100' })
 
@@ -25,7 +25,7 @@ test('a board command is recognised in the forms a coordinator types it', async 
   expect(COORDINATOR_READ.test('board.py DIR read parser')).toBe(false)
   // the board takes a name with its @
   expect(COORDINATOR_READ.test('board.py DIR read --all @coordinator')).toBe(true)
-  expect(runsNamed(`a ${run} b demo-20261116-101010 other-20261117-090000x`)).toEqual(['demo-20261116-101010', 'other-20261117-090000x'])
+  expect(runsNamed(`a ${run} b demo-20261116-101010 .swarm/other-20261117-090000x logs/crash-20261116-143022.log`)).toEqual(['demo-20261116-101010', 'other-20261117-090000x'])
   expect(wakeSequence(wakeMessage(12))).toBe(12)
   expect(Number.isSafeInteger(wakeSequence('hello'))).toBe(false)
 })
@@ -89,4 +89,65 @@ test('the roster is read with its posts cleaned and its tokens summed', async ()
   // a member that has not started is drawn with one class, not two
   const svg = graphSvg(shown, 1, new Set(), false, true)
   expect(svg).not.toMatch(/class="presence not started"/)
+})
+
+test('multi-segment board calls, wakeSequence bounds, and roster status/closed-run guards', async () => {
+  const falseRead = boardCalls('python3 /p/board.py /project/.swarm/demo-20261116-101010 read parser && echo "read coordinator"')
+  expect(falseRead.length).toBe(1)
+  expect(COORDINATOR_READ.test(falseRead[0]!.rest)).toBe(false)
+
+  const chained = boardCalls('cd /project && VAR=1 python3.12 -X utf8 /p/board.py ./.swarm/demo-20261116-101010 read "Coordinator" && python3 board.py $RUN pause')
+  expect(chained.map(c => [c.dir, c.action])).toEqual([['./.swarm/demo-20261116-101010', 'read'], ['$RUN', 'pause']])
+  expect(COORDINATOR_READ.test(chained[0]!.rest)).toBe(true)
+  expect(RUN.test('.swarm/demo-20261116-101010')).toBe(true)
+
+  expect(wakeSequence(`  ${wakeMessage(7)}\n`)).toBe(7)
+  expect(Number.isSafeInteger(wakeSequence(wakeMessage(0)))).toBe(false)
+
+  const agents = [
+    { id: 'a1', teammateId: 'art@team', description: '@art', type: 'swarm:worker', status: 'killed' },
+    { id: 'a2', teammateId: 'art@team', description: '@art', type: 'swarm:worker', status: 'waiting' },
+  ] as never
+  expect(findAgent(agents, 'art@team')?.id).toBe('a2')
+  expect(statusOf('worker', { id: 'art@team', last_read_seq: 0 }, agents)).toBe('working')
+  expect(detailOf('failed', { type: 'worker', model: 'sonnet', effort: 'medium', depends: [], owns: '', ready: true, blocked_on: [], asked: 0, unreachable: false }, false)).toBe('')
+
+  const closedRoster = JSON.stringify({
+    title: 'Closed', closed: true,
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 0 },
+      constructor: { role: 'worker', id: 'art@team', last_read_seq: 0 },
+    },
+  })
+  const tailedBoard = `${JSON.stringify({ seq: 500, agent: 'constructor', text: 'done', time: 't' })}\n`
+  const closed = parse('/project/.swarm/demo-20261116-101010', tailedBoard, closedRoster, agents, 300, {
+    items: [], limits: {},
+    members: { art: { type: 'worker', model: 'sonnet', effort: 'medium', depends: [], owns: '', ready: false, blocked_on: ['x'], asked: 0, unreachable: true } },
+  })
+  expect(closed.total).toBe(500)
+  expect(closed.members.find(m => m.name === 'constructor')?.status).toBe('waiting')
+  expect(closed.members.find(m => m.name === 'constructor')?.detail).toBe('')
+})
+
+test('wave 1/2 design, text, hive and palette helpers', async () => {
+  expect(toolSummary([{ tool: 'Agent' }])).toBe('Started 1 agent')
+  expect(toolSummary([{ tool: 'Agent' }, { tool: 'Agent' }])).toBe('Started 2 agents')
+
+  expect(compact(999_499)).toBe('999k')
+  expect(compact(999_500)).toBe('1.0M')
+
+  expect(stripKind('BRIEF\nOwns: a.ts')).toBe('Owns: a.ts')
+  expect(stripKind('NOT PASSED: line 4')).toBe('line 4')
+
+  expect(head('a👍🏽b', 3)).toBe('a')
+  expect(clean('hi\u001b]0;title\u0007\u202e\u2066there\u2069')).toBe('hithere')
+
+  const fenced = clip(`\`\`\`ts\n${'x'.repeat(480)}\n\`\`\``)
+  expect((fenced.match(/```/g) ?? []).length).toBe(2)
+
+  expect(statusCss).toContain('@media(prefers-color-scheme:dark)')
+  expect(statusDot('coordinating')).toContain('<path d="M6 1.2L10.8 6 6 10.8 1.2 6z"')
+  expect(statusDot('failed')).toContain('<path d="M2.8 2.8L9.2 9.2M9.2 2.8L2.8 9.2"')
+  expect(statusDot('waiting')).toContain('stroke-width="1.5"')
+  expect(statusDot('inactive')).toContain('fill="none"')
 })

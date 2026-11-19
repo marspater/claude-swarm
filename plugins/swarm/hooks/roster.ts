@@ -65,7 +65,7 @@ export type Report = {
 
 // What a member that is not working is waiting for, in words.
 export function detailOf(status: string, hint: Report['members'][string] | undefined, isPaused: boolean): string {
-  if (status === 'working' || status === 'killed' || status === 'coordinating') return ''
+  if (status === 'working' || status === 'killed' || status === 'coordinating' || status === 'failed') return ''
   if (status === 'unreachable') return 'cannot be woken'
   if (isPaused) return 'run paused'
   if (hint?.asked) return `waiting for an answer to #${hint.asked}`
@@ -95,6 +95,15 @@ export function targets(text: string, roster: Roster): string[] {
   })
 }
 
+const ACTIVE_AGENT_STATUSES = new Set(['running', 'pending', 'waiting', 'idle'])
+
+/** Finds the newest agent matching `id`, preferring active statuses over ended ones. */
+export function findAgent(agents: AgentInfo[], id: string | undefined): AgentInfo | undefined {
+  if (id === undefined) return undefined
+  const matches = agents.filter(one => one.id === id || one.teammateId === id)
+  return matches.findLast(one => ACTIVE_AGENT_STATUSES.has(one.status)) ?? matches.at(-1)
+}
+
 export function statusOf(
   role: string,
   member: Roster[string],
@@ -103,10 +112,10 @@ export function statusOf(
   if (member.killed) return 'killed'
   if (role === 'coordinator') return 'waiting'
   if (!member.id) return 'not started'
-  const agent = agents.find(one => one.id === member.id || one.teammateId === member.id)
+  const agent = findAgent(agents, member.id)
   if (agent === undefined) return 'waiting'
   if (agent.status === 'killed') return 'killed'
-  if (agent.status === 'running' || agent.status === 'pending') return 'working'
+  if (agent.status === 'running' || agent.status === 'pending' || agent.status === 'waiting') return 'working'
 
   return agent.status === 'failed' ? 'failed' : 'waiting'
 }
@@ -161,10 +170,12 @@ export function parse(
     counts(post.agent).sent++
     for (const name of post.to) if (post.seq > (memberNamed(roster, name)?.last_read_seq ?? Infinity)) counts(name).unread++
   }
+  const isClosed = state.closed === true
+  const liveAgents = isClosed ? [] : agents
   const members: Member[] = Object.entries(roster).map(([name, member]) => {
-    const hint = report?.members[name]
-    const base = member.role === 'coordinator' && coordinating && !member.killed ? 'coordinating' : statusOf(member.role ?? 'worker', member, agents)
-    const status = hint?.unreachable && base !== 'working' && base !== 'killed' ? 'unreachable' : base
+    const hint = report?.members && Object.hasOwn(report.members, name) ? report.members[name] : undefined
+    const base = member.role === 'coordinator' && coordinating && !member.killed && !isClosed ? 'coordinating' : statusOf(member.role ?? 'worker', member, liveAgents)
+    const status = !isClosed && hint?.unreachable && base !== 'working' && base !== 'killed' ? 'unreachable' : base
 
     return {
       name,
@@ -177,7 +188,7 @@ export function parse(
       depends: hint?.depends ?? [],
       owns: clean(hint?.owns ?? ''),
       status,
-      detail: detailOf(status, hint, Boolean(state.paused)),
+      detail: isClosed ? '' : detailOf(status, hint, Boolean(state.paused)),
       unread: counts(name).unread,
       posts: counts(name).sent,
     }
@@ -186,10 +197,10 @@ export function parse(
   return {
     title: clean(state.title),
     dir,
-    isClosed: state.closed === true,
+    isClosed,
     isPaused: Boolean(state.paused),
     posts: posts.slice(-limit),
-    total: posts.length,
+    total: Math.max(posts.length, posts.at(-1)?.seq ?? 0),
     earlierEdges: edgesOf(posts.slice(0, -limit)),
     members,
     attention: report?.items ?? [],

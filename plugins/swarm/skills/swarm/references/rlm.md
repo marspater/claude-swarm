@@ -68,7 +68,7 @@ Tell the user the number of slices and that each is one Haiku agent at low effor
 
 ### 4. Register the team
 
-- One analyst per slice, registered a batch at a time in the same step as its brief and spawn (step 6): `BOARD member slice-01 profile=explorer writes=0 group=slice effort=low`, with `effort: "low"` on its Agent call. The type is `swarm:explorer`, on its default Haiku: slice analysis is counting and noticing, and a stronger model or more effort costs many times more for the same result.
+- One analyst per slice, registered a batch at a time in the same step as its brief and spawn (step 6): `BOARD member slice-01 profile=explorer writes=0 group=slice effort=low owns='<path> lines <start>-<end>'`, with `effort: "low"` on its Agent call. The type is `swarm:explorer`, on its default Haiku: slice analysis is counting and noticing, and a stronger model or more effort costs many times more for the same result.
 - One synthesizer, of type `swarm:worker`, registered later: `BOARD member synth writes=0 depends=slice-01,slice-02,...` in the same step as its spawn (step 6). Registered now, it would be reported as unstarted for the whole run.
 - No verifier. Nothing is being changed.
 
@@ -86,7 +86,7 @@ are overlap with the previous slice, read for context and stack-trace continuity
 Question: <the user's question, word for word the same in every brief>
 Taxonomy: bucket every finding into [<TAG_1>, <TAG_2>, <TAG_3>, OTHER]. If a major pattern fits none,
 propose at most 2 new tags under OTHER.
-Report: with the board tool's ready action. First line: one sentence with your slice's main finding.
+Report: with the board tool's ready action (or `BOARD ready <name>` for a `swarm:worker` analyst). First line: one sentence with your slice's main finding.
 Then, compactly:
 - COUNTS: exact counts per taxonomy tag, respecting the count boundary
 - CLUSTERS: recurring patterns, with one example line number each
@@ -105,7 +105,7 @@ The synthesizer reads reports only, with one exception that you write into its b
 
 Spawn at most eight analysts at a time. Register and brief a slice in the same step as its spawn, never earlier: a registered member with no agent is reported as unstarted, and a briefed one as owed a wake. As `READY` posts arrive, register, brief and spawn the next slices.
 
-Between batches, let the earlier slices inform the later ones. When the one-line headers of two or more finished analysts name the same new tag or the same critical ID (a correlation ID, an error code, a symbol), add one line to the briefs of the slices not yet spawned: `Watchlist from earlier slices: also track occurrences of [<tag or id>].` Take it from the headers only, keep it to that one line, and do not open the full reports for it. Briefs already posted stay as they are. Register, brief and spawn the synthesizer after the last batch has started, so it does not sit idle through the run.
+Between batches, let the earlier slices inform the later ones. When the one-line headers of two or more finished analysts name the same new tag or the same critical ID (a correlation ID, an error code, a symbol), add one line to the briefs of the slices not yet spawned: `Watchlist from earlier slices: also track occurrences of [<tag or id>].` Take it from the headers only, keep it to that one line, and do not open the full reports for it. Briefs already posted stay as they are. Register, brief and spawn the synthesizer once the final batch finishes, so it does not wake on each final-batch `READY` or sit idle through the run.
 
 ### 7. Keep your own context small
 

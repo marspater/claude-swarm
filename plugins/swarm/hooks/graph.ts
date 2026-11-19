@@ -1,12 +1,15 @@
-import { statusCss } from './palette'
+import { statusCss, statusKey } from './palette'
+import { head as clipHead } from './text'
 import type { Post, Swarm } from '../types'
 
-const BROADCAST = /(?<![\w.@/])@all(?![\w-])/i
+const stripCode = (text: string) =>
+  text.replace(/```[\s\S]*?```/g, ' ').replace(/`[^`\n]*`/g, ' ')
+const BROADCAST = /(?<![\w.@/])@all[-_]*(?![\w-])/i
 const named = (text: string, name: string) =>
-  new RegExp(`(?<![\\w.@/])@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w-])`, 'i').test(text)
+  new RegExp(`(?<![\\w.@/])@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[-_]*(?![\\w-])`, 'i').test(stripCode(text))
 
 /** True when the post addresses `@all`: the members it does not also name are reached through that alone. */
-export const isBroadcast = (post: Post) => BROADCAST.test(post.text)
+export const isBroadcast = (post: Post) => BROADCAST.test(stripCode(post.text))
 const viaAll = (post: Post, to: string) => isBroadcast(post) && !named(post.text, to)
 
 /**
@@ -31,14 +34,13 @@ export function pairOf(edge: string): [string, string] | undefined {
   return to.startsWith('@') ? undefined : [from, to]
 }
 
-const WIDTH = 560
 const PILL_HEIGHT = 38
 const LEGEND = 50
 
 export function graphHeight(columns: number, memberCount: number): number {
   // The desktop clamps the frame width to the actual slot. Columns estimate
   // its height only, so a change in font metrics cannot narrow the frame.
-  return Math.max(200, Math.min(540, Math.round(columns * (memberCount > 6 ? 6.75 : 5.95))))
+  return Math.max(200, Math.min(620, Math.round(columns * (memberCount > 8 ? 7.6 : memberCount > 6 ? 7.11 : 5.95))))
 }
 
 const esc = (text: string) =>
@@ -70,23 +72,30 @@ export function graphSvg(
   const members = swarm.members.filter(member =>
     !hidden.has(member.name) && (live || participants.has(member.name)),
   )
-  const height = swarm.members.length > 6 ? 404 : 330
   const coordinator = swarm.members.find(member => member.role === 'coordinator')
   const outerMembers = swarm.members.filter(member => member !== coordinator)
   const halfOf = (name: string) => Math.max(38, 22 + Math.min(15, name.length) * 4.7)
   const centerHalf = coordinator ? halfOf(coordinator.name) : 0
+  const outerCount = outerMembers.length
+  const maxHalf = Math.max(38, ...outerMembers.map(member => halfOf(member.name)))
+  const rx = Math.max(186, outerCount <= 2 ? 186 : (maxHalf + 10) / Math.sin(Math.PI / outerCount))
+  const width = Math.max(560, Math.ceil((rx + maxHalf + 12) * 2))
+  const minRy = outerCount <= 2 ? 129 : (PILL_HEIGHT / 2 + 8) / Math.sin(Math.PI / outerCount)
+  const baseHeight = swarm.members.length > 6 ? 404 : 330
+  const height = Math.max(baseHeight, Math.ceil((Math.max(baseHeight / 2 - 36, minRy) + 36) * 2))
+  const ry = height / 2 - 36
   const positions = new Map(swarm.members.map(member => {
-    const label = member.name.length > 15 ? `${member.name.slice(0, 14)}…` : member.name
+    const label = member.name.length > 15 ? `${clipHead(member.name, 14)}…` : member.name
     const half = halfOf(member.name)
     const index = outerMembers.indexOf(member)
-    const angle = -Math.PI / 2 + (2 * Math.PI * index) / Math.max(1, outerMembers.length)
+    const angle = -Math.PI / 2 + (2 * Math.PI * index) / Math.max(1, outerCount)
     const isCenter = member === coordinator || (coordinator === undefined && swarm.members.length === 1)
-    let x = isCenter ? WIDTH / 2 : WIDTH / 2 + (WIDTH / 2 - 94) * Math.cos(angle)
-    const y = isCenter ? height / 2 : height / 2 + (height / 2 - 36) * Math.sin(angle)
+    let x = isCenter ? width / 2 : width / 2 + rx * Math.cos(angle)
+    const y = isCenter ? height / 2 : height / 2 + ry * Math.sin(angle)
     // A member level with the coordinator would sit against its side with no room for an arrow:
-    // it moves out to the frame's edge.
-    if (!isCenter && coordinator && Math.abs(y - height / 2) < PILL_HEIGHT + 18 && Math.abs(x - WIDTH / 2) - half - centerHalf < 64) {
-      x = x < WIDTH / 2 ? half + 6 : WIDTH - half - 6
+    // it moves outward toward the frame's edge, never inward.
+    if (!isCenter && coordinator && Math.abs(y - height / 2) < PILL_HEIGHT + 18 && Math.abs(x - width / 2) - half - centerHalf < 64) {
+      x = x < width / 2 ? Math.min(x, half + 10) : Math.max(x, width - half - 10)
     }
     return [member.name, { label, half, x, y }] as const
   }))
@@ -119,10 +128,10 @@ export function graphSvg(
   ]
   const drawn = new Set(edges.map(({ edge }) => edge))
 
-  const center = coordinator && positions.get(coordinator.name)
   const history: string[] = []
   const active: string[] = []
   const badges: string[] = []
+  const ripples: string[] = []
   for (const { edge, total, isDashed } of edges) {
     const [from = '', to = ''] = edge.split('>')
     if (from === to || !visible.has(from) || !visible.has(to)) continue
@@ -138,9 +147,7 @@ export function graphSvg(
     // Two members that address each other get a lens of two curves; a one-way line is nearly straight.
     const isMutual = drawn.has(`${to}>${from}`)
     const beside = isDashed && direct.has(edge) ? 20 : 0
-    const bow = (isMutual ? Math.max(16, Math.min(length * 0.16, 36)) : Math.min(length * 0.07, 14)) + beside
-    let cx = (a.x + b.x) / 2 - uy * bow
-    let cy = (a.y + b.y) / 2 + ux * bow
+    const baseBow = (isMutual ? Math.max(16, Math.min(length * 0.16, 36)) : Math.min(length * 0.07, 14)) + beside
     // Where a line from a pill's center towards (tx, ty) leaves the pill, a little clear of its border.
     const leave = (p: { x: number; y: number; half: number }, tx: number, ty: number, gap: number) => {
       const span = Math.hypot(tx - p.x, ty - p.y) || 1
@@ -149,24 +156,46 @@ export function graphSvg(
       const reach = Math.min(p.half / Math.abs(vx || 1e-9), (PILL_HEIGHT / 2) / Math.abs(vy || 1e-9)) + gap
       return [p.x + vx * reach, p.y + vy * reach] as const
     }
-    let [x1, y1] = leave(a, cx, cy, 3)
-    let [x2, y2] = leave(b, cx, cy, 4)
-    if (center && from !== coordinator?.name && to !== coordinator?.name) {
-      // Route peer-to-peer messages around the coordinator so packets stay visible.
-      const crossesCenter = (controlX: number, controlY: number, sx: number, sy: number, ex: number, ey: number) =>
-        Array.from({ length: 19 }, (_, index) => (index + 1) / 20).some(t => {
-          const x = (1 - t) ** 2 * sx + 2 * (1 - t) * t * controlX + t ** 2 * ex
-          const y = (1 - t) ** 2 * sy + 2 * (1 - t) * t * controlY + t ** 2 * ey
-          return Math.abs(x - center.x) < center.half + 8 && Math.abs(y - center.y) < PILL_HEIGHT / 2 + 8
-        })
-      for (const offset of [bow, -bow, 90, -90, 150, -150, 220, -220]) {
-        const candidateX = Math.max(8, Math.min(WIDTH - 8, (a.x + b.x) / 2 - uy * offset))
-        const candidateY = Math.max(8, Math.min(height - 8, (a.y + b.y) / 2 + ux * offset))
-        const [sx, sy] = leave(a, candidateX, candidateY, 3)
-        const [ex, ey] = leave(b, candidateX, candidateY, 4)
-        if (!crossesCenter(candidateX, candidateY, sx, sy, ex, ey)) {
-          cx = candidateX
-          cy = candidateY
+    // Apply border-to-border chord midpoints & proportional bow clamp so control points never enter a pill's box.
+    const chordBow = (offset: number) => {
+      const c0x = (a.x + b.x) / 2 - uy * offset
+      const c0y = (a.y + b.y) / 2 + ux * offset
+      const [sx, sy] = leave(a, c0x, c0y, 3)
+      const [ex, ey] = leave(b, c0x, c0y, 4)
+      const cdx = ex - sx
+      const cdy = ey - sy
+      const clen = Math.hypot(cdx, cdy) || 1
+      const cux = cdx / clen
+      const cuy = cdy / clen
+      const clamped = Math.sign(offset) * Math.min(Math.abs(offset), clen * 0.35)
+      return [(sx + ex) / 2 - cuy * clamped, (sy + ey) / 2 + cux * clamped, sx, sy, ex, ey] as const
+    }
+    let [cx, cy, x1, y1, x2, y2] = chordBow(baseBow)
+    const obstacles = members.filter(m => m.name !== from && m.name !== to).map(m => positions.get(m.name)!).filter(Boolean)
+    const crossesAny = (controlX: number, controlY: number, sx: number, sy: number, ex: number, ey: number) =>
+      Array.from({ length: 19 }, (_, index) => (index + 1) / 20).some(t => {
+        const x = (1 - t) ** 2 * sx + 2 * (1 - t) * t * controlX + t ** 2 * ex
+        const y = (1 - t) ** 2 * sy + 2 * (1 - t) * t * controlY + t ** 2 * ey
+        return obstacles.some(o => Math.abs(x - o.x) < o.half + 8 && Math.abs(y - o.y) < PILL_HEIGHT / 2 + 8)
+      })
+    if (obstacles.length > 0 && crossesAny(cx, cy, x1, y1, x2, y2)) {
+      // Route around non-endpoint pills while keeping solid and @all parallel edges separated.
+      for (const raw of [baseBow, -baseBow, 90, -90, 150, -150, 220, -220]) {
+        const isBow = raw === baseBow || raw === -baseBow
+        const [candX, candY, sx, sy, ex, ey] = isBow
+          ? chordBow(raw)
+          : (() => {
+              const offset = raw + Math.sign(raw) * beside
+              const kx = Math.max(8, Math.min(width - 8, (a.x + b.x) / 2 - uy * offset))
+              const ky = Math.max(8, Math.min(height - 8, (a.y + b.y) / 2 + ux * offset))
+              const [lsx, lsy] = leave(a, kx, ky, 3)
+              const [lex, ley] = leave(b, kx, ky, 4)
+              return [kx, ky, lsx, lsy, lex, ley] as const
+            })()
+        const forward = (ex - candX) * (b.x - ex) + (ey - candY) * (b.y - ey) > 0
+        if (forward && !crossesAny(candX, candY, sx, sy, ex, ey)) {
+          cx = candX
+          cy = candY
           x1 = sx; y1 = sy; x2 = ex; y2 = ey
           break
         }
@@ -176,7 +205,8 @@ export function graphSvg(
     const weight = weightOf(total)
     // The head is drawn by hand so it sits on the pill's border, turned the way the curve arrives, and the
     // line stops at its base instead of showing through its tip.
-    const head = (isCurrent ? 9 : 6.5) + weight * 1.3
+    const gap = Math.hypot(x2 - x1, y2 - y1)
+    const head = Math.min((isCurrent ? 9 : 6.5) + weight * 1.3, Math.max(4, gap * 0.45))
     const tangent = Math.hypot(x2 - cx, y2 - cy) || 1
     const tx = (x2 - cx) / tangent
     const ty = (y2 - cy) / tangent
@@ -184,24 +214,25 @@ export function graphSvg(
     const by = y2 - ty * head
     const wing = head * 0.46
     const tip = `M${n1(x2)} ${n1(y2)}L${n1(bx - ty * wing)} ${n1(by + tx * wing)}L${n1(bx + ty * wing)} ${n1(by - tx * wing)}z`
+    const dHistory = `M${n1(x1)} ${n1(y1)} Q${n1(cx)} ${n1(cy)} ${n1(bx)} ${n1(by)}`
     const d = `M${n1(x1)} ${n1(y1)} Q${n1(cx)} ${n1(cy)} ${n1(bx + tx)} ${n1(by + ty)}`
     const description = `<title>${esc(from)} to ${esc(to)} · ` +
       (isDashed ? `${total} via @all` : `${total} ${total === 1 ? 'mention' : 'mentions'}`) + '</title>'
     if (!isCurrent) {
       history.push(
-        `<path class="edge${isDashed ? ' via-all' : ''}" d="${d}" stroke-width="${n1(weight)}">${description}</path>` +
-        `<path class="tip" d="${tip}"/>`)
+        `<g class="history-edge"><path class="edge${isDashed ? ' via-all' : ''}" d="${dHistory}" stroke-width="${n1(weight)}">${description}</path>` +
+        `<path class="tip" d="${tip}"/></g>`)
       continue
     }
 
-    const draw = '<animate attributeName="stroke-dashoffset" from="100" to="0" dur="0.8s" calcMode="spline" keyTimes="0;1" keySplines=".22 .61 .36 1" fill="freeze"/>'
+    const draw = '<animate attributeName="stroke-dashoffset" from="102" to="0" dur="0.8s" calcMode="spline" keyTimes="0;1" keySplines=".22 .61 .36 1" fill="freeze"/>'
     active.push(`<path class="route-base" d="${d}" stroke-width="${n1(weight + 4)}">${description}</path>`)
     if (animate) active.push(`<path class="route reduced-route${isDashed ? ' via-all' : ''}" d="${d}" stroke-width="${n1(weight + 0.9)}">${description}</path>`)
     // A dashed line cannot also be drawn on by its dashes, so it fades in instead.
     active.push(isDashed
       ? `<path class="route via-all${animate ? ' motion' : ''}" d="${d}" stroke-width="${n1(weight + 0.9)}"${animate ? ' opacity="0"' : ''}>${description}` +
-        (animate ? '<animate attributeName="opacity" from="0" to="1" dur="0.5s" fill="freeze"/>' : '') + '</path>'
-      : `<path class="route${animate ? ' motion-route' : ''}" d="${d}" pathLength="100" stroke-width="${n1(weight + 0.9)}"${animate ? ' stroke-dashoffset="100"' : ''}>${description}` +
+        (animate ? '<animate attributeName="opacity" from="0" to="1" dur="0.65s" calcMode="spline" keyTimes="0;1" keySplines=".22 .61 .36 1" fill="freeze"/>' : '') + '</path>'
+      : `<path class="route${animate ? ' motion-route' : ''}" d="${d}" pathLength="100" stroke-width="${n1(weight + 0.9)}"${animate ? ' stroke-dashoffset="102"' : ''}>${description}` +
         (animate ? draw : '') + '</path>')
     // The head lands when the line reaches it, not before.
     active.push(animate
@@ -225,13 +256,16 @@ export function graphSvg(
     }
     if (total > 1 && (current?.to.length ?? 0) <= 3) {
       // On a short line the count would cover it, so it stands beside the line instead.
-      const short = Math.hypot(x2 - x1, y2 - y1) < 64
-      const side = Math.hypot(cx - (x1 + x2) / 2, cy - (y1 + y2) / 2) > 1 ? 1 : -1
+      const short = gap < 64
+      const mx = (x1 + x2) / 2
+      const my = (y1 + y2) / 2
+      const side = (-(cx - mx) * uy + (cy - my) * ux) < 0 ? -1 : 1
       const x = (x1 + 2 * cx + x2) / 4 + (short ? -uy * 15 * side : 0)
       const y = (y1 + 2 * cy + y2) / 4 + (short ? ux * 15 * side : 0)
+      const bw = Math.max(20, 10 + String(total).length * 7)
       badges.push(
         `<g transform="translate(${n1(x)} ${n1(y)})">` +
-        `<circle class="badge" r="10"/><text class="count" y="0" dy=".35em">${total}</text></g>`,
+        `<rect class="badge" x="${n1(-bw / 2)}" y="-10" width="${n1(bw)}" height="20" rx="10"/><text class="count" y="0" dy=".35em">${total}</text></g>`,
       )
     }
   }
@@ -257,74 +291,92 @@ export function graphSvg(
     const arrival = moving && (recipient || (sender && current?.to.length === 0))
       ? `<rect class="motion arrival" ${rect} opacity="0">${pulse(recipient ? 760 : 0)}</rect>`
       : ''
-    // An @all post is not drawn as a line to everyone unless asked: rings leave its sender instead.
-    const ripple = moving && sender && isCurrentBroadcast && !expandAll
-      ? [0, 0.28].map(delay =>
-        `<circle class="motion ripple" r="24" opacity="0">` +
-        (repeat
-          ? `<animate attributeName="r" values="24;150;150" keyTimes="0;.3;1" begin="${Math.round(delay * 1000) - phase}ms" dur="3.6s" repeatCount="indefinite"/>` +
-            `<animate attributeName="opacity" values=".5;0;0" keyTimes="0;.3;1" begin="${Math.round(delay * 1000) - phase}ms" dur="3.6s" repeatCount="indefinite"/>`
-          : `<animate attributeName="r" from="24" to="150" begin="${delay}s" dur="1.1s" calcMode="spline" keyTimes="0;1" keySplines=".22 .61 .36 1"/>` +
-            `<animate attributeName="opacity" from=".5" to="0" begin="${delay}s" dur="1.1s"/>`) +
-        '</circle>').join('')
-      : ''
+    if (moving && sender && isCurrentBroadcast && !expandAll) {
+      ripples.push(
+        `<g transform="translate(${p.x.toFixed(1)} ${p.y.toFixed(1)})">` +
+        [0, 0.22].map(delay =>
+          `<circle class="motion ripple" r="24" opacity="0">` +
+          (repeat
+            ? `<animate attributeName="r" values="24;150;150" keyTimes="0;.3;1" calcMode="spline" keySplines=".22 .61 .36 1;0 0 1 1" begin="${Math.round(delay * 1000) - phase}ms" dur="3.6s" repeatCount="indefinite"/>` +
+              `<animate attributeName="opacity" values=".5;0;0" keyTimes="0;.3;1" begin="${Math.round(delay * 1000) - phase}ms" dur="3.6s" repeatCount="indefinite"/>`
+            : `<animate attributeName="r" from="24" to="150" begin="${delay}s" dur="0.9s" calcMode="spline" keyTimes="0;1" keySplines=".22 .61 .36 1"/>` +
+              `<animate attributeName="opacity" from=".5" to="0" begin="${delay}s" dur="0.9s"/>`) +
+          '</circle>').join('') +
+        '</g>',
+      )
+    }
+    const cw = Math.max(44, 30 + String(sent).length * 6.5)
     const chip = sent > 0
-      ? `<g class="chip${sender && isCurrentBroadcast ? ' on' : ''}" transform="translate(${n1(p.half - 20)} ${-PILL_HEIGHT / 2})">` +
-        `<rect x="-23" y="-8" width="46" height="16" rx="8"/><text dy=".35em">@all ${sent}</text></g>`
+      ? `<g class="chip${sender && isCurrentBroadcast ? ' on' : ''}" transform="translate(${n1(p.half - cw / 2 - 4)} ${-PILL_HEIGHT / 2})">` +
+        `<rect x="${n1(-cw / 2)}" y="-8" width="${n1(cw)}" height="16" rx="8"/><text dy=".35em">@all ${sent}</text></g>`
       : ''
+    const px = -p.half + 14
+    const skey = statusKey(status)
+    const scls = esc(status.replace(/\s+/g, '-'))
+    const dot = !live ? ''
+      : skey === 'working' ? `<circle class="presence working" cx="${px}" r="3.7"/>`
+      : skey === 'waiting' ? `<circle class="presence-ring waiting" cx="${px}" r="3.1"/><circle class="presence waiting" cx="${px}" r="1.4"/>`
+      : skey === 'coordinating' ? `<path class="presence coordinating" d="M${px} -4L${px + 4} 0 ${px} 4 ${px - 4} 0z"/>`
+      : skey === 'failed' ? `<path class="presence-x ${scls}" d="M${px - 2.6} -2.6L${px + 2.6} 2.6M${px + 2.6} -2.6L${px - 2.6} 2.6"/>`
+      : `<circle class="presence ${scls}" cx="${px}" r="3.1"/>`
     return (
-      `<g transform="translate(${p.x.toFixed(1)} ${p.y.toFixed(1)})"${status === 'killed' ? ' opacity=".5"' : ''}>` +
-      `<title>${esc(title)}</title>` + ripple + `<rect class="pill${emphasis}${silent > 0 ? ' quiet' : ''}" ${rect}/>` +
-      arrival +
-      (live ? `<circle class="presence ${esc(status.replace(/\s+/g, '-'))}" cx="${-p.half + 14}" r="3.7"/>` : '') +
+      `<g transform="translate(${p.x.toFixed(1)} ${p.y.toFixed(1)})"${status === 'killed' ? ' class="killed"' : ''}>` +
+      `<title>${esc(title)}</title><rect class="pill${emphasis}${silent > 0 ? ' quiet' : ''}" ${rect}/>` +
+      arrival + dot +
       `<text class="name" x="${live ? 7 : 0}" dy=".35em">${esc(p.label)}</text>` + chip + '</g>'
     )
   })
 
   // The key under the diagram is drawn with the diagram's own classes, so it cannot say one thing and the lines another.
   const row = height + 16
+  const lcw = Math.max(44, 30 + String(allPosts).length * 6.5)
   const legend =
-    `<g class="legend"><path class="edge" d="M16 ${row}H40" stroke-width="2.4"/><path class="tip" d="M48 ${row}l-9 -4.2v8.4z"/>` +
+    `<g class="legend"><g opacity=".72"><path class="edge" d="M16 ${row}H40" stroke-width="2.4"/><path class="tip" d="M48 ${row}l-9 -4.2v8.4z"/></g>` +
     `<text x="56" y="${row}" dy=".35em">@mention, width = count</text>` +
-    `<path class="edge via-all" d="M224 ${row}H248" stroke-width="1.6"/><path class="tip" d="M256 ${row}l-9 -4.2v8.4z"/>` +
+    `<g opacity=".72"><path class="edge via-all" d="M224 ${row}H248" stroke-width="1.6"/><path class="tip" d="M256 ${row}l-9 -4.2v8.4z"/></g>` +
     `<text x="264" y="${row}" dy=".35em">via @all</text>` +
     `<rect class="pill quiet" x="336" y="${row - 7}" width="26" height="14" rx="6"/>` +
     `<text x="370" y="${row}" dy=".35em">posted with no mention</text>` +
-    `<g class="chip" transform="translate(39 ${row + 22})"><rect x="-23" y="-8" width="46" height="16" rx="8"/><text dy=".35em">@all ${allPosts}</text></g>` +
-    `<text x="70" y="${row + 22}" dy=".35em">${allPosts === 0 ? 'no @all posts yet' : expandAll ? '@all posts, drawn as dashed arrows' : '@all posts, drawn by Expand @all'}</text></g>`
+    `<g class="chip" transform="translate(${n1(16 + lcw / 2)} ${row + 22})"><rect x="${n1(-lcw / 2)}" y="-8" width="${n1(lcw)}" height="16" rx="8"/><text dy=".35em">@all ${allPosts}</text></g>` +
+    `<text x="${n1(16 + lcw + 8)}" y="${row + 22}" dy=".35em">${allPosts === 0 ? 'no @all posts yet' : expandAll ? '@all posts, drawn as dashed arrows' : '@all posts, drawn by Expand @all'}</text></g>`
 
   return (
-    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${WIDTH} ${height + LEGEND}" width="100%" height="100%" font-family="system-ui, sans-serif">` +
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height + LEGEND}" width="100%" height="100%" font-family="system-ui, sans-serif">` +
+    `<defs><clipPath id="stage"><rect width="${width}" height="${height}"/></clipPath></defs>` +
     `<style>
-      svg{--edge:#596375;--pill:#f8f8f7;--border:#a1a9b5;--ink:#252628;--accent:#235fc4;--tint:#eaf2ff;--packet:#fff}
-      @media (prefers-color-scheme: dark){svg{--edge:#9399a5;--pill:#242424;--border:#666b73;--ink:#f1f1ef;--accent:#8fb8ff;--tint:#243750;--packet:#fff}}
+      svg{--edge:#596375;--pill:#f8f8f7;--border:#87909d;--ink:#252628;--accent:#235fc4;--tint:#eaf2ff;--packet:#fff}
+      @media (prefers-color-scheme: dark){svg{--edge:#9399a5;--pill:#242424;--border:#737982;--ink:#f1f1ef;--accent:#8fb8ff;--tint:#243750;--packet:#fff}}
       @supports(color:color(display-p3 1 0 0)){
-        svg{--edge:color(display-p3 .35 .39 .46);--pill:color(display-p3 .97 .97 .965);--border:color(display-p3 .63 .66 .70);--ink:color(display-p3 .15 .15 .16);--accent:color(display-p3 .18 .37 .79);--tint:color(display-p3 .92 .95 1);--packet:color(display-p3 1 1 1)}
-        @media(prefers-color-scheme:dark){svg{--edge:color(display-p3 .58 .60 .64);--pill:color(display-p3 .14 .14 .14);--border:color(display-p3 .40 .42 .45);--ink:color(display-p3 .95 .95 .94);--accent:color(display-p3 .57 .73 1);--tint:color(display-p3 .15 .22 .31)}}
+        svg{--edge:color(display-p3 .35 .39 .46);--pill:color(display-p3 .97 .97 .965);--border:color(display-p3 .53 .56 .61);--ink:color(display-p3 .15 .15 .16);--accent:color(display-p3 .2033 .3675 .7427);--tint:color(display-p3 .92 .95 1);--packet:color(display-p3 1 1 1)}
+        @media(prefers-color-scheme:dark){svg{--edge:color(display-p3 .58 .60 .64);--pill:color(display-p3 .14 .14 .14);--border:color(display-p3 .45 .47 .51);--ink:color(display-p3 .95 .95 .94);--accent:color(display-p3 .5935 .7170 .9777);--tint:color(display-p3 .15 .22 .31)}}
       }
       .edge,.route,.route-base{fill:none;stroke-linecap:round}
-      .edge{stroke:var(--edge);opacity:.5}.tip{fill:var(--edge);opacity:.72}
+      .history-edge{opacity:.72}.edge{stroke:var(--edge)}.tip{fill:var(--edge)}
       .via-all{stroke-dasharray:6 5;stroke-linecap:butt}
       .route-base{stroke:var(--accent);opacity:.13}
-      .route{stroke:var(--accent)}.motion-route{stroke-dasharray:100 100}.tip-current{fill:var(--accent)}
+      .route{stroke:var(--accent)}.motion-route{stroke-dasharray:102 102}.tip-current{fill:var(--accent)}
       .packet-halo{fill:var(--accent)}.packet{fill:var(--packet);stroke:var(--accent);stroke-width:1.5}
       .pill{fill:var(--pill);stroke:var(--border)}.sender{fill:var(--tint);stroke:var(--accent);stroke-width:1.8}.recipient{stroke:var(--accent);stroke-width:1.5}
-      .quiet{stroke-dasharray:5 4}
+      .quiet{stroke-dasharray:5 4}.killed .pill{stroke-dasharray:2 3}.killed .name{opacity:.68;text-decoration:line-through}
       .arrival,.ripple{fill:none;stroke:var(--accent)}.arrival{stroke-width:4}.ripple{stroke-width:2}
-      .name,.count{fill:var(--ink);text-anchor:middle;font-weight:600}.name{font-size:16px}.count{font-size:12px}
+      .name,.count{fill:var(--ink);text-anchor:middle;font-weight:600}.name{font-size:14px}.count{font-size:12px}
       .badge{fill:var(--tint);stroke:var(--accent)}
       .chip rect{fill:var(--pill);stroke:var(--border)}.chip text{fill:var(--ink);opacity:.82;font-size:10.5px;font-weight:600;text-anchor:middle}
       .chip.on rect{fill:var(--tint);stroke:var(--accent)}
-      .legend>text{fill:var(--ink);opacity:.62;font-size:12px}
-      .presence{fill:none;stroke:var(--edge);stroke-width:1.3}
+      .legend>text{fill:var(--ink);opacity:.72;font-size:12px}
       ${statusCss}
-      .presence{stroke:var(--status-inactive)}
-      ${['working', 'coordinating', 'waiting','failed','unreachable'].map(status => `.presence.${status}{fill:var(--status-${status === 'unreachable' ? 'failed' : status});stroke:none}`).join('')}
+      .presence{fill:none;stroke:var(--status-inactive);stroke-width:1.2}
+      .presence-ring{fill:none;stroke:var(--status-waiting);stroke-width:1.2}
+      .presence-x{fill:none;stroke:var(--status-failed);stroke-width:1.6;stroke-linecap:round}
+      ${['working', 'coordinating', 'waiting'].map(status => `.presence.${status}{fill:var(--status-${status});stroke:none}`).join('')}
       .reduced-route{display:none}
       @media (prefers-reduced-motion: reduce){.motion,.motion-route{display:none}.reduced-route{display:inline}}
     </style>
     ` +
-    history.join('') + active.join('') + badges.join('') + nodes.join('') + legend +
+    `<g clip-path="url(#stage)">${ripples.join('')}</g>` +
+    history.join('') + active.join('') + nodes.join('') + badges.join('') +
+    `<line x1="16" y1="${height}" x2="${width - 16}" y2="${height}" stroke="var(--border)" opacity=".35"/>` +
+    legend +
     '</svg>'
   )
 }

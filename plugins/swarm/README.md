@@ -34,7 +34,7 @@ In the pane:
 - **Open an agent.** A sender's name on a post, or **Open conversation** on the Members tab, shows that agent's own conversation: in the main view in the terminal, and inside the pane in Desktop, which has no main view to switch. **Posts** on a member, or a name under the graph, shows that member's feed.
 - **Collapse history** follows only the latest post; **Show history** restores earlier posts.
 - **Read the graph.** A solid arrow is a mention by name, and its width grows with the count. A post to `@all` is counted in a chip on its sender; **Expand @all** draws it as a dashed arrow to each member it reached. A dashed outline marks a member that posted with no mention. The key under the diagram repeats this.
-- **Steer the run.** **Pause run** and **Resume run** in the header, and the buttons on Attention items, run the board command themselves, so they cost no coordinator turn. They appear only for the open run this conversation drives. A pause from the pane reaches the coordinator at its next board command. Resuming, from the pane or the coordinator, posts to the members the pause stopped mid-work, so they are woken at once.
+- **Steer the run.** **Pause run** and **Resume run** in the header, and the buttons on Attention items, run the board command themselves, so they cost no coordinator turn. They appear only for the open run this conversation drives. A pause from the pane reaches the coordinator at its next board command. Resuming, from the pane or the coordinator, posts to the workers, consultants, and verifiers the pause stopped mid-work, so they are woken at once.
 - **Look at another run.** **‹ Prev run** and **Next run ›** step through the project's other runs, read-only; **Back to live run** returns. The live run keeps running behind it.
 
 More examples:
@@ -79,14 +79,14 @@ The pane's **Attention** tab, and `board.py attention` for the coordinator, list
 | Unreachable | Three wakes failed. The tab offers "Ask coordinator to recover" |
 | Stale | A worker or designer reported a change after the verifier's `VERIFIED` |
 | Rework | A worker failed verification twice in a row. A third failure pauses the run. The tab offers "Ask coordinator" |
-| Spend | One member has used more than half of the run's tokens, in a run of three or more members past 200,000 tokens |
+| Spend | One member has used more than half of the run's tokens, when three or more non-coordinator members have recorded usage, past 200,000 tokens |
 | Paused | The run is paused, with the reason. On a spent budget the tab offers "+500k & resume" |
 
 A closed run lists nothing.
 
 Every post command also prints `UNREAD: …` to a sender that owes a read, which works even where the hooks are not loaded. The pane shortens long posts for display only: `board.jsonl`, `read` and `show` always carry the full text.
 
-The **Members** tab says what each member is doing: working, waiting for a named member, waiting for an answer to a named post, reported ready, unreachable, or not started. To recover an unreachable member the coordinator runs `retry` once, then `replace <old> <new>`, which registers a successor with the old member's brief, dependencies and the numbers of its posts.
+The **Members** tab says what each member is doing: coordinating, working, waiting for a named member, waiting for an answer to a named post, reported ready, run paused, unreachable, failed, killed (Retired), or not started. To recover an unreachable member the coordinator runs `retry` once, then `replace <old> <new>`, which registers a successor with the old member's brief, dependencies and the numbers of its posts.
 
 ## Specialist and designer profiles
 
@@ -148,10 +148,11 @@ The `.swarm` folder ignores itself in git, unless it already holds a `.gitignore
 - Failed wake attempts retry after a short lease, up to three attempts per pending sequence. A process crash after Claude queues a message and before the board records the acknowledgement can repeat the nudge. Workers use their board read cursor to avoid rereading delivered posts.
 - Claude may leave native teammates stopped after resuming a conversation. The coordinator uses board history to replace unreachable members.
 - Verification hashes tracked and non-ignored untracked source files before and after checks, and checks the same snapshot at acceptance. Keep generated files ignored or outside the source tree. Failed integration checkouts can be retained for diagnosis.
+- An isolated candidate is built on the checkout's HEAD unless `prepare` is given `--base <ref>`. A candidate built on another ref is verified but not accepted into the checkout: its commits go out from the members' branches, as pull requests for instance. `prepare` names a member that did not branch from the base.
 - A checked-out submodule counts as its recorded commit while it is clean and sits on that commit. Checks in an isolated candidate run without submodule contents, and a candidate that moves a submodule pointer cannot be accepted: land that change by hand.
 - Integration checkouts and old runs pile up under `.swarm`. `python3 <plugin>/skills/swarm/scripts/board.py <project>/.swarm prune [--days=N] [--dry-run]` removes the integration checkouts no candidate needs and moves closed runs idle for N days (14 by default) to `.swarm/archive`. It never touches an open run, a member's own checkout or a branch.
 - A member's model cannot be changed while it lives. The coordinator replaces the member instead.
-- The Attention tab's "Question" items are a heuristic: a post with a question mark that its recipient has not answered. A reply that cites a question's number (`re #12`) answers that question only; any other reply to the asker answers every earlier question from it, related or not; a BRIEF, READY, REVISE, FINDING, VERIFIED, NOT PASSED, NOT VERIFIED or SHUTDOWN answers none. A question in a code sample can show up there.
+- The Attention tab's "Question" items are a heuristic: a post with a question mark that its recipient has not answered. A reply that cites a question's number (`re #12`) answers that question only; any other reply to the asker answers every earlier question from it, related or not; a BRIEF, READY, REVISE, FINDING, VERIFIED, NOT PASSED, NOT VERIFIED or SHUTDOWN answers none. An unquoted question mark (such as a ternary outside backticks) can show up there.
 - Limits are enforced on `swarm:` members. One-shot helpers and a `general-purpose` stand-in are kept inside them by the coordinator's instructions only.
 - The six role skills are hidden from the `/` menu, but their descriptions, one short line each, are listed to the model in every session where the plugin is enabled. A role skill cannot be hidden from that list: Claude Code only preloads into an agent a skill the model may invoke. The coordinator's guides, the designer's Apple rules and the verifier's design method are plain reference files for that reason, and cost nothing until read.
 - In native Agent Teams mode Claude skips role-skill preload and applies the agent definition's instructions. A native designer reads its role skill as a file. In-process tests on Claude Code 2.1.325 covered registration, reading briefs, and waking an investigator, worker, and verifier. Split-pane mode and native teammate recovery after restart still need acceptance tests.

@@ -3,11 +3,11 @@ import { atom, read, update } from 'claude-code'
 import type { AgentInfo, EngineInterface, ModelUsage, Register, SessionMessage, Timer } from 'claude-code'
 
 import type { Member, Post, Swarm, Tab } from '../types'
-import { BOARD_CALL, COORDINATOR_READ, RUN, runsNamed, wakeMessage, wakeSequence } from './command'
-import { DEFAULT_EFFORT, DEFAULT_MODEL, SPECIALISTS, SWARM_AGENTS, familyOf, latestOf } from './models'
-import { KEPT, budgetOf, memberNamed, parse, parsePosts, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
-import { CLIP, bodyOf, clean, clip, compact, head, kindOf, openedText } from './text'
-import { statusInk, statusCss, statusDot } from './palette'
+import { COORDINATOR_READ, RUN, boardCalls, runsNamed, wakeMessage, wakeSequence } from './command'
+import { DEFAULT_EFFORT, DEFAULT_MODEL, LATEST, SPECIALISTS, SWARM_AGENTS, familyOf, latestOf } from './models'
+import { KEPT, budgetOf, findAgent, memberNamed, parse, parsePosts, targets, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
+import { CLIP, bodyOf, clean, clip, compact, head, kindOf, openedText, stripKind } from './text'
+import { statusInk, statusDot } from './palette'
 import { hiveArt, toolMood, toolSummary, type Mood } from './hive'
 import { edgesOf, graphHeight, graphSvg, isBroadcast, pairOf } from './graph'
 
@@ -17,19 +17,67 @@ const DEPLOYED = /^Swarm deployed\.(?:\s|$)/m
 const EMPTY: Swarm = { title: '', dir: '', isClosed: false, posts: [], members: [], attention: [], budget: 0, tokens: {} }
 const BOARD_TOOL = 'mcp__swarm__board'
 const counted = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`
+const postTime = (post: Post) => post.time.length >= 16 ? post.time.slice(11, 16) : ''
+
+// Adds Markdown hard-break trailing spaces only outside fenced code blocks, on non-blank lines, and not on GFM table rows.
+function formatMarkdown(text: string): string {
+  const lines = text.split('\n')
+  let fence: '`' | '~' | null = null
+  let fenceLen = 0
+  return lines.map((line, idx) => {
+    const trimmed = line.trimStart()
+    const m = /^(`{3,}|~{3,})/.exec(trimmed)
+    if (m) {
+      const ch = m[1]![0] as '`' | '~'
+      const len = m[1]!.length
+      if (fence === null) {
+        fence = ch
+        fenceLen = len
+      } else if (fence === ch && len >= fenceLen && trimmed.slice(len).trim() === '') {
+        fence = null
+        fenceLen = 0
+      }
+      return line
+    }
+    if (fence !== null || idx === lines.length - 1) return line
+    if (line.trim() === '' || trimmed.startsWith('|')) return line
+    return line.endsWith('  ') ? line : `${line}  `
+  }).join('\n')
+}
+
+function visualWidth(text: string): number {
+  let w = 0
+  for (const ch of text) {
+    const cp = ch.codePointAt(0)!
+    w += (cp >= 0x1100 && (
+      cp <= 0x115f || cp === 0x2329 || cp === 0x232a ||
+      (cp >= 0x2e80 && cp <= 0xa4cf && cp !== 0x303f) ||
+      (cp >= 0xac00 && cp <= 0xd7a3) ||
+      (cp >= 0xf900 && cp <= 0xfaff) ||
+      (cp >= 0xfe10 && cp <= 0xfe19) ||
+      (cp >= 0xfe30 && cp <= 0xfe6f) ||
+      (cp >= 0xff00 && cp <= 0xff60) ||
+      (cp >= 0xffe0 && cp <= 0xffe6) ||
+      cp >= 0x1f300
+    )) ? 2 : 1
+  }
+  return w
+}
+const estimateRows = (text: string, columns: number) =>
+  text.split('\n').reduce((sum, line) => sum + Math.max(1, Math.ceil(visualWidth(line) / columns)), 0)
 const TABS: Tab[] = ['board', 'attention', 'members', 'graph']
 const REPLAY_FRAME_MS = 1200
 const liveIndicator = (elapsed: number) => `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
   <style>
-    ${statusCss}circle{fill:var(--status-working)}
+    svg{--status-working:#349962}
+    @media(prefers-color-scheme:dark){svg{--status-working:#4cc480}}
+    @supports(color:color(display-p3 1 0 0)){svg{--status-working:color(display-p3 .3224 .5918 .4028)}@media(prefers-color-scheme:dark){svg{--status-working:color(display-p3 .4333 .7586 .5248)}}}
+    circle{fill:var(--status-working)}
+    .breath{transform-box:fill-box;transform-origin:center;animation:breath 4s cubic-bezier(.42,0,.58,1) -${elapsed % 4000}ms infinite}
+    @keyframes breath{0%,100%{transform:scale(1);opacity:.3}50%{transform:scale(2);opacity:.06}}
     @media (prefers-reduced-motion: reduce){.breath{display:none}}
   </style>
-  <circle class="breath" cx="8" cy="8" r="4" opacity=".2">
-    <animate attributeName="r" values="3.5;7;3.5" dur="4s" begin="-${elapsed % 4000}ms" repeatCount="indefinite"
-      calcMode="spline" keyTimes="0;.5;1" keySplines=".42 0 .58 1;.42 0 .58 1"/>
-    <animate attributeName="opacity" values=".3;.06;.3" dur="4s" begin="-${elapsed % 4000}ms" repeatCount="indefinite"
-      calcMode="spline" keyTimes="0;.5;1" keySplines=".42 0 .58 1;.42 0 .58 1"/>
-  </circle>
+  <circle class="breath" cx="8" cy="8" r="3.5"/>
   <circle cx="8" cy="8" r="3.5"/>
 </svg>`
 
@@ -60,13 +108,15 @@ const query = atom({ plugin: 'swarm', key: 'query' } as const, '')
 let browsed: Swarm | undefined
 const shownSwarm = async ($: EngineInterface) => browsed ?? await read($, swarm)
 
-// One theme colour per member, by its place on the roster.
-const HUES = ['claude', 'suggestion', 'success', 'warning', 'planMode', 'ide', 'merged', 'permission'] as const
+// One theme colour per member, by its place on the roster (never colliding with status hues).
+const HUES = ['claude', 'suggestion', 'planMode', 'ide', 'merged', 'permission', 'remember', 'autoAccept'] as const
 
 let player: Timer | undefined
 let livePlayer: Timer | undefined
+let playGen = 0
 
 function stop($: EngineInterface): Promise<unknown> {
+  playGen++
   player?.cancel()
   player = undefined
   return update($, isPlaying, () => false)
@@ -84,15 +134,19 @@ function scheduleLiveFrame($: EngineInterface): void {
   livePlayer = timer
 
   async function advance() {
-    const [{ posts }, current] = await Promise.all([read($, swarm), read($, livePulse)])
-    if (livePlayer !== timer) return
-    const next = posts.find(post => post.seq > current)
-    if (next === undefined) {
-      await stopLive($)
-      return
+    try {
+      const [{ posts }, current] = await Promise.all([read($, swarm), read($, livePulse)])
+      if (livePlayer !== timer) return
+      const next = posts.find(post => post.seq > current)
+      if (next === undefined) {
+        await stopLive($)
+        return
+      }
+      await update($, livePulse, () => next.seq)
+      if (livePlayer === timer) scheduleLiveFrame($)
+    } catch {
+      // Ignore transient read/update failures during teardown.
     }
-    await update($, livePulse, () => next.seq)
-    if (livePlayer === timer) scheduleLiveFrame($)
   }
 }
 
@@ -107,15 +161,19 @@ function scheduleFrame($: EngineInterface): void {
   player = timer
 
   async function advance() {
-    const [{ posts }, selected] = await Promise.all([shownSwarm($), read($, replay)])
-    if (player !== timer) return
-    const next = posts.find(post => post.seq > selected)
-    if (next === undefined) {
-      await stop($)
-      return
+    try {
+      const [{ posts }, selected] = await Promise.all([shownSwarm($), read($, replay)])
+      if (player !== timer) return
+      const next = posts.find(post => post.seq > selected)
+      if (next === undefined) {
+        await stop($)
+        return
+      }
+      await update($, replay, () => next.seq)
+      if (player === timer) scheduleFrame($)
+    } catch {
+      // Ignore transient read/update failures during teardown.
     }
-    await update($, replay, () => next.seq)
-    if (player === timer) scheduleFrame($)
   }
 }
 
@@ -135,13 +193,18 @@ async function play($: EngineInterface): Promise<void> {
   }
 }
 async function startPlay($: EngineInterface): Promise<void> {
+  const gen = ++playGen
   const [{ posts }, selected] = await Promise.all([shownSwarm($), read($, replay)])
+  if (gen !== playGen || isEnding) return
   const first = posts[0]?.seq
   const last = posts.at(-1)?.seq
   if (first === undefined || first === last) return
   await stopLive($)
+  if (gen !== playGen || isEnding) return
   await update($, replay, () => selected === 0 || selected === last ? first : Math.max(first, selected))
+  if (gen !== playGen || isEnding) return
   await update($, isPlaying, () => true)
+  if (gen !== playGen || isEnding) return
   scheduleFrame($)
 }
 
@@ -149,6 +212,8 @@ const QUIET_MS = 30_000
 const WAKE_ATTEMPTS = 3
 let seen = ''
 let seenBoard = ''
+let seenRoster = ''
+let boardStat: { dir: string; size: number; mtimeMs: number; content: string } | undefined
 let snapshot: Swarm | undefined
 let attentionRetry = 0
 let noticeFailures = 0
@@ -161,8 +226,11 @@ let isRefreshOwed = false
 let isRestoreOwed = false
 // True while a session.end runs, and from an exit on: a poll in between would read the session that is ending.
 let isEnding = false
+let isPaneOpen = false
 let poller: Timer | undefined
 let generation = 0
+let sessionEpoch = 0
+let browseGen = 0
 const agentRuns = new Map<string, string>()
 // Agents looked up and found to be no member of a run: asked once, not on every model step and tool call.
 const strangers = new Set<string>()
@@ -177,7 +245,7 @@ const stepped = new Map<string, { steps: Set<number>; sum: Spent; landing: Promi
 const TURNS_KEPT = 256
 // Charged against the budget as they are billed: fresh tokens whole, cached reads at a tenth.
 const weigh = (spent: Spent | undefined) => spent === undefined ? 0
-  : spent.input_tokens + spent.cache_creation_input_tokens + spent.output_tokens + Math.round(spent.cache_read_input_tokens * 0.1)
+  : (spent.input_tokens || 0) + (spent.cache_creation_input_tokens || 0) + (spent.output_tokens || 0) + Math.round((spent.cache_read_input_tokens || 0) * 0.1)
 /** What this report adds to the turn's charge: a step's own usage, or at the turn's end what its steps left out. */
 function charge(turnId: string, spent: Spent, index?: number): number {
   const turn: NonNullable<ReturnType<typeof stepped.get>> = stepped.get(turnId) ??
@@ -218,7 +286,19 @@ const TEAMMATES = 'teammates'
 function learnTeammate($: EngineInterface, id: string, address: string): void {
   if (teammates.get(id) === address) return
   teammates.set(id, address)
-  void $.store.set(TEAMMATES, Object.fromEntries([...teammates].slice(-200))).catch(() => undefined)
+  while (teammates.size > 200) {
+    const oldest = teammates.keys().next().value
+    if (oldest === undefined) break
+    teammates.delete(oldest)
+  }
+  void $.store.get(TEAMMATES).then(existing => {
+    const merged = {
+      ...(existing && typeof existing === 'object' ? existing as Record<string, string> : {}),
+      ...Object.fromEntries(teammates),
+    }
+    const entries = Object.entries(merged).slice(-200)
+    return $.store.set(TEAMMATES, Object.fromEntries(entries))
+  }).catch(() => undefined)
 }
 function teammateOf($: EngineInterface, id: string, agent?: AgentInfo): string | undefined {
   if (agent?.teammateId) learnTeammate($, id, agent.teammateId)
@@ -238,6 +318,10 @@ let opened = ''
 const NONE = { count: 0, first: 0, last: 0, since: 0 }
 const MENTION_GRACE_MS = 10_000
 let owed = NONE
+// A conversation this long is worth a word before a run starts in it: about half of what the coordinator's last run averaged.
+const LONG_CONVERSATION = 120_000
+// Posts the coordinator has opened with `show`: the board still counts them unread, but it is not told of them again.
+const shownPosts = { through: 0, posts: new Set<number>() }
 let hinted = 0
 let prompted = 0
 // A pause of the owned run that nobody was told about (the board pauses by itself when a member keeps failing
@@ -246,6 +330,7 @@ let prompted = 0
 // `pausing` while their command runs, `pauseQuiet` until a poll that began after it has looked.
 let pauseSeen: string | undefined  // undefined until the first look at a run: the pause it starts with is not news
 let pauseOwed = ''
+let budgetPauseNotifiedFor = ''
 let pausing = 0
 let pauseQuiet = 0
 let polls = 1
@@ -255,7 +340,7 @@ const pauseNotice = (title: string, reason: string) =>
 // A submitted notice is held until the turn it starts: a poll before that turn.start would submit a second beside it.
 const NOTICE_HOLD_MS = 10_000
 let noticeHold = 0
-type SpecialistWake = { name: string; id: string; seq: number; attempts: number; native: boolean }
+type SpecialistWake = { name: string; id: string; seq: number; attempts: number; told: number; native: boolean }
 let specialistWakes: SpecialistWake[] = []
 // Specialists owed a mention with no agent address on the roster: named in a relay notice, never the cause of one.
 let unaddressed: { name: string; seq: number }[] = []
@@ -334,13 +419,17 @@ async function refreshTalk($: EngineInterface): Promise<void> {
 function resetMonitoring(): void {
   moods.clear()
   generation++
-  seen = seenBoard = activity = stalled = ''
+  seen = seenBoard = seenRoster = activity = stalled = ''
+  boardStat = undefined
   snapshot = undefined
   attentionRetry = noticeFailures = noticeRetry = 0
   owed = NONE
+  shownPosts.through = 0
+  shownPosts.posts.clear()
   hinted = prompted = noticeHold = pauseQuiet = 0
   pauseSeen = undefined
   pauseOwed = ''
+  budgetPauseNotifiedFor = ''
   halted = undefined
   unaddressed = []
   specialistWakes = []
@@ -358,13 +447,26 @@ function boardCommand($: EngineInterface, directory: string, args: string[], std
 // newest posts, so the pane, the wakes and the stall check keep working.
 // ponytail: posts older than the tail drop out of the pane and the graph; page through the file if that matters.
 async function readBoard($: EngineInterface, dir: string): Promise<string> {
-  try {
-    return await $.fs.read(`${dir}/board.jsonl`)
-  } catch (error) {
-    const tail = await boardCommand($, dir, ['tail'])
-    if (tail.exitCode !== 0 || tail.isStdoutTruncated) throw error
-    return tail.stdout
+  const stat = await $.fs.stat(`${dir}/board.jsonl`).catch(() => undefined)
+  if (stat && boardStat && boardStat.dir === dir && boardStat.size === stat.size && boardStat.mtimeMs === stat.mtimeMs) {
+    return boardStat.content
   }
+  let content: string
+  if (stat && stat.size > 4_000_000) {
+    const tail = await boardCommand($, dir, ['tail'])
+    if (tail.exitCode !== 0 || tail.isStdoutTruncated) throw new Error('board tail failed')
+    content = tail.stdout
+  } else {
+    try {
+      content = await $.fs.read(`${dir}/board.jsonl`)
+    } catch (error) {
+      const tail = await boardCommand($, dir, ['tail'])
+      if (tail.exitCode !== 0 || tail.isStdoutTruncated) throw error
+      content = tail.stdout
+    }
+  }
+  if (stat) boardStat = { dir, size: stat.size, mtimeMs: stat.mtimeMs, content }
+  return content
 }
 
 async function reportOf($: EngineInterface, dir: string): Promise<Report | undefined> {
@@ -414,10 +516,37 @@ function openBoard($: EngineInterface) {
   return $.ui.open({ id: PANE, title: TITLE })
 }
 
+function normalizePath(p: string): string {
+  const isAbs = p.startsWith('/')
+  const parts: string[] = []
+  for (const part of p.split('/')) {
+    if (!part || part === '.') continue
+    if (part === '..') {
+      if (parts.length > 0 && parts.at(-1) !== '..') parts.pop()
+      else if (!isAbs) parts.push('..')
+    } else {
+      parts.push(part)
+    }
+  }
+  return (isAbs ? '/' : '') + parts.join('/')
+}
+
+async function resolveRunDir($: EngineInterface, dir: string): Promise<string> {
+  const cleanDir = dir.replace(/\/+$/, '')
+  if (cleanDir.startsWith('/')) return normalizePath(cleanDir)
+  const cwd = await $.session.cwd()
+  return normalizePath(`${cwd}/${cleanDir}`)
+}
+
+const parseDescribedName = (desc: string | undefined) =>
+  /^\s*@([A-Za-z][A-Za-z0-9_-]*):/.exec(desc ?? '')?.[1]?.toLowerCase()
+
 // Binds the run this session saved, if any: at a start, and on the first poll after /clear or a resume.
 async function restore($: EngineInterface, cwd: string): Promise<void> {
+  const sEpoch = sessionEpoch
   try {
     const restored = await boardCommand($, `${cwd}/.swarm`, ['restore', await lookupKey($)])
+    if (sEpoch !== sessionEpoch || isEnding) return
     const dir = restored.stdout.trim()
     if (restored.exitCode === 0 && RUN.test(dir)) await own($, dir)
   } catch {
@@ -439,19 +568,29 @@ async function openRunHere($: EngineInterface): Promise<boolean> {
 
 // Makes `dir` this conversation's run and offers its pane in the chat.
 async function own($: EngineInterface, dir: string): Promise<void> {
-  if (await read($, run) !== dir) {
+  const sEpoch = sessionEpoch
+  const current = await read($, run)
+  if (sEpoch !== sessionEpoch || isEnding) return
+  if (current !== dir) {
     resetMonitoring()
     strangers.clear()
   }
   closedRun = ''
   await update($, run, () => dir)
+  if (sEpoch !== sessionEpoch || isEnding) return
   // A resumed conversation gets the row again, since placed rows are not saved; a closed run does not.
-  const isClosed = await $.fs.read(`${dir}/members.json`)
-    .then(text => (JSON.parse(text) as { closed?: boolean }).closed === true)
-    .catch(() => false)
+  const state = await $.fs.read(`${dir}/members.json`)
+    .then(text => JSON.parse(text) as { closed?: boolean; paused?: string } & BudgetState)
+    .catch(() => undefined)
+  if (sEpoch !== sessionEpoch || isEnding) return
+  const isClosed = state?.closed === true
+  const isSpent = state !== undefined && budgetOf(state) > 0 && tokensUsed(state.usage?.tokens) >= budgetOf(state)
+  halted = !isClosed && state && (state.paused || isSpent)
+    ? { dir, why: state.paused ? `paused (${state.paused})` : 'over its token budget' }
+    : undefined
   if (!isClosed) await $.ui.place({ id: openerOf(dir) }).catch(() => undefined)
   // The desktop app queues /swarm-board typed while the coordinator works, so a run opens its own pane once.
-  if (!isClosed && opened !== dir) {
+  if (!isClosed && opened !== dir && sEpoch === sessionEpoch && !isEnding) {
     opened = dir
     await openBoard($).catch(() => undefined)
   }
@@ -482,12 +621,16 @@ async function adopt($: EngineInterface, name: string | undefined, prompt = ''):
 
 async function bind($: EngineInterface, dir: string): Promise<boolean> {
   try {
-    const epoch = generation
-    const saved = await boardCommand($, dir, ['bind', await lookupKey($)])
+    const sEpoch = sessionEpoch
+    const canonical = await resolveRunDir($, dir)
+    const saved = await boardCommand($, canonical, ['bind', await lookupKey($)])
     if (saved.exitCode !== 0) return false
     // The session ended while the board answered (/clear): the run is the old conversation's, not this one's.
-    if (epoch !== generation) return false
-    await own($, dir)
+    if (sEpoch !== sessionEpoch || isEnding) return false
+    const out = saved.stdout.trim()
+    const boundDir = RUN.test(out) ? out : canonical
+    if (await read($, run) === boundDir) return true
+    await own($, boundDir)
     return true
   } catch {
     return false
@@ -504,7 +647,7 @@ async function agentRun($: EngineInterface, id: string, agent?: AgentInfo): Prom
     const roster = await $.fs.read(`${active}/members.json`).then(text => (JSON.parse(text) as { members: Roster }).members)
       .catch(() => undefined)
     const registered = roster && Object.values(roster).some(member => member.id === address || member.id === id)
-    const name = /^@([a-z][a-z0-9_-]*):/.exec(agent?.description ?? '')?.[1]
+    const name = parseDescribedName(agent?.description)
     const starting = roster && memberNamed(roster, name)
     if (registered || (starting && !starting.id && !starting.killed && agent?.type === `swarm:${starting.profile || starting.role || 'worker'}`)) {
       // Kept: the agent list drops a fast agent before its last turn is accounted, and its description with it.
@@ -526,12 +669,12 @@ async function agentRun($: EngineInterface, id: string, agent?: AgentInfo): Prom
 /** Shows the member's conversation; false when there is none to show, with a toast saying why. */
 async function viewAgent($: EngineInterface, member: Member | undefined): Promise<boolean> {
   if (member === undefined) return false
-  if (member.role === 'coordinator') return !(await $.ui.view({})).deny
-  const agent = (await $.agent.list()).find(one => one.id === member.id || one.teammateId === member.id)
+  if (member.role === 'coordinator') return !(await $.ui.view({}).catch(() => ({ deny: 'no main view' }))).deny
+  const agent = findAgent(await $.agent.list(), member.id)
   if (agent && !(await $.ui.view({ agentId: agent.id }).catch(() => ({ deny: 'no main view' }))).deny) return true
   // No main view to move (the desktop app draws none) or no live agent: the pane shows what the session holds
   // of the conversation, which outlasts the agent. An ended teammate is read by its agent id, not its address.
-  const agentId = agent?.id ?? [...teammates].find(([, address]) => address === member.id)?.[0] ?? member.id
+  const agentId = agent?.id ?? [...teammates].findLast(([, address]) => address === member.id)?.[0] ?? member.id
   const messages = agentId === undefined
     ? { deny: 'no agent was started for it' }
     : await $.session.messages({ agentId }).catch(() => ({ deny: 'its conversation could not be read' }))
@@ -563,6 +706,7 @@ async function deliver(
   const script = `${$.plugin.root}/skills/swarm/scripts/board.py`
   const results = { pending: false, exhausted: [] as string[], relay: [] as SpecialistWake[], unaddressed: [] as typeof unaddressed }
   const native = roster.coordinator?.backend === 'native'
+  const toWake: { name: string; id: string; seq: number }[] = []
   for (const [name, member] of Object.entries(roster)) {
     if (epoch !== generation) break
     const id = member.id
@@ -575,9 +719,9 @@ async function deliver(
     }
     if (seq === undefined) {
       const told = member.told
+      const agent = findAgent(agents, id)
       if (told && member.last_read_seq < told.seq && told.seq === member.last_nudged_seq && told.times < WAKE_ATTEMPTS &&
-          now - told.at * 1000 >= QUIET_MS && agents.some(agent => (agent.id === id || agent.teammateId === id) &&
-            ['completed', 'idle', 'failed'].includes(agent.status))) {
+          now - told.at * 1000 >= QUIET_MS && (!agent || !['running', 'pending', 'waiting', 'killed'].includes(agent.status))) {
         // A fast turn can end before the send is acknowledged. Recover a missed rearm once its loop is idle.
         await boardCommand($, dir, ['rearm', '0', id])
         results.pending = true
@@ -598,36 +742,43 @@ async function deliver(
     // Claude skips the sending plugin's tool hooks in a plugin-origin wake,
     // even when the plugin calls SendMessage. These roles need a model-origin send.
     if (SPECIALISTS.includes(member.profile ?? '')) {
-      results.relay.push({ name, id, seq, attempts: claim?.seq === seq ? claim.attempts : 0, native })
+      results.relay.push({ name, id, seq, attempts: claim?.attempts ?? 0, told: member.told?.times ?? 0, native })
       continue
     }
-
-    const reserved = await boardCommand($, dir, ['claim', name, id, String(seq)]).catch(() => undefined)
+    toWake.push({ name, id, seq })
+  }
+  const CONCURRENCY = 4
+  for (let i = 0; i < toWake.length; i += CONCURRENCY) {
     if (epoch !== generation) break
-    const token = reserved?.stdout.trim() ?? ''
-    if (reserved?.exitCode !== 0 || !/^[a-f0-9]{32}$/.test(token)) continue
-    results.pending = true
-    try {
-      const text = `New board mentions through #${seq}. Run: python3 ${shellQuote(script)} ${shellQuote(dir)} read ${name}`
-      const { isDelivered } = await $.session.send({ to: native ? teammateName(id) : { agentId: id }, text })
-      if (isDelivered) await boardCommand($, dir, ['woke', name, String(seq), token])
-    } catch {
-      // The claim expires so an interrupted or failed send can be retried.
-    }
+    const batch = toWake.slice(i, i + CONCURRENCY)
+    await Promise.allSettled(batch.map(async ({ name, id, seq }) => {
+      const reserved = await boardCommand($, dir, ['claim', name, id, String(seq)]).catch(() => undefined)
+      if (epoch !== generation) return
+      const token = reserved?.stdout.trim() ?? ''
+      if (reserved?.exitCode !== 0 || !/^[a-f0-9]{32}$/.test(token)) return
+      results.pending = true
+      try {
+        const text = `New board mentions through #${seq}. Run: python3 ${shellQuote(script)} ${shellQuote(dir)} read ${name}`
+        const { isDelivered } = await $.session.send({ to: native ? teammateName(id) : { agentId: id }, text })
+        if (isDelivered) await boardCommand($, dir, ['woke', name, String(seq), token])
+      } catch {
+        // The claim expires so an interrupted or failed send can be retried.
+      }
+    }))
   }
   return results
 }
 
 function unreadNotice($: EngineInterface, dir: string): string {
   const script = `${$.plugin.root}/skills/swarm/scripts/board.py`
-  return `${owed.count} board post(s) address you from #${owed.first} on and you have not read them. ` +
-    `Read them before anything else: python3 ${shellQuote(script)} ${shellQuote(dir)} read coordinator`
+  return `${counted(owed.count, 'board post')} ${owed.count === 1 ? 'addresses' : 'address'} you from #${owed.first} on and you have not read ${owed.count === 1 ? 'it' : 'them'}. ` +
+    `Read ${owed.count === 1 ? 'it' : 'them'} before anything else: python3 ${shellQuote(script)} ${shellQuote(dir)} read coordinator`
 }
 
 function moodOf(full: Swarm, agents: AgentInfo[]): Mood {
   if (full.isClosed || full.isPaused) return 'sleep'
   const participants = new Set(full.members.filter(m => m.status === 'working' || m.status === 'coordinating')
-    .map(m => m.role === 'coordinator' ? 'coordinator' : agents.find(a => a.teammateId === m.id || a.id === m.id)?.id ?? m.id))
+    .map(m => m.role === 'coordinator' ? 'coordinator' : findAgent(agents, m.id)?.id ?? m.id))
   if (!participants.size) return 'sleep'
   return Array.from(moods).reverse().find(([id]) => participants.has(id))?.[1] ?? 'forage'
 }
@@ -668,11 +819,27 @@ async function refresh($: EngineInterface): Promise<void> {
       if (!/^[\w.-]+$/.test(name) || name === '.' || name === '..') throw new Error('invalid board pointer')
       dir = `${root}/${name}`
     }
-    const [board, rosterText, agents] = await Promise.all([
-      readBoard($, dir),
-      $.fs.read(`${dir}/members.json`),
-      $.agent.list(),
-    ])
+    // A run folder that was deleted or archived is no run: the pane says so instead of failing to load one forever.
+    // Any other failure to read the roster is still an error.
+    const roster = `${dir}/members.json`
+    const rosterText = await $.fs.read(roster).catch(async error => {
+      if (await $.fs.exists(roster).catch(() => true)) throw error
+      return undefined
+    })
+    if (rosterText === undefined) {
+      if (epoch !== generation) return
+      if (owned) await update($, run, () => '')
+      closeTalk($)
+      if ((await read($, swarm)).dir) {
+        await seek($, 0)
+        await update($, swarm, () => EMPTY)
+      }
+      seen = seenBoard = ''
+      snapshot = undefined
+      if (await read($, loadError)) await update($, loadError, () => '')
+      return
+    }
+    const [board, agents] = await Promise.all([readBoard($, dir), $.agent.list()])
     if (epoch !== generation) return
     const state = JSON.parse(rosterText) as { members: Roster; paused?: string; closed?: boolean } & BudgetState
     const isSpent = budgetOf(state) > 0 && tokensUsed(state.usage?.tokens) >= budgetOf(state)
@@ -682,7 +849,7 @@ async function refresh($: EngineInterface): Promise<void> {
       : undefined
     const agentStates = JSON.stringify(agents.map(a => [a.id, a.teammateId, a.status]))
     const progress = JSON.stringify([dir, board.length, agentStates, state.paused, state.closed,
-      Object.entries(state.members).map(([name, m]) => [name, m.id, m.killed, m.last_read_seq])])
+      Object.entries(state.members).map(([name, m]) => [name, m.id, m.killed, m.last_read_seq, m.last_nudged_seq ?? 0, m.wake_claim?.attempts ?? 0, (m.wake_claim?.attempts ?? 0) >= WAKE_ATTEMPTS])])
     if (progress !== activity) {
       activity = progress
       quietSince = now
@@ -691,13 +858,18 @@ async function refresh($: EngineInterface): Promise<void> {
     const key = JSON.stringify([dir, rosterText, agentStates, coordinating])
     let full = snapshot
     if (!full || key !== seen || board !== seenBoard || (attentionRetry > 0 && now >= attentionRetry)) {
+      if (rosterText !== seenRoster) {
+        strangers.clear()
+        seenRoster = rosterText
+      }
       const report = await reportOf($, dir)
-      if (epoch !== generation) return
+      if (epoch !== generation || isEnding) return
       attentionRetry = report ? 0 : now + 10_000
       full = parse(dir, board, rosterText, agents, Infinity, report, coordinating)
       full.mood = moodOf(full, agents)
       const next = { ...full, posts: full.posts.slice(-KEPT), earlierEdges: edgesOf(full.posts.slice(0, -KEPT)), attentionUnavailable: !report }
       const previous = await read($, swarm)
+      if (epoch !== generation || isEnding) return
       const lastPost = previous.posts.at(-1)?.seq ?? 0
       if (previous.dir !== dir && !browsed) {
         closeTalk($)
@@ -706,19 +878,20 @@ async function refresh($: EngineInterface): Promise<void> {
         await update($, inspected, () => null)
         await update($, earlier, () => 0)
         await update($, query, () => '')
-      } else if (!browsed && livePlayer === undefined && await read($, tab) === 'graph' && await read($, replay) === 0) {
+      } else if (!browsed && isPaneOpen && livePlayer === undefined && await read($, tab) === 'graph' && await read($, replay) === 0) {
         const firstNew = next.posts.find(post => post.seq > lastPost)
         if (firstNew) {
           await update($, livePulse, () => firstNew.seq)
           scheduleLiveFrame($)
         }
       }
+      if (epoch !== generation || isEnding) return
       await update($, swarm, () => next)
       seen = key
       seenBoard = board
       snapshot = full
     }
-    if (epoch !== generation) return
+    if (epoch !== generation || isEnding) return
     const mood = moodOf(full, agents)
     if (full.mood !== mood) {
       await update($, swarm, prev => prev.dir === dir ? { ...prev, mood } : prev)
@@ -726,13 +899,18 @@ async function refresh($: EngineInterface): Promise<void> {
     }
     if (await read($, loadError)) await update($, loadError, () => '')
     const unread = owned && !state.closed
-      ? full.posts.filter(post => post.seq > (state.members.coordinator?.last_read_seq ?? 0) && post.to.includes('coordinator'))
+      ? full.posts.filter(post => post.seq > Math.max(state.members.coordinator?.last_read_seq ?? 0, shownPosts.through) &&
+        post.to.includes('coordinator') && !shownPosts.posts.has(post.seq))
       : []
     const last = unread.at(-1)?.seq ?? 0
     owed = last === 0 ? NONE : { count: unread.length, first: unread[0]?.seq ?? last, last, since: last === owed.last ? owed.since : now }
     if (owned) {
       const reason = state.closed ? '' : state.paused ?? ''
-      if (pauseSeen !== undefined && reason !== pauseSeen) pauseOwed = pausing > 0 || pauseQuiet > 0 ? '' : reason
+      if (reason === '') budgetPauseNotifiedFor = ''
+      if (pauseSeen !== undefined && reason !== pauseSeen) {
+        pauseOwed = pausing > 0 || pauseQuiet > 0 ? '' : reason
+        if (pauseOwed.startsWith('token budget of ')) budgetPauseNotifiedFor = pauseOwed
+      }
       pauseSeen = reason
       if (poll > pauseQuiet) pauseQuiet = 0
       // Mid-turn it rides on the coordinator's next tool result instead.
@@ -740,8 +918,15 @@ async function refresh($: EngineInterface): Promise<void> {
         const text = `Swarm: Run paused\n${pauseNotice(full.title.replace(/\s+/g, ' '), pauseOwed)}`
         const unheard = () => $.ui.toast(`Swarm paused "${full.title}": ${reason}. The coordinator could not be told.`)
         pauseOwed = ''
-        noticeHold = now + NOTICE_HOLD_MS
-        void $.prompt.submit({ text }).then(result => { if (result.drop) unheard() }).catch(unheard)
+        noticeHold = (await $.clock.now()) + NOTICE_HOLD_MS
+        void $.prompt.submit({ text }).then(result => {
+          if (epoch !== generation) return
+          if (result.drop) { noticeHold = 0; unheard() }
+        }).catch(() => {
+          if (epoch !== generation) return
+          noticeHold = 0
+          unheard()
+        })
       }
     }
     if (!owned || state.closed || state.paused || isSpent) {
@@ -784,7 +969,7 @@ async function refresh($: EngineInterface): Promise<void> {
       const told = { relayHinted, hinted }
       if (askRelay) relayHinted = keyToRelay
       if (answerThrough) hinted = Math.max(hinted, answerThrough)
-      noticeHold = now + NOTICE_HOLD_MS
+      noticeHold = (await $.clock.now()) + NOTICE_HOLD_MS
       void $.prompt.submit({ text: `Swarm: ${heading}\nRun: ${full.title.replace(/\s+/g, ' ')}\n${notices.join('\n\n')}` })
         .then(result => {
           if (epoch !== generation) return
@@ -792,6 +977,8 @@ async function refresh($: EngineInterface): Promise<void> {
           // An explicit drop can mean the user stopped the session. Leave the notice on the board.
           if (result.drop) {
             noticeHold = 0
+            if (askRelay && relayHinted === keyToRelay) relayHinted = told.relayHinted
+            if (answerThrough && hinted === answerThrough) hinted = told.hinted
             $.ui.toast('Swarm was unable to notify the coordinator. Check the board for pending work.')
           }
         }).catch(() => {
@@ -811,8 +998,12 @@ async function refresh($: EngineInterface): Promise<void> {
         })
     }
   } catch {
-    if (epoch === generation && !(await read($, loadError))) {
-      await update($, loadError, () => 'Swarm could not read the board. It will retry automatically.')
+    try {
+      if (epoch === generation && !isEnding && !(await read($, loadError))) {
+        await update($, loadError, () => 'Swarm could not read the board. It will retry automatically.')
+      }
+    } catch {
+      // Ignore store errors during teardown.
     }
   } finally {
     isPolling = false
@@ -839,6 +1030,7 @@ async function account($: EngineInterface, report: string, agentId: string | und
   if (isClosed) {
     if (dir === await read($, run)) {
       closedRun = dir
+      resetMonitoring()
       await update($, run, () => '')
     }
     return true
@@ -851,13 +1043,17 @@ async function account($: EngineInterface, report: string, agentId: string | und
   if (result.exitCode !== 0 || result.stdout.trim() === '') return false
   const entry = JSON.parse(result.stdout) as { title: string; total: number; budget: number; paused: boolean }
   if (!entry.paused || dir !== await read($, run)) return true
-  const isTold = Boolean(pauseSeen)  // a poll saw the pause before this did, and tells it
+  const reason = `token budget of ${compact(entry.budget)} spent`
+  const isTold = budgetPauseNotifiedFor === reason
+  budgetPauseNotifiedFor = reason
+  pauseSeen = reason
   pauseExpected()
   // Known at once, not a poll later: the members' next tool calls are refused from here.
-  halted = { dir, why: `paused (token budget of ${compact(entry.budget)} spent)` }
+  halted = { dir, why: `paused (${reason})` }
   // The board reports the crossing once. A prompt that does not land would leave the run paused with nobody told.
   const unheard = () => $.ui.toast(`Swarm paused "${entry.title}": its token budget of ${compact(entry.budget)} is spent, and the coordinator could not be told. Raise the budget or close the run.`)
   if (isTold) return true
+  noticeHold = (await $.clock.now()) + NOTICE_HOLD_MS
   void $.prompt.submit({
     text: `Swarm: Run paused at token budget\n${entry.title} spent ${compact(entry.total)} tokens and reached its budget of ${compact(entry.budget)}. Tell the user what is done and ask whether to raise the budget with limit and then resume, or close the run.`,
   }).then(result => { if (result.drop) unheard() }).catch(unheard)
@@ -881,7 +1077,8 @@ async function refusal($: EngineInterface, agentId: string | undefined): Promise
 /** Runs board commands for the owned run straight from a pane button, with no coordinator turn; the first that fails is told. */
 async function control($: EngineInterface, dir: string, ...steps: string[][]): Promise<void> {
   if (dir === '' || dir !== await read($, run)) return
-  pausing++  // what the person does from the pane is not news to tell the coordinator
+  const mayPause = steps.some(args => args[0] === 'pause' || args[0] === 'resume' || args[0] === 'limit')
+  if (mayPause) pausing++  // what the person does from the pane is not news to tell the coordinator
   try {
     for (const args of steps) {
       const result = await boardCommand($, dir, args).catch(error => ({ exitCode: 1, stderr: String(error) }))
@@ -891,8 +1088,10 @@ async function control($: EngineInterface, dir: string, ...steps: string[][]): P
       }
     }
   } finally {
-    pausing--
-    pauseExpected()
+    if (mayPause) {
+      pausing--
+      pauseExpected()
+    }
   }
   await refresh($)
 }
@@ -909,14 +1108,18 @@ async function resetView($: EngineInterface): Promise<void> {
 
 /** Steps the pane to the project's next older (1) or newer (-1) run, or back to the live one (0). */
 async function browse($: EngineInterface, step: 1 | 0 | -1): Promise<void> {
+  const gen = ++browseGen
   try {
     const live = await read($, swarm)
+    if (gen !== browseGen) return
     const root = `${await $.session.cwd()}/.swarm`
+    if (gen !== browseGen) return
     // Run folders only, newest first as the board orders them: `archive` and stray folders carry no run's name.
     const stamp = (name: string) => name.replace(/x*$/, '').slice(-15)
     const names = step === 0 ? [] : (await $.fs.list(root))
       .filter(entry => entry.kind === 'dir' && RUN.test(`/.swarm/${entry.name}`)).map(entry => entry.name)
       .sort((a, b) => stamp(b).localeCompare(stamp(a)) || b.localeCompare(a))
+    if (gen !== browseGen) return
     const at = names.indexOf((browsed ?? live).dir.slice(root.length + 1))
     let isLiveNext = step === 0
     for (let index = at + step; step !== 0 && index >= 0 && index < names.length; index += step) {
@@ -927,9 +1130,14 @@ async function browse($: EngineInterface, step: 1 | 0 | -1): Promise<void> {
       }
       // A folder without a roster is no run: stepped over.
       const roster = await $.fs.read(`${dir}/members.json`).catch(() => undefined)
+      if (gen !== browseGen) return
       if (roster === undefined) continue
       const [board, report] = await Promise.all([readBoard($, dir).catch(() => ''), reportOf($, dir)])
-      browsed = { ...parse(dir, board, roster, await $.agent.list().catch(() => []), KEPT, report), mood: 'sleep', attentionUnavailable: !report }
+      if (gen !== browseGen) return
+      const isClosed = (JSON.parse(roster) as { closed?: boolean }).closed === true
+      const agents = isClosed ? [] : await $.agent.list().catch(() => [])
+      if (gen !== browseGen) return
+      browsed = { ...parse(dir, board, roster, agents, KEPT, report), mood: 'sleep', attentionUnavailable: !report }
       await stopLive($)
       await resetView($)
       return
@@ -942,7 +1150,7 @@ async function browse($: EngineInterface, step: 1 | 0 | -1): Promise<void> {
     browsed = undefined
     await resetView($)
   } catch {
-    $.ui.toast('Swarm could not read this project\'s runs.')
+    if (gen === browseGen) $.ui.toast('Swarm could not read this project\'s runs.')
   }
 }
 
@@ -957,9 +1165,9 @@ async function specialistBoard($: EngineInterface, e: {
 }) {
   if (!e.agentId) return { deny: 'The Swarm board tool is for Swarm specialists. The coordinator uses the board command.' }
   const agents = await $.agent.list()
-  const agent = agents.find(candidate => candidate.id === e.agentId)
+  const agent = findAgent(agents, e.agentId)
   if (!agent || !SPECIALISTS.some(role => agent.type === `swarm:${role}`)) return { deny: 'The Swarm board tool requires a read-only Swarm specialist.' }
-  const describedName = /^@([a-z][a-z0-9_-]*):/.exec(agent?.description ?? '')?.[1]
+  const describedName = parseDescribedName(agent?.description)
   let dir = await agentRun($, e.agentId, agent)
   let needsBinding = false
   // No run yet, or this agent belongs to a newer run than the one the conversation last owned.
@@ -985,8 +1193,12 @@ async function specialistBoard($: EngineInterface, e: {
   )
   // The first read may arrive before the coordinator records the returned address.
   const starting = memberNamed(members, describedName)
-  const uniqueStarter = starting && !starting.id &&
-    agents.filter(candidate => candidate.type === agent?.type && candidate.description.startsWith(`@${describedName}:`)).length === 1
+  const uniqueStarter = starting && !starting.id && describedName !== undefined &&
+    agents.filter(candidate =>
+      candidate.type === agent?.type &&
+      !['killed', 'failed', 'completed'].includes(candidate.status) &&
+      parseDescribedName(candidate.description) === describedName,
+    ).length === 1
   const assignment = assigned ?? (uniqueStarter && describedName ? [describedName, starting] as const : undefined)
   const member = assignment?.[1]
   const kind = agent?.type.slice('swarm:'.length) ?? ''
@@ -1028,14 +1240,20 @@ async function specialistBoard($: EngineInterface, e: {
   if (action === 'read') args.push(`--max-bytes=${PAGE}`)
   if (action === 'revise') args.push(text)
   const result = await boardCommand($, dir, args, action === 'post' || action === 'ready' ? text : undefined)
-  if (result.exitCode !== 0) return { deny: result.stderr.trim() || 'The board action failed.' }
+  if (result.exitCode !== 0) {
+    const err = result.stderr.trim().replace(/show --post=(\d+)/g, 'action "show" with seq $1')
+    return { deny: err || 'The board action failed.' }
+  }
   if (result.isStdoutTruncated) return { deny: 'The board response exceeded the tool limit. Use show with a post number, or ask the coordinator for help if it is a single long post.' }
   if (writesPost || action === 'read') $.clock.after(0, () => void refresh($))
   if (action === 'show' && result.stdout.length > PAGE) {
     if (e.seq) return { result: `${head(result.stdout, PAGE)}\n(Cut here: the post is longer than one page.)` }
     // `show` has no page of its own: the newest posts are kept, from the start of a line.
     const kept = result.stdout.slice(-PAGE)
-    return { result: `Earlier posts are left out: the history is longer than one page. Narrow it with a member filter, or open one post with seq.\n${kept.slice(kept.indexOf('\n') + 1)}` }
+    const nl = kept.indexOf('\n')
+    let body = nl >= 0 ? kept.slice(nl + 1) : kept
+    if (body.length > 0 && body.charCodeAt(0) >= 0xdc00 && body.charCodeAt(0) <= 0xdfff) body = body.slice(1)
+    return { result: `Earlier posts are left out: the history is longer than one page. Narrow it with a member filter, or open one post with seq.\n${body}` }
   }
   // The board cuts a post longer than the page and says how to see it whole, in shell words: a specialist has the tool.
   return { result: result.stdout.replace(/\[cut to fit the page\. The whole post: show --post=(\d+)\]/g, '[cut to fit the page. The whole post: action "show" with seq $1]') }
@@ -1044,7 +1262,7 @@ async function specialistBoard($: EngineInterface, e: {
 // The band's button that opens the pane.
 function shortcut($: EngineInterface, e: Parameters<EngineInterface['ui']['resolve']>[0], singleCaption = false) {
   const { Box, Button } = $.ui.resolve(e)
-  const button = <Button key={SHORTCUT} variant="secondary" label="Swarm: The Board" onPress={() => void openBoard($)} />
+  const button = <Button key={SHORTCUT} variant="secondary" label="Swarm: The Board" onPress={() => void openBoard($).catch(() => undefined)} />
   if (e.surface !== 'desktop') return button
   // Cover the composer's tinted inset with the same theme surface as the crab.
   return <Box flexDirection="row" alignItems="center" backgroundColor="userMessageBackground"
@@ -1062,6 +1280,11 @@ export const register: Register = on => {
       clock = { scene, view, start: now, offset: 0 }
       clocks.set(slot, clock)
     } else if (clock.view !== view) {
+      const prev = clock.view.split('/')
+      const next = view.split('/')
+      if (clock.view.startsWith('graph/') && view.startsWith('graph/') && next[3] === 'true' && prev[3] !== 'true') {
+        clock.start = prev[2] === 'true' ? now - REPLAY_FRAME_MS : now
+      }
       clock.view = view
       clock.offset = Math.max(0, now - clock.start)
     }
@@ -1070,6 +1293,8 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     poller?.cancel()
+    sessionEpoch++
+    browseGen++
     resetMonitoring()
     agentRuns.clear()
     strangers.clear()
@@ -1077,7 +1302,7 @@ export const register: Register = on => {
     teammates.clear()
     pendingStarts.clear()
     spawnEfforts.clear()
-    isCoordinatorBusy = isEnding = isRefreshOwed = false
+    isCoordinatorBusy = isEnding = isRefreshOwed = isPaneOpen = false
     // A start that follows no session.end (a reload) still opens its run's pane and reads its state anew.
     opened = closedRun = ''
     talk = browsed = undefined
@@ -1088,36 +1313,39 @@ export const register: Register = on => {
     await update($, run, () => '')
     await update($, swarm, () => EMPTY)
     await update($, loadError, () => '')
-    await $.command.register({
-      name: 'swarm-board',
-      immediate: true,
-      description:
-        'Open the Swarm pane: the live board, members and @mention graph',
-    })
-    await $.tool.register({
-      name: 'board',
-      description: 'Swarm specialist board. Read unread posts, show history, post a message, report ready, or withdraw readiness. The tool uses your own assignment.',
-      isDeferred: false,
-      inputSchema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          action: { enum: ['read', 'show', 'post', 'ready', 'revise'] },
-          member: { type: 'string', description: 'Optional member filter for show.' },
-          seq: { type: 'integer', minimum: 1, description: 'Optional single post number for show.' },
-          text: { type: 'string', maxLength: 12000, description: 'Report, message, or reason.' },
+    try {
+      await $.command.register({
+        name: 'swarm-board',
+        immediate: true,
+        description:
+          'Open the Swarm pane: the live board, members and @mention graph',
+      })
+      await $.tool.register({
+        name: 'board',
+        description: 'Swarm specialist board. Read unread posts, show history, post a message, report ready, or withdraw readiness. The tool uses your own assignment.',
+        isDeferred: false,
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            action: { enum: ['read', 'show', 'post', 'ready', 'revise'] },
+            member: { type: 'string', description: 'Optional member filter for show.' },
+            seq: { type: 'integer', minimum: 1, description: 'Optional single post number for show.' },
+            text: { type: 'string', maxLength: 12000, description: 'Report, message, or reason.' },
+          },
+          required: ['action'],
         },
-        required: ['action'],
-      },
-    })
-    await stop($)
-    await stopLive($)
-    isRestoreOwed = false
-    await restore($, e.cwd)
-    poller = $.clock.every(2000, () => {
-      void refresh($)
-      void refreshTalk($)
-    })
+      })
+    } finally {
+      await stop($).catch(() => undefined)
+      await stopLive($).catch(() => undefined)
+      isRestoreOwed = false
+      await restore($, e.cwd)
+      poller = $.clock.every(2000, () => {
+        void refresh($)
+        void refreshTalk($)
+      })
+    }
 
     return next(e)
   })
@@ -1149,17 +1377,15 @@ export const register: Register = on => {
     if (stopped) return { deny: stopped }
     const actor = e.agentId ?? 'coordinator'
     moods.delete(actor)
-    moods.set(actor, e.tool === BOARD_TOOL && ['read', 'show'].includes(e.action) ? 'inspect' : toolMood(e.tool, e.tool === 'Bash' ? String(e.command) : ''))
+    moods.set(actor, toolMood(e.tool, e.tool === 'Bash' ? String(e.command) : ''))
     const agentCall = e.tool === 'Agent' && typeof e.tool_use_id === 'string' ? e.tool_use_id : undefined
     if (agentCall && e.tool === 'Agent') spawnEfforts.set(agentCall, e.effort)
-    // The board command this call runs, if it is one: its run folder and its subcommand.
+    // The board command(s) this call runs, if any: each run folder and subcommand.
     const command = e.tool === 'Bash' ? String(e.command) : ''
-    const match = BOARD_CALL.exec(command)
-    const action = match?.[4]
-    const isCoordinatorRead = action === 'read' && COORDINATOR_READ.test(command)
-    let called = (match?.[1] ?? match?.[2] ?? match?.[3] ?? '').replace(/\/+$/, '')
-    // A pause the coordinator's own command makes (`pause`, a `limit` under what is spent) it reads in the output.
-    const mayPause = e.agentId === undefined && (action === 'pause' || action === 'limit')
+    const calls = e.tool === 'Bash' ? boardCalls(command) : []
+    const isCoordinatorRead = calls.some(c => c.action === 'read' && COORDINATOR_READ.test(c.rest))
+    // A pause the coordinator's own command makes (`pause`, `resume`, or `limit` under what is spent) it reads in the output.
+    const mayPause = e.agentId === undefined && calls.some(c => c.action === 'pause' || c.action === 'resume' || c.action === 'limit')
     if (mayPause) pausing++
     const raw = await next(e).finally(() => {
       if (agentCall) spawnEfforts.delete(agentCall)
@@ -1174,7 +1400,22 @@ export const register: Register = on => {
       if (e.agentId === undefined && raw.deny === undefined && raw.isError === undefined) {
         const dir = await read($, run)
         // Only a real read of this run's board answers its mentions: the words alone may sit in a commit message.
-        if (isCoordinatorRead && called === dir) owed = NONE
+        for (const c of calls) {
+          if (c.action === 'read' && COORDINATOR_READ.test(c.rest)) {
+            const calledDir = RUN.test(c.dir) ? await resolveRunDir($, c.dir) : c.dir
+            if (calledDir === dir) {
+              owed = NONE
+              break
+            }
+          }
+        }
+        for (const c of calls) {
+          if (c.action !== 'show' || !RUN.test(c.dir) || await resolveRunDir($, c.dir) !== dir) continue
+          const one = /--post=(\d+)/.exec(c.rest)
+          if (one) shownPosts.posts.add(Number(one[1]))
+          else shownPosts.through = Math.max(shownPosts.through, snapshot?.posts.at(-1)?.seq ?? 0)
+          if (owed.last <= shownPosts.through || (owed.count === 1 && shownPosts.posts.has(owed.last))) owed = NONE
+        }
         const notices: string[] = []
         const key = relayKey(dir)
         if (key && key !== relayHinted && !(e.tool === 'SendMessage' && Number.isSafeInteger(wakeSequence(String(e.message))))) {
@@ -1195,25 +1436,39 @@ export const register: Register = on => {
     } catch {
       // A failed reminder must not change the tool's result.
     }
-    if (e.tool !== 'Bash' || result.isError || result.deny) return result
-    // `init` names the folder to make the run under and prints the run folder it made.
-    if (action === 'init' && e.agentId === undefined) {
-      called = String((raw.result as { stdout?: unknown } | undefined)?.stdout ?? '').trim().split('\n').at(-1)?.trim() ?? ''
-    }
-    const dir = called
-    // A read whose run could not be read off the command still changed what is owed: the roster is read again now.
-    if (isCoordinatorRead && e.agentId === undefined && !RUN.test(dir)) $.clock.after(0, () => void refresh($))
-    if (!RUN.test(dir)) return result
+    if (e.tool !== 'Bash' || result.isError || result.deny || calls.length === 0) return result
     try {
-      const owned = await read($, run)
-      // The coordinator's own planning shows whose run it is as surely as its first read, which it may skip: the
-      // run is bound from `init` on, so that planning is charged to it. `plan` only reads, so it claims a run only
-      // while none is owned. The board refuses a run another conversation owns.
-      const claims = isCoordinatorRead || action === 'init' || action === 'member' || (action === 'plan' && owned === '')
-      if (e.agentId === undefined && claims && dir !== owned) await bind($, dir)
-      // The roster may now record an agent that was looked up before it was on it.
-      if (e.agentId === undefined) strangers.clear()
-      if (dir === owned || e.agentId === undefined) $.clock.after(0, () => void refresh($))
+      if (e.agentId === undefined && calls.some(c => c.action === 'member' || c.action === 'started' || c.action === 'replace')) {
+        strangers.clear()
+      }
+      for (const c of calls) {
+        // `init` names the folder to make the run under and prints the run folder it made.
+        const rawDir = c.action === 'init' && e.agentId === undefined
+          ? String((raw.result as { stdout?: unknown } | undefined)?.stdout ?? '').trim().split('\n').at(-1)?.trim() ?? ''
+          : c.dir
+        const isReadCoord = c.action === 'read' && COORDINATOR_READ.test(c.rest)
+        // A read whose run could not be read off the command still changed what is owed: the roster is read again now.
+        if (isReadCoord && e.agentId === undefined && !RUN.test(rawDir)) $.clock.after(0, () => void refresh($))
+        if (!RUN.test(rawDir)) continue
+        const dir = await resolveRunDir($, rawDir)
+        const owned = await read($, run)
+        // The coordinator's own planning shows whose run it is as surely as its first read, which it may skip: the
+        // run is bound from `init` on, so that planning is charged to it. `plan` only reads, so it claims a run only
+        // while none is owned. The board refuses a run another conversation owns.
+        const claims = isReadCoord || c.action === 'init' || c.action === 'member' || (c.action === 'plan' && owned === '')
+        if (e.agentId === undefined && claims && dir !== owned) await bind($, dir)
+        // The roster may now record an agent that was looked up before it was on it.
+        if (e.agentId === undefined) strangers.clear()
+        if (dir === owned || e.agentId === undefined) $.clock.after(0, () => void refresh($))
+      }
+      // Every wake of the coordinator re-reads its whole conversation, so a run started in a long one pays for
+      // that history on each of them. Said once, when the run is made, while starting elsewhere is still cheap.
+      if (e.agentId === undefined && calls.some(c => c.action === 'init')) {
+        const held = (await $.session.usage()).context.tokens ?? 0
+        if (held >= LONG_CONVERSATION && result.deny === undefined && result.isError === undefined) {
+          result = { ...result, context: [...(result.context ?? []), `Swarm: This conversation already holds about ${compact(held)} tokens, and each time you are woken during the run all of them are read again. Before you start any member, tell the user that a fresh conversation, or /compact first, would make this run much cheaper, and ask whether to go on here.`] }
+        }
+      }
     } catch {
       // A failed binding must not change the tool's result.
     }
@@ -1254,7 +1509,7 @@ export const register: Register = on => {
 
   on('agent.spawn', async ($, e, next) => {
     if (!SWARM_AGENTS.has(e.subagentType)) return next(e)
-    const named = /^@([a-z][a-z0-9_-]*):/.exec(e.description)?.[1]
+    const named = parseDescribedName(e.description)
     type RunState = {
       title?: string
       members: Roster
@@ -1262,12 +1517,20 @@ export const register: Register = on => {
       paused?: string
     } & BudgetState
     const stateOf = async (dir: string) => JSON.parse(await $.fs.read(`${dir}/members.json`)) as RunState
-    const current = await read($, run) || closedRun
-    const running = e.resume ? await $.agent.list().then(agents => agents.find(agent => agent.id === e.resume?.agentId)) : undefined
+    const activeRun = await read($, run)
+    const current = activeRun || closedRun
+    const running = e.resume ? findAgent(await $.agent.list(), e.resume.agentId) : undefined
     const resumedRun = e.resume ? await agentRun($, e.resume.agentId, running) : ''
     let owned = resumedRun || current
     let state = owned ? await stateOf(owned).catch(() => undefined) : undefined
-    if (owned && !state) return { deny: 'Swarm could not read this run’s roster. Check the board before starting or resuming a member.' }
+    if (owned && !state) {
+      if (!activeRun && !resumedRun && owned === closedRun) {
+        closedRun = ''
+        owned = ''
+      } else {
+        return { deny: 'Swarm could not read this run’s roster. Check the board before starting or resuming a member.' }
+      }
+    }
     // No run yet, or the member belongs to another run than the one this conversation last owned:
     // a newer one, or, where the name is reused, the one its prompt names.
     const ownName = owned.slice(owned.lastIndexOf('/') + 1)
@@ -1323,17 +1586,22 @@ export const register: Register = on => {
       return { deny: `This run is paused (${state.paused}), so no member is started. Resume it with the board's resume command first.` }
     }
     if (e.resume) {
+      const address = teammateOf($, e.resume.agentId, running)
       const entry = Object.values(state.members).find(member => member.id === e.resume?.agentId ||
-        (running?.teammateId !== undefined && member.id === running.teammateId))
+        (address !== undefined && member.id === address))
       if (entry?.killed || memberNamed(state.members, named)?.killed) return { deny: 'This Swarm member has been retired.' }
       const resumed = memberNamed(state.members, named)
+      if (resumed && entry && resumed !== entry) return { deny: 'This agent is no longer assigned to that Swarm member.' }
       if (resumed?.id && !entry) return { deny: 'This agent is no longer assigned to that Swarm member.' }
       const again = await next(e)
+      if (again.agentId) {
+        agentRuns.set(again.agentId, owned)
+        if (again.teammateId) learnTeammate($, again.agentId, again.teammateId)
+      }
       // A member whose first start was never recorded is recorded now, or it could not be woken. Only an
       // agent of the type the roster gives the member: a resume skips the checks a fresh start goes through.
       if (!entry && named && resumed && !resumed.id && again.agentId &&
           running?.type === `swarm:${resumed.profile || resumed.role || 'worker'}`) {
-        agentRuns.set(again.agentId, owned)
         await boardCommand($, owned, ['started', named, again.teammateId ?? again.agentId, '']).catch(() => undefined)
       }
       return again
@@ -1358,6 +1626,8 @@ export const register: Register = on => {
         team.filter(([, entry]) => entry.role !== 'verifier').length > Number(state.limits?.max_workers ?? Infinity)) {
       return { deny: 'The Swarm roster exceeds this run’s member limit. Check the board plan before launching more agents.' }
     }
+    const isExactModel = (m: string) => /(?:^|\.)claude-/i.test(m) || (m !== 'inherit' && !Object.hasOwn(LATEST, m.toLowerCase()))
+    let modelToUse: string | undefined
     {
       const kind = e.subagentType.slice('swarm:'.length)
       // The type is what the roster says: the default model, the limits and the board tool all follow it.
@@ -1365,20 +1635,32 @@ export const register: Register = on => {
       if (registered !== kind) {
         return { deny: `The roster has @${named} as ${registered}, but this call would start it as ${kind}. Start it with subagent_type "swarm:${registered}", or change the roster with the board's member command.` }
       }
-      const actual = e.model === 'inherit' ? e.parentModel : latestOf(e.model) ?? DEFAULT_MODEL[kind] ?? ''
+      const memberModel = member.model
+      let actual: string
+      if (memberModel === 'inherit' && (e.model === undefined || e.model === 'inherit')) {
+        actual = e.parentModel
+        modelToUse = e.parentModel
+      } else if (memberModel && isExactModel(memberModel) && (e.model === undefined || familyOf(latestOf(e.model) ?? '') === familyOf(memberModel))) {
+        actual = memberModel
+        modelToUse = memberModel
+      } else {
+        actual = e.model === 'inherit' ? e.parentModel : latestOf(e.model) ?? DEFAULT_MODEL[kind] ?? ''
+        modelToUse = e.model === 'inherit' ? e.parentModel : latestOf(e.model) ?? DEFAULT_MODEL[kind]
+      }
       const runsOn = familyOf(actual)
-      const allowed = state.limits?.[runsOn]?.split(',')
+      const limitRaw = state.limits && Object.hasOwn(state.limits, runsOn) ? state.limits[runsOn] : undefined
+      const allowed = limitRaw?.split(',').filter(x => x && x !== 'none')
       if (allowed && !allowed.includes(kind) && !allowed.includes(named)) {
-        return { deny: `This run allows ${runsOn} only for: ${allowed.join(', ')}. Register @${named} with another model= and pass that model on the Agent call.` }
+        return { deny: `This run allows ${runsOn} only for: ${allowed.join(', ') || 'none'}. Register @${named} with another model= and pass that model on the Agent call.` }
       }
       // The roster's model, or the type's default when it names none: a model passed only on the
       // Agent call would otherwise skip the plan the user saw and the board's rules for the type.
-      if (member.model === 'inherit' && e.model !== 'inherit') {
-        return { deny: `The roster has @${named} on the coordinator's model. Pass model: "inherit" on the Agent call, or change the roster with the board's member command.` }
+      if (memberModel === 'inherit' && e.model !== undefined && e.model !== 'inherit' && familyOf(e.parentModel) !== runsOn) {
+        return { deny: `The roster has @${named} on the coordinator's model. Omit model or pass model: "inherit" on the Agent call, or change the roster with the board's member command.` }
       }
-      const expected = member.model === 'inherit' ? e.parentModel : member.model || familyOf(DEFAULT_MODEL[kind] ?? '')
-      if (expected && (expected.startsWith('claude-') ? expected !== actual : familyOf(expected) !== runsOn)) {
-        return { deny: `The roster has @${named} on ${expected}, but this call would start it on ${runsOn}. Pass model: "${expected}" on the Agent call, or change the roster with the board's member command.` }
+      const expected = memberModel === 'inherit' ? e.parentModel : memberModel || familyOf(DEFAULT_MODEL[kind] ?? '')
+      if (expected && (isExactModel(expected) ? expected.toLowerCase() !== actual.toLowerCase() : familyOf(expected) !== runsOn)) {
+        return { deny: `The roster has @${named} on ${expected}, but this call would start it on ${actual || runsOn}. Pass model: "${expected}" on the Agent call, or change the roster with the board's member command.` }
       }
       const effort = member.effort || DEFAULT_EFFORT[kind]
       if (spawnEfforts.has(e.tool_use_id) && (spawnEfforts.get(e.tool_use_id) ?? DEFAULT_EFFORT[kind]) !== effort) {
@@ -1389,15 +1671,21 @@ export const register: Register = on => {
     if (pendingStarts.has(key)) return { deny: `@${named} is already starting.` }
     pendingStarts.add(key)
     try {
-      if (member.id && (await $.agent.list()).some(agent =>
-        (agent.id === member.id || agent.teammateId === member.id) && agent.status !== 'killed' && agent.status !== 'failed')) {
-        return { deny: `@${named} already has an agent. Resume it with SendMessage or replace its assignment.` }
+      if (member.id) {
+        const existing = findAgent(await $.agent.list(), member.id)
+        if (!existing || (existing.status !== 'killed' && existing.status !== 'failed')) {
+          return { deny: `@${named} already has an agent. Resume it with SendMessage or replace its assignment.` }
+        }
       }
       if (owned !== current && !(await bind($, owned))) return { deny: 'Swarm could not claim that run. Check that this conversation owns it.' }
       // The table decides, not the session's alias or the agent file: a family name becomes the newest model
       // of that family, and a call that names no model gets its type's default.
-      const model = e.model === 'inherit' ? e.model : latestOf(e.model) ?? DEFAULT_MODEL[e.subagentType.slice('swarm:'.length)]
-      const started = await next(model === e.model ? e : { ...e, model })
+      const background = !e.isTeammate ? true : e.background
+      const started = await next(
+        modelToUse !== e.model || background !== e.background
+          ? { ...e, model: modelToUse, background }
+          : e,
+      )
       if (started.agentId) {
         agentRuns.set(started.agentId, owned)
         if (started.teammateId) learnTeammate($, started.agentId, started.teammateId)
@@ -1431,11 +1719,14 @@ export const register: Register = on => {
     const response = yield* next(e)
     try {
       const spent = response.usage
-      const turn = spent && charge(e.turnId, spent, e.index) > 0 ? stepped.get(e.turnId) : undefined
+      const delta = spent ? charge(e.turnId, spent, e.index) : 0
+      const turn = delta > 0 ? stepped.get(e.turnId) : undefined
       if (spent && turn) {
-        const amount = weigh(spent)
+        if (snapshot && snapshot.budget > 0 && tokensUsed(snapshot.tokens) + delta >= snapshot.budget) {
+          halted = { dir: snapshot.dir, why: `paused (token budget of ${compact(snapshot.budget)} spent)` }
+        }
         turn.landing = turn.landing
-          .then(() => account($, `${e.turnId}:${e.index}`, e.agentId, amount))
+          .then(() => account($, `${e.turnId}:${e.index}`, e.agentId, delta))
           .catch(() => false)
           .then(landed => { if (!landed) uncharge(e.turnId, spent, e.index) })
       }
@@ -1461,7 +1752,7 @@ export const register: Register = on => {
       }
       if (e.agentId !== undefined) {
         // A member that was woken and ended its turn without reading is owed the wake again.
-        const agent = (await $.agent.list()).find(agent => agent.id === e.agentId)
+        const agent = findAgent(await $.agent.list(), e.agentId)
         const dir = await agentRun($, e.agentId, agent)
         const address = teammateOf($, e.agentId, agent)
         if (dir) await boardCommand($, dir, ['rearm', String(Math.ceil(e.durationMs)), e.agentId, ...(address ? [address] : [])]).catch(() => undefined)
@@ -1481,6 +1772,9 @@ export const register: Register = on => {
     // the old session's id, and after an exit nothing is left to poll for.
     isEnding = true
     isRefreshOwed = false
+    isPaneOpen = false
+    sessionEpoch++
+    browseGen++
     if (!goesOn) {
       poller?.cancel()
       poller = undefined
@@ -1524,13 +1818,17 @@ export const register: Register = on => {
   })
 
   on('ui.open', { id: PANE }, async ($, e, next) => {
+    isPaneOpen = true
     const result = await next(e)
     await $.ui.invalidate('ui.render')
     return result
   })
   on('ui.close', { id: PANE }, async ($, e, next) => {
+    isPaneOpen = false
     const result = await next(e)
     talk = undefined  // nothing reads a conversation behind a closed pane
+    await stop($)
+    await stopLive($)
     await $.ui.invalidate('ui.render')
     return result
   })
@@ -1566,7 +1864,7 @@ export const register: Register = on => {
       <Box flexDirection="column" rowGap={1}>
         {reply}
         <Box flexDirection="row">
-          <Button key="swarm-board-from-reply" variant="secondary" label="Open Swarm board" onPress={() => void openBoard($)} />
+          <Button key="swarm-board-from-reply" variant="secondary" label="Open Swarm board" onPress={() => void openBoard($).catch(() => undefined)} />
         </Box>
       </Box>
     )
@@ -1578,7 +1876,7 @@ export const register: Register = on => {
     const [heading, ...body] = e.props.text.slice('Swarm: '.length).split('\n')
     return (
       <Box flexDirection="column">
-        <Text dimColor><Text bold>Swarm</Text>{` · ${heading}`}</Text>
+        <Text dimColor><Text weight="semibold">Swarm</Text>{` · ${heading}`}</Text>
         {e.props.isExpanded && body.length > 0 && <Text dimColor>{body.join('\n')}</Text>}
       </Box>
     )
@@ -1592,18 +1890,24 @@ export const register: Register = on => {
     const shown = await read($, swarm)
     const isShown = shown.dir !== '' && openerOf(shown.dir) === e.props.id
 
+    const activeMembers = shown.members.filter(m => m.role !== 'coordinator' && m.status !== 'killed').length
+
     return (
       <Box flexDirection="row" alignItems="center" columnGap={2} flexWrap="wrap" borderStyle="round" borderColor="subtle" paddingX={1}>
         <Text>
-          <Text bold>Swarm</Text>
+          <Text weight="semibold">Swarm</Text>
           {isShown && <Text>{`  ${shown.title}`}</Text>}
-          {isShown && <Text dimColor>{`  ·  ${shown.isClosed ? 'closed' : counted(Math.max(0, shown.members.length - 1), 'member')} · ${counted(shown.total ?? shown.posts.length, 'post')}`}</Text>}
+          {isShown && (
+            <Text dimColor tabular>
+              {` · ${shown.isClosed ? 'closed' : shown.isPaused ? `paused · ${counted(activeMembers, 'member')}` : counted(activeMembers, 'member')} · ${counted(shown.total ?? shown.posts.length, 'post')}`}
+            </Text>
+          )}
         </Text>
         <Button
           key="open-swarm"
           variant="primary"
           label="Open Swarm board"
-          onPress={() => void openBoard($)}
+          onPress={() => void openBoard($).catch(() => undefined)}
         />
       </Box>
     )
@@ -1616,20 +1920,36 @@ export const register: Register = on => {
     const error = await read($, loadError)
     if (e.props.placement === 'widget') {
       const active = shown.members.filter(member => member.status === 'working').length
+      const coordinating = shown.members.filter(member => member.status === 'coordinating').length
       return (
         <Box flexDirection="row" columnGap={1} alignItems="center">
-          <Text bold>Swarm board</Text>
-          {active > 0 && <Text dimColor>{`${active} working`}</Text>}
+          <Text weight="semibold">Swarm board</Text>
+          {shown.dir === '' ? (
+            <Text dimColor>No swarm</Text>
+          ) : shown.isClosed ? (
+            <Text dimColor>Closed</Text>
+          ) : shown.isPaused ? (
+            <Text color="warning">Paused</Text>
+          ) : active > 0 ? (
+            <Text color="success" tabular>{`${active} working`}</Text>
+          ) : coordinating > 0 ? (
+            <Text color="claude" tabular>{`${coordinating} coordinating`}</Text>
+          ) : null}
+          {shown.dir !== '' && shown.attention.length > 0 && (
+            <Text color="warning" tabular>{`${shown.attention.length} attention`}</Text>
+          )}
         </Box>
       )
     }
+    isPaneOpen = true
     const current = await read($, tab)
     const now = HeaderArt ? await $.clock.now() : 0
     const mood = shown.mood ?? 'sleep'
-    const hiveOffset = phase(e.surface + '-hive', shown.dir + '/' + mood, current, now)
-    const liveOffset = phase(e.surface + '-live', shown.dir, current, now)
+    const hiveOffset = phase(e.surface + '-hive', shown.dir + '/' + mood, shown.dir ? 'header' : 'empty', now)
     const latest = shown.posts.at(-1)?.seq
-    if (current !== 'graph') phase(e.surface + '-route', shown.dir + '/' + latest, current, now)
+    if (current !== 'graph' && clocks.get(e.surface + '-route')?.scene === shown.dir + '/' + latest) {
+      phase(e.surface + '-route', shown.dir + '/' + latest, current, now)
+    }
     const memberOf = (name: string) => shown.members.find(member => member.name === name)
     const feedOf = async (name: string) => {
       talk = undefined
@@ -1646,9 +1966,9 @@ export const register: Register = on => {
 
     if (shown.dir === '') {
       return (
-        <Box flexDirection="column">
+        <Box flexDirection="column" gap={1}>
           {HeaderArt && <HeaderArt key="hive" source={hiveArt('sleep', hiveOffset)} alt="Sleeping bees" width={88} height={44} />}
-          <Text bold>{error || 'No swarm in this project'}</Text>
+          <Text weight="semibold" color={error ? 'warning' : undefined}>{error || 'No swarm in this project'}</Text>
           {!error && <Text dimColor>Start one with /swarm:swarm and a task.</Text>}
         </Box>
       )
@@ -1659,8 +1979,10 @@ export const register: Register = on => {
         .filter(m => ['waiting', 'not started', 'killed'].includes(m.status))
         .map(m => m.name),
     )
-    const hueOf = (name: string) =>
-      HUES[Math.max(0, shown.members.findIndex(m => m.name === name)) % HUES.length]
+    const hueOf = (name: string) => {
+      const idx = shown.members.findIndex(m => m.name === name)
+      return idx < 0 ? 'subtle' : HUES[idx % HUES.length]!
+    }
     const inactiveToggle = (count: number) =>
       count === 0 && !hiding ? (
         <Text dimColor>No inactive members</Text>
@@ -1677,7 +1999,9 @@ export const register: Register = on => {
     // The buttons that change a run act on the one this conversation owns, while it is open: never on a run only looked at.
     const isDriven = !browsed && !shown.isClosed && (await read($, run)) === shown.dir
     const working = shown.members.filter(m => m.status === 'working').length
+    const coordinating = shown.members.filter(m => m.status === 'coordinating').length
     const waiting = shown.members.filter(m => m.role !== 'coordinator' && m.status === 'waiting').length
+    const failed = shown.members.filter(m => m.status === 'failed' || m.status === 'unreachable').length
     const tokens = shown.tokens
     const total = tokensUsed(tokens)
     const openPost = async (seq: number) => {
@@ -1685,7 +2009,33 @@ export const register: Register = on => {
       if (!shown.posts.some(post => post.seq === seq)) {
         try {
           const [board, saved] = await Promise.all([readBoard($, shown.dir), $.fs.read(`${shown.dir}/members.json`)])
-          older = parsePosts(board, (JSON.parse(saved) as { members: Roster }).members).find(post => post.seq === seq)
+          const roster = (JSON.parse(saved) as { members: Roster }).members
+          older = parsePosts(board, roster).find(post => post.seq === seq)
+          if (!older) {
+            const shownOne = await boardCommand($, shown.dir, ['show', `--post=${seq}`, '--json']).catch(() => undefined)
+            const rawOut = shownOne?.exitCode === 0 ? shownOne.stdout.trim() : ''
+            if (rawOut.startsWith('{')) {
+              const parsed = JSON.parse(rawOut) as Omit<Post, 'to'> & { to?: string[] }
+              older = {
+                ...parsed,
+                text: clean(parsed.text),
+                to: parsed.to ?? targets(parsed.text, roster).filter(n => n !== parsed.agent),
+              }
+            } else if (rawOut) {
+              const m = /^#(\d+)\s+(\d{2}:\d{2}:\d{2})\s+@(\S+)\s+->\s+([^\n]*)(?:\n([\s\S]*))?$/.exec(rawOut)
+              if (m) {
+                const body = clean((m[5] ?? '').split('\n').map(l => l.startsWith('  ') ? l.slice(2) : l).join('\n').trimEnd())
+                const toRaw = (m[4] ?? '').trim()
+                older = {
+                  seq: Number(m[1]),
+                  agent: m[3]!,
+                  time: `0000-00-00T${m[2]}`,
+                  to: toRaw === '-' || toRaw === '' ? [] : toRaw.split(/\s+/).map(s => s.replace(/^@/, '')),
+                  text: body,
+                }
+              }
+            }
+          }
         } catch {
           // The board may have disappeared while this row was visible.
         }
@@ -1708,23 +2058,50 @@ export const register: Register = on => {
       const open = await read($, expanded)
       const collapsed = await read($, latestOnly)
       const more = await read($, earlier)
-      const preview = (post: Post) => clip(bodyOf(post))
+      const preview = (post: Post) => clip(stripKind(bodyOf(post)))
       // Fill the pane from the newest post back, so the feed follows the board.
-      const wanted = (await read($, query)).trim().toLowerCase()
+      const rawQuery = await read($, query)
+      const wanted = rawQuery.trim().toLowerCase()
       const inspectedPost = await read($, inspected)
       const available = inspectedPost && !shown.posts.some(post => post.seq === inspectedPost.seq) ? [inspectedPost, ...shown.posts] : shown.posts
       const terms = wanted.split(/\s+/).filter(term => term !== '')
-      const haystack = (post: Post) =>
-        `@${post.agent} from:${post.agent} ${post.to.map(name => `@${name} to:${name}`).join(' ')} #${post.seq} ${kindOf(post.text)?.label ?? ''} ${post.text}`.toLowerCase()
+      const matchesTerm = (post: Post, term: string): boolean => {
+        if (term.startsWith('from:')) {
+          const who = term.slice(5).replace(/^@/, '')
+          return who !== '' && post.agent.toLowerCase() === who
+        }
+        if (term.startsWith('to:')) {
+          const who = term.slice(3).replace(/^@/, '')
+          return who !== '' && post.to.some(name => name.toLowerCase() === who)
+        }
+        if (term.startsWith('@') && term.length > 1) {
+          const who = term.slice(1)
+          return post.agent.toLowerCase() === who || post.to.some(name => name.toLowerCase() === who)
+        }
+        if (/^#\d+$/.test(term)) {
+          return post.seq === Number(term.slice(1))
+        }
+        const kind = kindOf(post.text)?.label.toLowerCase()
+        if (term.startsWith('kind:')) {
+          const k = term.slice(5)
+          return k !== '' && kind === k
+        }
+        if (kind && (kind === term || kind.split(/\s+/).includes(term))) {
+          return kind === term
+        }
+        if ((term === 'passed' || term === 'verified') && kind === `not ${term}`) return false
+        return post.text.toLowerCase().includes(term) || post.agent.toLowerCase().includes(term) ||
+          post.to.some(name => name.toLowerCase().includes(term))
+      }
       const matching = terms.length === 0
         ? available
-        : available.filter(post => { const text = haystack(post); return terms.every(term => text.includes(term)) })
+        : available.filter(post => terms.every(term => matchesTerm(post, term)))
       const search = (
         <Box flexDirection="row" alignItems="center" columnGap={1} flexWrap="wrap" marginTop={1}>
           <Input
             key="board-search"
-            placeholder="Filter posts: text, @member, from:name, to:name, brief…"
-            value={wanted}
+            placeholder="Filter: text, @name, from:, to:, kind:"
+            value={rawQuery}
             submitLabel="Filter"
             onSubmit={value => update($, query, () => value.trim())}
           />
@@ -1737,9 +2114,8 @@ export const register: Register = on => {
       let used = 0
       for (const post of [...matching].reverse()) {
         // The opened post takes the rows it really draws, so the posts around it are fitted to what is left.
-        const text = post.seq === open ? openedText(post) : preview(post)
-        const cost =
-          4 + text.split('\n').length + Math.floor(text.length / columns)
+        const text = post.seq === open ? stripKind(openedText(post)) : preview(post)
+        const cost = 4 + estimateRows(text, columns)
         if (fitted.length > 0 && used + cost > rows) break
         fitted.unshift(post)
         used += cost
@@ -1784,6 +2160,9 @@ export const register: Register = on => {
             )}
             {visible.map(post => {
               const kind = kindOf(post.text)
+              const time = postTime(post)
+              const hasMore = stripKind(bodyOf(post)).length > CLIP
+              const canViewGraph = e.surface !== 'terminal' && shown.posts.some(p => p.seq === post.seq)
 
               return (
                 <Box
@@ -1803,45 +2182,47 @@ export const register: Register = on => {
                         label={`@${post.agent}`}
                         onPress={async () => { if (!(await viewAgent($, memberOf(post.agent)))) await feedOf(post.agent) }}
                       />
-                      <Text>
+                      {post.to.length > 0 && (
                         <Text dimColor>
-                          {post.to.length > 0
-                            ? `→  ${post.to.slice(0, 2).map(name => `@${name}`).join(' ')}${post.to.length > 2 ? ` +${post.to.length - 2}` : ''}`
-                            : ''}
+                          {`→ ${post.to.slice(0, 2).map(name => `@${name}`).join(' ')}${post.to.length > 2 ? ` +${post.to.length - 2}` : ''}`}
                         </Text>
-                        {kind !== undefined && (
-                          <Text bold color={kind.color}>{`   ${kind.label}`}</Text>
-                        )}
-                      </Text>
+                      )}
+                      {kind !== undefined && (
+                        <Text weight="semibold" color={kind.color}>{kind.label}</Text>
+                      )}
                     </Box>
-                    <Text dimColor>{`#${post.seq} · ${post.time.slice(11, 16)}`}</Text>
+                    <Text dimColor tabular>{`#${post.seq}${time ? ` · ${time}` : ''}`}</Text>
                   </Box>
-                  <Markdown text={(post.seq === open ? openedText(post) : preview(post)).replace(/\n/g, '  \n')} />
-                  <Box flexDirection="row" gap="sm" flexWrap="wrap">
-                    {bodyOf(post).length > CLIP && (
-                      <Button
-                        key={`more-${post.seq}`}
-                        plain
-                        dimColor
-                        onPress={() =>
-                          update($, expanded, seq => (seq === post.seq ? 0 : post.seq))
-                        }
-                        label={post.seq === open ? '▴ Show less' : '▾ Show more'}
-                      />
-                    )}
-                    {e.surface !== 'terminal' && post.to.length > 0 && (
-                      <Button
-                        key={`graph-post-${post.seq}`}
-                        plain
-                        dimColor
-                        label="View in graph"
-                        onPress={async () => {
-                          await seek($, post.seq)
-                          await update($, tab, () => 'graph')
-                        }}
-                      />
-                    )}
-                  </Box>
+                  <Markdown text={formatMarkdown(post.seq === open ? stripKind(openedText(post)) : preview(post))} />
+                  {(hasMore || canViewGraph) && (
+                    <Box flexDirection="row" gap="sm" flexWrap="wrap">
+                      {hasMore && (
+                        <Button
+                          key={`more-${post.seq}`}
+                          plain
+                          dimColor
+                          onPress={async () => {
+                            const nextSeq = open === post.seq ? 0 : post.seq
+                            await update($, expanded, () => nextSeq)
+                            if (inspectedPost && inspectedPost.seq !== nextSeq) await update($, inspected, () => null)
+                          }}
+                          label={post.seq === open ? '▴ Show less' : '▾ Show more'}
+                        />
+                      )}
+                      {canViewGraph && (
+                        <Button
+                          key={`graph-post-${post.seq}`}
+                          plain
+                          dimColor
+                          label="View in graph"
+                          onPress={async () => {
+                            await seek($, post.seq)
+                            await update($, tab, () => 'graph')
+                          }}
+                        />
+                      )}
+                    </Box>
+                  )}
                 </Box>
               )
             })}
@@ -1853,16 +2234,32 @@ export const register: Register = on => {
         ['unreachable', 'ignored', 'stale', 'rework'].includes(kind) ? 'error' : kind === 'paused' ? 'suggestion'
           : ['unread', 'review', 'question', 'unstarted', 'blocked', 'spend'].includes(kind) ? 'warning' : undefined
       const isSpent = shown.budget > 0 && total >= shown.budget
-      const ask = (text: string) => void $.prompt.submit({ text }).catch(() => undefined)
+      const ask = (text: string) => {
+        const fail = () => $.ui.toast('Swarm could not send that request to the coordinator.')
+        void $.prompt.submit({ text }).then(res => { if (res.drop) fail() }).catch(fail)
+      }
+      const seenKeys = new Map<string, number>()
       body = shown.attention.length === 0 ? (
         <Box marginTop={1}>
           <Text dimColor>{shown.attentionUnavailable ? 'Attention details unavailable. Swarm will retry.' : 'Nothing needs attention.'}</Text>
         </Box>
       ) : (
         <Box flexDirection="column" gap={1} marginTop={1}>
-          {shown.attention.map((item, index) => (
+          {shown.attention.map(item => {
+            const baseKey = `${item.kind}-${item.member}-${item.seq}`
+            const count = seenKeys.get(baseKey) ?? 0
+            seenKeys.set(baseKey, count + 1)
+            const itemKey = count === 0 ? baseKey : `${baseKey}-${count}`
+            const hasActions = item.seq > 0 || (isDriven && (
+              item.kind === 'unreachable' ||
+              (item.kind === 'paused' && isSpent) ||
+              item.kind === 'ignored' ||
+              item.kind === 'review' ||
+              item.kind === 'rework'
+            ))
+            return (
             <Box
-              key={`attention-${index}`}
+              key={`attention-${itemKey}`}
               flexDirection="column"
               borderStyle="round"
               borderColor={tone(item.kind) ?? 'subtle'}
@@ -1870,13 +2267,14 @@ export const register: Register = on => {
               paddingX={1}
             >
               <Text>
-                <Text bold color={tone(item.kind)}>{String(item.kind || 'note').toUpperCase()}</Text>
+                <Text weight="semibold" color={tone(item.kind)}>{String(item.kind || 'note').toUpperCase()}</Text>
                 <Text>{`  ${item.text}`}</Text>
               </Text>
+              {hasActions && (
               <Box flexDirection="row" gap="sm" flexWrap="wrap">
                 {item.seq > 0 && (
                   <Button
-                    key={`attention-open-${index}`}
+                    key={`attention-open-${itemKey}`}
                     plain
                     label={`Open post #${item.seq}`}
                     onPress={() => openPost(item.seq)}
@@ -1884,7 +2282,7 @@ export const register: Register = on => {
                 )}
                 {item.kind === 'unreachable' && isDriven && (
                   <Button
-                    key={`attention-recover-${index}`}
+                    key={`attention-recover-${itemKey}`}
                     plain
                     label="Ask coordinator to recover"
                     onPress={() => ask(`Swarm: Recover @${item.member}\n@${item.member} is unreachable (board post #${item.seq}). Run the board's retry command for it once. If it is still unreachable after that, use the board's replace command to register a successor with its brief and history, then spawn the successor.`)}
@@ -1892,18 +2290,18 @@ export const register: Register = on => {
                 )}
                 {item.kind === 'paused' && isSpent && isDriven && (
                   <Button
-                    key={`attention-budget-${index}`}
+                    key={`attention-budget-${itemKey}`}
                     plain
                     label="+500k & resume"
-                    onPress={() => control($, shown.dir, ['limit', `budget=${shown.budget + 500_000}`], ['resume'])}
+                    onPress={() => control($, shown.dir, ['limit', `budget=${Math.max(shown.budget, total) + 500_000}`], ['resume'])}
                   />
                 )}
                 {item.kind === 'ignored' && isDriven && (
-                  <Button key={`attention-retry-${index}`} plain label="Retry" onPress={() => control($, shown.dir, ['retry', item.member])} />
+                  <Button key={`attention-retry-${itemKey}`} plain label="Retry" onPress={() => control($, shown.dir, ['retry', item.member])} />
                 )}
                 {item.kind === 'review' && isDriven && (
                   <Button
-                    key={`attention-review-${index}`}
+                    key={`attention-review-${itemKey}`}
                     plain
                     label="Ask coordinator to review"
                     onPress={() => ask(`Swarm: Review @${item.member}'s finding\n@${item.member}'s finding awaits your review (board post #${item.seq}). Read it with the board's show --post=${item.seq}, then accept it with the board's confirm command or answer @${item.member} on the board.`)}
@@ -1911,15 +2309,17 @@ export const register: Register = on => {
                 )}
                 {item.kind === 'rework' && isDriven && (
                   <Button
-                    key={`attention-rework-${index}`}
+                    key={`attention-rework-${itemKey}`}
                     plain
-                    label="Ask coordinator"
-                    onPress={() => ask(`Swarm: @${item.member} keeps failing verification\n@${item.member} has not passed verification several times in a row${item.seq ? ` (board post #${item.seq})` : ''}. Read its NOT PASSED posts, then decide: give it a narrower brief, replace it, or pause the run and ask the user.`)}
+                    label="Ask coordinator to intervene"
+                    onPress={() => ask(`Swarm: @${item.member} keeps failing verification\n@${item.member} has not passed verification several times in a row${item.seq ? ` (board post #${item.seq})` : ''}. Read its NOT PASSED posts with the board's show command, then decide: give it a narrower brief, replace it, or pause the run and ask the user.`)}
                   />
                 )}
               </Box>
+              )}
             </Box>
-          ))}
+            )
+          })}
         </Box>
       )
     } else if (current === 'members' && talk?.dir === shown.dir) {
@@ -1929,7 +2329,7 @@ export const register: Register = on => {
       let fitted = 0
       let used = 0
       for (const row of [...open.rows].reverse()) {
-        const cost = 2 + row.text.split('\n').length + Math.floor(row.text.length / columns)
+        const cost = 2 + estimateRows(row.text, columns)
         if (fitted > 0 && used + cost > rows) break
         fitted++
         used += cost
@@ -1941,8 +2341,8 @@ export const register: Register = on => {
         <Text key={`talk-${index}`} dimColor>{row.text}</Text>
       ) : row.kind === 'prompt' ? (
         <Box key={`talk-${index}`} flexDirection="column" borderStyle="round" borderColor="subtle" borderDimColor paddingX={1}>
-          <Text bold dimColor>{index === 0 ? 'Prompt' : 'Message'}</Text>
-          <Markdown text={row.text.replace(/\n/g, '  \n')} />
+          <Text size="caption" weight="semibold" dimColor>{index === 0 ? 'Prompt' : 'Message'}</Text>
+          <Markdown text={formatMarkdown(row.text)} />
         </Box>
       ) : (
         <Markdown key={`talk-${index}`} text={row.text} />
@@ -1952,7 +2352,7 @@ export const register: Register = on => {
           <Box flexDirection="row" alignItems="center" columnGap={1} flexWrap="wrap">
             <Button key="talk-back" plain label="‹ Members" onPress={() => closeTalk($)} />
             <Text wrap="truncate-end">
-              <Text bold color={hueOf(open.name)}>@{open.name}</Text>
+              <Text weight="semibold" color={hueOf(open.name)}>@{open.name}</Text>
               <Text dimColor>{`  conversation${member ? ` · ${member.status}` : ''}`}</Text>
             </Text>
           </Box>
@@ -1986,44 +2386,50 @@ export const register: Register = on => {
           member.depends.length === 0 ? '' : `after ${member.depends.map(name => `@${name}`).join(', ')}`,
         ].filter(part => part !== '').join(' · ')
 
+        const canOpenTalk = member.role === 'coordinator' || (member.id !== undefined && member.status !== 'killed')
+        const hasActions = canOpenTalk || member.posts > 0
+        const summaryLines = last ? bodyOf(last).split('\n').slice(0, kindOf(last.text) ? 2 : 1).filter(l => l.trim() !== '').join(' · ') : ''
+
         // Every card has the same rows in the same order, so a column of them can be scanned: who it is and
         // what it runs on, then how it is doing, then what it waits for, owns and last said.
         return (
           <Box key={member.name} flexDirection="column" borderStyle="round" borderColor={hueOf(member.name)} borderDimColor paddingX={1}>
             <Text strikethrough={member.status === 'killed'} wrap="truncate-end">
-              <Text bold color={hueOf(member.name)}>@{member.name}</Text>
+              <Text weight="semibold" color={hueOf(member.name)}>@{member.name}</Text>
               <Text dimColor>
                 {`  ${[member.role === 'coordinator' ? '' : member.type, `${member.model} ${member.effort}`.trim()].filter(part => part !== '').join(' · ')}`}
               </Text>
             </Text>
-            <Box flexDirection="row" alignItems="center">
+            <Box flexDirection="row" alignItems="center" columnGap="xs">
               {HeaderArt ? <HeaderArt source={statusDot(member.status)} alt={member.status} width={12} height={12} /> :
               <Text color={statusColor}>{isBroken ? '!' : ['killed', 'not started'].includes(member.status) ? '○' : '●'}</Text>}
-              <Text wrap="truncate-end">
-                <Text dimColor>{` ${member.status} · ${counted(member.posts, 'post')}`}</Text>
+              <Text tabular wrap="truncate-end">
+                <Text dimColor>{`${member.status} · ${counted(member.posts, 'post')}`}</Text>
                 {spentBy(member) > 0 && <Text dimColor>{` · ${compact(spentBy(member))} tokens`}</Text>}
                 {member.unread > 0 && member.status !== 'killed' && (
-                  <Text bold color="warning">{` · ${member.unread} unread`}</Text>
+                  <Text weight="semibold" color="warning">{` · ${member.unread} unread`}</Text>
                 )}
               </Text>
             </Box>
             {member.status !== 'killed' && member.detail !== '' && (
-              <Text color={isBroken ? 'error' : 'warning'} wrap="truncate-end">{member.detail}</Text>
+              <Text color={isBroken ? 'error' : member.detail === 'reported ready' ? 'success' : 'warning'} wrap="truncate-end">{member.detail}</Text>
             )}
             {member.status !== 'killed' && plan !== '' && <Text dimColor wrap="truncate-end">{plan}</Text>}
             {last !== undefined && (
-              <Text dimColor wrap="truncate-end">
-                {`#${last.seq}  ${bodyOf(last).split('\n').slice(0, kindOf(last.text) ? 2 : 1).join(' · ')}`}
+              <Text dimColor tabular wrap="truncate-end">
+                {`#${last.seq}${summaryLines ? `  ${summaryLines}` : ''}`}
               </Text>
             )}
-            <Box flexDirection="row" gap="sm" flexWrap="wrap">
-              {(member.role === 'coordinator' || (member.id !== undefined && member.status !== 'killed')) && (
-                <Button key={`view-${member.name}`} plain dimColor label="Open conversation" onPress={async () => { if (!(await viewAgent($, member))) await feedOf(member.name) }} />
-              )}
-              {member.posts > 0 && (
-                <Button key={`feed-${member.name}`} plain dimColor label="Posts" onPress={() => feedOf(member.name)} />
-              )}
-            </Box>
+            {hasActions && (
+              <Box flexDirection="row" gap="sm" flexWrap="wrap">
+                {canOpenTalk && (
+                  <Button key={`view-${member.name}`} plain dimColor label="Open conversation" onPress={async () => { if (!(await viewAgent($, member))) await feedOf(member.name) }} />
+                )}
+                {member.posts > 0 && (
+                  <Button key={`feed-${member.name}`} plain dimColor label="Posts" onPress={() => feedOf(member.name)} />
+                )}
+              </Box>
+            )}
           </Box>
         )
       }
@@ -2044,20 +2450,31 @@ export const register: Register = on => {
         ['Standing by', shown.members.filter(m => ['waiting', 'not started'].includes(m.status) && !(hiding && inactive.has(m.name)))],
         ['Retired', hiding ? [] : shown.members.filter(m => m.status === 'killed')],
       ]
+      const visibleGroups = groups.filter(([, list]) => list.length > 0)
       body = (
         <Box flexDirection="column" marginTop={1}>
           {inactiveToggle(inactive.size)}
-          {groups
-            .filter(([, list]) => list.length > 0)
-            .map(([title, list]) => (
+          {visibleGroups.length === 0 && shown.members.length > 0 ? (
+            <Box marginTop={1}>
+              <Text dimColor>All members are inactive.</Text>
+            </Box>
+          ) : (
+            visibleGroups.map(([title, list]) => (
               <Box key={title} flexDirection="column" gap={1} marginTop={1}>
-                <Text bold dimColor>{`${title} · ${list.length}`}</Text>
+                <Text size="caption" weight="semibold" dimColor>{`${title} · ${list.length}`}</Text>
                 {[...list].sort(byName).map(card)}
               </Box>
-            ))}
+            ))
+          )}
         </Box>
       )
-    } else if (e.surface !== 'terminal' && shown.posts.length > 0) {
+    } else if (shown.posts.length === 0) {
+      body = (
+        <Box marginTop={1}>
+          <Text dimColor>No posts yet.</Text>
+        </Box>
+      )
+    } else if (e.surface !== 'terminal') {
       // the terminal has no Svg: it keeps the list below
       const { Svg } = $.ui.resolve(e)
       const selected = await read($, replay)
@@ -2081,18 +2498,29 @@ export const register: Register = on => {
       const repeat = index === shown.posts.length - 1 && !animate
       const isExpanded = await read($, expandAll)
       const hasBroadcast = shown.posts.some(isBroadcast) || Object.keys(shown.earlierEdges ?? {}).some(edge => edge.endsWith('>@all'))
+      const isLiveVisible = live && !browsed && !shown.isClosed && !shown.isPaused
+      const liveOffset = phase(e.surface + '-live', shown.dir, String(isLiveVisible), now)
+      const statusSig = live && repeat ? shown.members.map(m => `${m.name}:${m.status}`).join(',') : ''
       const routeOffset = phase(e.surface + '-route', shown.dir + '/' + latest,
-        [current, post.seq, animate, repeat, isExpanded, ...hidden].join('/'), now)
+        [current, post.seq, animate, repeat, isExpanded, statusSig, ...hidden].join('/'), now)
+      const postKind = kindOf(post.text)
+      const time = postTime(post)
+      const strippedGraphBody = stripKind(bodyOf(post))
       body = (
         <Box flexDirection="column" marginTop={1} gap={1}>
           <Box flexDirection="row" justifyContent="space-between" flexWrap="wrap" columnGap={1}>
-            {live && !browsed && !shown.isClosed && !shown.isPaused ? (
+            {isLiveVisible ? (
               <Box flexDirection="row" alignItems="center" gap="xs">
-                <Svg key="live-indicator" source={liveIndicator(liveOffset)} alt="Live activity" width={16} height={16} isInteractive />
-                <Text bold color="success">Live</Text>
+                <Svg key="live-indicator" source={liveIndicator(liveOffset)} alt="Live activity" width={16} height={16} />
+                <Text weight="semibold" color="success">Live</Text>
               </Box>
             ) : (
-              <Text dimColor>{live ? (shown.isPaused && !shown.isClosed ? 'Paused' : 'Latest post') : `Post ${index + 1} of ${shown.posts.length}`}</Text>
+              <Box flexDirection="row" alignItems="center" gap="sm">
+                <Text dimColor tabular>{live ? (shown.isPaused && !shown.isClosed ? 'Paused' : 'Latest post') : `Post ${index + 1} of ${shown.posts.length}`}</Text>
+                {!live && (
+                  <Button key="replay-live" plain label={shown.isClosed ? 'Latest' : 'Go live'} onPress={() => seek($, 0)} />
+                )}
+              </Box>
             )}
             <Box flexDirection="row" gap="sm" alignItems="center">
               <Button
@@ -2106,19 +2534,18 @@ export const register: Register = on => {
             </Box>
           </Box>
           <Box flexDirection="row" gap="xs" alignItems="center" flexWrap="wrap">
-            <Button key="replay-first" plain dimColor={index === 0} onPress={() => seek($, shown.posts[0]!.seq)}>First</Button>
-            <Button key="replay-back" plain dimColor={index === 0} onPress={() => seek($, shown.posts[Math.max(0, index - 1)]!.seq)}>‹ Prev</Button>
-            <Button
-              key="replay-play"
-              variant="primary"
-              label={playing ? 'Pause' : 'Play'}
-              dimColor={shown.posts.length === 1}
-              onPress={() => play($)}
-            />
-            <Button key="replay-next" plain dimColor={index === shown.posts.length - 1} onPress={() => seek($, shown.posts[Math.min(index + 1, shown.posts.length - 1)]!.seq)}>Next ›</Button>
-            {!live && (
-              <Button key="replay-live" plain label={shown.isClosed ? 'Latest' : 'Go live'} onPress={() => seek($, 0)} />
-            )}
+            <Button key="replay-first" plain dimColor={index === 0} onPress={() => index > 0 ? seek($, shown.posts[0]!.seq) : undefined}>First</Button>
+            <Button key="replay-back" plain dimColor={index === 0} onPress={() => index > 0 ? seek($, shown.posts[index - 1]!.seq) : undefined}>‹ Prev</Button>
+            <Box minWidth={8}>
+              <Button
+                key="replay-play"
+                variant={shown.posts.length <= 1 ? 'secondary' : 'primary'}
+                label={playing ? 'Pause' : 'Play'}
+                dimColor={shown.posts.length <= 1}
+                onPress={() => shown.posts.length > 1 ? play($) : undefined}
+              />
+            </Box>
+            <Button key="replay-next" plain dimColor={index === shown.posts.length - 1} onPress={() => index < shown.posts.length - 1 ? seek($, shown.posts[index + 1]!.seq) : undefined}>Next ›</Button>
           </Box>
           <Svg
             key="message-routes" source={graphSvg(shown, post.seq, hidden, animate, live, repeat, routeOffset, isExpanded)}
@@ -2134,18 +2561,23 @@ export const register: Register = on => {
             ))}
           </Box>
           <Box key="graph-post" flexDirection="column" gap="xs" borderStyle="round" borderColor="subtle" borderDimColor paddingX={1}>
-            <Text wrap="truncate-end">
-              <Text dimColor>{`#${post.seq}  `}</Text>
-              <Text bold color={hueOf(post.agent)}>@{post.agent}</Text>
-              <Text dimColor>{post.to.length ? `  →  ${post.to.map(name => `@${name}`).join(' ')}` : '  ·  No mentions'}</Text>
-            </Text>
-            <Markdown text={(detailsOpen ? openedText(post) : clip(bodyOf(post))).replace(/\n/g, '  \n')} />
-            {bodyOf(post).length > CLIP && (
+            <Box flexDirection="row" justifyContent="space-between" flexWrap="wrap" columnGap={1}>
+              <Text wrap="truncate-end">
+                <Text weight="semibold" color={hueOf(post.agent)}>@{post.agent}</Text>
+                <Text dimColor>{post.to.length ? ` → ${post.to.map(name => `@${name}`).join(' ')}` : ' · no mentions'}</Text>
+                {postKind !== undefined && (
+                  <Text weight="semibold" color={postKind.color}>{` · ${postKind.label}`}</Text>
+                )}
+              </Text>
+              <Text dimColor tabular>{`#${post.seq}${time ? ` · ${time}` : ''}`}</Text>
+            </Box>
+            <Markdown text={formatMarkdown(detailsOpen ? stripKind(openedText(post)) : clip(strippedGraphBody))} />
+            {strippedGraphBody.length > CLIP && (
               <Button
                 key="graph-post-details"
                 plain
                 dimColor
-                label={detailsOpen ? 'Show less' : 'Show full post'}
+                label={detailsOpen ? '▴ Show less' : '▾ Show more'}
                 onPress={() => update($, expanded, seq => seq === post.seq ? 0 : post.seq)}
               />
             )}
@@ -2153,54 +2585,80 @@ export const register: Register = on => {
         </Box>
       )
     } else {
+      const isExpanded = await read($, expandAll)
+      const hasBroadcast = shown.posts.some(isBroadcast) || Object.keys(shown.earlierEdges ?? {}).some(edge => edge.endsWith('>@all'))
       const edges = new Map<string, number>()
       // Posts older than the ones kept still count, as they do in the diagram.
       // The same keys the diagram counts: a pair by name, a pair reached through @all, and a sender's @all posts.
       for (const [edge, count] of Object.entries({ ...shown.earlierEdges, ...Object.fromEntries(
         Object.entries(edgesOf(shown.posts)).map(([key, more]) => [key, more + (shown.earlierEdges?.[key] ?? 0)])) })) {
         const [from = '', to = '', via] = edge.split('>')
-        if (to === '@none' || (hiding && (inactive.has(from) || inactive.has(to)))) continue
+        if (to === '@none' || (via && !isExpanded) || (hiding && (inactive.has(from) || inactive.has(to)))) continue
         edges.set(to === '@all' ? `@${from} → @all` : `@${from} → @${to}${via ? ' (via @all)' : ''}`, count)
       }
+      const sorted = [...edges.entries()].sort((a, b) => b[1] - a[1])
+      const visibleEdges = sorted.slice(0, rows)
       const most = [...edges.values()].reduce((max, count) => Math.max(max, count), 1)
+      const maxDigits = Math.max(1, ...visibleEdges.map(([, c]) => String(c).length))
       const summary =
         edges.size === 0 ? (
           <Text dimColor>No mentions yet.</Text>
         ) : (
-          [...edges.entries()]
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, rows)
-            .map(([edge, count]) => (
-              <Text key={edge}>
-                <Text color="success">
-                  {'█'.repeat(Math.max(1, Math.round((count / most) * 8)))}
+          <Box flexDirection="column">
+            {visibleEdges.map(([edge, count]) => (
+              <Text key={edge} tabular>
+                <Text color="claude">
+                  {'█'.repeat(Math.max(1, Math.round((count / most) * 8))).padEnd(8, '░')}
                 </Text>
-                {` ${count}  ${edge}`}
+                {` ${String(count).padStart(maxDigits, ' ')}  ${edge}`}
               </Text>
-            ))
+            ))}
+            {sorted.length > rows && (
+              <Text dimColor>{`… and ${sorted.length - rows} more`}</Text>
+            )}
+          </Box>
         )
       body = (
         <Box flexDirection="column" marginTop={1} gap={1}>
-          {inactiveToggle(inactive.size)}
+          <Box flexDirection="row" gap="sm" alignItems="center">
+            <Button
+              key="expand-all"
+              plain
+              dimColor={!hasBroadcast}
+              label={isExpanded ? 'Collapse @all' : 'Expand @all'}
+              onPress={() => update($, expandAll, isOn => !isOn)}
+            />
+            {inactiveToggle(inactive.size)}
+          </Box>
           {summary}
         </Box>
       )
     }
+
+    const activeSummary = [
+      coordinating > 0 ? `${coordinating} coordinating` : '',
+      `${working} working`,
+      `${waiting} waiting`,
+    ].filter(Boolean).join(' · ')
 
     return (
       <Box flexDirection="column">
         <Box flexDirection="row" alignItems="center" columnGap={1}>
           {HeaderArt && <HeaderArt key="hive" source={hiveArt(mood, hiveOffset)} alt={`Swarm hive: ${shown.mood ?? 'sleep'}`} width={88} height={44} />}
           <Box flexDirection="column" flexShrink={1}>
-            <Text bold wrap="truncate-end">{shown.title}</Text>
-            <Text dimColor>
-              {`${shown.isClosed ? 'Closed' : shown.isPaused ? 'Paused' : `${working} working · ${waiting} waiting`} · ${counted(shown.total ?? shown.posts.length, 'post')}`}
+            <Text size="heading" weight="semibold" wrap="truncate-end">{shown.title}</Text>
+            <Text dimColor tabular wrap="truncate-end">
+              {shown.isClosed ? 'Closed' : shown.isPaused ? 'Paused' : activeSummary}
+              {!shown.isClosed && failed > 0 && <Text color="error">{` · ${failed} failed`}</Text>}
+              {` · ${counted(shown.total ?? shown.posts.length, 'post')}`}
               {total > 0 ? ` · ${compact(total)}${shown.budget > 0 ? ` of ${compact(shown.budget)}` : ''} tokens` : ''}
             </Text>
           </Box>
         </Box>
         {error && <Text color="warning">{error}</Text>}
         <Box flexDirection="row" gap="sm" flexWrap="wrap" alignItems="center">
+          <Button key="run-prev" plain dimColor label="‹ Prev run" onPress={() => browse($, 1)} />
+          <Button key="run-next" plain dimColor label="Next run ›" onPress={() => browse($, -1)} />
           {isDriven && (
             <Button
               key="run-pause"
@@ -2209,15 +2667,14 @@ export const register: Register = on => {
               onPress={() => control($, shown.dir, shown.isPaused ? ['resume'] : ['pause', 'paused from the pane'])}
             />
           )}
-          <Button key="run-prev" plain dimColor label="‹ Prev run" onPress={() => browse($, 1)} />
-          <Button key="run-next" plain dimColor label="Next run ›" onPress={() => browse($, -1)} />
-          {browsed && <Text bold color="warning">Not the live run · read-only</Text>}
+          {browsed && <Text weight="semibold" color="warning">Not the live run · read-only</Text>}
           {browsed && <Button key="run-live" plain label="Back to live run" onPress={() => browse($, 0)} />}
         </Box>
         <Box flexDirection="row" gap="xs" flexWrap="wrap" marginTop={1}>
-          {TABS.map(name => (
+          {TABS.map((name, tabIdx) => (
             <Button
               key={`tab-${name}`}
+              hotkey={String(tabIdx + 1)}
               variant={name === current ? 'primary' : 'secondary'}
               onPress={async () => {
                 closeTalk($)

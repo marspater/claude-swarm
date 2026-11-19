@@ -21,7 +21,7 @@ export type Member = {
   /** The members whose READY it waits for, and what it owns, as the roster records them. */
   depends: string[]
   owns: string
-  /** `working`, `waiting`, `not started`, `failed`, `unreachable` or `killed`. */
+  /** `coordinating`, `working`, `waiting`, `not started`, `failed`, `unreachable` or `killed`. */
   status: string
   /** What a member that is not working waits for, in words; empty when nothing is pending. */
   detail: string
