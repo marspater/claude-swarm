@@ -173,9 +173,16 @@ export function parse(
     }
     return member
   }
+  // The last post each member made, and the last one addressed to it.
+  const said = new Map<string, number>()
+  const heard = new Map<string, number>()
   for (const post of posts) {
     counts(post.agent).sent++
-    for (const name of post.to) if (post.seq > (memberNamed(roster, name)?.last_read_seq ?? Infinity)) counts(name).unread++
+    said.set(post.agent, post.seq)
+    for (const name of post.to) {
+      heard.set(name, post.seq)
+      if (post.seq > (memberNamed(roster, name)?.last_read_seq ?? Infinity)) counts(name).unread++
+    }
   }
   const isClosed = state.closed === true
   const liveAgents = isClosed ? [] : agents
@@ -192,6 +199,20 @@ export function parse(
         member: name,
         seq: 0,
         text: `@${name} was retired, but agent ${zombie.id} is still ${zombie.status}. Stop it before reusing its files.`,
+      })
+    }
+
+    // Its agent ended, it has read everything addressed to it, and it answered none of it: no report, no question,
+    // nothing it waits for. While others work nobody notices, and whoever depends on it waits for good.
+    const lastHeard = heard.get(name) ?? 0
+    if (!isClosed && !state.paused && (member.role ?? 'worker') === 'worker' && member.id !== undefined && status === 'waiting' &&
+        hint !== undefined && !hint.ready && !hint.asked && hint.blocked_on.length === 0 &&
+        counts(name).unread === 0 && lastHeard > 0 && (said.get(name) ?? 0) < lastHeard) {
+      zombieAttention.push({
+        kind: 'silent',
+        member: name,
+        seq: lastHeard,
+        text: `@${name} stopped without reporting: its agent ended after reading #${lastHeard} and it has posted nothing since. Ask it where it stands in a post that mentions it, or replace it.`,
       })
     }
 

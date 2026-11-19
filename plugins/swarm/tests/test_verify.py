@@ -620,6 +620,12 @@ class VerifyRegressions(unittest.TestCase):
             interrupted = json.loads(run(*gate, "prepare", "shared", "--check", reject))
             run(*gate, "test", interrupted["candidate"], "v", ok=False)
             assert "verified_by" not in json.loads((Path(board) / "verification.json").read_text())
+            # The rejection also withdrew the worker's READY: no candidate is built on a report that was refused.
+            refused = subprocess.run([*gate, "prepare", "shared", "--check", "test -s app.txt"], capture_output=True, text=True)
+            assert refused.returncode != 0 and "waiting for READY from @w: its last one no longer counts" in refused.stderr
+            run(*post, "post", "w", "@v fixed it, have a look")  # a plain reply is no report
+            run(*gate, "prepare", "shared", "--check", "test -s app.txt", ok=False)
+            run(*post, "ready", "w", text="fixed")
             cand = json.loads(run(*gate, "prepare", "shared", "--check", "test -s app.txt"))
             line = run(*gate, "test", cand["candidate"], "v").splitlines()[-1]
             # A rejection that quotes the pass line is no pass.
@@ -632,6 +638,11 @@ class VerifyRegressions(unittest.TestCase):
             run(*gate, "accept", cand["candidate"], ok=False)
             run(*post, "post", "v", "@coordinator " + line, ok=False)
             run(*gate, "accept", cand["candidate"], ok=False)
+            # The candidate rests on the refused report, so it cannot be tested again either: the worker reports, and a
+            # new candidate is prepared.
+            run(*gate, "test", cand["candidate"], "v", ok=False)
+            run(*post, "ready", "w", text="regression fixed")
+            cand = json.loads(run(*gate, "prepare", "shared", "--check", "test -s app.txt"))
             line = run(*gate, "test", cand["candidate"], "v").splitlines()[-1]
             run(*post, "post", "v", "@coordinator " + line)
             run(*gate, "accept", cand["candidate"])

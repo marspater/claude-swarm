@@ -384,6 +384,12 @@ let prompted = 0
 // `pausing` while their command runs, `pauseQuiet` until a poll that began after it has looked.
 let pauseSeen: string | undefined  // undefined until the first look at a run: the pause it starts with is not news
 let pauseOwed = ''
+// Members that stopped without reporting: when each was first seen so, which the coordinator has been told of, and
+// what it is owed with its next tool call. Told once per member and post, with no wake of its own.
+const SILENT_GRACE_MS = 60_000
+let silentSince = new Map<string, number>()
+let silentTold = new Set<string>()
+let silentOwed: string[] = []
 let budgetPauseNotifiedFor = ''
 let pausing = 0
 let pauseQuiet = 0
@@ -488,6 +494,9 @@ function resetMonitoring(): void {
   hinted = prompted = noticeHold = pauseQuiet = 0
   pauseSeen = undefined
   pauseOwed = ''
+  silentSince = new Map()
+  silentTold = new Set()
+  silentOwed = []
   budgetPauseNotifiedFor = ''
   halted = undefined
   unaddressed = []
@@ -1063,6 +1072,21 @@ async function refresh($: EngineInterface): Promise<void> {
       seen = key
       seenBoard = board
       snapshot = full
+    }
+    if (owned) {
+      const since = new Map<string, number>()
+      for (const item of full.attention) {
+        if (item.kind !== 'silent') continue
+        const key = `${item.member}#${item.seq}`
+        const first = silentSince.get(key) ?? now
+        since.set(key, first)
+        // A turn that ends and the wake that starts the next one can be a poll apart.
+        if (!silentTold.has(key) && now - first >= SILENT_GRACE_MS) {
+          silentTold.add(key)
+          silentOwed.push(item.text)
+        }
+      }
+      silentSince = since
     }
     if (epoch !== generation || isEnding) return
     const mood = moodOf(full, agents)
@@ -1760,6 +1784,10 @@ export const register: Register = on => {
         if (dir && pauseOwed) {
           notices.push(`Swarm: ${pauseNotice('This run', pauseOwed)}`)
           pauseOwed = ''
+        }
+        if (dir && silentOwed.length > 0) {
+          notices.push(...silentOwed.map(text => `Swarm: ${text}`))
+          silentOwed = []
         }
         if (notices.length > 0 && result.deny === undefined) result = { ...result, context: [...(result.context ?? []), ...notices] }
       }
@@ -2694,7 +2722,7 @@ export const register: Register = on => {
       // A kind this version does not know is still shown, uncoloured.
       const tone = (kind: string) =>
         ['unreachable', 'ignored', 'stale', 'rework', 'retired-running'].includes(kind) ? 'error' : kind === 'paused' ? 'suggestion'
-          : ['unread', 'review', 'question', 'unstarted', 'blocked', 'spend'].includes(kind) ? 'warning' : undefined
+          : ['unread', 'review', 'question', 'unstarted', 'blocked', 'spend', 'silent'].includes(kind) ? 'warning' : undefined
       const isSpent = shown.budget > 0 && total >= shown.budget
       const ask = (text: string) => {
         const fail = () => $.ui.toast('Swarm could not send that request to the coordinator.')
@@ -2712,12 +2740,16 @@ export const register: Register = on => {
             const count = seenKeys.get(baseKey) ?? 0
             seenKeys.set(baseKey, count + 1)
             const itemKey = count === 0 ? baseKey : `${baseKey}-${count}`
+            // Every item can be put in front of the coordinator: the kinds below have a request of their own, a
+            // paused run waits for the person, and an ignored member is retried on the board itself.
+            const isPlainAsk = !['unreachable', 'review', 'rework', 'paused', 'ignored'].includes(item.kind)
             const hasActions = item.seq > 0 || (isDriven && (
               item.kind === 'unreachable' ||
               (item.kind === 'paused' && isSpent) ||
               item.kind === 'ignored' ||
               item.kind === 'review' ||
-              item.kind === 'rework'
+              item.kind === 'rework' ||
+              isPlainAsk
             ))
             return (
             <Box
@@ -2767,6 +2799,14 @@ export const register: Register = on => {
                     plain
                     label="Ask coordinator to review"
                     onPress={() => ask(`Swarm: Review @${item.member}'s finding\n@${item.member}'s finding awaits your review (board post #${item.seq}). Read it with the board's show --post=${item.seq}, then accept it with the board's confirm command or answer @${item.member} on the board.`)}
+                  />
+                )}
+                {isPlainAsk && isDriven && (
+                  <Button
+                    key={`attention-ask-${itemKey}`}
+                    plain
+                    label={item.member === 'coordinator' ? 'Tell coordinator' : 'Ask coordinator to handle'}
+                    onPress={() => ask(`Swarm: Needs your attention\n${item.text}${item.seq ? ` It is board post #${item.seq}: read it with the board's show --post=${item.seq}.` : ''} Deal with it now, or tell the user why it stands.`)}
                   />
                 )}
                 {item.kind === 'rework' && isDriven && (

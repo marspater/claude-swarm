@@ -2817,3 +2817,71 @@ test('a retired member whose build is still running in its worktree is reported 
   const other = await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" replace shared shared-2` })
   expect(other.context?.join('\n')).toContain('@shared was retired. A build or test it started in the shared folder cannot be told')
 })
+
+test('a member whose agent ended without a report is flagged while others work, and the coordinator hears once', async ($, on) => {
+  const state = {
+    title: 'Demo swarm',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 4 },
+      quiet: { role: 'worker', id: 'q1', last_read_seq: 1 },
+      asker: { role: 'worker', id: 'k1', last_read_seq: 2 },
+      busy: { role: 'worker', id: 'b1', last_read_seq: 3 },
+      done: { role: 'worker', id: 'd1', last_read_seq: 4 },
+    },
+  }
+  const hint = (ready = false) => ({ type: 'worker', model: 'sonnet', effort: 'medium', depends: [], owns: '', ready, blocked_on: [], asked: 0, unreachable: false })
+  const { seen, answer, board } = owning(on, {
+    board: () => posts(
+      { agent: 'coordinator', to: ['quiet'], text: '@quiet BRIEF' },
+      { agent: 'coordinator', to: ['asker'], text: '@asker BRIEF' },
+      { agent: 'coordinator', to: ['busy'], text: '@busy BRIEF' },
+      { agent: 'coordinator', to: ['done'], text: '@done BRIEF' },
+      { agent: 'asker', to: ['coordinator'], text: '@coordinator which file?' },
+      { agent: 'done', to: ['coordinator'], text: 'READY\nall done' },
+    ),
+    roster: () => JSON.stringify(state),
+  })
+  on('process.run', (_, e) => {
+    const stdout = board(e)
+    return answer(e.argv[3] === 'attention'
+      ? JSON.stringify({
+        items: [{ kind: 'question', member: 'coordinator', seq: 5, text: '@asker asked @coordinator in #5 and has no answer.' }],
+        members: { quiet: hint(), asker: hint(), busy: hint(), done: hint(true) }, limits: {},
+      })
+      : stdout)
+  })
+  // quiet, asker and done have ended; busy is still at work
+  on('agent.list', () => ({ value: [
+    { id: 'q1', description: '@quiet', type: 'swarm:worker', status: 'completed' },
+    { id: 'k1', description: '@asker', type: 'swarm:worker', status: 'completed' },
+    { id: 'b1', description: '@busy', type: 'swarm:worker', status: 'running' },
+    { id: 'd1', description: '@done', type: 'swarm:worker', status: 'completed' },
+  ] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  const told = async () => (await $.tool.call({ tool: 'Bash', command: 'ls' })).context?.join('\n') ?? ''
+
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  // a turn may have just ended: nothing is said within the first minute
+  expect(await told()).not.toContain('stopped without reporting')
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-attention' })
+  expect(await ui.find({ type: 'Text', text: /@quiet stopped without reporting/ })).toBeDefined()
+  // any item can be put in front of the coordinator from the pane: a post it ignored, and a member that went quiet
+  expect((await ui.find({ key: 'attention-ask-question-coordinator-5' }))?.props.label).toBe('Tell coordinator')
+  await ui.press({ key: 'attention-ask-question-coordinator-5' })
+  expect(seen.prompts.at(-1)).toContain('Swarm: Needs your attention\n@asker asked @coordinator in #5 and has no answer. It is board post #5: read it with the board\'s show --post=5.')
+  expect((await ui.find({ key: 'attention-ask-silent-quiet-1' }))?.props.label).toBe('Ask coordinator to handle')
+  await ui.press({ key: 'attention-ask-silent-quiet-1' })
+  expect(seen.prompts.at(-1)).toContain('@quiet stopped without reporting')
+  await ui.unmount()
+  await clock.advance(62_000)
+  const notice = await told()
+  expect(notice).toContain('@quiet stopped without reporting: its agent ended after reading #1')
+  // a member that asked, one that is still working and one that reported are not flagged
+  expect(notice).not.toMatch(/@(asker|busy|done) stopped/)
+  await clock.advance(62_000)
+  expect(await told()).not.toContain('stopped without reporting')
+})

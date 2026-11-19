@@ -17,7 +17,7 @@ import time
 import uuid
 
 sys.dont_write_bytecode = True
-from board import REPORT_WORD, atomic_write, load, load_state, readiness, save
+from board import REPORT_WORD, atomic_write, latest_reports, load, load_state, readiness, save
 
 GIT_ENV_STRIP = {
     "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
@@ -209,7 +209,10 @@ def inputs(run, mode):
         if member.get("role") != "worker" or member.get("killed") or member.get("consult") == "1":
             continue
         if name not in ready:
-            raise ValueError(f"waiting for READY from @{name}")
+            reported = latest_reports(posts).get(name, {}).get("kind") == "ready"
+            raise ValueError(f"waiting for READY from @{name}" + (
+                ": its last one no longer counts, because a NOT PASSED followed it or a member it depends on is not ready"
+                if reported else ""))
         post = ready[name]
         revision = post.get("revision")
         wants_commit = mode == "isolated" and member.get("writes") != "0"

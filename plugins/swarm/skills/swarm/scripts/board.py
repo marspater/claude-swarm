@@ -194,12 +194,28 @@ def latest_reports(posts):
     return latest
 
 
+def rejected(post, members):
+    """The workers a verifier's NOT PASSED is about: those its first line names, or failing that every worker it reaches."""
+    word = REPORT_WORD.match(post["text"])
+    if not word or word[1] != "NOT PASSED" or members.get(post["agent"], {}).get("role") != "verifier":
+        return []
+    reached = post.get("to", [])
+    first = [name for name in targets(post["text"].split("\n", 1)[0], members, include_killed=True)
+             if name in reached and members.get(name, {}).get("role") == "worker"]
+    return first or [name for name in reached if members.get(name, {}).get("role") == "worker"]
+
+
 def readiness(members, posts):
-    ready = {}
+    ready, refused = {}, {}
+    for post in posts:
+        for name in rejected(post, members):
+            refused[name] = post["seq"]
     # Evaluate the latest reports in board order so prerequisites must still be current.
     for name, post in sorted(latest_reports(posts).items(), key=lambda entry: entry[1]["seq"]):
         member = members.get(name, {})
+        # A NOT PASSED withdraws the report it answers: the fix is on the record only once the worker reports again.
         if (post["kind"] == "ready" and member.get("role") == "worker" and not member.get("killed")
+                and refused.get(name, 0) < post["seq"]
                 and all(dep in ready for dep in dependencies(member))):
             ready[name] = post
     return ready
@@ -510,9 +526,7 @@ def rework(state, posts):
         if word[1] == "VERIFIED":
             failed, latest = {}, {}
         elif word[1] == "NOT PASSED":
-            first_workers = [name for name in targets(post["text"].split("\n", 1)[0], members, include_killed=True)
-                             if name in post["to"] and members.get(name, {}).get("role") == "worker"]
-            for name in (first_workers or [name for name in post["to"] if members.get(name, {}).get("role") == "worker"]):
+            for name in rejected(post, members):
                 # A verdict made with no candidate on the table is counted on its own.
                 if post.get("candidate") is None or latest.get(name) != post["candidate"]:
                     failed.setdefault(name, []).append(post["seq"])

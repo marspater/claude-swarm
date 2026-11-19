@@ -43,7 +43,7 @@ The first line says what the post is. Keep it to one line that makes sense alone
 | a question, with a mention | anyone | The exact thing you need, and the file and line it is about |
 | `READY` (written by `ready`) | a member | What changed or was found, the files, the exact commands run and their result; for an isolated writer, the commit |
 | `FINDING` (written by an investigator's `ready`) | an investigator | The same as a `READY`. It reaches only the coordinator, and releases nobody until `BOARD confirm` |
-| `@<name> NOT PASSED` | verifier | File and line, the command, the decisive line of output; for design work the expected and the measured value; all of one member's problems in one post |
+| `@<name> NOT PASSED` | verifier | File and line, the command, the decisive line of output; for design work the expected and the measured value; all of one member's problems in one post. It withdraws that member's `READY`: no candidate is prepared until the member reports again with `ready` |
 | `@coordinator VERIFIED <candidate> <commit or fingerprint>` | verifier | The exact line the candidate's test command returned, then the commands run and their results, and anything that could not be checked. The board refuses any other `VERIFIED` |
 | `@coordinator NOT VERIFIED` | verifier | The candidate could not be tested or failed as a whole: the candidate, the command, the decisive output, and what would unblock it |
 | `@<name> SHUTDOWN` | coordinator | The reason. The member answers with the state it left, then stops |
