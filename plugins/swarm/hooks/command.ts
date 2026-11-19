@@ -1,7 +1,7 @@
 // The text forms this module recognises: a board command in a Bash call, a run folder, a wake message.
 
 // python3 with any flags (-B, -X utf8), the script, the run folder (a trailing slash allowed), the subcommand.
-export const BOARD_CALL = /^(?:[A-Za-z_]\w*=(?:"[^"\n]*"|'[^'\n]*'|[^\s"'<>;]*)\s+)*(?:\S*\/)?python3(?:\.\d+)?\s+(?:-(?:[A-Za-z]+|[XW]\s+\S+)\s+)*(?:"[^"\n]*(?:^|\/)board\.py"|'[^'\n]*(?:^|\/)board\.py'|(?:[^\s"'<>;]*\/)?board\.py)\s+(?:"([^"\n]+)"|'([^'\n]+)'|((?:\\.|[^\s"'<>;])+))\s+([a-z]+)(?:[ \t]+([a-z-]+))?/
+export const BOARD_CALL = /^(?:[A-Za-z_]\w*=(?:"[^"\n]*"|'[^'\n]*'|[^\s"'<>;]*)\s+)*(?:\S*\/)?python3(?:\.\d+)?\s+(?:-(?:[A-Za-z]+|[XW]\s+\S+)\s+)*(?:"[^"\n]*(?:^|\/)board\.py"|'[^'\n]*(?:^|\/)board\.py'|(?:(?:\\.|[^\s"'<>;])*\/)?board\.py)\s+(?:"([^"\n]+)"|'([^'\n]+)'|((?:\\.|[^\s"'<>;])+))\s+([a-z]+)(?:[ \t]+([a-z-]+))?/
 export const RUN = /(?:^|\/)\.swarm\/[\w.-]+-\d{8}-\d{6}x*$/
 // `read coordinator`, with the read's flags on either side of the name, which the board also takes as `@coordinator`.
 // Only read off a BOARD_CALL whose subcommand is `read`: alone it also matches a commit message.
@@ -21,9 +21,10 @@ export const runsNamed = (prompt: string) => {
   return [...new Set(matches)].slice(0, 20)
 }
 
-/** Splits a shell command line into individual statements on unquoted `&&`, `||`, `|`, `;`, and `\n`. */
+/** Splits a shell command line into individual statements on unquoted `&&`, `||`, `|`, `;`, and `\n`, skipping heredoc bodies. */
 export function splitShellSegments(command: string): string[] {
   const segments: string[] = []
+  const pendingHeredocs: Array<{ delim: string; stripTabs: boolean }> = []
   let quote: "'" | '"' | undefined
   let start = 0
   for (let i = 0; i < command.length; i++) {
@@ -40,6 +41,35 @@ export function splitShellSegments(command: string): string[] {
       quote = ch
       continue
     }
+    if (ch === '<' && command[i + 1] === '<' && command[i + 2] !== '<') {
+      let j = i + 2
+      let stripTabs = false
+      if (command[j] === '-') {
+        stripTabs = true
+        j++
+      }
+      while (j < command.length && (command[j] === ' ' || command[j] === '\t')) j++
+      let delim = ''
+      const q = command[j]
+      if (q === "'" || q === '"') {
+        j++
+        while (j < command.length && command[j] !== q && command[j] !== '\n') {
+          if (q === '"' && command[j] === '\\' && j + 1 < command.length) j++
+          delim += command[j]!
+          j++
+        }
+        if (command[j] === q) j++
+      } else {
+        while (j < command.length && !/[\s;|&<>()]/.test(command[j]!)) {
+          if (command[j] === '\\' && j + 1 < command.length) j++
+          delim += command[j]!
+          j++
+        }
+      }
+      if (delim) pendingHeredocs.push({ delim, stripTabs })
+      i = j - 1
+      continue
+    }
     const isAnd = ch === '&' && command[i + 1] === '&'
     const isOr = ch === '|' && command[i + 1] === '|'
     const isPipe = ch === '|' && !isOr && command[i - 1] !== '>'
@@ -47,6 +77,22 @@ export function splitShellSegments(command: string): string[] {
       segments.push(command.slice(start, i))
       if (isAnd || isOr) i++
       start = i + 1
+      if (ch === '\n' && pendingHeredocs.length > 0) {
+        let pos = i + 1
+        while (pendingHeredocs.length > 0 && pos < command.length) {
+          const { delim, stripTabs } = pendingHeredocs.shift()!
+          while (pos < command.length) {
+            const nl = command.indexOf('\n', pos)
+            const lineEnd = nl === -1 ? command.length : nl
+            const rawLine = command.slice(pos, lineEnd).replace(/\r$/, '')
+            const candidate = stripTabs ? rawLine.replace(/^\t+/, '') : rawLine
+            pos = nl === -1 ? command.length : nl + 1
+            if (candidate === delim) break
+          }
+        }
+        i = pos - 1
+        start = pos
+      }
     }
   }
   segments.push(command.slice(start))

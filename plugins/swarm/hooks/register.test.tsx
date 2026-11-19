@@ -2592,3 +2592,181 @@ test('a replacement is not started while the member it replaces is still running
   expect(started.deny).toBeUndefined()
   expect(started.agentId).toBe('new')
 })
+
+test('hardening: native retired enforcement, immediate sync after coordinator commands, and zombie replace notice', async ($, on) => {
+  const state: Record<string, unknown> = {
+    title: 'Native swarm',
+    members: {
+      coordinator: { role: 'coordinator', backend: 'native', last_read_seq: 1 },
+      parser: { role: 'worker', id: 'parser@demo', killed: '1', last_read_seq: 1 },
+      worker: { role: 'worker', id: 'w-1', last_read_seq: 1 },
+    },
+  }
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['worker'], text: '@worker BRIEF' }),
+    roster: () => JSON.stringify(state),
+  })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({
+    value: [
+      { id: 'tm-1', teammateId: 'parser@demo', description: '@parser', type: 'swarm:worker', status: 'waiting' },
+      { id: 'w-1', description: '@worker', type: 'swarm:worker', status: 'waiting' },
+    ] as never,
+  }))
+  on('tool.call', (_, e) => {
+    if (e.tool === 'Bash' && String(e.command).includes('replace')) {
+      const members = state.members as Record<string, Record<string, unknown>>
+      members.worker = { ...members.worker, killed: '1', replaced_by: 'worker-2' }
+      members['worker-2'] = { role: 'worker', last_read_seq: 1 }
+    }
+    return { result: {} }
+  })
+  mock.clock(on)
+
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  // Binding via read immediately populates retired (including native teammate id) before any poll.
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  expect((await $.tool.call({ tool: 'Bash', command: 'echo hi', agentId: 'tm-1' })).deny).toContain('has been retired')
+
+  // Coordinator replace immediately syncs retired and attaches zombie notice when w-1 is waiting.
+  const rep = await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" replace worker worker-2` })
+  expect(rep.context?.join('\n')).toContain('@worker was retired, but agent w-1 is still waiting')
+  expect((await $.tool.call({ tool: 'Bash', command: 'echo hi', agentId: 'w-1' })).deny).toContain('has been retired')
+})
+
+test('hardening: transitive predecessor chain, overlapping paths, spawnIsolations, and exact model guidance', async ($, on) => {
+  const startedCalls: string[][] = []
+  const state = {
+    title: 'Chain swarm',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 },
+      a: { role: 'worker', id: 'a-old', killed: '1', replaced_by: 'a-2', last_read_seq: 1 },
+      'a-2': { role: 'worker', killed: '1', replaced_by: 'a-3', last_read_seq: 1 },
+      'a-3': { role: 'worker', last_read_seq: 1 },
+      x: { role: 'worker', id: 'x-old', killed: '1', paths: 'src/api', last_read_seq: 1 },
+      y: { role: 'worker', paths: 'src/api/routes.ts', last_read_seq: 1 },
+      wt: { role: 'worker', last_read_seq: 1 },
+      exact: { role: 'worker', model: 'claude-opus-4-6', last_read_seq: 1 },
+    },
+  }
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['wt'], text: '@wt BRIEF' }),
+    roster: () => JSON.stringify(state),
+  })
+  on('process.run', (_, e) => {
+    if (e.argv.includes('started')) startedCalls.push([...e.argv.slice(4)])
+    return answer(board(e))
+  })
+  on('agent.list', () => ({
+    value: [
+      { id: 'a-old', description: '@a', type: 'swarm:worker', status: 'waiting' },
+      { id: 'x-old', description: '@x', type: 'swarm:worker', status: 'running' },
+    ] as never,
+  }))
+  on('agent.spawn', () => ({ model: 'sonnet', agentId: 'wt-1' }))
+  let wtSpawn: Awaited<ReturnType<typeof $.agent.spawn>> | undefined
+  on('tool.call', async (_, e) => {
+    if (e.tool === 'Agent' && e.tool_use_id === 'wt-call') {
+      wtSpawn = await $.agent.spawn({
+        tool_use_id: 'wt-call', prompt: 'Use the board.', description: '@wt: go', subagentType: 'swarm:worker',
+        provider: { plugin: 'swarm', tier: 'core' as const }, parentModel: 'sonnet', background: true, fork: false,
+      })
+    }
+    return { result: {} }
+  })
+  mock.clock(on)
+
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+
+  // Transitive chain a -> a-2 -> a-3 blocked while a-old is waiting.
+  const chainDeny = await $.agent.spawn({
+    tool_use_id: 't1', prompt: 'Use the board.', description: '@a-3: go', subagentType: 'swarm:worker',
+    provider: { plugin: 'swarm', tier: 'core' as const }, parentModel: 'sonnet', background: true, fork: false,
+  })
+  expect(chainDeny.deny).toContain('@a, which @a-3 replaces, is still waiting as agent a-old')
+
+  // Overlapping paths with killed x-old still running blocks y.
+  const pathDeny = await $.agent.spawn({
+    tool_use_id: 't2', prompt: 'Use the board.', description: '@y: go', subagentType: 'swarm:worker',
+    provider: { plugin: 'swarm', tier: 'core' as const }, parentModel: 'sonnet', background: true, fork: false,
+  })
+  expect(pathDeny.deny).toContain('@x, which previously owned overlapping paths, is still running as agent x-old')
+
+  // Exact model guidance does not tell coordinator to pass exact ID.
+  const modelDeny = await $.agent.spawn({
+    tool_use_id: 't3', prompt: 'Use the board.', description: '@exact: go', model: 'sonnet', subagentType: 'swarm:worker',
+    provider: { plugin: 'swarm', tier: 'core' as const }, parentModel: 'sonnet', background: true, fork: false,
+  })
+  expect(modelDeny.deny).toContain('Omit model or pass model: "opus" on the Agent call')
+
+  // spawnIsolations passes isolated=1 for worktree.
+  await $.tool.call({
+    tool: 'Agent', tool_use_id: 'wt-call', subagent_type: 'swarm:worker', description: '@wt: go',
+    prompt: 'Use the board.', isolation: 'worktree',
+  })
+  expect(wtSpawn?.agentId).toBe('wt-1')
+  expect(startedCalls.at(-1)).toEqual(['wt', 'wt-1', '', 'isolated=1'])
+})
+
+test('hardening: runtime file edit guards, shared git commit guard, coordinator bg/Monitor guard, and READY question grace', async ($, on) => {
+  const boardLines = posts(
+    { agent: 'coordinator', to: ['alice', 'bob', 'ver'], text: '@alice @bob @ver BRIEF' },
+    { agent: 'alice', to: ['coordinator'], text: '@coordinator READY: done, should we deploy?' },
+  )
+  const state = {
+    title: 'Guard swarm',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 },
+      alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '0', last_read_seq: 1 },
+      bob: { role: 'worker', id: 'bob-1', paths: 'src/bob', isolated: '1', last_read_seq: 1 },
+      ver: { role: 'verifier', id: 'ver-1', last_read_seq: 1 },
+    },
+  }
+  const { answer, board, seen } = owning(on, {
+    board: () => boardLines,
+    roster: () => JSON.stringify(state),
+  })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({
+    value: [
+      { id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' },
+      { id: 'bob-1', description: '@bob', type: 'swarm:worker', status: 'running' },
+      { id: 'ver-1', description: '@ver', type: 'swarm:verifier', status: 'running' },
+    ] as never,
+  }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+
+  // File edit guards inside cwd
+  expect((await $.tool.call({ tool: 'Edit', file_path: '/project/.swarm/r/board.jsonl', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toContain('.swarm/')
+  expect((await $.tool.call({ tool: 'Write', file_path: '/project/src/alice/a.ts', content: 'x', agentId: 'ver-1' })).deny).toContain('read-only')
+  expect((await $.tool.call({ tool: 'Edit', file_path: '/project/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toContain('claimed by @bob')
+  expect((await $.tool.call({ tool: 'Edit', file_path: '/project/README.md', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toContain('claimed paths')
+  expect((await $.tool.call({ tool: 'Edit', file_path: '/project/src/alice/a.ts', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toBeUndefined()
+  // Outside cwd (/tmp and worktrees) are untouched
+  expect((await $.tool.call({ tool: 'Write', file_path: '/tmp/design.html', content: '<html/>', agentId: 'ver-1' })).deny).toBeUndefined()
+  expect((await $.tool.call({ tool: 'Edit', file_path: '/worktrees/wt1/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'bob-1' })).deny).toBeUndefined()
+
+  // Shared git commit guard
+  expect((await $.tool.call({ tool: 'Bash', command: 'git commit -m "wip"', agentId: 'alice-1' })).deny).toContain('Shared-checkout writers must not run `git commit`')
+  expect((await $.tool.call({ tool: 'Bash', command: 'git -C /tmp/wt commit -m "wip"', agentId: 'alice-1' })).deny).toBeUndefined()
+  expect((await $.tool.call({ tool: 'Bash', command: 'cd /tmp/wt && git commit -m "wip"', agentId: 'alice-1' })).deny).toBeUndefined()
+  expect((await $.tool.call({ tool: 'Bash', command: 'git commit -m "wip"', agentId: 'bob-1' })).deny).toBeUndefined()
+
+  // Coordinator Monitor & background Bash guards
+  expect((await $.tool.call({ tool: 'Monitor', command: 'tail -f log' } as never)).deny).toContain('Monitor')
+  expect((await $.tool.call({ tool: 'Bash', command: 'sleep 10 && echo hi', run_in_background: true })).deny).toContain('background watcher')
+  const bgOk = await $.tool.call({ tool: 'Bash', command: 'bun test', run_in_background: true })
+  expect(bgOk.deny).toBeUndefined()
+  expect(bgOk.context?.join('\n')).toContain('wake the coordinator')
+
+  // READY with unquoted '?' is NOT delayed 10 minutes (delivered after 10s MENTION_GRACE_MS)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'coord-turn', reason: 'answer' })
+  await clock.advance(12_000)
+  expect(seen.prompts.some(t => t.includes('board post'))).toBe(true)
+})

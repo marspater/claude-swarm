@@ -272,7 +272,10 @@ def is_run_data(name, run_data):
 
 def pending_changes(project):
     """Paths git reports as changed or untracked, other than Swarm's own run data."""
-    _, run_data = repository(project)
+    found = repository(project)
+    if found is None:
+        raise ValueError("not a git repository")
+    _, run_data = found
     entries = git(project, "status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=none").split(b"\0")
     pending, index = [], 0
     while index < len(entries):
@@ -372,7 +375,10 @@ def prepare(run, project, mode, checks, onto=None):
             "inputs": recorded, "digest": source_digest(work),
         }
         with board_lock(run):
-            check_inputs(run, candidate)
+            current_inputs = inputs(run, mode)
+            check_checks_field(run, candidate, current_inputs)
+            if current_inputs != recorded:
+                raise ValueError("worker readiness changed; prepare and test a new candidate")
             try:
                 with (run / "verification.json").open(encoding="utf-8") as file:
                     previous = json.load(file)
@@ -414,7 +420,8 @@ def run_check(command, cwd, timeout):
     except BaseException:
         # A check that ends on its own may leave what it started for the next check; one that is cut short may not.
         # A second signal must not cut the cleanup short: they are ignored until the group is gone.
-        for number in previous:
+        previous[signal.SIGINT] = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        for number in (signal.SIGTERM, signal.SIGHUP):
             signal.signal(number, signal.SIG_IGN)
         for number in (signal.SIGTERM, signal.SIGKILL):
             if gone():
@@ -433,7 +440,7 @@ def run_check(command, cwd, timeout):
             signal.signal(number, handler)
 
 
-def test_candidate(run, project, identifier, verifier):
+def test_candidate(run, project, identifier, verifier, timeout_arg=None):
     verifier = verifier.lstrip("@").lower()
     attempt = uuid.uuid4().hex
     with board_lock(run):
@@ -446,14 +453,21 @@ def test_candidate(run, project, identifier, verifier):
         candidate["attempt"] = attempt
         save_candidate(run, candidate)
 
-    raw_timeout = os.environ.get("SWARM_VERIFY_TIMEOUT", "").strip()
+    if timeout_arg is not None:
+        raw_timeout = timeout_arg.strip()
+        source_name = "--timeout"
+        if not raw_timeout:
+            raise ValueError("--timeout must be a positive number")
+    else:
+        raw_timeout = os.environ.get("SWARM_VERIFY_TIMEOUT", "").strip()
+        source_name = "SWARM_VERIFY_TIMEOUT"
     if raw_timeout:
         try:
             timeout = float(raw_timeout)
         except ValueError:
-            raise ValueError("SWARM_VERIFY_TIMEOUT must be a positive number") from None
+            raise ValueError(f"{source_name} must be a positive number") from None
         if not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError("SWARM_VERIFY_TIMEOUT must be a positive number")
+            raise ValueError(f"{source_name} must be a positive number")
     else:
         timeout = None
     for command in candidate["checks"]:
@@ -497,8 +511,19 @@ def accept(run, project, identifier):
         verifier = candidate["verified_by"]
         expected_line = f"VERIFIED {identifier} {candidate.get('commit') or candidate.get('digest')}"
         latest_input_seq = max((seq for seq, _ in candidate["inputs"].values()), default=0)
+        latest_rejection_seq = max(
+            (
+                p["seq"]
+                for p in posts
+                if state["members"].get(p["agent"], {}).get("role") == "verifier"
+                and (word := REPORT_WORD.match(p["text"]))
+                and word[1] in {"NOT PASSED", "NOT VERIFIED"}
+            ),
+            default=0,
+        )
+        cutoff_seq = max(latest_input_seq, latest_rejection_seq)
         if not any(
-            p["seq"] > latest_input_seq
+            p["seq"] > cutoff_seq
             and p["agent"] == verifier
             and (word := REPORT_WORD.match(p["text"])) and word[1] == "VERIFIED"  # `NOT VERIFIED <the line>` is no pass
             and re.search(rf"(?<!\w){re.escape(expected_line)}(?!\w)", p["text"].split("\n")[0])
@@ -558,6 +583,7 @@ def main():
     test = actions.add_parser("test")
     test.add_argument("candidate")
     test.add_argument("verifier")
+    test.add_argument("--timeout", help="per-check timeout in seconds (overrides SWARM_VERIFY_TIMEOUT)")
     actions.add_parser("accept").add_argument("candidate")
     args = parser.parse_args()
     project = args.project.resolve(strict=True)
@@ -574,7 +600,7 @@ def main():
                 raise ValueError("--base is for an isolated candidate; a shared one is the checkout as it stands")
             prepare(run, project, args.mode, None if args.no_checks else args.check, args.base)
         elif args.action == "test":
-            test_candidate(run, project, args.candidate, args.verifier)
+            test_candidate(run, project, args.candidate, args.verifier, args.timeout)
         else:
             accept(run, project, args.candidate)
 

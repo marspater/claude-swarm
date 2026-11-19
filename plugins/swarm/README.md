@@ -51,7 +51,7 @@ Experimental: to use Claude's native shared task list, launch `/swarm:swarm --na
 
 **The plan comes first.** Before any member starts, the coordinator shows the team as a table: each member's type, model, effort, what it owns and what it waits for. It starts straight away for a small team on the default models, and asks first when the plan has more than five members, when a member would run on a stronger model than its type's default, when a member would run on Fable that you did not ask for, or when you asked to approve the plan.
 
-**Limits go in the task.** Write them in plain words; the coordinator records them and the board enforces them:
+**Limits go in the task.** Write them in plain words; the coordinator records them and the board enforces them (passing an empty value like `budget=`, `max_workers=`, `max_members=`, or `fable=` clears a limit):
 
 | You write | The run gets |
 | --- | --- |
@@ -77,6 +77,7 @@ The pane's **Attention** tab, and `board.py attention` for the coordinator, list
 | Unread | Posts addressed to the coordinator that it has not read. It is also told in its next tool result, and by a prompt when idle; `close` refuses until it reads them |
 | Ignored | A member was woken three times in a row and still has not read its mentions. The tab offers "Retry" |
 | Unreachable | Three wakes failed. The tab offers "Ask coordinator to recover" |
+| Retired running | (Swarm pane only) A retired member's agent is still alive (`running`, `pending`, or `waiting`); stop it before spawning or replacing |
 | Stale | A worker or designer reported a change after the verifier's `VERIFIED` |
 | Rework | A worker failed verification twice in a row. A third failure pauses the run. The tab offers "Ask coordinator" |
 | Spend | One member has used more than half of the run's tokens, when three or more non-coordinator members have recorded usage, past 200,000 tokens |
@@ -86,7 +87,7 @@ A closed run lists nothing.
 
 Every post command also prints `UNREAD: …` to a sender that owes a read, which works even where the hooks are not loaded. The pane shortens long posts for display only: `board.jsonl`, `read` and `show` always carry the full text.
 
-The **Members** tab says what each member is doing: coordinating, working, waiting for a named member, waiting for an answer to a named post, reported ready, run paused, unreachable, failed, killed (Retired), or not started. To recover an unreachable member the coordinator runs `retry` once, then `replace <old> <new>`, which registers a successor with the old member's brief, dependencies and the numbers of its posts.
+The **Members** tab says what each member is doing: coordinating, working, waiting for a named member, waiting for an answer to a named post, reported ready, run paused, unreachable, failed, killed (Retired), or not started. To recover an unreachable member the coordinator runs `retry` once, then `replace <old> <new>`, which registers a successor with the old member's brief, dependencies and the numbers of its posts (`replace` refuses an already-replaced member, and the spawn hook refuses spawning the replacement while any predecessor or killed member with overlapping `paths=` is still active).
 
 ## Specialist and designer profiles
 
@@ -147,7 +148,8 @@ The `.swarm` folder ignores itself in git, unless it already holds a `.gitignore
 - Resuming the bound conversation restores its run while that run is open; a closed run is only shown. Other conversations may view the project's newest run without driving it.
 - Failed wake attempts retry after a short lease, up to three attempts per pending sequence. A process crash after Claude queues a message and before the board records the acknowledgement can repeat the nudge. Workers use their board read cursor to avoid rereading delivered posts.
 - Claude may leave native teammates stopped after resuming a conversation. The coordinator uses board history to replace unreachable members.
-- Verification hashes tracked and non-ignored untracked source files before and after checks, and checks the same snapshot at acceptance. Keep generated files ignored or outside the source tree. Failed integration checkouts can be retained for diagnosis.
+- Verification hashes tracked and non-ignored untracked source files before and after checks, and checks the same snapshot at acceptance. Keep generated files ignored or outside the source tree. Failed integration checkouts can be retained for diagnosis. `verify.py ... test` accepts `--timeout <seconds>` (overriding `SWARM_VERIFY_TIMEOUT`) to end a hanging check and its process group.
+- In a shared checkout, hooks enforce each writer's claimed `paths=` on edits (blocking writes to another writer's paths, outside the writer's own `paths=`, or inside `.swarm/`), refuse bare `git commit` for shared writers (one commit follows `VERIFY accept`), and refuse coordinator `Monitor` or background poll watchers on open runs.
 - An isolated candidate is built on the checkout's HEAD unless `prepare` is given `--base <ref>`. A candidate built on another ref is verified but not accepted into the checkout: its commits go out from the members' branches, as pull requests for instance. `prepare` names a member that did not branch from the base.
 - A checked-out submodule counts as its recorded commit while it is clean and sits on that commit. Checks in an isolated candidate run without submodule contents, and a candidate that moves a submodule pointer cannot be accepted: land that change by hand.
 - A verifier is woken for piece reviews once the last worker is ready, not for each `READY`. A `READY` that arrives while others still work is held for the coordinator for up to ten minutes, or until the last member stops; questions, findings and verdicts are never held.

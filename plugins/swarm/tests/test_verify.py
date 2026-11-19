@@ -641,6 +641,44 @@ class VerifyRegressions(unittest.TestCase):
             # Ignored build output does not block the report, wherever in the checkout it is made from.
             run(*post, "ready", "w", "HEAD", cwd=work / "build", text="added new_feature.py")
 
+    def test_accept_requires_verified_after_rejection_and_timeout_flag_and_nongit_pending(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            (proj / "app.txt").write_text("ok")
+            board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Rejection seq")
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            run(*post, "ready", "w", text="done")
+            cand = json.loads(run(*gate, "prepare", "shared", "--check", "test -s app.txt"))
+            line = run(*gate, "test", cand["candidate"], "v").splitlines()[-1]
+            run(*post, "post", "v", "@coordinator " + line)
+            run(*post, "post", "v", "@coordinator NOT VERIFIED: recheck needed")
+            # Re-running test restores verified_by, but accept must still require a new VERIFIED post after the rejection.
+            line2 = run(*gate, "test", cand["candidate"], "v").splitlines()[-1]
+            run(*gate, "accept", cand["candidate"], ok=False)
+            run(*post, "post", "v", "@coordinator " + line2)
+            run(*gate, "accept", cand["candidate"])
+
+            # --timeout overrides SWARM_VERIFY_TIMEOUT and validates finite positive numbers
+            cand2 = json.loads(run(*gate, "prepare", "shared", "--check", "sleep 1"))
+            env = dict(os.environ, SWARM_VERIFY_TIMEOUT="invalid")
+            res = subprocess.run([*gate, "test", cand2["candidate"], "v", "--timeout", "0.2"],
+                                 capture_output=True, text=True, env=env)
+            assert res.returncode != 0 and "timed out" in res.stderr, res.stderr
+            for bad in ("", "0", "-1", "nan", "inf", "abc"):
+                run(*gate, "test", cand2["candidate"], "v", "--timeout", bad, ok=False)
+
+            # pending_changes outside a git repository raises ValueError, not TypeError
+            sys.path.insert(0, str(SCRIPTS))
+            try:
+                import verify
+                with self.assertRaises(ValueError):
+                    verify.pending_changes(proj)
+            finally:
+                sys.path.remove(str(SCRIPTS))
+
 
 if __name__ == "__main__":
     scenario()

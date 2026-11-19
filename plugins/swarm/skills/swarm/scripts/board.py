@@ -2,7 +2,7 @@
 """Shared message board for a swarm: numbered posts, @mentions, unread cursors.
 
 usage: board.py DIR init TITLE                    prints the run folder it created; use that as DIR from then on
-       board.py DIR member NAME [key=value ...]   add or update (role= profile= writes= consult= group= depends= owns= paths= model= effort= id= backend= killed=1)
+       board.py DIR member NAME [key=value ...]   add or update (role= profile= writes= consult= group= depends= owns= paths= model= effort= id= backend= isolated= killed=1)
        board.py DIR limit [key=value ...]         set run limits: max_workers= max_members= budget=<tokens> <model>=<types>
        board.py DIR plan                          the team as a table: type, model, effort, dependencies, ownership
        board.py DIR attention [--json]            what needs someone: unanswered questions, blocked or unreachable members, stale verification
@@ -28,7 +28,7 @@ usage: board.py DIR init TITLE                    prints the run folder it creat
        board.py .swarm adopt KEY NAME [HINT]       bind the one open run that has member NAME; exit 3 when ambiguous, 4 when an open run lacks it, 5 when HINT names an ineligible run
        board.py .swarm locate KEY NAME [HINT]      find the one open run that has member NAME without binding it
        board.py .swarm agent-run KEY ID...         find the run owning agent ID
-       board.py DIR started NAME ID EXPECTED       record a started agent's ID if it matches EXPECTED
+       board.py DIR started NAME ID EXPECTED [isolated=0|1]  record a started agent's ID if it matches EXPECTED
        board.py DIR close                         mark the run finished
        board.py DIR account TURN_HASH ACTOR_KEY TOKENS  record a completed turn once
        board.py DIR status                        members, unread counts, who mentioned whom
@@ -74,7 +74,7 @@ QUESTION = re.compile(r"(?<!\?)\?(?!\?|\.?\w|:|[ \t]+[^\n?]*[ \t]+:)")
 SUMMARY_CHARS = 200
 ARG_COUNTS = {
     "init": (1, None), "restore": (1, 1), "adopt": (2, None), "locate": (2, None),
-    "agent-run": (2, 3), "started": (3, 3), "member": (1, None),
+    "agent-run": (2, 3), "started": (3, 4), "member": (1, None),
     "limit": (0, None), "plan": (0, 0), "attention": (0, 1), "retry": (1, 1),
     "replace": (2, None), "post": (1, None), "ready": (1, 2), "revise": (1, None),
     "confirm": (2, 2), "read": (1, 4), "show": (0, 2), "wake": (0, 0),
@@ -214,7 +214,7 @@ PROFILES = {*READ_ONLY, "designer"}
 FAMILIES = ("haiku", "sonnet", "opus", "fable")
 LIMITS = {"max_workers", "max_members", "budget", *FAMILIES}
 INHERITED = ("role", "group", "profile", "writes", "depends", "owns", "paths", "model", "effort", "consult")
-MEMBER_FIELDS = {*INHERITED, "backend", "id", "killed"}
+MEMBER_FIELDS = {*INHERITED, "backend", "id", "killed", "isolated"}
 
 
 def assignments(args, allowed):
@@ -260,17 +260,18 @@ def validate_member(name, member, changes, members):
     if "paths" in changes:
         cleaned = []
         for raw in changes["paths"].split(","):
-            path = re.sub(r"/+", "/", raw.strip()).removeprefix("./").rstrip("/")
-            if not path:
+            token = raw.strip()
+            if not token:
                 continue
-            if path.startswith("/") or ".." in path.split("/") or "\n" in path:
+            if token.startswith("/") or any(c in token for c in ("\n", "\r", "\0", "\\")):
                 raise ValueError("paths= takes files and folders relative to the repository root, separated by commas")
-            cleaned.append(path)
+            parts = [seg for seg in token.split("/") if seg not in ("", ".")]
+            if ".." in parts:
+                raise ValueError("paths= takes files and folders relative to the repository root, separated by commas")
+            if not parts:
+                raise ValueError("paths= must name specific files or folders relative to the repository root, not '.'")
+            cleaned.append("/".join(parts))
         member["paths"] = ",".join(dict.fromkeys(cleaned))
-    clash = claimed_twice(name, member, members)
-    if clash:
-        raise ValueError("@%s and @%s both claim %s. No path has two writers: give it to one of them and have the other "
-                         "depend on that member or post what it needs changed there" % (name, clash[0], clash[1]))
     if "role" in changes and member["role"] not in ({COORDINATOR} if name == COORDINATOR else {"worker", "verifier"}):
         raise ValueError(f"invalid role for @{name}")
     if ("profile" in changes and member["profile"] not in {"", *PROFILES}) or (
@@ -291,7 +292,7 @@ def validate_member(name, member, changes, members):
         raise ValueError("the coordinator cannot be assigned an agent address, retired, or made dependent")
     if "killed" in changes and changes["killed"] != "1":
         raise ValueError("use killed=1 to retire a member, or replace to register a successor")
-    for flag in ("writes", "consult"):
+    for flag in ("writes", "consult", "isolated"):
         if flag in changes and changes[flag] not in {"", "0", "1"}:
             raise ValueError(f"{flag} must be 0 or 1")
     if "effort" in changes and changes["effort"] not in {"", "low", "medium", "high", "xhigh", "max"}:
@@ -306,6 +307,10 @@ def validate_member(name, member, changes, members):
     if "id" in changes and (not changes["id"] or any(c.isspace() for c in changes["id"]) or any(
             other != name and not entry.get("killed") and entry.get("id") == changes["id"] for other, entry in members.items())):
         raise ValueError("agent addresses must be nonempty and unique among active members")
+    clash = claimed_twice(name, member, members)
+    if clash:
+        raise ValueError("@%s and @%s both claim %s. No path has two writers: give it to one of them and have the other "
+                         "depend on that member or post what it needs changed there" % (name, clash[0], clash[1]))
 
 
 def usable_name(name, members):
@@ -485,7 +490,7 @@ def rework(state, posts):
         if word[1] == "VERIFIED":
             failed = {}
         elif word[1] == "NOT PASSED":
-            first_workers = [name for name in targets(post["text"].split("\n", 1)[0], members)
+            first_workers = [name for name in targets(post["text"].split("\n", 1)[0], members, include_killed=True)
                              if name in post["to"] and members.get(name, {}).get("role") == "worker"]
             for name in (first_workers or [name for name in post["to"] if members.get(name, {}).get("role") == "worker"]):
                 failed.setdefault(name, []).append(post["seq"])
@@ -575,7 +580,8 @@ def attention(state, posts):
     if closed:  # a finished run asks for nothing: what was left open is history
         items, asked = [], {}
     view = {name: {"type": kind_of(member), "model": model_of(member), "effort": effort_of(member),
-                   "depends": dependencies(member), "owns": member.get("owns", ""), "ready": name in ready,
+                   "depends": dependencies(member), "owns": member.get("owns", ""), "paths": claims(member),
+                   "ready": name in ready,
                    "blocked_on": [] if closed or name in ready else [d for d in dependencies(member) if d not in ready],
                    "asked": asked.get(name, 0), "unreachable": not closed and name in team and unreachable(name, members, posts)}
             for name, member in members.items() if name != COORDINATOR}
@@ -723,11 +729,11 @@ def prune(root, args):
     print("%sremove %d worktree(s) and archive %d run(s)" % (would, removed, archived))
 
 
-def targets(text, members):
-    """The names a post reaches: its @name, @group and @all mentions, expanded to live members."""
+def targets(text, members, *, include_killed=False):
+    """The names a post reaches: its @name, @group and @all mentions, expanded to live members (or all when include_killed)."""
     # the name as written reaches a roster made before names had to end in a letter or digit
     mentioned = {form for m in MENTION.findall(QUOTED.sub("", text)) for form in (m.lower(), m.lower().rstrip("-_"))}
-    return [n for n, m in members.items() if not m.get("killed") and mentioned & {"all", n, m.get("group")}]
+    return [n for n, m in members.items() if (include_killed or not m.get("killed")) and mentioned & {"all", n, m.get("group")}]
 
 
 def show(post):
@@ -739,8 +745,8 @@ def init(d, title):
     parent, name = os.path.split(os.path.abspath(d))
     if os.path.basename(parent) != ".swarm":  # never write a "*" .gitignore anywhere else
         sys.exit("DIR must be <project>/.swarm/<swarm-name>")
-    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,200}", name) or not title.strip():
-        sys.exit("init requires a run name using letters, digits, dots, underscores or hyphens, and a nonempty title")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}", name) or not title.strip():
+        sys.exit("init requires a run name starting with a letter or digit and using letters, digits, dots, underscores or hyphens, and a nonempty title")
     os.makedirs(parent, exist_ok=True)
     run = "%s-%s" % (name, time.strftime("%Y%m%d-%H%M%S"))
     while True:  # mkdir is atomic, so two runs started in the same second get two folders
@@ -878,13 +884,15 @@ def main(argv):
         return
 
     try:
-        lock = open(os.path.join(d, ".lock"), "w")
+        lock = open(os.path.join(d, ".lock"), "a")
+        lock_mode = fcntl.LOCK_EX
     except OSError:
         if cmd not in READ_COMMANDS:
             raise
         lock = open(os.path.join(d, "members.json"), "rb")  # a read-only folder can still be shown
+        lock_mode = fcntl.LOCK_SH
     with lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)  # released when the process exits
+        fcntl.flock(lock, lock_mode)  # released when the process exits
         if cmd == "account":
             return account(d, args)
         state, posts = load(d)
@@ -928,14 +936,25 @@ def main(argv):
         if cmd == "started":
             name = known(args[0])
             member = members[name]
-            address, expected = args[1:]
+            address, expected = args[1], args[2]
+            isolated = None
+            if len(args) == 4:
+                if args[3] not in {"isolated=0", "isolated=1"}:
+                    sys.exit("started optional 4th argument must be isolated=0 or isolated=1")
+                isolated = args[3].partition("=")[2]
             if member.get("killed") or name == COORDINATOR:
                 sys.exit("the assignment is no longer active")
             validate_member(name, member, {"id": address}, members)
             if member.get("id") == address:
-                if any(key in member for key in ("wake_claim", "last_nudged_seq", "told")):
-                    for key in ("wake_claim", "last_nudged_seq", "told"):
+                dirty = False
+                for key in ("wake_claim", "last_nudged_seq", "told"):
+                    if key in member:
                         member.pop(key, None)
+                        dirty = True
+                if isolated is not None and member.get("isolated") != isolated:
+                    member["isolated"] = isolated
+                    dirty = True
+                if dirty:
                     save(d, state)
                 return
             if member.get("id", "") != expected:
@@ -943,6 +962,10 @@ def main(argv):
             for key in ("wake_claim", "last_nudged_seq", "told"):
                 member.pop(key, None)
             member["id"] = address
+            if isolated is not None:
+                member["isolated"] = isolated
+            else:
+                member.pop("isolated", None)
             save(d, state)
 
         elif cmd == "member":
@@ -958,10 +981,14 @@ def main(argv):
             if "id" in changes and changes["id"] != member.get("id"):
                 for key in ("wake_claim", "last_nudged_seq", "told"):
                     member.pop(key, None)
+                if "isolated" not in changes:
+                    member.pop("isolated", None)
             if member.get("profile") in READ_ONLY and "profile" in changes and changes["profile"] not in READ_ONLY and "writes" not in changes:
                 member.pop("writes", None)  # a specialist turned worker or designer writes again unless told otherwise
             member.update(changes)
             validate_member(name, member, changes, members)
+            if changes.get("group") in {"", "-"}:
+                member.pop("group", None)
             if "role" in changes or "consult" in changes:
                 stranded(name, members)
             if kind_of(member) == "investigator" and family(model_of(member)) == "fable":
@@ -994,7 +1021,7 @@ def main(argv):
 
         elif cmd == "limit":
             changes = assignments(args, LIMITS)
-            if any(not re.fullmatch(r"[0-9]{1,15}", changes[k]) for k in changes if k in ("max_workers", "max_members", "budget")):
+            if any(changes[k] != "" and not re.fullmatch(r"[0-9]{1,15}", changes[k]) for k in changes if k in ("max_workers", "max_members", "budget")):
                 sys.exit("limits are max_workers=N max_members=N budget=TOKENS and <model>=<types>, for models: " + " ".join(FAMILIES))
             for model in FAMILIES:
                 for token in changes.get(model, "").split(","):
@@ -1006,14 +1033,17 @@ def main(argv):
                         print("note: %s=%s names no agent type and no member yet. Types are: %s" % (model, token, ", ".join(DEFAULTS)))
             limits = state.setdefault("limits", {})
             for k, v in changes.items():
-                if v == "" and k in FAMILIES:
+                if v == "":
                     limits.pop(k, None)
                 else:
                     limits[k] = v
             budget, total = budget_usage(state)
-            if budget and total >= budget and not state.get("paused"):  # as `account` does when a turn crosses it
-                state["paused"] = spent(budget)
-                print("paused: %s (%d used). Raise it with limit budget=<tokens>, then resume" % (state["paused"], total))
+            if budget and total >= budget:
+                if not state.get("paused"):  # as `account` does when a turn crosses it
+                    state["paused"] = spent(budget)
+                    print("paused: %s (%d used). Raise it with limit budget=<tokens>, then resume" % (state["paused"], total))
+                elif state["paused"].startswith("token budget of "):
+                    state["paused"] = spent(budget)
             save(d, state)
             print("limits: " + (" ".join("%s=%s" % kv for kv in state["limits"].items()) or "none"))
             for error in limit_errors(state):
@@ -1025,7 +1055,7 @@ def main(argv):
             print("  %-16s %-13s %-8s %-7s %-18s %s" % ("member", "type", "model", "effort", "waits for", "owns"))
             for name, member in team.items():
                 print("  %-16s %-13s %-8s %-7s %-18s %s" % ("@" + name, kind_of(member), family(model_of(member)), effort_of(member),
-                                                           ",".join(dependencies(member)) or "-", member.get("owns", "-")))
+                                                           ",".join(dependencies(member)) or "-", member.get("owns") or member.get("paths") or "-"))
             models = Counter(family(model_of(member)) for member in team.values())
             print("  %d members: %s" % (len(team), ", ".join("%d %s" % (count, model) for model, count in models.most_common())))
             if state.get("limits"):
@@ -1062,6 +1092,8 @@ def main(argv):
             # A removed member can still be replaced: that is how the members waiting for it get a successor.
             if old == COORDINATOR or new in members or not usable_name(new, members):
                 sys.exit("replace needs an existing member and a new, unused name that is not a group's")
+            if members[old].get("replaced_by"):
+                sys.exit("@%s was already replaced by @%s; replace @%s instead" % (old, members[old]["replaced_by"], members[old]["replaced_by"]))
             before_counts, before_family = roster_counts(state), set(family_limit_errors(state))
             entry = {key: value for key, value in members[old].items() if key in INHERITED}
             given = assignments(args[2:], MEMBER_FIELDS - {"killed", "backend"})
@@ -1077,6 +1109,8 @@ def main(argv):
             members[old]["killed"] = "1"
             members[old]["replaced_by"] = new
             validate_member(new, entry, given, members)
+            if given.get("group") in {"", "-"}:
+                entry.pop("group", None)
             if "depends" in given:
                 entry["depends"] = ",".join(dependencies(entry))
             members[new] = entry

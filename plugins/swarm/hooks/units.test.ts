@@ -201,3 +201,49 @@ test('wave 3 command, graph, roster, text and hive edge cases', async () => {
   expect(toolMood('Bash', 'python3 "/path with spaces/board.py" "/my project/.swarm/demo-20261116-101010" read coordinator')).toBe('inspect')
   expect(toolMood('Bash', 'python3 "/path with spaces/board.py" "/my project/.swarm/demo-20261116-101010" post coordinator')).toBe('relay')
 })
+
+test('heredoc bodies, escaped board.py paths, and zombie retired-running attention', () => {
+  // Heredoc bodies with apostrophes and && / ; must not split segments or corrupt quote tracking
+  const withHeredoc = [
+    "python3 /p/board.py /repo/.swarm/r-20261116-101010 post parser <<'EOF'",
+    "don't split && git commit -m 'nope'",
+    'EOF',
+    'echo after',
+  ].join('\n')
+  const segs = splitShellSegments(withHeredoc)
+  expect(segs).toEqual([
+    "python3 /p/board.py /repo/.swarm/r-20261116-101010 post parser <<'EOF'",
+    'echo after',
+  ])
+  expect(boardCalls(withHeredoc).map(c => c.action)).toEqual(['post'])
+
+  // Escaped spaces in unquoted board.py path
+  const escaped = boardCalls('python3 /my\\ path/board.py /repo/.swarm/r-20261116-101010 member parser')
+  expect(escaped).toHaveLength(1)
+  expect(escaped[0]?.action).toBe('member')
+  expect(escaped[0]?.subarg).toBe('parser')
+
+  // Zombie retired-running attention & detail in roster.parse()
+  const rosterJson = JSON.stringify({
+    title: 'Demo',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 0 },
+      parser: { role: 'worker', id: 'old-1', killed: '1', paths: 'src/a.ts', isolated: '0', last_read_seq: 0 },
+    },
+  })
+  const parsed = parse(
+    '/repo/.swarm/r-20261116-101010',
+    '',
+    rosterJson,
+    [{ id: 'old-1', description: '@parser', type: 'swarm:worker', status: 'waiting' }] as never,
+  )
+  const parser = parsed.members.find(m => m.name === 'parser')!
+  expect(parser.status).toBe('killed')
+  expect(parser.detail).toBe('still waiting (old-1)')
+  expect(parsed.attention).toContainEqual({
+    kind: 'retired-running',
+    member: 'parser',
+    seq: 0,
+    text: '@parser was retired, but agent old-1 is still waiting. Stop it before reusing its files.',
+  })
+})

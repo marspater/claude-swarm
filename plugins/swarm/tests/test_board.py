@@ -1228,6 +1228,80 @@ class BoardRegressions(unittest.TestCase):
         run(d, "post", "coordinator", "@w second")
         assert "#2" in run(d, "show", "--post=2")
 
+    def test_started_isolated_paths_rework_replace_limit_and_init_hardening(self):
+        with tempfile.TemporaryDirectory() as t:
+            # init rejects leading dot or hyphen
+            run(os.path.join(t, ".swarm", ".hidden"), "init", "Bad", ok=False)
+            run(os.path.join(t, ".swarm", "-flag"), "init", "Bad", ok=False)
+            d = run(os.path.join(t, ".swarm", "hardening"), "init", "Hardening").strip()
+
+            # isolated field on member and started, not inherited on replace
+            run(d, "member", "w1", "isolated=1")
+            assert saved(d)["members"]["w1"]["isolated"] == "1"
+            run(d, "member", "w1", "isolated=2", ok=False)
+            run(d, "started", "w1", "id-1", "", ok=True)
+            assert "isolated" not in saved(d)["members"]["w1"]  # id change cleared stale isolated
+            run(d, "started", "w1", "id-1", "id-1", "isolated=1")
+            assert saved(d)["members"]["w1"]["isolated"] == "1"
+            run(d, "started", "w1", "id-2", "id-1", "isolated=0")
+            assert saved(d)["members"]["w1"]["isolated"] == "0"
+            run(d, "started", "w1", "id-2", "id-2", "isolated=2", ok=False)
+            run(d, "started", "w1", "id-2", "id-2", "isolated=", ok=False)
+            run(d, "member", "w1", "id=id-3")
+            assert "isolated" not in saved(d)["members"]["w1"]
+            run(d, "member", "w1", "isolated=1")
+            run(d, "replace", "w1", "w1b")
+            assert "isolated" not in saved(d)["members"]["w1b"]
+            # replace refuses already-replaced member
+            run(d, "replace", "w1", "w1c", ok=False)
+
+            # group=- clears group in member and replace
+            run(d, "member", "w1b", "group=alpha")
+            assert saved(d)["members"]["w1b"]["group"] == "alpha"
+            run(d, "member", "w1b", "group=-")
+            assert not saved(d)["members"]["w1b"].get("group")
+            run(d, "member", "w1b", "group=alpha")
+            run(d, "replace", "w1b", "w1c", "group=-")
+            assert not saved(d)["members"]["w1c"].get("group")
+
+            # paths normalization, rejection of ., \, \r, \0, and claimed_twice ordering
+            run(d, "member", "p1", "paths=././a,a/./b")
+            assert saved(d)["members"]["p1"]["paths"] == "a,a/b"
+            for bad_path in (".", "./", "./.", "a\\b", "a\rb"):
+                run(d, "member", "p2", "paths=" + bad_path, ok=False)
+            sys.path.insert(0, os.path.dirname(BOARD))
+            try:
+                import board
+                with self.assertRaises(ValueError):
+                    board.validate_member("p2", {"role": "worker"}, {"paths": "a\0b"}, {})
+            finally:
+                sys.path.remove(os.path.dirname(BOARD))
+            run(d, "member", "p2", "writes=invalid", "paths=a", ok=False)
+            run(d, "member", "p2", "role=verifier", "paths=a")  # verifier does not clash
+            att = json.loads(run(d, "attention", "--json"))
+            assert att["members"]["p1"]["paths"] == ["a", "a/b"]
+            assert "a,a/b" in run(d, "plan")
+
+            # rework ignores killed status of first-line target so body mention is not blamed
+            run(d, "member", "des", "profile=designer")
+            run(d, "member", "v", "role=verifier")
+            for i in range(3):
+                run(d, "post", "v", stdin=f"@w1c NOT PASSED: fail {i}\nSee @des")
+            run(d, "member", "w1c", "killed=1")
+            att2 = json.loads(run(d, "attention", "--json"))
+            assert not [i for i in att2["items"] if i["kind"] == "rework" and i["member"] == "des"]
+
+            # limit clearing and budget pause deduplication
+            run(d, "resume")
+            run(d, "limit", "max_workers=5", "max_members=10", "budget=100")
+            run(d, "account", "a" * 64, "coordinator", "200")
+            run(d, "limit", "budget=150")
+            assert saved(d)["paused"] == "token budget of 150 spent"
+            paused_items = [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "paused"]
+            assert len(paused_items) == 1
+            run(d, "limit", "max_workers=", "max_members=", "budget=")
+            assert saved(d)["limits"] == {}
+
 
 if __name__ == "__main__":
     scenario()

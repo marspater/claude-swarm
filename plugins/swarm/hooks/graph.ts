@@ -3,7 +3,7 @@ import { head as clipHead } from './text'
 import type { Post, Swarm } from '../types'
 
 const stripCode = (text: string) =>
-  text.replace(/```[\s\S]*?```|(`+)[^\n]*?\1/g, ' ')
+  text.replace(/```[\s\S]*?```|(`+)[^\n]*?\1|\w+:\/\/\S+/g, ' ')
 const BROADCAST = /(?<![\w.@/])@all[-_]*(?![\w-])/i
 const named = (text: string, name: string) =>
   new RegExp(`(?<![\\w.@/])@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[-_]*(?![\\w-])`, 'i').test(stripCode(text))

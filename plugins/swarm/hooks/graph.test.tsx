@@ -565,3 +565,8 @@ test('topology-aware peer ordering clusters communicating outer peers adjacent t
   expect(Math.sign(largeA.x - largeLayout.vw / 2)).toBe(Math.sign(largeZ.x - largeLayout.vw / 2))
   expect(Math.abs(largeZ.y - largeA.y)).toBeLessThanOrEqual(55)
 })
+
+test('URLs containing @all do not trigger isBroadcast', () => {
+  expect(isBroadcast({ seq: 1, agent: 'parser', to: ['coordinator'], text: 'See https://example.com/?@all for details', time: '' })).toBe(false)
+  expect(isBroadcast({ seq: 2, agent: 'parser', to: ['coordinator'], text: '@all please check https://example.com/?@all', time: '' })).toBe(true)
+})

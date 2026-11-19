@@ -9,7 +9,7 @@ You are the coordinator. The roster in `<run>/members.json` is the team: who exi
 | `role` | `worker` (default), `verifier`, `coordinator` | `role=verifier` when registering a verifier |
 | `profile` | The agent type behind a specialist (`explorer`, `investigator`, `architect`) or a `designer` | `profile=<type>` with `writes=0` for a specialist; `profile=designer` for a designer, which writes files |
 | `backend` | `native` on the coordinator's own entry when the run uses native Agent Teams; the plugin then expects named teammates | `BOARD member coordinator backend=native`, before any member starts |
-| `paths` | The files and folders a writer may edit, from the repository root, separated by commas. The board refuses a path that another active writer claims, or a folder that holds one. A successor made with `replace` inherits them | `paths=Sources/Feed,Tests/FeedTests.swift` at registration, before the brief |
+| `paths` | The files and folders a writer may edit, from the repository root, separated by commas. The board refuses a path that another active writer claims, or a folder that holds one. In a shared checkout, hooks enforce `paths=` on edits (blocking writes to another writer's paths, outside the member's own `paths=`, or inside `.swarm/`). A successor made with `replace` inherits them | `paths=Sources/Feed,Tests/FeedTests.swift` at registration, before the brief |
 | `consult` | Marks an architect that advises you on one question. Verification ignores it, so it never blocks or voids a candidate | `consult=1 effort=medium` at registration (with `effort: "medium"` on `Agent`); `killed=1` once it has answered (in native mode, request teammate shutdown too) |
 | `writes` | `0` for a member that changes no files | You, for read-only members |
 | `group` | A numbered pool's name, reached with `@<group>` | `group=fix` |
@@ -35,15 +35,15 @@ The hooks record each address when its agent starts. Check `BOARD status` after 
 
 ## Limits
 
-The `swarm` skill's step 1 says how limits are recorded and what the board refuses. Here, only what follows from them for the roster: `BOARD member` and `BOARD replace` refuse a change that breaks a limit, and say which. When the budget is spent the plugin pauses the run and calls you: report what is done and what is left, and ask the user before you raise the budget and resume. Never raise a limit on your own.
+The `swarm` skill's step 1 says how limits are recorded and what the board refuses. Here, only what follows from them for the roster: `BOARD member` and `BOARD replace` refuse a change that breaks a limit, and say which. Passing an empty value (`budget=`, `max_workers=`, `max_members=`, `fable=`) clears that limit. When the budget is spent the plugin pauses the run and calls you: report what is done and what is left, and ask the user before you raise the budget and resume. Never raise a limit on your own.
 
 ## Workspaces
 
 | | Shared (default) | Isolated |
 | --- | --- | --- |
-| How | Nothing extra | `isolation: "worktree"` on every writer's Agent call, a designer's included, in a git repository |
+| How | Shared checkout; hooks enforce `paths=` on edits and refuse bare `git commit` for shared writers | `isolation: "worktree"` on every writer's Agent call, a designer's included, in a git repository |
 | Use when | Pieces touch different files and do not build into the same output | Writers would break each other: one build directory, generated files, a lockfile |
-| A writer reports with | `BOARD ready <name>` | `BOARD ready <name> HEAD` from its worktree (or `<full commit id>`), after committing on its branch; a downstream isolated writer inspects (`git show <commit>:<path>`) or merges (`git merge --no-ff <commit>`) upstream `READY <commit>`s before building/testing |
+| A writer reports with | `BOARD ready <name>` (does not commit; runs only narrow fast checks, skipping any filtered test that triggers the whole build and naming it in `READY` for the verifier; never invents a build lock or queue; one commit follows `VERIFY accept`) | `BOARD ready <name> HEAD` from its worktree (or `<full commit id>`), after committing on its branch; a downstream isolated writer inspects (`git show <commit>:<path>`) or merges (`git merge --no-ff <commit>`) upstream `READY <commit>`s before building/testing |
 | Read-only members | No difference | Mark them `writes=0` so readiness does not expect a commit |
 | Verification | `VERIFY prepare shared` | `VERIFY prepare isolated` merges the exact commits into an integration worktree |
 
@@ -74,8 +74,8 @@ If it does not answer after it has been woken, stop its agent, then mark it. In 
 **Replace a member** that cannot be woken, keeps failing, or needs another model:
 
 1. If it is only unreachable, try `BOARD retry <name>` once and wait for the next delivery.
-2. Check it has no live session, so two agents never hold one piece.
-3. `BOARD replace parser parser-2`, with `model=<m>` and `effort=<e>` when they should change. Escalating an investigator to Fable needs both: `model=fable effort=medium`. This marks parser `killed=1`, registers parser-2 with the same type, ownership, group and dependencies, moves every member that waited for parser onto parser-2, and posts parser-2 a brief: parser's brief, plus the numbers of parser's posts and the instruction to read them first.
+2. Check it has no live session, so two agents never hold one piece. If a retired member's agent is still alive (`running`, `pending`, or `waiting`), the Swarm pane's Attention tab (and a hook context notice after `replace` / `killed=1`) flags `retired-running`, and the spawn hook refuses spawning the replacement while any predecessor (or a killed member with overlapping `paths=`) is still active.
+3. `BOARD replace parser parser-2`, with `model=<m>` and `effort=<e>` when they should change. Escalating an investigator to Fable needs both: `model=fable effort=medium`. `BOARD replace` refuses an already-replaced member. Otherwise it marks parser `killed=1`, registers parser-2 with the same type, ownership, group and dependencies, moves every member that waited for parser onto parser-2, and posts parser-2 a brief: parser's brief, plus the numbers of parser's posts and the instruction to read them first.
 4. Spawn parser-2 as the type the command prints, and record its id (in native mode, also reassign `TaskUpdate.owner` to `parser-2`).
 
 A living member's model cannot be changed. Replacement is the only way.
@@ -84,7 +84,7 @@ A living member's model cannot be changed. Replacement is the only way.
 
 - Waiting for the user: `BOARD pause <reason>`, say what you need, `BOARD resume` when they answer. While paused nothing is delivered and the monitor stays quiet.
 - The monitor calls you once when an open run is quiet and no member can advance. Run the coordinator loop; do not just acknowledge it.
-- `BOARD attention` is the list of what is stuck: a paused run, posts you have not read, findings to review, unanswered questions, unstarted, unreachable or ignored members, a worker that failed verification twice in a row (rework), one member holding most of the spend, members waiting on a removed, unreachable or never-started member, and stale verification. The pane's Attention tab shows the same list to the user.
+- `BOARD attention` is the list of what is stuck: a paused run, posts you have not read, findings to review, unanswered questions, unstarted, unreachable or ignored members, a worker that failed verification twice in a row (rework), one member holding most of the spend, members waiting on a removed, unreachable or never-started member, and stale verification. The pane's Attention tab shows the same list to the user, plus `retired-running` when a retired member's agent is still alive.
 - A member that is "waiting" with unread mentions should have been woken. If attention lists it as unreachable, retry once, then replace it.
 
 ## Recovery

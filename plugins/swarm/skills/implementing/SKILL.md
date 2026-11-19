@@ -23,7 +23,7 @@ You own a bounded piece. Use its acceptance criteria to decide what to read, cha
 - No refactoring, renaming or reformatting beyond the lines you must change. No new dependency without asking.
 - Implement a shared contract exactly as the brief states it. If it cannot be met, ask before you diverge: the other side is building against the same words.
 - When the brief or repository calls for a test, or existing tests would miss the regression, put the new check alongside the closest existing test. For a bug fix, confirm the assertion catches the old behavior when practical.
-- Check compatibility, failure, and retries where the changed behavior touches them. Preserve existing behavior and tests outside the brief. In shared work, report overlapping edits before changing someone else's lines.
+- Check compatibility, failure, and retries where the changed behavior touches them. Preserve existing behavior and tests outside the brief. In shared work, stay inside your claimed `paths=` (edits outside your `paths=`, to another writer's paths, or inside `.swarm/` are blocked; if a change is needed outside them, ask the owner or coordinator on the board instead of editing).
 
 ## Build from a designer's spec
 
@@ -36,7 +36,7 @@ When your brief names a `swarm:designer`'s spec, tokens or assets as its source,
 
 ## Prove
 
-- Run the narrowest check first: the one test file. Run the brief's full check once, before you report.
+- Run the narrowest check first: the one test file. In a shared checkout, run only narrow, fast checks; if even a filtered test triggers the whole build, skip it and name it in `READY` for the verifier, and never invent a build lock or queue. In isolated work, run the brief's full check once before you report.
 - Keep output small: use the runner's quiet mode, and on a failure read the failing assertion, not the whole log.
 - A failing check needs a reason. Identify whether it exercises your change, fails on the existing baseline, or is blocked by the environment when you can establish the difference. If a required check is blocked, post the command, decisive output, and what would unblock it. Leave the work pending until the coordinator resolves the requirement.
 - After two attempts at the same failing check, stop retrying. Post the failing assertion, what you tried, and the decision or input you need, then end the turn.
@@ -47,6 +47,6 @@ For a read-only synthesis, use the upstream reports named in the brief. Open the
 
 ## Report
 
-Aim for a `ready` report of about 1500 characters. State what changed and why, the owned paths, the exact commands and observed results, and any caveats the verifier needs. For isolated work, commit first, following the user's commit rules, and report with `BOARD ready <name> HEAD` from your worktree, which reads the commit itself. Keep git in plain, separate commands: an isolated agent is refused one that mixes git into a pipeline, a `$(...)`, a `trap` or a heredoc. Include the worktree and branch. A later change requires `revise` followed by a fresh report.
+Aim for a `ready` report of about 1500 characters. State what changed and why, the owned paths, the exact commands and observed results, and any caveats the verifier needs. In a shared checkout, **do not commit** (bare `git commit` is refused; one commit follows `VERIFY accept`) and report with `BOARD ready <name>`. For isolated work, commit first, following the user's commit rules, and report with `BOARD ready <name> HEAD` from your worktree, which reads the commit itself. Keep git in plain, separate commands: an isolated agent is refused one that mixes git into a pipeline, a `$(...)`, a `trap` or a heredoc. Include the worktree and branch. A later change requires `revise` followed by a fresh report.
 
 > `src/refresh.ts` now shares the in-flight refresh for a key and clears it on completion. `tests/refresh.test.ts` covers duplicate calls and a retry after failure. `npm test -- refresh` passed 14 tests. The regression test failed on the original code with two fetches. The integrated scheduler check belongs to the verifier.

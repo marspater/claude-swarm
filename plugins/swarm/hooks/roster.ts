@@ -37,6 +37,8 @@ export type Roster = Record<
     consult?: string
     model?: string
     effort?: string
+    paths?: string
+    isolated?: string
     id?: string
     killed?: string
     replaced_by?: string
@@ -58,6 +60,7 @@ export type Report = {
     effort: string
     depends: string[]
     owns: string
+    paths?: string[]
     ready: boolean
     blocked_on: string[]
     asked: number
@@ -176,10 +179,21 @@ export function parse(
   }
   const isClosed = state.closed === true
   const liveAgents = isClosed ? [] : agents
+  const zombieAttention: AttentionItem[] = []
   const members: Member[] = Object.entries(roster).map(([name, member]) => {
     const hint = report?.members && Object.hasOwn(report.members, name) ? report.members[name] : undefined
     const base = member.role === 'coordinator' && coordinating && !member.killed && !isClosed ? 'coordinating' : statusOf(member.role ?? 'worker', member, liveAgents)
     const status = !isClosed && hint?.unreachable && base !== 'working' && base !== 'killed' ? 'unreachable' : base
+    const zombie = !isClosed && member.killed && member.id ? findAgent(liveAgents, member.id) : undefined
+    const isZombie = zombie !== undefined && (zombie.status === 'running' || zombie.status === 'pending' || zombie.status === 'waiting')
+    if (isZombie) {
+      zombieAttention.push({
+        kind: 'retired-running',
+        member: name,
+        seq: 0,
+        text: `@${name} was retired, but agent ${zombie.id} is still ${zombie.status}. Stop it before reusing its files.`,
+      })
+    }
 
     return {
       name,
@@ -192,7 +206,7 @@ export function parse(
       depends: hint?.depends ?? [],
       owns: clean(hint?.owns ?? ''),
       status,
-      detail: isClosed ? '' : detailOf(status, hint, Boolean(state.paused)),
+      detail: isClosed ? '' : isZombie ? `still ${zombie.status} (${zombie.id})` : detailOf(status, hint, Boolean(state.paused)),
       unread: counts(name).unread,
       posts: counts(name).sent,
     }
@@ -207,7 +221,7 @@ export function parse(
     total: Math.max(posts.length, posts.at(-1)?.seq ?? 0),
     earlierEdges: edgesOf(posts.slice(0, -limit)),
     members,
-    attention: report?.items ?? [],
+    attention: [...(report?.items ?? []), ...zombieAttention],
     budget: budgetOf(state),
     tokens: state.usage?.tokens ?? {},
   }
