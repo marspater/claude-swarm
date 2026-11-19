@@ -1171,7 +1171,7 @@ test('Attention opens a post outside the recent window and a missing board clear
 
 test('the coordinator is told of unread mentions mid-turn and when idle, and a member turn re-arms its wake', async ($, on) => {
   const RUN = '/project/.swarm/demo-20261116-101010'
-  const board = [
+  let board = [
     { seq: 1, agent: 'coordinator', to: ['parser'], text: '@parser BRIEF\nOwns: date.ts' },
     { seq: 2, agent: 'parser', to: ['coordinator'], text: '@coordinator which file?' },
   ].map(post => JSON.stringify({ ...post, time: '2026-11-16T14:03:22+0100' })).join('\n') + '\n'
@@ -1223,12 +1223,14 @@ test('the coordinator is told of unread mentions mid-turn and when idle, and a m
   // mid-turn nothing is submitted; once the turn ends with the post still unread, one prompt is
   await clock.advance(20000)
   expect(prompts).toEqual([])
+  board += JSON.stringify({ seq: 3, agent: 'parser', to: ['coordinator'], text: '@coordinator another question?',
+    time: '2026-11-16T14:03:42+0100' }) + '\n'
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' })
   await clock.advance(4000)
   expect(prompts.length).toBe(1)
-  expect(prompts[0]).toContain('addresses you from #2')
+  expect(prompts[0]).toContain('2 board posts address you from #2')
   await clock.advance(20000)
-  expect(prompts.filter(text => text.includes('addresses you')).length).toBe(1)
+  expect(prompts.filter(text => text.includes('board posts address you')).length).toBe(1)
   // a member's finished turn asks the board to wake it again for anything it left unread
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'm', reason: 'answer', agentId: 'a1' })
   expect(commands).toContain('rearm 1 a1')
@@ -2753,6 +2755,9 @@ test('hardening: runtime file edit guards, shared git commit guard, coordinator 
   expect((await $.tool.call({ tool: 'Edit', file_path: '/worktrees/wt1/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'bob-1' })).deny).toBeUndefined()
 
   // Shared git commit guard
+  for (const command of ['git -C . commit', 'cd . && git commit', 'cd /tmp/wt && git -C /project commit']) {
+    expect((await $.tool.call({ tool: 'Bash', command, agentId: 'alice-1' })).deny).toContain('Shared-checkout writers')
+  }
   expect((await $.tool.call({ tool: 'Bash', command: 'git commit -m "wip"', agentId: 'alice-1' })).deny).toContain('Shared-checkout writers must not run `git commit`')
   expect((await $.tool.call({ tool: 'Bash', command: 'git -C /tmp/wt commit -m "wip"', agentId: 'alice-1' })).deny).toBeUndefined()
   expect((await $.tool.call({ tool: 'Bash', command: 'cd /tmp/wt && git commit -m "wip"', agentId: 'alice-1' })).deny).toBeUndefined()

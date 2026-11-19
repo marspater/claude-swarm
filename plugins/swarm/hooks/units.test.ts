@@ -222,6 +222,9 @@ test('heredoc bodies, escaped board.py paths, and zombie retired-running attenti
   expect(escaped).toHaveLength(1)
   expect(escaped[0]?.action).toBe('member')
   expect(escaped[0]?.subarg).toBe('parser')
+  for (const name of ['release-docs-2', '"@RELEASE-docs-2"', "'release-docs-2'"]) {
+    expect(boardCalls('python3 board.py run replace ' + name + ' next')[0]?.subarg).toBe('release-docs-2')
+  }
 
   // Zombie retired-running attention & detail in roster.parse()
   const rosterJson = JSON.stringify({

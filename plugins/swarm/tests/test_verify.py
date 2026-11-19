@@ -266,6 +266,8 @@ def scenario():
         run(*gate, "prepare", "shared", "--check", "true", "--no-checks", ok=False)
         assert "only writers are designers" in subprocess.run([*gate, "prepare", "shared", "--no-checks"], capture_output=True, text=True, env=env).stderr
         run(*post, "member", "worker", "profile=designer")
+        run(*gate, "prepare", "shared", "--no-checks", env=env, ok=False)
+        run(*post, "ready", "worker", text="design checked")
         bare = json.loads(run(*gate, "prepare", "shared", "--no-checks", env=env))
         assert run(*gate, "test", bare["candidate"], "verifier", env=env) == "VERIFIED %s %s" % (bare["candidate"], bare["digest"])
         run(*post, "post", "verifier", "@coordinator VERIFIED %s %s" % (bare["candidate"], bare["digest"]), env=env)
@@ -501,6 +503,8 @@ class VerifyRegressions(unittest.TestCase):
             run(*post, "ready", "d", text="spec2")
             run(*post, "ready", "w", rev, text="bumped")
             run(*gate, "prepare", "isolated", "--check", "true", ok=False)
+            gp("submodule", "deinit", "-f", "vendor/lib")
+            run(*gate, "prepare", "isolated", "--check", "true", ok=False)
             # Prune skips closed run containing active registered git worktree
             wt = Path(board) / "worker-wt"
             gp("worktree", "add", "--detach", str(wt), "HEAD")
@@ -550,12 +554,12 @@ class VerifyRegressions(unittest.TestCase):
             run(*post, "member", "v", "role=verifier")
             run(*post, "ready", "w", text="done")
             cand = json.loads(run(*gate, "prepare", "shared", "--check", "test -s app.txt"))
+            passed = run(*gate, "test", cand["candidate"], "v").splitlines()[-1]
             for bad_timeout in ("0", "-5", "nan", "inf", "abc"):
                 env = dict(os.environ, SWARM_VERIFY_TIMEOUT=bad_timeout)
                 res = subprocess.run([*gate, "test", cand["candidate"], "v"], capture_output=True, text=True, env=env)
                 assert res.returncode != 0 and "SWARM_VERIFY_TIMEOUT must be a positive number" in res.stderr
-            line = run(*gate, "test", cand["candidate"], "v").splitlines()[-1]
-            run(*post, "post", "v", "@coordinator " + line)
+            run(*post, "post", "v", "@coordinator " + passed)
             run(*gate, "accept", cand["candidate"])
             members_path = Path(board) / "members.json"
             state = json.loads(members_path.read_text())
@@ -576,6 +580,13 @@ class VerifyRegressions(unittest.TestCase):
             run(*post, "member", "v", "role=verifier")
             run(*post, "member", "v2", "role=verifier")
             run(*post, "ready", "w", text="done")
+            cand = json.loads(run(*gate, "prepare", "shared", "--check", "test -s app.txt"))
+            line = run(*gate, "test", cand["candidate"], "v").splitlines()[-1]
+            # A rejection delivered during the check invalidates that attempt too.
+            reject = shlex.join([str(arg) for arg in [*post, "post", "v2", "@w NOT PASSED reviewed during test"]])
+            interrupted = json.loads(run(*gate, "prepare", "shared", "--check", reject))
+            run(*gate, "test", interrupted["candidate"], "v", ok=False)
+            assert "verified_by" not in json.loads((Path(board) / "verification.json").read_text())
             cand = json.loads(run(*gate, "prepare", "shared", "--check", "test -s app.txt"))
             line = run(*gate, "test", cand["candidate"], "v").splitlines()[-1]
             # A rejection that quotes the pass line is no pass.

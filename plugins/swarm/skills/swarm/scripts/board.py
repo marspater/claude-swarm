@@ -112,12 +112,12 @@ def load_state(d):
     return state
 
 
-def load(d):
+def load(d, *, repair=True):
     state = load_state(d)
     path = os.path.join(d, "board.jsonl")
     posts = []
     try:
-        f, writable = open(path, "rb+"), True
+        f, writable = open(path, "rb+" if repair else "rb"), repair
     except OSError:  # a read-only copy can still be shown; it is simply not repaired
         f, writable = open(path, "rb"), False
     with f:
@@ -238,6 +238,11 @@ def claims(member):
     return [path for path in (member.get("paths") or "").split(",") if path]
 
 
+def assignment_scope(member):
+    return (kind_of(member), member.get("writes") != "0", member.get("consult") == "1",
+            member.get("owns", ""), set(claims(member)), set(dependencies(member)))
+
+
 def claimed_twice(name, member, members):
     """The first path two active writers both claim, with the other member's name, or None."""
     def writes(entry):
@@ -305,8 +310,8 @@ def validate_member(name, member, changes, members):
     if member.get("consult") == "1" and (kind_of(member) != "architect" or member.get("writes") != "0"):
         raise ValueError("consult=1 is only valid for a read-only architect")
     if "id" in changes and (not changes["id"] or any(c.isspace() for c in changes["id"]) or any(
-            other != name and not entry.get("killed") and entry.get("id") == changes["id"] for other, entry in members.items())):
-        raise ValueError("agent addresses must be nonempty and unique among active members")
+            other != name and entry.get("id") == changes["id"] for other, entry in members.items())):
+        raise ValueError("agent addresses must be nonempty and unique within the run, including retired members")
     clash = claimed_twice(name, member, members)
     if clash:
         raise ValueError("@%s and @%s both claim %s. No path has two writers: give it to one of them and have the other "
@@ -440,7 +445,9 @@ def void_pass(d):
             candidate = json.load(f)
     except (FileNotFoundError, ValueError):
         return
-    if isinstance(candidate, dict) and not candidate.get("accepted") and candidate.pop("verified_by", None):
+    if isinstance(candidate, dict) and not candidate.get("accepted") and ("verified_by" in candidate or "attempt" in candidate):
+        candidate.pop("verified_by", None)
+        candidate.pop("attempt", None)
         atomic_write(path, json.dumps(candidate, indent=2))
 
 
@@ -889,13 +896,16 @@ def main(argv):
     except OSError:
         if cmd not in READ_COMMANDS:
             raise
-        lock = open(os.path.join(d, "members.json"), "rb")  # a read-only folder can still be shown
+        try:
+            lock = open(os.path.join(d, ".lock"), "rb")
+        except FileNotFoundError:  # an old read-only copy may lack a lock file
+            lock = open(os.path.join(d, "members.json"), "rb")
         lock_mode = fcntl.LOCK_SH
     with lock:
         fcntl.flock(lock, lock_mode)  # released when the process exits
         if cmd == "account":
             return account(d, args)
-        state, posts = load(d)
+        state, posts = load(d, repair=lock_mode == fcntl.LOCK_EX)
         members = state["members"]
         budget, total = budget_usage(state)
         over_budget = bool(budget and total >= budget)
@@ -917,6 +927,12 @@ def main(argv):
         def post_message(sender, text, recipients, *, save_roster=False, **extra):
             post = {"seq": len(posts) + 1, "agent": sender, "text": text,
                     "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "to": recipients, **extra}
+            if post.get("kind") == "ready":
+                current = readiness(members, [*posts, post])
+                if any(entry.get("role") == "worker" and entry.get("consult") != "1" and name not in current
+                       for name, entry in team_of(members).items()):
+                    recipients = [name for name in recipients if members[name].get("role") != "verifier"]
+                    post["to"] = recipients
             if save_roster:
                 state["pending_post"] = post
                 save(d, state)
@@ -977,6 +993,7 @@ def main(argv):
             was_fable_inv = (name in members and kind_of(members[name]) == "investigator"
                              and family(model_of(members[name])) == "fable")
             member = members.setdefault(name, {"role": "worker", "last_read_seq": len(posts)})
+            previous = member.copy()
             changes = assignments(args[1:], MEMBER_FIELDS)
             if "id" in changes and changes["id"] != member.get("id"):
                 for key in ("wake_claim", "last_nudged_seq", "told"):
@@ -1017,6 +1034,11 @@ def main(argv):
                 sys.exit("over the run's limits, nothing was changed: " + "; ".join(errors))
             if model_of(member).lower() == "inherit" and any(f in state.get("limits", {}) for f in FAMILIES):
                 print(f"note: @{name} has model=inherit, which cannot be checked against family limits here", file=sys.stderr)
+            if (not member.get("killed") and assignment_scope(previous) != assignment_scope(member)
+                    and latest_reports(posts).get(name, {}).get("kind") in {"ready", "finding"}):
+                recipients = [name] + [n for n, entry in team_of(members).items() if name in dependencies(entry)]
+                return post_message(COORDINATOR, f"@{name} Your assignment changed. Review its scope and report again.",
+                                    recipients, kind="revise", subject=name, save_roster=True)
             save(d, state)
 
         elif cmd == "limit":
@@ -1252,15 +1274,6 @@ def main(argv):
                               or (name == COORDINATOR and kind_of(member) == "investigator")]
             if cmd == "ready" and kind_of(member) != "investigator" and not is_consultant:
                 recipients.extend(name for name in targets(report, members) if name != sender and name not in recipients)
-            if cmd == "ready":
-                # A verifier reviews when there is something whole to review. Woken for each READY of five it spends
-                # a turn per piece and is mid-review when the candidate arrives; it hears once the last worker is ready.
-                # The same holds in rework after a failed candidate: one worker revising wakes it at once, several
-                # wake it when the last of them reports.
-                waiting = [name for name, entry in team_of(members).items() if entry.get("role") == "worker"
-                           and entry.get("consult") != "1" and name != sender and name not in through]
-                if waiting:
-                    recipients = [name for name in recipients if members[name].get("role") != "verifier"]
             post_message(sender, text, recipients, kind=cmd, revision=revision)
 
         elif cmd == "confirm":

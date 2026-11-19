@@ -352,18 +352,11 @@ def prepare(run, project, mode, checks, onto=None):
                         raise ValueError(f"could not merge @{name}'s commit {revision[:12]}: {error}. If Git asks for an identity "
                                          "or a signing key, configure it for this repository, then prepare again") from None
             commit = git(integration, "rev-parse", "HEAD").decode().strip()
-            diff = git(integration, "diff", "--raw", "-z", base, commit).split(b"\0")
-            idx = 0
-            while idx + 1 < len(diff):
-                meta, sub_name = diff[idx], diff[idx + 1]
-                idx += 2
-                parts = meta.lstrip(b":").split()
-                if len(parts) >= 5 and parts[4][:1] in (b"R", b"C"):
-                    idx += 1
-                if len(parts) >= 4 and b"160000" in parts[:2] and parts[2] != parts[3]:
-                    sub_rel = os.fsdecode(sub_name)
-                    if (root / sub_rel / ".git").exists():
-                        raise ValueError(f"cannot verify submodule update at {sub_rel} in isolated mode; land submodule pointer changes by hand")
+            diff = git(integration, "diff", "--no-renames", "--ignore-submodules=none", "--raw", "-z", base, commit).split(b"\0")
+            for meta, name in zip(diff[::2], diff[1::2]):
+                if b"160000" in meta.lstrip(b":").split()[:2]:
+                    raise ValueError(f"cannot verify submodule update at {os.fsdecode(name)} in isolated mode; "
+                                     "land submodule pointer changes by hand")
             work = integration / project.relative_to(root)
             if not work.is_dir():
                 raise ValueError("the requested project directory is missing in the candidate")
@@ -442,17 +435,6 @@ def run_check(command, cwd, timeout):
 
 def test_candidate(run, project, identifier, verifier, timeout_arg=None):
     verifier = verifier.lstrip("@").lower()
-    attempt = uuid.uuid4().hex
-    with board_lock(run):
-        candidate = candidate_for(run, project, identifier)
-        active_verifier(run, verifier)
-        if candidate.get("accepted"):
-            raise ValueError("this candidate was accepted; prepare a new candidate to test again")
-        check_inputs(run, candidate)  # before anything is cleared: a test that cannot run voids nothing
-        candidate.pop("verified_by", None)
-        candidate["attempt"] = attempt
-        save_candidate(run, candidate)
-
     if timeout_arg is not None:
         raw_timeout = timeout_arg.strip()
         source_name = "--timeout"
@@ -470,6 +452,18 @@ def test_candidate(run, project, identifier, verifier, timeout_arg=None):
             raise ValueError(f"{source_name} must be a positive number")
     else:
         timeout = None
+
+    attempt = uuid.uuid4().hex
+    with board_lock(run):
+        candidate = candidate_for(run, project, identifier)
+        active_verifier(run, verifier)
+        if candidate.get("accepted"):
+            raise ValueError("this candidate was accepted; prepare a new candidate to test again")
+        check_inputs(run, candidate)  # before anything is cleared: a test that cannot run voids nothing
+        candidate.pop("verified_by", None)
+        candidate["attempt"] = attempt
+        save_candidate(run, candidate)
+
     for command in candidate["checks"]:
         print(f"$ {command}", flush=True)
         try:
@@ -483,7 +477,7 @@ def test_candidate(run, project, identifier, verifier, timeout_arg=None):
     with board_lock(run):
         candidate = candidate_for(run, project, identifier)
         if candidate.get("attempt") != attempt:
-            raise ValueError("another verification attempt superseded this one")
+            raise ValueError("the verification attempt was withdrawn or superseded")
         active_verifier(run, verifier)
         check_inputs(run, candidate)
         candidate["verified_by"] = verifier

@@ -504,14 +504,14 @@ def scenario():
         run(edge, "member", "base", "killed=1")
         run(edge, "replace", "base", "base-2")
         assert saved(edge)["members"]["b"]["depends"] == "base-2"
-        # an investigator's confirmed finding reaches the verifier as well as the dependants
+        # A confirmed finding waits for the remaining workers before waking the verifier.
         run(edge, "member", "probe", "profile=investigator", "writes=0", "model=sonnet")
         run(edge, "ready", "probe", stdin="cause found")
         with open(os.path.join(edge, "board.jsonl"), encoding="utf-8") as f:
             finding = len(f.readlines())
         run(edge, "confirm", "probe", str(finding))
         with open(os.path.join(edge, "board.jsonl"), encoding="utf-8") as f:
-            assert "v" in json.loads(f.readlines()[-1])["to"]
+            assert "v" not in json.loads(f.readlines()[-1])["to"]
         # a board whose sequence is a JSON true is refused, not read as post 1
         forged = run(name, "init", "Forged").strip()
         with open(os.path.join(forged, "board.jsonl"), "w", encoding="utf-8") as f:
@@ -857,6 +857,61 @@ class BoardRegressions(unittest.TestCase):
 
     def init_run(self, name="reg"):
         return run(os.path.join(self.swarm, name), "init", "Regression").strip()
+
+    def test_scope_change_withdraws_reports_and_rechecks_dependents(self):
+        d = self.init_run()
+        run(d, "member", "w", "paths=src")
+        run(d, "member", "follower", "depends=w")
+        run(d, "ready", "w", stdin="done")
+        run(d, "ready", "follower", stdin="done")
+        def readiness():
+            team = json.loads(run(d, "attention", "--json"))["members"]
+            return [team[n]["ready"] for n in ("w", "follower")]
+        run(d, "member", "w", "paths=./src/", "id=address")
+        assert readiness() == [True, True]
+        run(d, "member", "w", "paths=src,tests")
+        assert readiness() == [False, False]
+        run(d, "ready", "w", stdin="covered tests")
+        assert readiness() == [True, False]
+        run(d, "ready", "follower", stdin="rechecked")
+        assert readiness() == [True, True]
+
+    def test_verifier_wakes_only_for_current_combined_reports(self):
+        d = self.init_run()
+        run(d, "member", "upstream", "profile=investigator")
+        run(d, "member", "w", "depends=upstream")
+        run(d, "member", "v", "role=verifier")
+        for _ in range(2):
+            finding = run(d, "ready", "upstream", stdin="observed").split()[1][1:]
+            assert "@v" not in run(d, "confirm", "upstream", finding)
+            assert "@v" in run(d, "ready", "w", stdin="checked")
+
+    def test_read_only_reader_leaves_journal_repair_to_writer(self):
+        from pathlib import Path
+        d = self.init_run()
+        journal = Path(d) / "board.jsonl"
+        lock = Path(d) / ".lock"
+        run(d, "status")  # create the same lock a writer uses
+        journal.write_bytes(b'{"seq":')
+        lock.chmod(0o444)
+        try:
+            if os.access(lock, os.W_OK):
+                self.skipTest("test requires a user subject to file permissions")
+            run(d, "status")
+            assert journal.read_bytes() == b'{"seq":'
+        finally:
+            lock.chmod(0o644)
+        run(d, "status")
+        assert journal.read_bytes() == b""
+
+    def test_retired_address_cannot_bind_a_successor(self):
+        d = self.init_run()
+        run(d, "member", "old", "id=address")
+        run(d, "replace", "old", "new", "id=address", ok=False)
+        assert not saved(d)["members"]["old"].get("killed")
+        run(d, "replace", "old", "new")
+        run(d, "started", "new", "address", "", ok=False)
+        run(d, "started", "new", "new-address", "")
 
     def test_family_inherit_warns_when_limit_active(self):
         d = self.init_run()

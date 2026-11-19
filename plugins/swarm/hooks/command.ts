@@ -1,7 +1,7 @@
 // The text forms this module recognises: a board command in a Bash call, a run folder, a wake message.
 
 // python3 with any flags (-B, -X utf8), the script, the run folder (a trailing slash allowed), the subcommand.
-export const BOARD_CALL = /^(?:[A-Za-z_]\w*=(?:"[^"\n]*"|'[^'\n]*'|[^\s"'<>;]*)\s+)*(?:\S*\/)?python3(?:\.\d+)?\s+(?:-(?:[A-Za-z]+|[XW]\s+\S+)\s+)*(?:"[^"\n]*(?:^|\/)board\.py"|'[^'\n]*(?:^|\/)board\.py'|(?:(?:\\.|[^\s"'<>;])*\/)?board\.py)\s+(?:"([^"\n]+)"|'([^'\n]+)'|((?:\\.|[^\s"'<>;])+))\s+([a-z]+)(?:[ \t]+([a-z-]+))?/
+export const BOARD_CALL = /^(?:[A-Za-z_]\w*=(?:"[^"\n]*"|'[^'\n]*'|[^\s"'<>;]*)\s+)*(?:\S*\/)?python3(?:\.\d+)?\s+(?:-(?:[A-Za-z]+|[XW]\s+\S+)\s+)*(?:"[^"\n]*(?:^|\/)board\.py"|'[^'\n]*(?:^|\/)board\.py'|(?:(?:\\.|[^\s"'<>;])*\/)?board\.py)\s+(?:"([^"\n]+)"|'([^'\n]+)'|((?:\\.|[^\s"'<>;])+))\s+([a-z]+)(?=\s|$)/
 export const RUN = /(?:^|\/)\.swarm\/[\w.-]+-\d{8}-\d{6}x*$/
 // `read coordinator`, with the read's flags on either side of the name, which the board also takes as `@coordinator`.
 // Only read off a BOARD_CALL whose subcommand is `read`: alone it also matches a commit message.
@@ -116,10 +116,9 @@ export function boardCalls(command: string): ParsedBoardCall[] {
     const rawDir = match[1] ?? match[2] ?? match[3]?.replace(/\\(.)/g, '$1') ?? ''
     const dir = rawDir.replace(/\/+$/, '')
     const action = match[4]!
-    const subarg = match[5]
-    // The gap before the subarg may be several spaces or tabs; the folder may itself end in a letter.
-    const tailLen = action.length + (subarg ? /[ \t]+[a-z-]+$/.exec(match[0])![0].length : 0)
-    const rest = segment.slice(match[0].length - tailLen)
+    const rest = segment.slice(match[0].length - action.length)
+    const argument = /^[a-z]+[ \t]+(?:"@?([\w-]+)"|'@?([\w-]+)'|@?([\w-]+))(?=\s|$)/.exec(rest)
+    const subarg = (argument?.[1] ?? argument?.[2] ?? argument?.[3])?.toLowerCase()
     results.push({ dir, action, subarg, rest })
   }
   return results

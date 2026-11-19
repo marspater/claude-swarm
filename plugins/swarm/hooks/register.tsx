@@ -1055,7 +1055,10 @@ async function refresh($: EngineInterface): Promise<void> {
         post.to.includes('coordinator') && !shownPosts.posts.has(post.seq))
       : []
     const last = unread.at(-1)?.seq ?? 0
-    owed = last === 0 ? NONE : { count: unread.length, first: unread[0]?.seq ?? last, last, since: last === owed.last ? owed.since : now }
+    const firstPending = unread.find(post => post.seq > prompted)?.seq
+    const since = firstPending !== undefined && owedSeqs.includes(firstPending) && owed.last > prompted
+      ? owed.since : now
+    owed = last === 0 ? NONE : { count: unread.length, first: unread[0]?.seq ?? last, last, since }
     owedSeqs = unread.map(post => post.seq)
     // A consultant's READY is the answer the coordinator asked for, and a READY that asks something is a question.
     isOwedRoutine = !full.attentionUnavailable && unread.length > 0 && unread.every(post => kindOf(post.text)?.label === 'READY' &&
@@ -1549,37 +1552,39 @@ export const register: Register = on => {
     { deny: 'The board tool ran out of time. End your turn and report this sentence to the coordinator.' }
   ))
 
-function isBareGitCommit(command: string): boolean {
-  let changedDir = false
-  for (const segment of splitShellSegments(command)) {
-    if (/^(?:[A-Za-z_]\w*=(?:"[^"\n]*"|'[^'\n]*'|[^\s"'<>;]*)\s+)*cd(?:\s|$)/.test(segment)) {
-      changedDir = true
-      continue
+  function commitsInSharedCheckout(command: string, cwd: string): boolean {
+    const directoryAfter = (current: string | undefined, arg?: string) => {
+      if (arg === undefined) return undefined
+      const path = arg.replace(/^(['"])(.*)\1$/, '$2')
+      if (!path || path === '.' || path === './') return current
+      if (path.startsWith('/')) return normalizePath(path)
+      return current && normalizePath(`${current}/${path}`)
     }
-    const gitMatch = /^(?:[A-Za-z_]\w*=(?:"[^"\n]*"|'[^'\n]*'|[^\s"'<>;]*)\s+)*(?:\S*\/)?git\b(.*)$/.exec(segment)
-    if (!gitMatch) continue
-    const tokens = (gitMatch[1] ?? '').trim().split(/\s+/).filter(Boolean)
-    let hasMinusC = false
-    let subcommand = ''
-    for (let i = 0; i < tokens.length; i++) {
-      const tok = tokens[i]!
-      if (tok === '-C' || tok.startsWith('-C')) {
-        hasMinusC = true
-        if (tok === '-C') i++
+    let shellDir: string | undefined = cwd
+    for (const segment of splitShellSegments(command)) {
+      const cd = /^cd\s+(?:--\s+)?("[^"]*"|'[^']*'|\S+)$/.exec(segment)
+      if (cd) {
+        shellDir = directoryAfter(shellDir, cd[1])
         continue
       }
-      if (tok === '-c' || tok === '--git-dir' || tok === '--work-tree' || tok === '--namespace' || tok === '--super-prefix' || tok === '--config-env') {
-        i++
-        continue
+      const gitMatch = /^(?:[A-Za-z_]\w*=(?:"[^"\n]*"|'[^'\n]*'|[^\s"'<>;]*)\s+)*(?:\S*\/)?git\b(.*)$/.exec(segment)
+      if (!gitMatch) continue
+      const tokens = gitMatch[1]?.match(/"[^"]*"|'[^']*'|\S+/g) ?? []
+      let gitDir = shellDir
+      for (let i = 0; i < tokens.length; i++) {
+        const tok = tokens[i]!
+        if (tok.startsWith('-C')) {
+          gitDir = directoryAfter(gitDir, tok === '-C' ? tokens[++i] : tok.slice(2))
+        } else if (['-c', '--git-dir', '--work-tree', '--namespace', '--super-prefix', '--config-env'].includes(tok)) {
+          i++
+        } else if (!tok.startsWith('-')) {
+          if (tok === 'commit' && gitDir === cwd) return true
+          break
+        }
       }
-      if (tok.startsWith('-')) continue
-      subcommand = tok
-      break
     }
-    if (subcommand === 'commit' && !hasMinusC && !changedDir) return true
+    return false
   }
-  return false
-}
 
   on('tool.call', async ($, e, next) => {
     // A tool call in the main conversation means the coordinator is mid-turn, even when this
@@ -1668,7 +1673,7 @@ function isBareGitCommit(command: string): boolean {
                   sharedAgents.has(e.agentId) ||
                   ownedRoster.members.coordinator?.backend === 'native'
                 )
-                if (isShared && isBareGitCommit(command)) {
+                if (isShared && commitsInSharedCheckout(command, activeDir.slice(0, activeDir.lastIndexOf('/.swarm/')))) {
                   return { deny: `Shared-checkout writers must not run \`git commit\`: leave your edits in the working tree and report via \`BOARD ready ${memberName}\`.` }
                 }
               }
