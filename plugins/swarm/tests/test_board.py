@@ -1183,6 +1183,33 @@ class BoardRegressions(unittest.TestCase):
         run(d, "member", "inv2", "effort=high", ok=False)
         run(d, "member", "inv2", "id=id-inv2b", "effort=high", ok=False)
 
+    def test_paths_refuse_a_second_writer_and_pass_to_a_successor(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = run(os.path.join(t, ".swarm", "claims"), "init", "Claims").strip()
+
+            def refused(*args):
+                r = subprocess.run([sys.executable, BOARD, d, *args], capture_output=True, text=True)
+                assert r.returncode != 0, (args, r.stdout)
+                return r.stderr
+            run(d, "member", "feed", "paths=./Sources/Feed/,Tests/LifecycleSuite.swift")
+            assert saved(d)["members"]["feed"]["paths"] == "Sources/Feed,Tests/LifecycleSuite.swift"
+            # the same file, a file inside a claimed folder, and a folder holding a claimed file are all refused
+            for taken in ("Tests/LifecycleSuite.swift", "Sources/Feed/Parser.swift", "Tests"):
+                clash = refused("member", "widgets", "paths=Sources/Widgets," + taken)
+                assert "@widgets and @feed both claim" in clash and "widgets" not in saved(d)["members"]
+            run(d, "member", "widgets", "paths=Sources/Widgets,Sources/FeedKit")  # a name that only starts alike is another folder
+            assert "relative to the repository root" in refused("member", "other", "paths=/etc/hosts")
+            assert "relative to the repository root" in refused("member", "other", "paths=../outside")
+            # a reader claims nothing, and a retired member's paths are free again
+            run(d, "member", "scout", "profile=explorer", "paths=Sources/Feed")
+            refused("member", "widgets", "paths=Sources/Feed")
+            run(d, "post", "coordinator", "@feed BRIEF\nOwns: the feed")
+            run(d, "replace", "feed", "feed-2")
+            assert saved(d)["members"]["feed-2"]["paths"] == "Sources/Feed,Tests/LifecycleSuite.swift"
+            assert "@widgets and @feed-2 both claim" in refused("member", "widgets", "paths=Sources/Feed")
+            run(d, "member", "feed-2", "killed=1")
+            run(d, "member", "widgets", "paths=Sources/Feed")
+
     def test_cli_int_validation_and_trailing_whitespace_truncation(self):
         d = self.init_run()
         run(d, "member", "w", "id=id-w")

@@ -2,7 +2,7 @@
 """Shared message board for a swarm: numbered posts, @mentions, unread cursors.
 
 usage: board.py DIR init TITLE                    prints the run folder it created; use that as DIR from then on
-       board.py DIR member NAME [key=value ...]   add or update (role= profile= writes= consult= group= depends= owns= model= effort= id= backend= killed=1)
+       board.py DIR member NAME [key=value ...]   add or update (role= profile= writes= consult= group= depends= owns= paths= model= effort= id= backend= killed=1)
        board.py DIR limit [key=value ...]         set run limits: max_workers= max_members= budget=<tokens> <model>=<types>
        board.py DIR plan                          the team as a table: type, model, effort, dependencies, ownership
        board.py DIR attention [--json]            what needs someone: unanswered questions, blocked or unreachable members, stale verification
@@ -213,7 +213,7 @@ READ_ONLY = {"explorer", "investigator", "architect"}
 PROFILES = {*READ_ONLY, "designer"}
 FAMILIES = ("haiku", "sonnet", "opus", "fable")
 LIMITS = {"max_workers", "max_members", "budget", *FAMILIES}
-INHERITED = ("role", "group", "profile", "writes", "depends", "owns", "model", "effort", "consult")
+INHERITED = ("role", "group", "profile", "writes", "depends", "owns", "paths", "model", "effort", "consult")
 MEMBER_FIELDS = {*INHERITED, "backend", "id", "killed"}
 
 
@@ -233,7 +233,44 @@ def assignments(args, allowed):
     return changes
 
 
+def claims(member):
+    """The files and folders a member claims with paths=, as paths from the repository root."""
+    return [path for path in (member.get("paths") or "").split(",") if path]
+
+
+def claimed_twice(name, member, members):
+    """The first path two active writers both claim, with the other member's name, or None."""
+    def writes(entry):
+        return (entry.get("role") == "worker" and not entry.get("killed") and entry.get("writes") != "0"
+                and entry.get("consult") != "1" and kind_of(entry) not in READ_ONLY)
+    if not writes(member):
+        return None
+    for other, entry in members.items():
+        if other == name or not writes(entry):
+            continue
+        for mine in claims(member):
+            for theirs in claims(entry):
+                # A folder claims everything under it.
+                if mine == theirs or mine.startswith(theirs + "/") or theirs.startswith(mine + "/"):
+                    return other, mine if len(mine) >= len(theirs) else theirs
+    return None
+
+
 def validate_member(name, member, changes, members):
+    if "paths" in changes:
+        cleaned = []
+        for raw in changes["paths"].split(","):
+            path = re.sub(r"/+", "/", raw.strip()).removeprefix("./").rstrip("/")
+            if not path:
+                continue
+            if path.startswith("/") or ".." in path.split("/") or "\n" in path:
+                raise ValueError("paths= takes files and folders relative to the repository root, separated by commas")
+            cleaned.append(path)
+        member["paths"] = ",".join(dict.fromkeys(cleaned))
+    clash = claimed_twice(name, member, members)
+    if clash:
+        raise ValueError("@%s and @%s both claim %s. No path has two writers: give it to one of them and have the other "
+                         "depend on that member or post what it needs changed there" % (name, clash[0], clash[1]))
     if "role" in changes and member["role"] not in ({COORDINATOR} if name == COORDINATOR else {"worker", "verifier"}):
         raise ValueError(f"invalid role for @{name}")
     if ("profile" in changes and member["profile"] not in {"", *PROFILES}) or (

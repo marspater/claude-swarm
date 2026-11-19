@@ -39,13 +39,101 @@ const LEGEND = 50
 
 // Past this many members round the coordinator the ring gives way to two arcs, one name to a row.
 const RING_LIMIT = 10
-const SIDE_PITCH = PILL_HEIGHT + 10
+const SIDE_PITCH = PILL_HEIGHT + 12
 const halfOf = (name: string) => Math.max(38, 22 + Math.min(15, name.length) * 4.7)
+const CURVE_SAMPLES = Array.from({ length: 23 }, (_, index) => (index + 1) / 24)
+
+/** Signed distance from (x, y) to a pill's rounded rectangle (corner radius 13). */
+function pillDist(x: number, y: number, pill: { x: number; y: number; half: number }): number {
+  const qx = Math.abs(x - pill.x) - (pill.half - 13)
+  const qy = Math.abs(y - pill.y) - (PILL_HEIGHT / 2 - 13)
+  return Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - 13
+}
+
+/** Members shown in the graph for the current replay cursor and filter state. */
+export function visibleMembers(
+  swarm: Swarm,
+  upTo = Infinity,
+  hidden: ReadonlySet<string> = new Set(),
+  live = true,
+): Swarm['members'] {
+  if (live) return swarm.members.filter(member => !hidden.has(member.name))
+  // Members whose only posts are older than the ones kept still took part.
+  const participants = new Set<string>(
+    Object.keys(swarm.earlierEdges ?? {}).flatMap(edge => pairOf(edge) ?? [edge.split('>')[0] ?? '']),
+  )
+  for (const post of swarm.posts) {
+    if (post.seq <= upTo) {
+      participants.add(post.agent)
+      for (const recipient of post.to) participants.add(recipient)
+    }
+  }
+  return swarm.members.filter(member => !hidden.has(member.name) && participants.has(member.name))
+}
+
+/** Clusters outer members that communicate or depend on each other while preserving roster order otherwise. */
+export function orderOuterMembers(
+  outerMembers: Swarm['members'],
+  direct: ReadonlyMap<string, number> = new Map(),
+): Swarm['members'] {
+  if (outerMembers.length <= 2) return outerMembers
+  const outerNames = new Set(outerMembers.map(member => member.name))
+  const weightBetween = (a: Swarm['members'][number], b: Swarm['members'][number]) =>
+    (direct.get(`${a.name}>${b.name}`) ?? 0) +
+    (direct.get(`${b.name}>${a.name}`) ?? 0) +
+    ((a.depends?.includes(b.name) || b.depends?.includes(a.name)) ? 1 : 0)
+
+  let hasPeerLink = false
+  for (let i = 0; i < outerMembers.length && !hasPeerLink; i++) {
+    const u = outerMembers[i]!
+    if (u.depends?.some(dep => dep !== u.name && outerNames.has(dep))) {
+      hasPeerLink = true
+      break
+    }
+    for (let j = i + 1; j < outerMembers.length; j++) {
+      const v = outerMembers[j]!
+      if ((direct.get(`${u.name}>${v.name}`) ?? 0) > 0 || (direct.get(`${v.name}>${u.name}`) ?? 0) > 0) {
+        hasPeerLink = true
+        break
+      }
+    }
+  }
+  if (!hasPeerLink) return outerMembers
+
+  const visited = new Set<number>([0])
+  const ordered: Swarm['members'] = [outerMembers[0]!]
+  let current = outerMembers[0]!
+  while (ordered.length < outerMembers.length) {
+    let bestIndex = -1
+    let bestWeight = 0
+    for (let i = 0; i < outerMembers.length; i++) {
+      if (visited.has(i)) continue
+      const candidate = outerMembers[i]!
+      const weight = weightBetween(current, candidate)
+      if (weight > bestWeight) {
+        bestWeight = weight
+        bestIndex = i
+      }
+    }
+    if (bestIndex < 0) {
+      for (let i = 0; i < outerMembers.length; i++) {
+        if (!visited.has(i)) {
+          bestIndex = i
+          break
+        }
+      }
+    }
+    visited.add(bestIndex)
+    current = outerMembers[bestIndex]!
+    ordered.push(current)
+  }
+  return ordered
+}
 
 /** The drawing's own size: it widens with long names and many members, so its shape is not one fixed ratio. */
-function stageOf(all: Swarm['members']) {
+function stageOf(all: Swarm['members'], direct?: ReadonlyMap<string, number>) {
   const coordinator = all.find(member => member.role === 'coordinator')
-  const outerMembers = all.filter(member => member !== coordinator)
+  const outerMembers = orderOuterMembers(all.filter(member => member !== coordinator), direct)
   const outerCount = outerMembers.length
   const maxHalf = Math.max(38, ...outerMembers.map(member => halfOf(member.name)))
   if (outerCount > RING_LIMIT) {
@@ -63,7 +151,7 @@ function stageOf(all: Swarm['members']) {
       const row = isRight ? index : count - 1 - (index - perSide)
       const offset = (row - (count - 1) / 2) * SIDE_PITCH
       const t = perSide > 1 ? offset / (((perSide - 1) / 2) * SIDE_PITCH) : 0
-      const reach = rx * (0.55 + 0.45 * Math.sqrt(Math.max(0, 1 - t * t)))
+      const reach = rx * (0.76 + 0.24 * Math.sqrt(Math.max(0, 1 - t * t)))
       return { x: width / 2 + (isRight ? reach : -reach), y: height / 2 + offset }
     }
     return { coordinator, outerMembers, width, height, place }
@@ -89,7 +177,7 @@ export function graphHeight(columns: number, members: Swarm['members']): number 
   // metrics cannot narrow the frame. The height follows the drawing's shape: a frame taller than the drawing
   // leaves the difference empty above the graph and below its legend.
   const { width, height } = stageOf(members)
-  return Math.max(200, Math.min(620, Math.round(columns * COLUMN_WIDTH * (height + LEGEND) / width)))
+  return Math.max(200, Math.min(members.length > 22 ? 780 : 620, Math.round(columns * COLUMN_WIDTH * (height + LEGEND) / width)))
 }
 
 const esc = (text: string) =>
@@ -111,32 +199,7 @@ export function graphSvg(
   const phase = elapsed % 3600
   const current = swarm.posts.find(post => post.seq === upTo)
   const earlier = Object.entries(swarm.earlierEdges ?? {})
-  // Members whose only posts are older than the ones kept still took part.
-  const participants = new Set<string>(earlier.flatMap(([edge]) => pairOf(edge) ?? [edge.split('>')[0] ?? '']))
-  for (const post of swarm.posts) {
-    if (post.seq > upTo) break
-    participants.add(post.agent)
-    for (const recipient of post.to) participants.add(recipient)
-  }
-  const members = swarm.members.filter(member =>
-    !hidden.has(member.name) && (live || participants.has(member.name)),
-  )
-  const { coordinator, outerMembers, width, height, place } = stageOf(swarm.members)
-  const centerHalf = coordinator ? halfOf(coordinator.name) : 0
-  const positions = new Map(swarm.members.map(member => {
-    const label = member.name.length > 15 ? `${clipHead(member.name, 14)}…` : member.name
-    const half = halfOf(member.name)
-    const isCenter = member === coordinator || (coordinator === undefined && swarm.members.length === 1)
-    const spot = isCenter ? { x: width / 2, y: height / 2 } : place(outerMembers.indexOf(member))
-    let x = spot.x
-    const y = spot.y
-    // A member level with the coordinator would sit against its side with no room for an arrow:
-    // it moves outward toward the frame's edge, never inward.
-    if (!isCenter && coordinator && Math.abs(y - height / 2) < PILL_HEIGHT + 18 && Math.abs(x - width / 2) - half - centerHalf < 64) {
-      x = x < width / 2 ? Math.min(x, half + 10) : Math.max(x, width - half - 10)
-    }
-    return [member.name, { label, half, x, y }] as const
-  }))
+  const members = visibleMembers(swarm, upTo, hidden, live)
   const visible = new Set(members.map(member => member.name))
 
   // Posts older than the ones kept still count: the pane keeps their totals, not their text.
@@ -157,6 +220,24 @@ export function graphSvg(
     if (post.to.length === 0) bump(unaddressed, post.agent)
     for (const to of post.to) bump(viaAll(post, to) ? broadcastTo : direct, `${post.agent}>${to}`)
   }
+
+  const { coordinator, outerMembers, width, height, place } = stageOf(members, direct)
+  const centerHalf = coordinator ? halfOf(coordinator.name) : 0
+  const outerIndex = new Map(outerMembers.map((member, index) => [member.name, index]))
+  const positions = new Map(members.map(member => {
+    const label = member.name.length > 15 ? `${clipHead(member.name, 14)}…` : member.name
+    const half = halfOf(member.name)
+    const isCenter = member === coordinator || (coordinator === undefined && members.length === 1)
+    const spot = isCenter ? { x: width / 2, y: height / 2 } : place(outerIndex.get(member.name)!)
+    let x = spot.x
+    const y = spot.y
+    // A member level with the coordinator would sit against its side with no room for an arrow:
+    // it moves outward toward the frame's edge, never inward.
+    if (!isCenter && coordinator && Math.abs(y - height / 2) < PILL_HEIGHT + 18 && Math.abs(x - width / 2) - half - centerHalf < 64) {
+      x = x < width / 2 ? Math.min(x, half + 10) : Math.max(x, width - half - 10)
+    }
+    return [member.name, { label, half, x, y }] as const
+  }))
   const isCurrentBroadcast = current !== undefined && isBroadcast(current)
   // Solid for mentions by name. What reached a member through @all is a dashed line of its own, drawn only
   // when asked for; where the two members also named each other it runs beside the solid one.
@@ -170,6 +251,8 @@ export function graphSvg(
   const active: string[] = []
   const badges: string[] = []
   const ripples: string[] = []
+  const outerCount = outerMembers.length
+  const pad = outerCount <= 6 ? 8 : 4.5
   for (const { edge, total, isDashed } of edges) {
     const [from = '', to = ''] = edge.split('>')
     if (from === to || !visible.has(from) || !visible.has(to)) continue
@@ -182,10 +265,18 @@ export function graphSvg(
     const length = Math.hypot(dx, dy)
     const ux = dx / length
     const uy = dy / length
-    // Two members that address each other get a lens of two curves; a one-way line is nearly straight.
+    // Two members that address each other get a lens of two curves; a one-way line bends gently inward.
     const isMutual = drawn.has(`${to}>${from}`)
     const beside = isDashed && direct.has(edge) ? 20 : 0
-    const baseBow = (isMutual ? Math.max(16, Math.min(length * 0.16, 36)) : Math.min(length * 0.07, 14)) + beside
+    const bowMag = isMutual
+      ? (outerCount > RING_LIMIT ? Math.max(14, Math.min(length * 0.14, 28)) : Math.max(16, Math.min(length * 0.16, 36)))
+      : Math.min(length * 0.07, 14)
+    const bowSign = !isMutual && outerCount > 4 && coordinator &&
+      (from === coordinator.name || to === coordinator.name) &&
+      uy * ((a.x + b.x) / 2 - width / 2) < 0
+      ? -1
+      : 1
+    const baseBow = bowSign * (bowMag + beside)
     // Where a line from a pill's center towards (tx, ty) leaves the pill, a little clear of its border.
     const leave = (p: { x: number; y: number; half: number }, tx: number, ty: number, gap: number) => {
       const span = Math.hypot(tx - p.x, ty - p.y) || 1
@@ -194,6 +285,8 @@ export function graphSvg(
       const reach = Math.min(p.half / Math.abs(vx || 1e-9), (PILL_HEIGHT / 2) / Math.abs(vy || 1e-9)) + gap
       return [p.x + vx * reach, p.y + vy * reach] as const
     }
+    const clampStage = (px: number, py: number) =>
+      [Math.max(8, Math.min(width - 8, px)), Math.max(8, Math.min(height - 8, py))] as const
     // Apply border-to-border chord midpoints & proportional bow clamp so control points never enter a pill's box.
     const chordBow = (offset: number) => {
       const c0x = (a.x + b.x) / 2 - uy * offset
@@ -205,38 +298,58 @@ export function graphSvg(
       const clen = Math.hypot(cdx, cdy) || 1
       const cux = cdx / clen
       const cuy = cdy / clen
-      const clamped = Math.sign(offset) * Math.min(Math.abs(offset), clen * 0.35)
-      return [(sx + ex) / 2 - cuy * clamped, (sy + ey) / 2 + cux * clamped, sx, sy, ex, ey] as const
+      const clamped = Math.sign(offset) * Math.min(Math.abs(offset), clen * 0.42)
+      const [kx, ky] = clampStage((sx + ex) / 2 - cuy * clamped, (sy + ey) / 2 + cux * clamped)
+      return [kx, ky, sx, sy, ex, ey] as const
+    }
+    const detourBow = (offset: number) => {
+      const [kx, ky] = clampStage((a.x + b.x) / 2 - uy * offset, (a.y + b.y) / 2 + ux * offset)
+      const [sx, sy] = leave(a, kx, ky, 3)
+      const [ex, ey] = leave(b, kx, ky, 4)
+      return [kx, ky, sx, sy, ex, ey] as const
     }
     let [cx, cy, x1, y1, x2, y2] = chordBow(baseBow)
     const obstacles = members.filter(m => m.name !== from && m.name !== to).map(m => positions.get(m.name)!).filter(Boolean)
-    const crossesAny = (controlX: number, controlY: number, sx: number, sy: number, ex: number, ey: number) =>
-      Array.from({ length: 19 }, (_, index) => (index + 1) / 20).some(t => {
+    const minClearance = (controlX: number, controlY: number, sx: number, sy: number, ex: number, ey: number) => {
+      let min = Infinity
+      for (const t of CURVE_SAMPLES) {
         const x = (1 - t) ** 2 * sx + 2 * (1 - t) * t * controlX + t ** 2 * ex
         const y = (1 - t) ** 2 * sy + 2 * (1 - t) * t * controlY + t ** 2 * ey
-        return obstacles.some(o => Math.abs(x - o.x) < o.half + 8 && Math.abs(y - o.y) < PILL_HEIGHT / 2 + 8)
-      })
-    if (obstacles.length > 0 && crossesAny(cx, cy, x1, y1, x2, y2)) {
-      // Route around non-endpoint pills while keeping solid and @all parallel edges separated.
-      for (const raw of [baseBow, -baseBow, 90, -90, 150, -150, 220, -220]) {
-        const isBow = raw === baseBow || raw === -baseBow
-        const [candX, candY, sx, sy, ex, ey] = isBow
-          ? chordBow(raw)
-          : (() => {
-              const offset = raw + Math.sign(raw) * beside
-              const kx = Math.max(8, Math.min(width - 8, (a.x + b.x) / 2 - uy * offset))
-              const ky = Math.max(8, Math.min(height - 8, (a.y + b.y) / 2 + ux * offset))
-              const [lsx, lsy] = leave(a, kx, ky, 3)
-              const [lex, ley] = leave(b, kx, ky, 4)
-              return [kx, ky, lsx, lsy, lex, ley] as const
-            })()
+        for (const o of obstacles) {
+          const dist = pillDist(x, y, o)
+          if (dist < min) min = dist
+        }
+      }
+      return min
+    }
+    if (obstacles.length > 0 && minClearance(cx, cy, x1, y1, x2, y2) < pad) {
+      // Route around non-endpoint pills with graduated detours while keeping mutual and @all edges separated.
+      const bowCandidates = (isMutual ? [baseBow, baseBow * 1.45, baseBow * 1.9, -baseBow] : [baseBow, -baseBow])
+        .map(offset => ({ useChord: true, offset }))
+      const stepCandidates = [24, 36, 52, 70, 90, 120, 155, 195, 235].flatMap(mag => [
+        { useChord: mag <= 70, offset: bowSign * (mag + beside) },
+        { useChord: mag <= 70, offset: -bowSign * (mag + beside) },
+      ])
+      let bestClear = -Infinity
+      let bestCand: readonly [number, number, number, number, number, number] | undefined
+      for (const { useChord, offset } of [...bowCandidates, ...stepCandidates]) {
+        const cand = useChord ? chordBow(offset) : detourBow(offset)
+        const [candX, candY, sx, sy, ex, ey] = cand
         const forward = (ex - candX) * (b.x - ex) + (ey - candY) * (b.y - ey) > 0
-        if (forward && !crossesAny(candX, candY, sx, sy, ex, ey)) {
-          cx = candX
-          cy = candY
-          x1 = sx; y1 = sy; x2 = ex; y2 = ey
+        if (!forward) continue
+        const clear = minClearance(candX, candY, sx, sy, ex, ey)
+        if (clear >= pad) {
+          cx = candX; cy = candY; x1 = sx; y1 = sy; x2 = ex; y2 = ey
+          bestCand = undefined
           break
         }
+        if (clear > bestClear) {
+          bestClear = clear
+          bestCand = cand
+        }
+      }
+      if (bestCand) {
+        [cx, cy, x1, y1, x2, y2] = bestCand
       }
     }
     const isCurrent = current?.agent === from && current.to.includes(to) && viaAll(current, to) === isDashed

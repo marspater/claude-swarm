@@ -2528,3 +2528,67 @@ test('a mention older than the tail of a large board is still delivered', async 
   expect(sends.join('\n')).toContain('mentions through #1')
   expect(seen.commands).toContain(`woke parser 1 ${'a'.repeat(32)}`)
 })
+
+test('a retired member that is still mid-turn has its tool calls refused, and its replacement does not', async ($, on) => {
+  const state = {
+    title: 'Demo swarm',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 },
+      parser: { role: 'worker', id: 'old', killed: '1', last_read_seq: 1 },
+      'parser-2': { role: 'worker', id: 'new', last_read_seq: 1 },
+    },
+  }
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['parser-2'], text: '@parser-2 BRIEF' }),
+    roster: () => JSON.stringify(state),
+  })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({ value: [
+    { id: 'old', description: '@parser', type: 'swarm:worker', status: 'running' },
+    { id: 'new', description: '@parser-2', type: 'swarm:worker', status: 'running' },
+  ] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  expect((await $.tool.call({ tool: 'Bash', command: './test.sh', agentId: 'old' })).deny).toContain('has been retired')
+  expect((await $.tool.call({ tool: 'Bash', command: './test.sh', agentId: 'new' })).deny).toBeUndefined()
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).deny).toBeUndefined()
+})
+
+test('a replacement is not started while the member it replaces is still running', async ($, on) => {
+  const state = {
+    title: 'Demo swarm',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 },
+      parser: { role: 'worker', id: 'old', killed: '1', replaced_by: 'parser-2', last_read_seq: 1 },
+      'parser-2': { role: 'worker', last_read_seq: 1 },
+    },
+  }
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['parser-2'], text: '@parser-2 BRIEF' }),
+    roster: () => JSON.stringify(state),
+  })
+  on('process.run', (_, e) => answer(board(e)))
+  let status = 'running'
+  on('agent.list', () => ({ value: [{ id: 'old', description: '@parser', type: 'swarm:worker', status }] as never }))
+  on('agent.spawn', () => ({ model: 'sonnet', agentId: 'new' }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  const start = () => $.agent.spawn({
+    tool_use_id: 'successor', prompt: 'Use the board.', description: '@parser-2: take over', subagentType: 'swarm:worker',
+    provider: { plugin: 'swarm', tier: 'core' as const }, parentModel: 'sonnet', background: true, fork: false,
+  })
+
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const held = await start()
+  expect(held.deny).toContain('@parser, which @parser-2 replaces, is still running as agent old')
+  status = 'completed'
+  const started = await start()
+  expect(started.deny).toBeUndefined()
+  expect(started.agentId).toBe('new')
+})

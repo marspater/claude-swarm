@@ -9,6 +9,7 @@ You are the coordinator. The roster in `<run>/members.json` is the team: who exi
 | `role` | `worker` (default), `verifier`, `coordinator` | `role=verifier` when registering a verifier |
 | `profile` | The agent type behind a specialist (`explorer`, `investigator`, `architect`) or a `designer` | `profile=<type>` with `writes=0` for a specialist; `profile=designer` for a designer, which writes files |
 | `backend` | `native` on the coordinator's own entry when the run uses native Agent Teams; the plugin then expects named teammates | `BOARD member coordinator backend=native`, before any member starts |
+| `paths` | The files and folders a writer may edit, from the repository root, separated by commas. The board refuses a path that another active writer claims, or a folder that holds one. A successor made with `replace` inherits them | `paths=Sources/Feed,Tests/FeedTests.swift` at registration, before the brief |
 | `consult` | Marks an architect that advises you on one question. Verification ignores it, so it never blocks or voids a candidate | `consult=1 effort=medium` at registration (with `effort: "medium"` on `Agent`); `killed=1` once it has answered (in native mode, request teammate shutdown too) |
 | `writes` | `0` for a member that changes no files | You, for read-only members |
 | `group` | A numbered pool's name, reached with `@<group>` | `group=fix` |

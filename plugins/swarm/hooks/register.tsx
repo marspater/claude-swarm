@@ -9,7 +9,7 @@ import { KEPT, budgetOf, findAgent, memberNamed, parse, parsePosts, targets, tok
 import { CLIP, bodyOf, clean, clip, compact, head, kindOf, openedText, stripKind } from './text'
 import { statusInk, statusDot } from './palette'
 import { hiveArt, toolMood, toolSummary, type Mood } from './hive'
-import { edgesOf, graphHeight, graphSvg, isBroadcast, pairOf } from './graph'
+import { edgesOf, graphHeight, graphSvg, isBroadcast, pairOf, visibleMembers } from './graph'
 
 const PANE = 'swarm'
 const TITLE = 'Swarm'
@@ -234,6 +234,8 @@ let browseGen = 0
 const agentRuns = new Map<string, string>()
 // Agents looked up and found to be no member of a run: asked once, not on every model step and tool call.
 const strangers = new Set<string>()
+// The agents of the owned run's retired members, as the last poll read them.
+let retired: ReadonlySet<string> = new Set()
 // The run this conversation drove until it closed: its members are still refused by name.
 let closedRun = ''
 // The owned run while it is paused or over budget, and why: its members are refused their next tool call.
@@ -427,6 +429,7 @@ async function refreshTalk($: EngineInterface): Promise<void> {
 }
 
 function resetMonitoring(): void {
+  retired = new Set()
   moods.clear()
   generation++
   seen = seenBoard = seenRoster = activity = stalled = heavyTold = ''
@@ -904,6 +907,9 @@ async function refresh($: EngineInterface): Promise<void> {
     if (epoch !== generation) return
     const state = JSON.parse(rosterText) as { members: Roster; paused?: string; closed?: boolean } & BudgetState
     const isSpent = budgetOf(state) > 0 && tokensUsed(state.usage?.tokens) >= budgetOf(state)
+    retired = new Set(owned && !state.closed
+      ? Object.values(state.members).flatMap(member => member.killed && member.id ? [member.id] : [])
+      : [])
     // Read anew on every poll, so a resume or a raised budget lets the members' tools through again.
     halted = owned && !state.closed && (state.paused || isSpent)
       ? { dir, why: state.paused ? `paused (${state.paused})` : 'over its token budget' }
@@ -1131,7 +1137,12 @@ async function account($: EngineInterface, report: string, agentId: string | und
 // A member of a paused or spent run is refused its next tool call, so a turn in flight ends there instead of
 // spending on. The coordinator is never refused: it has to report, raise the budget and resume.
 async function refusal($: EngineInterface, agentId: string | undefined): Promise<string | undefined> {
-  if (agentId === undefined || !halted) return undefined
+  if (agentId === undefined) return undefined
+  // A member that was replaced or removed may still be mid-turn: it builds and edits beside the team that took over.
+  if (retired.has(agentId)) {
+    return 'This Swarm member has been retired, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped.'
+  }
+  if (!halted) return undefined
   try {
     const dir = agentRuns.get(agentId) ??
       await agentRun($, agentId, (await $.agent.list()).find(one => one.id === agentId))
@@ -1720,6 +1731,12 @@ export const register: Register = on => {
     // Registration is where the limits are checked, so an unregistered member would start outside them.
     if (!named || !member || member.killed) {
       return { deny: 'Register the member with the board\'s member command first, then start it with a description that begins "@<its name>: ".' }
+    }
+    // A replacement is not started beside the member it replaces: both would work in the same files.
+    const previous = Object.entries(state.members).find(([, entry]) => entry.killed && entry.replaced_by === named && entry.id)
+    const before = previous && findAgent(await $.agent.list().catch(() => []), previous[1].id)
+    if (previous && before && ['running', 'pending'].includes(before.status)) {
+      return { deny: `@${previous[0]}, which @${named} replaces, is still running as agent ${before.id}. Stop that agent first, and wait for any build or test it started to end, then start @${named} again.` }
     }
     const team = Object.entries(state.members).filter(([name, entry]) => name !== 'coordinator' && !entry.killed)
     if (team.length > Number(state.limits?.max_members ?? Infinity) ||
@@ -2661,7 +2678,7 @@ export const register: Register = on => {
           <Svg
             key="message-routes" source={graphSvg(shown, post.seq, hidden, animate, live, repeat, routeOffset, isExpanded)}
             width={1024}
-            height={graphHeight(columns, shown.members)}
+            height={graphHeight(columns, visibleMembers(shown, post.seq, hidden, live))}
             alt={`Post ${post.seq} · @${post.agent}${post.to.length ? ` to ${post.to.map(name => `@${name}`).join(', ')}` : ' · no mentions'}`}
             isInteractive
           />

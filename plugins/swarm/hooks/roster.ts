@@ -39,6 +39,7 @@ export type Roster = Record<
     effort?: string
     id?: string
     killed?: string
+    replaced_by?: string
     last_read_seq: number
     last_nudged_seq?: number
     wake_claim?: { seq: number; attempts: number; until: number }
