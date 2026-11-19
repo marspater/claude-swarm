@@ -1146,9 +1146,11 @@ def main(argv):
                 # A member waiting on this one always hears, as does the coordinator when a finding it may confirm is withdrawn.
                 recipients = [name for name in recipients if sender in dependencies(members[name])
                               or (name == COORDINATOR and kind_of(member) == "investigator")]
-            if cmd == "ready" and not in_play:
+            if cmd == "ready":
                 # A verifier reviews when there is something whole to review. Woken for each READY of five it spends
                 # a turn per piece and is mid-review when the candidate arrives; it hears once the last worker is ready.
+                # The same holds in rework after a failed candidate: one worker revising wakes it at once, several
+                # wake it when the last of them reports.
                 waiting = [name for name, entry in team_of(members).items() if entry.get("role") == "worker"
                            and entry.get("consult") != "1" and name != sender and name not in through]
                 if waiting:

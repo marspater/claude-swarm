@@ -630,6 +630,18 @@ async function adopt($: EngineInterface, name: string | undefined, prompt = ''):
   }
 }
 
+// What the coordinator is told when it makes a run. A run can be started from memory, with no /swarm:swarm in the
+// turn and so none of the skill's current rules; and every wake re-reads the whole conversation, so a run started
+// in a long one pays for that history each time.
+async function initNotes($: EngineInterface): Promise<string[]> {
+  const notes = [`Swarm: A run was made. If this turn did not start from /swarm:swarm, Read ${$.plugin.root}/skills/swarm/SKILL.md before going on: its rules are the current ones. Before you start a member, show the user the plan and name the token budget, or say that none is set.`]
+  const held = await $.session.usage().then(usage => usage.context.tokens ?? 0).catch(() => 0)
+  if (held >= LONG_CONVERSATION) {
+    notes.push(`Swarm: This conversation already holds about ${compact(held)} tokens, and each time you are woken during the run all of them are read again. Before you start any member, tell the user that a fresh conversation, or /compact first, would make this run much cheaper, and ask whether to go on here.`)
+  }
+  return notes
+}
+
 // Six members started at once ask for the same run at once: they share one answer.
 const binding = new Map<string, Promise<boolean>>()
 function bind($: EngineInterface, dir: string): Promise<boolean> {
@@ -924,7 +936,9 @@ async function refresh($: EngineInterface): Promise<void> {
     const last = unread.at(-1)?.seq ?? 0
     owed = last === 0 ? NONE : { count: unread.length, first: unread[0]?.seq ?? last, last, since: last === owed.last ? owed.since : now }
     owedSeqs = unread.map(post => post.seq)
-    isOwedRoutine = unread.length > 0 && unread.every(post => kindOf(post.text)?.label === 'READY') &&
+    // A consultant's READY is the answer the coordinator asked for, and a READY that asks something is a question.
+    isOwedRoutine = unread.length > 0 && unread.every(post => kindOf(post.text)?.label === 'READY' &&
+      state.members[post.agent]?.consult !== '1' && !full.attention.some(item => item.kind === 'question' && item.seq === post.seq)) &&
       full.members.some(member => member.role !== 'coordinator' && member.status === 'working')
     if (owned) {
       const reason = state.closed ? '' : state.paused ?? ''
@@ -1435,7 +1449,7 @@ export const register: Register = on => {
           if (c.action !== 'show' || !RUN.test(c.dir) || await resolveRunDir($, c.dir) !== dir) continue
           // One post, the whole board, or one member's posts: only what was printed counts as seen.
           const one = /--post=(\d+)/.exec(c.rest)
-          const who = c.rest.trim().split(/\s+/).slice(1).find(word => word !== '' && !word.startsWith('-'))?.replace(/^[@'"]+|['"]+$/g, '')
+          const who = c.rest.trim().split(/\s+/).slice(1).find(word => word !== '' && !word.startsWith('-'))?.replace(/^[@'"]+|['"]+$/g, '').toLowerCase()
           if (one) shownPosts.posts.add(Number(one[1]))
           else if (who === undefined) shownPosts.through = Math.max(shownPosts.through, snapshot?.posts.at(-1)?.seq ?? 0)
           else for (const post of snapshot?.posts ?? []) if (post.agent === who || post.to.includes(who)) shownPosts.posts.add(post.seq)
@@ -1475,6 +1489,9 @@ export const register: Register = on => {
       } catch {
         // No pointer, no run to claim.
       }
+      // Hidden in a substitution or not, it is an `init`: the same words go with it.
+      const notes = await initNotes($).catch(() => [])
+      if (notes.length > 0 && result.deny === undefined && result.isError === undefined) result = { ...result, context: [...(result.context ?? []), ...notes] }
     }
     if (e.tool !== 'Bash' || result.isError || result.deny || calls.length === 0) return result
     try {
@@ -1504,13 +1521,7 @@ export const register: Register = on => {
       // Every wake of the coordinator re-reads its whole conversation, so a run started in a long one pays for
       // that history on each of them. Said once, when the run is made, while starting elsewhere is still cheap.
       if (e.agentId === undefined && calls.some(c => c.action === 'init') && result.deny === undefined && result.isError === undefined) {
-        // A run can be started from memory, with no /swarm:swarm in the turn and so none of the skill's current rules.
-        const notes = [`Swarm: A run was made. If this turn did not start from /swarm:swarm, Read ${$.plugin.root}/skills/swarm/SKILL.md before going on: its rules are the current ones. Before you start a member, show the user the plan and name the token budget, or say that none is set.`]
-        const held = await $.session.usage().then(usage => usage.context.tokens ?? 0).catch(() => 0)
-        if (held >= LONG_CONVERSATION) {
-          notes.push(`Swarm: This conversation already holds about ${compact(held)} tokens, and each time you are woken during the run all of them are read again. Before you start any member, tell the user that a fresh conversation, or /compact first, would make this run much cheaper, and ask whether to go on here.`)
-        }
-        result = { ...result, context: [...(result.context ?? []), ...notes] }
+        result = { ...result, context: [...(result.context ?? []), ...await initNotes($)] }
       }
     } catch {
       // A failed binding must not change the tool's result.
@@ -2587,8 +2598,6 @@ export const register: Register = on => {
           <Box flexDirection="row" gap="xs" alignItems="center" flexWrap="wrap">
             <Button key="replay-first" plain dimColor={index === 0} onPress={() => index > 0 ? seek($, shown.posts[0]!.seq) : undefined}>First</Button>
             <Button key="replay-back" plain dimColor={index === 0} onPress={() => index > 0 ? seek($, shown.posts[index - 1]!.seq) : undefined}>‹ Prev</Button>
-            <Button key="replay-next" plain dimColor={index === shown.posts.length - 1} onPress={() => index < shown.posts.length - 1 ? seek($, shown.posts[index + 1]!.seq) : undefined}>Next ›</Button>
-            {/* Last in the row: its label changes width, and nothing after it is pushed around. */}
             <Button
               key="replay-play"
               variant={shown.posts.length <= 1 ? 'secondary' : 'primary'}
@@ -2596,6 +2605,7 @@ export const register: Register = on => {
               dimColor={shown.posts.length <= 1}
               onPress={() => shown.posts.length > 1 ? play($) : undefined}
             />
+            <Button key="replay-next" plain dimColor={index === shown.posts.length - 1} onPress={() => index < shown.posts.length - 1 ? seek($, shown.posts[index + 1]!.seq) : undefined}>Next ›</Button>
           </Box>
           <Svg
             key="message-routes" source={graphSvg(shown, post.seq, hidden, animate, live, repeat, routeOffset, isExpanded)}

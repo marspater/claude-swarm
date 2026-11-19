@@ -732,6 +732,14 @@ def audit(name):
             json.dump(candidate, f)
         line = run(quiet, "revise", "first", "again").splitlines()[0]
         assert ("@coordinator" in line and "@v" in line) == heard, (candidate, line)
+    # rework by several workers after a failed candidate wakes the verifier when the last of them reports, not per piece
+    run(quiet, "member", "third")
+    for gone in ("second", "scout"):
+        run(quiet, "member", gone, "killed=1")
+    with open(record, "w") as f:
+        json.dump({"inputs": {"first": [1, None], "third": [1, None]}}, f)
+    assert "@v" not in run(quiet, "ready", "first", stdin="fixed").splitlines()[0]
+    assert "@v" in run(quiet, "ready", "third", stdin="fixed too").splitlines()[0]
     os.unlink(record)
     # the plan says what the run has no guard against
     plan = run(team, "plan")

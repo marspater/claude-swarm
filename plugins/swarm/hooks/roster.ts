@@ -33,6 +33,8 @@ export type Roster = Record<
     group?: string
     profile?: string
     writes?: string
+    /** `1` for a consultant: it advises the coordinator and contributes nothing to the candidate. */
+    consult?: string
     model?: string
     effort?: string
     id?: string

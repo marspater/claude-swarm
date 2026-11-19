@@ -2278,6 +2278,9 @@ test('a READY is held while others still work, and a run made inside a command s
   const prompts: string[] = []
   const commands: string[] = []
   let lexer = 'running'
+  let advice = false
+  const consulted = board + JSON.stringify({ seq: 3, agent: 'sage', to: ['coordinator'], text: 'READY\nuse the adapter', time: '2026-11-16T14:05:22+0100' }) + '\n'
+  const withSage = JSON.stringify({ ...JSON.parse(roster), members: { ...JSON.parse(roster).members, sage: { role: 'worker', profile: 'architect', consult: '1', id: 'a3', last_read_seq: 1 } } })
   const clock = mock.clock(on)
   on('command.register', () => ({ value: { command: 'swarm-board' } }))
   on('tool.register', (_, spec) => ({ value: { tool: `mcp__swarm__${spec.name}` } }))
@@ -2286,7 +2289,7 @@ test('a READY is held while others still work, and a run made inside a command s
   on('session.cwd', () => ({ value: '/project' }))
   on('fs.exists', () => ({ value: false }))
   on('fs.read', (_, e) => ({
-    value: e.path === `${RUN}/board.jsonl` ? board : e.path === `${RUN}/members.json` ? roster
+    value: e.path === `${RUN}/board.jsonl` ? (advice ? consulted : board) : e.path === `${RUN}/members.json` ? (advice ? withSage : roster)
       : e.path === '/project/.swarm/current' ? 'demo-20261116-101010\n' : '',
   }))
   on('agent.list', () => ({ value: [
@@ -2307,8 +2310,9 @@ test('a READY is held while others still work, and a run made inside a command s
 
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
   // the folder never reaches the output and no board call can be read off the command: the pointer names the run
-  await $.tool.call({ tool: 'Bash', command: 'R=$(python3 /p/board.py /project/.swarm/demo init "Demo swarm")' })
+  const made = await $.tool.call({ tool: 'Bash', command: 'R=$(python3 /p/board.py /project/.swarm/demo init "Demo swarm")' })
   expect(commands).toContain(`bind ${RUN}`)
+  expect(made.context?.join(' ')).toContain('skills/swarm/SKILL.md')
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' })
   // one of two workers reported: nothing the coordinator can act on, so it is left asleep while the other works
   await clock.advance(60000)
@@ -2317,4 +2321,10 @@ test('a READY is held while others still work, and a run made inside a command s
   lexer = 'completed'
   await clock.advance(16000)
   expect(prompts.filter(text => text.includes('addresses you')).length).toBe(1)
+  // a consultant's READY is the answer that was asked for: it is not held, whoever else is working
+  lexer = 'running'
+  advice = true
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' })
+  await clock.advance(16000)
+  expect(prompts.filter(text => /address(es)? you/.test(text)).length).toBe(2)
 })
