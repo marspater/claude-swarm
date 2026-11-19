@@ -37,6 +37,9 @@ export function pairOf(edge: string): [string, string] | undefined {
 const PILL_HEIGHT = 38
 const LEGEND = 50
 
+// Past this many members round the coordinator the ring gives way to two arcs, one name to a row.
+const RING_LIMIT = 10
+const SIDE_PITCH = PILL_HEIGHT + 10
 const halfOf = (name: string) => Math.max(38, 22 + Math.min(15, name.length) * 4.7)
 
 /** The drawing's own size: it widens with long names and many members, so its shape is not one fixed ratio. */
@@ -45,12 +48,37 @@ function stageOf(all: Swarm['members']) {
   const outerMembers = all.filter(member => member !== coordinator)
   const outerCount = outerMembers.length
   const maxHalf = Math.max(38, ...outerMembers.map(member => halfOf(member.name)))
+  if (outerCount > RING_LIMIT) {
+    // A ring keeps a name's width between neighbours all the way round, so a large team makes it very wide and
+    // the frame scales everything down to fit. Two facing arcs stack the names instead: the drawing grows taller,
+    // not wider, and the names keep their size.
+    const perSide = Math.ceil(outerCount / 2)
+    const rx = Math.max(250, maxHalf + (coordinator ? halfOf(coordinator.name) : 0) + 70)
+    const width = Math.max(560, Math.ceil((rx + maxHalf + 12) * 2))
+    const height = Math.max(404, (perSide - 1) * SIDE_PITCH + 72)
+    const place = (index: number) => {
+      const isRight = index < perSide
+      const count = isRight ? perSide : outerCount - perSide
+      // Clockwise, as on the ring: down the right side, then up the left.
+      const row = isRight ? index : count - 1 - (index - perSide)
+      const offset = (row - (count - 1) / 2) * SIDE_PITCH
+      const t = perSide > 1 ? offset / (((perSide - 1) / 2) * SIDE_PITCH) : 0
+      const reach = rx * (0.55 + 0.45 * Math.sqrt(Math.max(0, 1 - t * t)))
+      return { x: width / 2 + (isRight ? reach : -reach), y: height / 2 + offset }
+    }
+    return { coordinator, outerMembers, width, height, place }
+  }
   const rx = Math.max(186, outerCount <= 2 ? 186 : (maxHalf + 10) / Math.sin(Math.PI / outerCount))
   const width = Math.max(560, Math.ceil((rx + maxHalf + 12) * 2))
   const minRy = outerCount <= 2 ? 129 : (PILL_HEIGHT / 2 + 8) / Math.sin(Math.PI / outerCount)
   const baseHeight = all.length > 6 ? 404 : 330
   const height = Math.max(baseHeight, Math.ceil((Math.max(baseHeight / 2 - 36, minRy) + 36) * 2))
-  return { coordinator, outerMembers, outerCount, rx, width, height }
+  const ry = height / 2 - 36
+  const place = (index: number) => {
+    const angle = -Math.PI / 2 + (2 * Math.PI * index) / Math.max(1, outerCount)
+    return { x: width / 2 + rx * Math.cos(angle), y: height / 2 + ry * Math.sin(angle) }
+  }
+  return { coordinator, outerMembers, width, height, place }
 }
 
 // What one text column measures across the frame, as the pane draws it.
@@ -93,17 +121,15 @@ export function graphSvg(
   const members = swarm.members.filter(member =>
     !hidden.has(member.name) && (live || participants.has(member.name)),
   )
-  const { coordinator, outerMembers, outerCount, rx, width, height } = stageOf(swarm.members)
+  const { coordinator, outerMembers, width, height, place } = stageOf(swarm.members)
   const centerHalf = coordinator ? halfOf(coordinator.name) : 0
-  const ry = height / 2 - 36
   const positions = new Map(swarm.members.map(member => {
     const label = member.name.length > 15 ? `${clipHead(member.name, 14)}…` : member.name
     const half = halfOf(member.name)
-    const index = outerMembers.indexOf(member)
-    const angle = -Math.PI / 2 + (2 * Math.PI * index) / Math.max(1, outerCount)
     const isCenter = member === coordinator || (coordinator === undefined && swarm.members.length === 1)
-    let x = isCenter ? width / 2 : width / 2 + rx * Math.cos(angle)
-    const y = isCenter ? height / 2 : height / 2 + ry * Math.sin(angle)
+    const spot = isCenter ? { x: width / 2, y: height / 2 } : place(outerMembers.indexOf(member))
+    let x = spot.x
+    const y = spot.y
     // A member level with the coordinator would sit against its side with no room for an arrow:
     // it moves outward toward the frame's edge, never inward.
     if (!isCenter && coordinator && Math.abs(y - height / 2) < PILL_HEIGHT + 18 && Math.abs(x - width / 2) - half - centerHalf < 64) {

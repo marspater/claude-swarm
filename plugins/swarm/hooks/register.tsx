@@ -647,6 +647,12 @@ async function adopt($: EngineInterface, name: string | undefined, prompt = ''):
 async function initNotes($: EngineInterface): Promise<string[]> {
   const notes = [`Swarm: A run was made. If this turn did not start from /swarm:swarm, Read ${$.plugin.root}/skills/swarm/SKILL.md before going on: its rules are the current ones. Before you start a member, show the user the plan and name the token budget, or say that none is set.`]
   const held = await $.session.usage().then(usage => usage.context.tokens ?? 0).catch(() => 0)
+  // The desktop app starts a conversation in a worktree of its own and lets its tools edit files only there.
+  const cwd = await $.session.cwd().catch(() => '')
+  const link = cwd ? await $.fs.read(`${cwd}/.git`).catch(() => '') : ''
+  if (/^gitdir:.*\/worktrees\//.test(link.trim())) {
+    notes.push(`Swarm: This conversation runs in a Git worktree of its own (${cwd}). The app can refuse a member's file edits outside that folder, and a member started with isolation: "worktree" works outside it. Before you start a writer with worktree isolation, tell the user: either the writers share this folder with owners that do not overlap, or the run is started from a conversation on the main checkout.`)
+  }
   if (held >= LONG_CONVERSATION) {
     notes.push(`Swarm: This conversation already holds about ${compact(held)} tokens, and each time you are woken during the run all of them are read again. Before you start any member, tell the user that a fresh conversation, or /compact first, would make this run much cheaper, and ask whether to go on here.`)
   }

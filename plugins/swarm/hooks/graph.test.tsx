@@ -307,3 +307,25 @@ test('the graph frame takes the shape of the drawing, so no band of empty space 
   // a wide drawing of many long names is no taller than a small one
   expect(graphHeight(75, many)).toBeLessThan(graphHeight(75, team(['a', 'b', 'c', 'd', 'e', 'f'])))
 })
+
+test('a large team is drawn in two arcs: names keep their size and no two overlap', () => {
+  const names = Array.from({ length: 20 }, (_, index) => `worker-number-${index}`)
+  const members = [
+    { name: 'coordinator', role: 'coordinator', status: 'coordinating', posts: 0 },
+    ...names.map(name => ({ name, role: 'worker', status: 'working', posts: 0 })),
+  ] as never
+  const svg = graphSvg({ members, posts: [], dir: '/r' } as never, 0, new Set(), false, true)
+  const [, width = 0, height = 0] = /viewBox="0 0 (\d+) (\d+)"/.exec(svg)?.map(Number) ?? []
+  // a ring of twenty such names is over 1300 wide and is scaled to less than half its size in the pane
+  expect(width).toBeLessThan(760)
+  expect(graphHeight(75, members)).toBeGreaterThan(450)
+  const spots = [...svg.matchAll(/<g transform="translate\(([\d.-]+) ([\d.-]+)\)"><title>/g)].map(match => [Number(match[1]), Number(match[2])] as const)
+  expect(spots.length).toBe(21)
+  for (const [i, a] of spots.entries()) {
+    expect(a[0]).toBeGreaterThan(80)
+    expect(a[0]).toBeLessThan(width - 80)
+    expect(a[1]).toBeGreaterThan(18)
+    expect(a[1]).toBeLessThan(height - 50 - 18)
+    for (const b of spots.slice(i + 1)) expect(Math.abs(a[0] - b[0]) >= 170 || Math.abs(a[1] - b[1]) >= 46).toBe(true)
+  }
+})
