@@ -9,7 +9,7 @@ import { KEPT, budgetOf, memberNamed, parse, parsePosts, tokensUsed, type Budget
 import { CLIP, bodyOf, clean, clip, compact, head, kindOf, openedText } from './text'
 import { statusInk, statusCss, statusDot } from './palette'
 import { hiveArt, toolMood, toolSummary, type Mood } from './hive'
-import { edgesOf, graphHeight, graphSvg } from './graph'
+import { edgesOf, graphHeight, graphSvg, isBroadcast, pairOf } from './graph'
 
 const PANE = 'swarm'
 const TITLE = 'Swarm'
@@ -47,6 +47,8 @@ const livePulse = atom({ plugin: 'swarm', key: 'livePulse' } as const, 0)
 const latestOnly = atom({ plugin: 'swarm', key: 'latestOnly' } as const, false)
 const earlier = atom({ plugin: 'swarm', key: 'earlier' } as const, 0)
 const hideInactive = atom({ plugin: 'swarm', key: 'hideInactive' } as const, false)
+// Whether the graph draws an @all post as a dashed line to each member it reached, or only counts it on its sender.
+const expandAll = atom({ plugin: 'swarm', key: 'expandAll' } as const, false)
 // The seq of the one long post shown in full; 0 for none.
 const expanded = atom({ plugin: 'swarm', key: 'expanded' } as const, 0)
 const inspected = atom({ plugin: 'swarm', key: 'inspected' } as const, null as Post | null)
@@ -1984,27 +1986,26 @@ export const register: Register = on => {
           member.depends.length === 0 ? '' : `after ${member.depends.map(name => `@${name}`).join(', ')}`,
         ].filter(part => part !== '').join(' · ')
 
+        // Every card has the same rows in the same order, so a column of them can be scanned: who it is and
+        // what it runs on, then how it is doing, then what it waits for, owns and last said.
         return (
-          <Box key={member.name} flexDirection="column">
-            <Box flexDirection="row" justifyContent="space-between" flexWrap="wrap" columnGap={1}>
-              <Text strikethrough={member.status === 'killed'} wrap="truncate-end">
-                <Text bold color={hueOf(member.name)}>@{member.name}</Text>
-                <Text dimColor>
-                  {member.role === 'coordinator' ? '' : `  ${member.type}`}
-                  {member.model === '' ? '' : `  ${member.model}${member.effort === '' ? '' : ` ${member.effort}`}`}
-                </Text>
+          <Box key={member.name} flexDirection="column" borderStyle="round" borderColor={hueOf(member.name)} borderDimColor paddingX={1}>
+            <Text strikethrough={member.status === 'killed'} wrap="truncate-end">
+              <Text bold color={hueOf(member.name)}>@{member.name}</Text>
+              <Text dimColor>
+                {`  ${[member.role === 'coordinator' ? '' : member.type, `${member.model} ${member.effort}`.trim()].filter(part => part !== '').join(' · ')}`}
               </Text>
-              <Box flexDirection="row" alignItems="center">
-                {HeaderArt ? <HeaderArt source={statusDot(member.status)} alt={member.status} width={12} height={12} /> :
-                <Text color={statusColor}>{isBroken ? '!' : ['killed', 'not started'].includes(member.status) ? '○' : '●'}</Text>}
-                <Text>
+            </Text>
+            <Box flexDirection="row" alignItems="center">
+              {HeaderArt ? <HeaderArt source={statusDot(member.status)} alt={member.status} width={12} height={12} /> :
+              <Text color={statusColor}>{isBroken ? '!' : ['killed', 'not started'].includes(member.status) ? '○' : '●'}</Text>}
+              <Text wrap="truncate-end">
                 <Text dimColor>{` ${member.status} · ${counted(member.posts, 'post')}`}</Text>
                 {spentBy(member) > 0 && <Text dimColor>{` · ${compact(spentBy(member))} tokens`}</Text>}
                 {member.unread > 0 && member.status !== 'killed' && (
                   <Text bold color="warning">{` · ${member.unread} unread`}</Text>
                 )}
-                </Text>
-              </Box>
+              </Text>
             </Box>
             {member.status !== 'killed' && member.detail !== '' && (
               <Text color={isBroken ? 'error' : 'warning'} wrap="truncate-end">{member.detail}</Text>
@@ -2049,7 +2050,7 @@ export const register: Register = on => {
           {groups
             .filter(([, list]) => list.length > 0)
             .map(([title, list]) => (
-              <Box key={title} flexDirection="column" gap={1} marginTop={1}>
+              <Box key={title} flexDirection="column" marginTop={1}>
                 <Text bold dimColor>{`${title} · ${list.length}`}</Text>
                 {[...list].sort(byName).map(card)}
               </Box>
@@ -2068,7 +2069,7 @@ export const register: Register = on => {
       const post = shown.posts[index]!
       const detailsOpen = await read($, expanded) === post.seq
       const participants = live ? undefined : new Set([
-        ...Object.keys(shown.earlierEdges ?? {}).flatMap(edge => edge.split('>')),
+        ...Object.keys(shown.earlierEdges ?? {}).flatMap(edge => pairOf(edge) ?? [edge.split('>')[0] ?? '']),
         ...shown.posts.slice(0, index + 1).flatMap(entry => [entry.agent, ...entry.to]),
       ])
       const hideable = [...inactive].filter(name =>
@@ -2078,8 +2079,10 @@ export const register: Register = on => {
       const hidden = new Set(hiding ? hideable : [])
       const animate = playing || (live && pulse === post.seq)
       const repeat = index === shown.posts.length - 1 && !animate
+      const isExpanded = await read($, expandAll)
+      const hasBroadcast = shown.posts.some(isBroadcast) || Object.keys(shown.earlierEdges ?? {}).some(edge => edge.endsWith('>@all'))
       const routeOffset = phase(e.surface + '-route', shown.dir + '/' + latest,
-        [current, post.seq, animate, repeat, ...hidden].join('/'), now)
+        [current, post.seq, animate, repeat, isExpanded, ...hidden].join('/'), now)
       body = (
         <Box flexDirection="column" marginTop={1} gap={1}>
           <Box flexDirection="row" justifyContent="space-between" flexWrap="wrap" columnGap={1}>
@@ -2091,7 +2094,16 @@ export const register: Register = on => {
             ) : (
               <Text dimColor>{live ? (shown.isPaused && !shown.isClosed ? 'Paused' : 'Latest post') : `Post ${index + 1} of ${shown.posts.length}`}</Text>
             )}
-            {inactiveToggle(hideable.length)}
+            <Box flexDirection="row" gap="sm" alignItems="center">
+              <Button
+                key="expand-all"
+                plain
+                dimColor={!hasBroadcast}
+                label={isExpanded ? 'Collapse @all' : 'Expand @all'}
+                onPress={() => update($, expandAll, isOn => !isOn)}
+              />
+              {inactiveToggle(hideable.length)}
+            </Box>
           </Box>
           <Box flexDirection="row" gap="xs" alignItems="center" flexWrap="wrap">
             <Button key="replay-first" plain dimColor={index === 0} onPress={() => seek($, shown.posts[0]!.seq)}>First</Button>
@@ -2109,7 +2121,7 @@ export const register: Register = on => {
             )}
           </Box>
           <Svg
-            key="message-routes" source={graphSvg(shown, post.seq, hidden, animate, live, repeat, routeOffset)}
+            key="message-routes" source={graphSvg(shown, post.seq, hidden, animate, live, repeat, routeOffset, isExpanded)}
             width={1024}
             height={graphHeight(columns, shown.members.length)}
             alt={`Post ${post.seq} · @${post.agent}${post.to.length ? ` to ${post.to.map(name => `@${name}`).join(', ')}` : ' · no mentions'}`}
@@ -2143,17 +2155,12 @@ export const register: Register = on => {
     } else {
       const edges = new Map<string, number>()
       // Posts older than the ones kept still count, as they do in the diagram.
-      for (const [edge, count] of Object.entries(shown.earlierEdges ?? {})) {
-        const [from = '', to = ''] = edge.split('>')
-        if (hiding && (inactive.has(from) || inactive.has(to))) continue
-        edges.set(`@${from} → @${to}`, count)
-      }
-      for (const post of shown.posts) {
-        for (const name of post.to) {
-          if (hiding && (inactive.has(post.agent) || inactive.has(name))) continue
-          const edge = `@${post.agent} → @${name}`
-          edges.set(edge, (edges.get(edge) ?? 0) + 1)
-        }
+      // The same keys the diagram counts: a pair by name, a pair reached through @all, and a sender's @all posts.
+      for (const [edge, count] of Object.entries({ ...shown.earlierEdges, ...Object.fromEntries(
+        Object.entries(edgesOf(shown.posts)).map(([key, more]) => [key, more + (shown.earlierEdges?.[key] ?? 0)])) })) {
+        const [from = '', to = '', via] = edge.split('>')
+        if (to === '@none' || (hiding && (inactive.has(from) || inactive.has(to)))) continue
+        edges.set(to === '@all' ? `@${from} → @all` : `@${from} → @${to}${via ? ' (via @all)' : ''}`, count)
       }
       const most = [...edges.values()].reduce((max, count) => Math.max(max, count), 1)
       const summary =

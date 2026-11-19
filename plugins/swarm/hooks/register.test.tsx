@@ -101,6 +101,16 @@ test('the pane draws the board, the members and the graph', async ($, on) => {
     await ui.press({ key: 'tab-members' })
     expect(await ui.find({ type: 'Text', text: /working · 1 post$/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /1 unread/ })).toBeDefined()
+    // every member is a card of its own with the same rows in the same order: who it is, then how it is doing
+    const cards = (await ui.findAll({ type: 'Box' })).filter(box => box.props.borderStyle === 'round')
+    expect(cards.length).toBeGreaterThan(2)
+    for (const card of cards) {
+      const [identity, state] = card.children as { type: string; props: Record<string, unknown>; text?: string }[]
+      expect(identity?.type).toBe('Text')
+      expect(String(card.text)).toMatch(new RegExp(`^@${card.key}\\b`))
+      expect(state?.type).toBe('Box')
+      expect(state?.props.flexDirection).toBe('row')
+    }
     // the removed member shows until inactive members are hidden
     expect(await ui.find({ type: 'Text', text: /Retired/ })).toBeDefined()
     await ui.press({ key: 'hide-inactive' })

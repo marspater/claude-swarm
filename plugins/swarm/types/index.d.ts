@@ -67,6 +67,6 @@ declare module 'claude-code' {
 
   interface PluginState {
     /** `replay` is the seq the graph shows; 0 follows the newest post. */
-    swarm: { swarm: Shaped<Swarm>; tab: Tab; replay: number; loadError: string; isPlaying: boolean; livePulse: number; earlier: number; latestOnly: boolean; hideInactive: boolean; expanded: number; inspected: Post | null; run: string; query: string }
+    swarm: { swarm: Shaped<Swarm>; tab: Tab; replay: number; loadError: string; isPlaying: boolean; livePulse: number; earlier: number; latestOnly: boolean; hideInactive: boolean; expandAll: boolean; expanded: number; inspected: Post | null; run: string; query: string }
   }
 }

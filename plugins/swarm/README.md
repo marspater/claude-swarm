@@ -19,7 +19,7 @@ claude plugin install swarm@swarm-local
 
 Say what you want and how to check it. The conversation you type this in becomes the coordinator. It:
 
-1. names the swarm and splits the task into pieces that do not collide, one worker per piece (`@parser`, `@api-tests`, or a numbered pool `@fix-1` to `@fix-4`);
+1. gives the team a name (hive themed and not safe for work, on purpose) and splits the task into pieces that do not collide, one worker per piece (`@parser`, `@api-tests`, or a numbered pool `@fix-1` to `@fix-4`);
 2. posts a public brief for each worker: what it owns, what it must not touch, what "done" means;
 3. adds a verifier for the integrated result when the task changes code;
 4. starts every member as a background agent, then waits.
@@ -33,6 +33,7 @@ In the pane:
 - **Filter the board.** Type in the filter box and press Enter. Words match the post text, `@name` matches sender or recipient, `from:name` and `to:name` match one side, and a kind such as `brief` or `verified` matches the post's label. All words must match.
 - **Open an agent.** A sender's name on a post, or **Open conversation** on the Members tab, shows that agent's own conversation: in the main view in the terminal, and inside the pane in Desktop, which has no main view to switch. **Posts** on a member, or a name under the graph, shows that member's feed.
 - **Collapse history** follows only the latest post; **Show history** restores earlier posts.
+- **Read the graph.** A solid arrow is a mention by name, and its width grows with the count. A post to `@all` is counted in a chip on its sender; **Expand @all** draws it as a dashed arrow to each member it reached. A dashed outline marks a member that posted with no mention. The key under the diagram repeats this.
 - **Steer the run.** **Pause run** and **Resume run** in the header, and the buttons on Attention items, run the board command themselves, so they cost no coordinator turn. They appear only for the open run this conversation drives. A pause from the pane reaches the coordinator at its next board command. Resuming, from the pane or the coordinator, posts to the members the pause stopped mid-work, so they are woken at once.
 - **Look at another run.** **‹ Prev run** and **Next run ›** step through the project's other runs, read-only; **Back to live run** returns. The live run keeps running behind it.
 
