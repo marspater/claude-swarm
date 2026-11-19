@@ -2438,3 +2438,93 @@ test('wave 3 fixes: multi-word kind filter, non-round budget pause dedup, specia
   expect(await ui.find({ type: 'Text', text: /#3 ·/ })).toBeUndefined()
   await ui.unmount()
 })
+
+test('an agent outside the roster neither joins the run by resuming nor pauses its members by spending', async ($, on) => {
+  const state = {
+    title: 'Demo swarm', limits: { budget: '1000' }, paused: undefined as string | undefined,
+    usage: { tokens: { coordinator: 900 } as Record<string, number> },
+    members: { coordinator: { role: 'coordinator', last_read_seq: 1 }, parser: { role: 'worker', id: 'a1', last_read_seq: 1 } },
+  }
+  const { seen, answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['parser'], text: '@parser BRIEF' }),
+    roster: () => JSON.stringify(state),
+  })
+  const clock = mock.clock(on)
+  on('process.run', (_, e) => {
+    const stdout = board(e)
+    if (e.argv[3] !== 'account') return answer(stdout)
+    const actor = e.argv[5] ?? ''
+    state.usage.tokens[actor] = (state.usage.tokens[actor] ?? 0) + Number(e.argv[6])
+    const total = Object.values(state.usage.tokens).reduce((sum, value) => sum + value, 0)
+    const paused = !state.paused && total >= 1000
+    if (paused) state.paused = 'token budget of 1000 spent'
+    return answer(JSON.stringify({ title: state.title, total, budget: 1000, paused }))
+  })
+  on('agent.list', () => ({ value: [
+    { id: 'a1', description: '@parser', type: 'swarm:worker', status: 'running' },
+    { id: 'outsider', description: 'Continue previous work', type: 'swarm:worker', status: 'running' },
+  ] as never }))
+  on('agent.spawn', (_, e) => ({ model: 'sonnet', agentId: e.resume?.agentId ?? 'started' }))
+  on('tool.call', () => ({ result: {} }))
+  let spent = 0
+  on('turn.step', async function* (_, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'tool_use' as const,
+      usage: { model: 'm', input_tokens: spent, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }
+  })
+  const step = async (turnId: string, tokens: number, agentId: string) => {
+    spent = tokens
+    for await (const _ of $.turn.step({ turnId, index: 0, model: 'm', messageCount: 1, agentId })) { /* no chunks */ }
+    await clock.advance(1)
+  }
+  const accounts = () => seen.commands.filter(command => command.startsWith('account')).length
+  const reads = (agentId: string) => $.tool.call({ tool: 'Read', file_path: '/project/a.ts', agentId })
+
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  expect((await reads('a1')).deny).toBeUndefined()
+
+  // An unrelated agent is resumed while the run is open: it is let through, and is no member for that.
+  const resumed = await $.agent.spawn({
+    tool_use_id: 'again', prompt: 'Go on.', description: 'Continue previous work', subagentType: 'swarm:worker',
+    provider: { plugin: 'swarm', tier: 'core' as const }, parentModel: 'sonnet', background: true, fork: false,
+    resume: { agentId: 'outsider' },
+  } as never)
+  expect(resumed.deny).toBeUndefined()
+  // Its model step would cross the budget, were it the run's: nothing is charged and no member is stopped.
+  await step('foreign', 200, 'outsider')
+  expect(accounts()).toBe(0)
+  expect((await reads('a1')).deny).toBeUndefined()
+  // A member's step that crosses it stops the members at once, and still not the outsider.
+  await step('own', 200, 'a1')
+  expect((await reads('a1')).deny).toContain('run is paused')
+  expect((await reads('outsider')).deny).toBeUndefined()
+})
+
+test('a mention older than the tail of a large board is still delivered', async ($, on) => {
+  const state = {
+    title: 'Demo swarm',
+    members: { coordinator: { role: 'coordinator', last_read_seq: 2000 }, parser: { role: 'worker', id: 'a1', last_read_seq: 0 } },
+  }
+  const tail = JSON.stringify({ seq: 2000, agent: 'coordinator', to: [], text: 'a later note for nobody', time: '2026-11-16T14:03:22+0100' }) + '\n'
+  const { seen, answer, board } = owning(on, { board: () => tail, roster: () => JSON.stringify(state) })
+  on('fs.stat', () => ({ value: { size: 5_000_000, mtimeMs: 1 } as never }))
+  on('process.run', (_, e) => {
+    const stdout = board(e)
+    const action = e.argv[3]
+    return answer(action === 'tail' ? tail : action === 'wake' ? '@parser a1 through #1\n' : action === 'claim' ? 'a'.repeat(32) : stdout)
+  })
+  on('agent.list', () => ({ value: [{ id: 'a1', description: '@parser', type: 'swarm:worker', status: 'idle' }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const sends: string[] = []
+  on('session.send', (_, e) => { sends.push(e.text); return { isDelivered: true } })
+  const clock = mock.clock(on)
+
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'c', reason: 'answer' })
+  await clock.advance(4000)
+  expect(seen.commands).toContain('claim parser a1 1')
+  expect(sends.join('\n')).toContain('mentions through #1')
+  expect(seen.commands).toContain(`woke parser 1 ${'a'.repeat(32)}`)
+})

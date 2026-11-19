@@ -565,6 +565,82 @@ class VerifyRegressions(unittest.TestCase):
             run(*gate, "accept", cand["candidate"])
             assert "accepted_seq" in json.loads(members_path.read_text())
 
+    def test_negative_verdict_voids_the_pass_until_a_fresh_test(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            (proj / "app.txt").write_text("ok")
+            board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Revoked pass")
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            run(*post, "member", "v2", "role=verifier")
+            run(*post, "ready", "w", text="done")
+            cand = json.loads(run(*gate, "prepare", "shared", "--check", "test -s app.txt"))
+            line = run(*gate, "test", cand["candidate"], "v").splitlines()[-1]
+            # A rejection that quotes the pass line is no pass.
+            run(*post, "post", "v", "@coordinator NOT " + line)
+            run(*gate, "accept", cand["candidate"], ok=False)
+            line = run(*gate, "test", cand["candidate"], "v").splitlines()[-1]
+            run(*post, "post", "v", "@coordinator " + line)
+            # Any active verifier's later rejection voids the pass, and posting the old line again does not restore it.
+            run(*post, "post", "v2", "@w @coordinator NOT PASSED regression identified; reject this candidate")
+            run(*gate, "accept", cand["candidate"], ok=False)
+            run(*post, "post", "v", "@coordinator " + line, ok=False)
+            run(*gate, "accept", cand["candidate"], ok=False)
+            line = run(*gate, "test", cand["candidate"], "v").splitlines()[-1]
+            run(*post, "post", "v", "@coordinator " + line)
+            run(*gate, "accept", cand["candidate"])
+
+    def test_timed_out_check_leaves_no_descendant_running(self):
+        with tempfile.TemporaryDirectory() as t, tempfile.TemporaryDirectory() as outside:
+            proj = Path(t).resolve()
+            (proj / "app.txt").write_text("ok")
+            marker = Path(outside) / "marker"
+            board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Timeout tree")
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            run(*post, "ready", "w", text="done")
+            # The shell has a command after the child, so it cannot exec the child in its own place. The child
+            # ignores a polite termination.
+            child = ("import signal, time, pathlib; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                     "time.sleep(1.5); pathlib.Path(%r).write_text('late')" % str(marker))
+            check = "%s -c %s; true" % (shlex.quote(sys.executable), shlex.quote(child))
+            cand = json.loads(run(*gate, "prepare", "shared", "--check", check))
+            env = dict(os.environ, SWARM_VERIFY_TIMEOUT="0.3")
+            res = subprocess.run([*gate, "test", cand["candidate"], "v"], capture_output=True, text=True, env=env)
+            assert res.returncode != 0 and "timed out" in res.stderr, res.stderr
+            import time
+            time.sleep(2)
+            assert not marker.exists(), "a descendant of the timed-out check kept running"
+
+    def test_ready_head_refuses_untracked_source(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve() / "main"
+            proj.mkdir()
+            g = self._init_git(proj)
+            (proj / ".gitignore").write_text("build/\n")
+            g("add", ".gitignore")
+            g("commit", "-m", "ignore build")
+            board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Untracked")
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            run(*post, "member", "w")
+            work = proj.parent / "worker"
+            g("worktree", "add", "-b", "worker", str(work))
+            (work / "build").mkdir()
+            (work / "build" / "out.o").write_text("ignored")
+            (work / "pkg").mkdir()
+            (work / "pkg" / "new_feature.py").write_text("def feature(): return 42\n")
+            res = subprocess.run([*post, "ready", "w", "HEAD"], cwd=work / "build", input="added new_feature.py",
+                                 capture_output=True, text=True)
+            assert res.returncode != 0 and "pkg/new_feature.py" in res.stderr, res.stderr
+            g("add", "pkg", cwd=work)
+            g("commit", "-m", "feature", cwd=work)
+            # Ignored build output does not block the report, wherever in the checkout it is made from.
+            run(*post, "ready", "w", "HEAD", cwd=work / "build", text="added new_feature.py")
+
 
 if __name__ == "__main__":
     scenario()

@@ -9,13 +9,15 @@ import math
 import os
 from pathlib import Path
 import re
+import signal
 import stat
 import subprocess
 import sys
+import time
 import uuid
 
 sys.dont_write_bytecode = True
-from board import atomic_write, load, load_state, readiness, save
+from board import REPORT_WORD, atomic_write, load, load_state, readiness, save
 
 GIT_ENV_STRIP = {
     "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
@@ -390,6 +392,44 @@ def prepare(run, project, mode, checks, onto=None):
                       "digest": candidate["digest"]}))
 
 
+def run_check(command, cwd, timeout):
+    """One check in its own process group: whatever it started ends with it, on a timeout or an interruption too."""
+    process = subprocess.Popen(["/bin/sh", "-c", command], cwd=cwd, stdin=subprocess.DEVNULL, start_new_session=True)
+
+    def gone():
+        process.poll()
+        try:
+            os.killpg(process.pid, 0)
+        except (ProcessLookupError, PermissionError):  # macOS answers EPERM for a group of exited processes
+            return True
+        return False
+
+    def interrupted(number, _frame):
+        raise SystemExit(128 + number)
+
+    # The group no longer dies with this process, so a signal sent to it has to reach the cleanup below.
+    previous = {number: signal.signal(number, interrupted) for number in (signal.SIGTERM, signal.SIGHUP)}
+    try:
+        return process.wait(timeout=timeout)
+    except BaseException:
+        # A check that ends on its own may leave what it started for the next check; one that is cut short may not.
+        for number in (signal.SIGTERM, signal.SIGKILL):
+            if gone():
+                break
+            try:
+                os.killpg(process.pid, number)
+            except (ProcessLookupError, PermissionError):
+                break
+            deadline = time.monotonic() + 0.5
+            while not gone() and time.monotonic() < deadline:
+                time.sleep(0.02)
+        process.wait()
+        raise
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
 def test_candidate(run, project, identifier, verifier):
     verifier = verifier.lstrip("@").lower()
     attempt = uuid.uuid4().hex
@@ -416,11 +456,11 @@ def test_candidate(run, project, identifier, verifier):
     for command in candidate["checks"]:
         print(f"$ {command}", flush=True)
         try:
-            result = subprocess.run(["/bin/sh", "-c", command], cwd=candidate["path"], stdin=subprocess.DEVNULL, timeout=timeout)
+            returncode = run_check(command, candidate["path"], timeout)
         except subprocess.TimeoutExpired:
             raise ValueError(f"verification command timed out after {timeout}s: {command}") from None
-        print(f"Exit {result.returncode}", flush=True)
-        if result.returncode:
+        print(f"Exit {returncode}", flush=True)
+        if returncode:
             raise ValueError("verification failed")
 
     with board_lock(run):
@@ -438,7 +478,8 @@ def accept(run, project, identifier):
     with board_lock(run):
         candidate = candidate_for(run, project, identifier)
         if not candidate.get("verified_by"):
-            raise ValueError("no passing verification for this candidate")
+            raise ValueError("no passing verification for this candidate: a verifier's NOT PASSED or NOT VERIFIED "
+                             "withdraws an earlier pass, so have the verifier run the test again")
         if candidate.get("accepted"):
             check_current(run, candidate)
             state, posts = load(run)
@@ -456,6 +497,7 @@ def accept(run, project, identifier):
         if not any(
             p["seq"] > latest_input_seq
             and p["agent"] == verifier
+            and (word := REPORT_WORD.match(p["text"])) and word[1] == "VERIFIED"  # `NOT VERIFIED <the line>` is no pass
             and re.search(rf"(?<!\w){re.escape(expected_line)}(?!\w)", p["text"].split("\n")[0])
             for p in posts
         ):

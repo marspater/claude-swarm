@@ -390,6 +390,18 @@ def verified_line(d, verifier, first):
     return True
 
 
+def void_pass(d):
+    """A verifier's rejection withdraws the pass of the candidate on the table: only a fresh test restores it."""
+    path = os.path.join(d, "verification.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            candidate = json.load(f)
+    except (FileNotFoundError, ValueError):
+        return
+    if isinstance(candidate, dict) and not candidate.get("accepted") and candidate.pop("verified_by", None):
+        atomic_write(path, json.dumps(candidate, indent=2))
+
+
 def successor(name, members):
     seen = set()
     while name in members and members[name].get("killed") and members[name].get("replaced_by") and name not in seen:
@@ -1083,8 +1095,11 @@ def main(argv):
                 sys.exit("only a verifier can post VERIFIED")
             if word == "VERIFIED" and not verified_line(d, sender, first):
                 sys.exit("VERIFIED must be the line the coordinator's verify command returns: VERIFIED <candidate> <digest>. "
-                         "Wait for the candidate; report anything else as NOT VERIFIED or as a note.")
+                         "Wait for the candidate; report anything else as NOT VERIFIED or as a note. "
+                         "A pass a later NOT PASSED or NOT VERIFIED withdrew is restored only by running the test again.")
             recipients = [name for name in targets(text, members) if name != sender]
+            if word in {"NOT PASSED", "NOT VERIFIED"} and members[sender].get("role") == "verifier":
+                void_pass(d)
             stuck = ""
             if word == "NOT PASSED" and members[sender].get("role") == "verifier" and not state.get("paused"):
                 # Paused by the verdict itself, so a resumed run is stopped again only by a further one.
@@ -1121,9 +1136,17 @@ def main(argv):
                     found = verify.git(here, "rev-parse", "--verify", "HEAD^{commit}", optional=True)
                     if found is None:
                         sys.exit("HEAD is no commit here: run `ready` from your checkout, or give the full commit ID")
-                    # HEAD of a checkout with edits in it is not the work being reported: the edits are.
-                    if verify.git(here, "status", "--porcelain", "--untracked-files=no", optional=True):
-                        sys.exit("this checkout has uncommitted changes, so HEAD is not what you are reporting: commit first")
+                    # HEAD of a checkout with edits in it is not the work being reported: the edits are. A new file
+                    # nobody added counts: verification merges the commit and would never see it.
+                    try:
+                        root = verify.Path(os.fsdecode(verify.toplevel(here).rstrip(b"\n")))
+                        loose = verify.pending_changes(root)
+                    except (ValueError, OSError) as error:
+                        sys.exit("git could not read this checkout, so HEAD cannot be reported: %s" % error)
+                    if loose:
+                        names = ", ".join(os.fsdecode(path) for path in loose[:5]) + (" and more" if len(loose) > 5 else "")
+                        sys.exit("this checkout has uncommitted changes or untracked files, so HEAD is not what you are reporting: %s. "
+                                 "Commit them or add them to .gitignore first, or give the full commit ID" % names)
                     revision = found.decode().strip()
                 if revision is not None and not COMMIT.fullmatch(revision):
                     sys.exit("expected a full commit ID")

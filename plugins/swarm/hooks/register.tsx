@@ -456,8 +456,9 @@ function boardCommand($: EngineInterface, directory: string, args: string[], std
 }
 
 // A read over 4 MiB is refused, and a long run's board grows past that. The board's own `tail` then gives the
-// newest posts, so the pane, the wakes and the stall check keep working.
-// ponytail: posts older than the tail drop out of the pane and the graph; page through the file if that matters.
+// newest posts, so the pane and the stall check keep working; the wakes also ask the board what is owed (`owedBeforeTail`).
+// ponytail: posts older than the tail drop out of the pane and the graph, and the coordinator is not reminded of an
+// unread mention that old (the board's own UNREAD line on its next post still is); page through the file if that matters.
 async function readBoard($: EngineInterface, dir: string): Promise<string> {
   const stat = await $.fs.stat(`${dir}/board.jsonl`).catch(() => undefined)
   if (stat && boardStat && boardStat.dir === dir && boardStat.size === stat.size && boardStat.mtimeMs === stat.mtimeMs) {
@@ -479,6 +480,15 @@ async function readBoard($: EngineInterface, dir: string): Promise<string> {
   }
   if (stat) boardStat = { dir, size: stat.size, mtimeMs: stat.mtimeMs, content }
   return content
+}
+
+/** The newest mention the board still owes each member a wake for: read off `wake` when only the board's tail was read. */
+async function owedBeforeTail($: EngineInterface, dir: string): Promise<Map<string, number>> {
+  const listed = await boardCommand($, dir, ['wake']).catch(() => undefined)
+  const owedTo = new Map<string, number>()
+  if (listed?.exitCode !== 0) return owedTo
+  for (const [, name, seq] of listed.stdout.matchAll(/^@(\S+) \S+ through #(\d+)/gm)) owedTo.set(name!, Number(seq))
+  return owedTo
 }
 
 async function reportOf($: EngineInterface, dir: string): Promise<Report | undefined> {
@@ -734,6 +744,7 @@ async function deliver(
   agents: AgentInfo[],
   now: number,
   epoch: number,
+  older: ReadonlyMap<string, number> = new Map(),
 ): Promise<{ pending: boolean; exhausted: string[]; relay: SpecialistWake[]; unaddressed: typeof unaddressed }> {
   const script = `${$.plugin.root}/skills/swarm/scripts/board.py`
   const results = { pending: false, exhausted: [] as string[], relay: [] as SpecialistWake[], unaddressed: [] as typeof unaddressed }
@@ -744,7 +755,9 @@ async function deliver(
     const id = member.id
     if (member.killed || member.role === 'coordinator') continue
     const from = Math.max(member.last_read_seq, member.last_nudged_seq ?? 0)
-    const seq = posts.findLast(post => post.seq > from && post.to.includes(name))?.seq
+    // `older`: what the board itself says is owed, for a mention that lies before the tail read of a large board.
+    const before = older.get(name) ?? 0
+    const seq = posts.findLast(post => post.seq > from && post.to.includes(name))?.seq ?? (before > from ? before : undefined)
     if (!id) {
       if (seq !== undefined && SPECIALISTS.includes(member.profile ?? '')) results.unaddressed.push({ name, seq })
       continue
@@ -982,7 +995,8 @@ async function refresh($: EngineInterface): Promise<void> {
       return
     }
     if (epoch !== generation) return
-    const { pending, exhausted, relay, unaddressed: unsent } = await deliver($, dir, state.members, full.posts, agents, now, epoch)
+    const { pending, exhausted, relay, unaddressed: unsent } = await deliver($, dir, state.members, full.posts, agents, now, epoch,
+      (full.posts[0]?.seq ?? 1) > 1 ? await owedBeforeTail($, dir) : undefined)
     if (epoch !== generation) return
     specialistWakes = relay
     unaddressed = unsent
@@ -1670,15 +1684,18 @@ export const register: Register = on => {
       const resumed = memberNamed(state.members, named)
       if (resumed && entry && resumed !== entry) return { deny: 'This agent is no longer assigned to that Swarm member.' }
       if (resumed?.id && !entry) return { deny: 'This agent is no longer assigned to that Swarm member.' }
+      // A member whose first start was never recorded is recorded now, or it could not be woken. Only an
+      // agent of the type the roster gives the member: a resume skips the checks a fresh start goes through.
+      const isUnrecorded = !entry && named !== undefined && resumed !== undefined && !resumed.id &&
+        running?.type === `swarm:${resumed.profile || resumed.role || 'worker'}`
       const again = await next(e)
-      if (again.agentId) {
+      // An agent the roster does not know is resumed as what it is, no member: it is neither charged to the run
+      // nor stopped with it.
+      if (again.agentId && (entry || isUnrecorded)) {
         agentRuns.set(again.agentId, owned)
         if (again.teammateId) learnTeammate($, again.agentId, again.teammateId)
       }
-      // A member whose first start was never recorded is recorded now, or it could not be woken. Only an
-      // agent of the type the roster gives the member: a resume skips the checks a fresh start goes through.
-      if (!entry && named && resumed && !resumed.id && again.agentId &&
-          running?.type === `swarm:${resumed.profile || resumed.role || 'worker'}`) {
+      if (isUnrecorded && named && again.agentId) {
         await boardCommand($, owned, ['started', named, again.teammateId ?? again.agentId, '']).catch(() => undefined)
       }
       return again
@@ -1799,7 +1816,10 @@ export const register: Register = on => {
       const delta = spent ? charge(e.turnId, spent, e.index) : 0
       const turn = delta > 0 ? stepped.get(e.turnId) : undefined
       if (spent && turn) {
-        if (snapshot && snapshot.budget > 0 && tokensUsed(snapshot.tokens) + delta >= snapshot.budget) {
+        // Only a step of this run's own spends its budget: the coordinator's, or an agent already known to be a member.
+        const isOwn = snapshot !== undefined &&
+          (e.agentId === undefined ? await read($, run) : agentRuns.get(e.agentId)) === snapshot.dir
+        if (snapshot && isOwn && snapshot.budget > 0 && tokensUsed(snapshot.tokens) + delta >= snapshot.budget) {
           halted = { dir: snapshot.dir, why: `paused (token budget of ${compact(snapshot.budget)} spent)` }
         }
         turn.landing = turn.landing

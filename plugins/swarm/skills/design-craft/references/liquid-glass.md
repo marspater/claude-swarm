@@ -10,11 +10,13 @@ Supplement to section 5 of `apple-design.md`, which holds the rules for where gl
   - The setting became a continuous transparency slider. A spec has to hold at both ends of it, not only at the default.
   - Glass borders are sharper and dark glass is lighter.
   - `UIDesignRequiresCompatibility` is deprecated, so there is no opt-out on the current SDK.
-  - New: `@Environment(\.appearsActive)` for dimming custom glass in an inactive window, `TabsPickerStyle` to keep a segmented picker distinct from navigation tabs, and macOS menu bar items that show the icon alone unless you ask for `.labelStyle(.titleAndIcon)`.
+  - New: `TabsPickerStyle` to keep a segmented picker distinct from navigation tabs. SwiftUI menu items on macOS keep their title and hide the symbol unless you ask for `.labelStyle(.titleAndIcon)`.
 
 ## 2. Standard chrome first (SwiftUI)
 
 Remove custom bar backgrounds and borders and let the system containers supply glass, scroll-edge softening and tab minimization.
+
+The example is the iPhone form. `.topBarTrailing`, `.tabBarMinimizeBehavior(.onScrollDown)` and `.tabViewBottomAccessory` do not compile for macOS: there, place the item with `.primaryAction` and leave the two tab-bar modifiers out.
 
 ```swift
 TabView {
@@ -48,7 +50,7 @@ An accessory reads `@Environment(\.tabViewBottomAccessoryPlacement)` and drops i
 - Variants: `.regular` for chrome; `.clear` only over rich media, with a dimming scrim if text needs it. Never the two side by side.
 - `.buttonStyle(.glass)` for ordinary actions and `.glassProminent` or `.tint(_:)` for the one primary action or the active state.
 - `glassEffectID(_:in:)` lets controls morph as they appear and disappear. `glassEffectUnion(id:namespace:)` joins adjacent controls into one permanent shape, such as a zoom stack.
-- From 27, dim a custom cluster in an inactive window with `appearsActive`.
+- Dim a custom cluster in an inactive window with `@Environment(\.appearsActive)`. It is not new in 27: earlier SDKs have it.
 
 ```swift
 GlassEffectContainer(spacing: 24) {
@@ -97,7 +99,7 @@ extension View {
 ## 5. AppKit and UIKit
 
 - **AppKit (macOS 26):** `NSGlassEffectView` for a custom floating surface (`contentView`, `cornerRadius`, `style`, `tintColor`). Group adjacent ones in `NSGlassEffectContainerView`. The view calms itself when its window loses key status; do not override that.
-- **UIKit (iOS and iPadOS 26):** `UIGlassEffect` in a `UIVisualEffectView`. Group neighbours in `UIGlassEffectContainerView`.
+- **UIKit (iOS and iPadOS 26):** `UIGlassEffect` in a `UIVisualEffectView`. Group neighbours by nesting those views in the `contentView` of a `UIVisualEffectView` whose effect is a `UIGlassContainerEffect`.
 
 ## 6. Reject on review
 

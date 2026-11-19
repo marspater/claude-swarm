@@ -17,7 +17,7 @@ Version check before relying on details: confirm the project's deployment target
 
 - Units are points. Do not carry web px values or an 8-pt rule into native specs. System metrics (44, 20, 17, 13, 11) are not on an 8 grid and are correct.
 - Prefer system-supplied spacing over literals: default stack spacing, `.padding()` with no value, `scenePadding`, `contentMargins`, `safeAreaInset`, list and form insets. Literal values come from the spacing tokens and are for custom layouts only.
-- Hit targets: at least 44x44 pt on iOS and iPadOS. The visual can be smaller; extend the hit area with `contentShape`. macOS follows control sizes (`mini` to `extraLarge`); do not inflate Mac controls to 44.
+- Hit targets: at least 44x44 pt on iOS and iPadOS. That is the HIG's default control size; its absolute floor is 28x28 pt. The visual can be smaller: give the control a larger layout area and make that area hit-testable with `contentShape`. macOS follows control sizes (`mini` to `extraLarge`), with a HIG default of 28x28 pt and a floor of 20x20 pt; do not inflate Mac controls to 44.
 - Hairlines are 1 device pixel (`1 / displayScale`), not 1 pt.
 - Corners use continuous curvature; specify the corner style explicitly. An SVG `rx` arc is circular and will not match, so mock with the real shape or note the difference.
 - Nested corners are concentric. On 26 and later use the system's concentric shape and container-shape APIs instead of hand-computed radii.
@@ -37,7 +37,7 @@ Version check before relying on details: confirm the project's deployment target
 - Semantic first: `.primary`, `.secondary`, `.tertiary` foreground styles, the accent/tint colour, system background and fill colours, the separator colour. They already adapt to light and dark, increased contrast, vibrancy and platform.
 - Custom colours live in the asset catalog as colour sets with Any and Dark appearances, plus High Contrast variants wherever the standard pair fails contrast. Name them by role (`surfaceRaised`), not by hue. Views reference names only, never literals.
 - Deliver the token table as: role, then light / dark / high-contrast light / high-contrast dark, in sRGB hex with the OKLCH source.
-- Contrast: the HIG minimums are 4.5:1 for text up to 17 pt, and 3:1 at 18 pt and above or at 14 pt and above when bold. Default to 4.5:1 for all text and treat 3:1 as the exception. Verify every text-on-surface pair in every appearance.
+- Contrast: the WCAG AA minimums, which the HIG points to, are 4.5:1 for text up to 17 pt, and 3:1 at 18 pt and above or at 14 pt and above when bold. Default to 4.5:1 for all text and treat 3:1 as the exception. Verify every text-on-surface pair in every appearance.
 - Text on a material or on glass has no single background. Test it over the lightest and the darkest content it can sit on.
 - In dark appearance, base and elevated levels differ (elevated surfaces are lighter). Do not flatten them.
 
@@ -59,7 +59,7 @@ Version check before relying on details: confirm the project's deployment target
 - Do not use a symbol against its meaning. Symbols that depict Apple products or features cannot be repurposed (licence restriction).
 - Custom symbol: start from the SF Symbols app template of the closest existing symbol, draw to its guides (baseline, cap height, margins), supply the weights and scales interpolation needs, use flattened paths only (see booleans in `design-craft`), and annotate layers for hierarchical, palette and variable-color rendering. Validate the template in the SF Symbols app.
 - Symbol animation: use built-in symbol effects and content transitions, not hand-built animation.
-- App icon: layered artwork composed in Icon Composer. Supply a 1024 canvas with layers as separate SVGs (a background plus grouped foreground layers). No baked mask, corner radius, shadow, gloss or blur: the system applies the shape and the glass. Simple, bold, centred shapes and few layers. Check the default, dark and mono/tinted renderings, and check small sizes.
+- App icon: layered artwork composed in Icon Composer. Supply a 1024 canvas with layers as separate SVGs (a background plus grouped foreground layers). SVG is this skill's convention, so layers stay sharp and editable; it is not the only format Icon Composer takes. No baked mask, corner radius, shadow, gloss or blur: the system applies the shape and the glass. Simple, bold, centred shapes and few layers. Check the default, dark and mono/tinted renderings, and check small sizes.
 - Icon Composer and the SF Symbols app are GUI tools. Prepare files to spec and state that in-app assembly and validation is still pending, unless you actually performed it.
 
 ## 7. Platform idiom
