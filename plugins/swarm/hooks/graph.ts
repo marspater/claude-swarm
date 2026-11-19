@@ -309,6 +309,8 @@ export function graphSvg(
       return [kx, ky, sx, sy, ex, ey] as const
     }
     let [cx, cy, x1, y1, x2, y2] = chordBow(baseBow)
+    const isForward = (controlX: number, controlY: number, ex: number, ey: number) =>
+      (ex - controlX) * (b.x - ex) + (ey - controlY) * (b.y - ey) > 0
     const obstacles = members.filter(m => m.name !== from && m.name !== to).map(m => positions.get(m.name)!).filter(Boolean)
     const minClearance = (controlX: number, controlY: number, sx: number, sy: number, ex: number, ey: number) => {
       let min = Infinity
@@ -322,25 +324,71 @@ export function graphSvg(
       }
       return min
     }
-    if (obstacles.length > 0 && minClearance(cx, cy, x1, y1, x2, y2) < pad) {
-      // Route around non-endpoint pills with graduated detours while keeping mutual and @all edges separated.
+    const initialForward = isForward(cx, cy, x2, y2)
+    if (!initialForward || (obstacles.length > 0 && minClearance(cx, cy, x1, y1, x2, y2) < pad)) {
+      // Route around non-endpoint pills with graduated detours while keeping mutual and @all edges separated,
+      // and scale down bow on short diagonal chords if the default bow reverses the arrival tangent.
+      const shrinkCandidates = !initialForward
+        ? [baseBow * 0.6, baseBow * 0.35, baseBow * 0.15, 0].map(offset => ({ useChord: true, offset }))
+        : []
       const bowCandidates = (isMutual ? [baseBow, baseBow * 1.45, baseBow * 1.9, -baseBow] : [baseBow, -baseBow])
         .map(offset => ({ useChord: true, offset }))
       const stepCandidates = [24, 36, 52, 70, 90, 120, 155, 195, 235].flatMap(mag => [
         { useChord: mag <= 70, offset: bowSign * (mag + beside) },
         { useChord: mag <= 70, offset: -bowSign * (mag + beside) },
       ])
+      const innerFace = (p: { x: number; y: number; half: number }, targetX: number, gap: number) => {
+        const dir = p.x < width / 2 ? 1 : p.x > width / 2 ? -1 : (targetX >= p.x ? 1 : -1)
+        return [p.x + dir * (p.half + gap), p.y] as const
+      }
+      const [isx, isy] = innerFace(a, b.x, 3)
+      const [iex, iey] = innerFace(b, a.x, 4)
+      const corridorCandidates = (() => {
+        if (outerCount <= RING_LIMIT && beside === 0) return []
+        const list: Array<readonly [number, number, number, number, number, number]> = []
+        const idx = iex - isx, idy = iey - isy
+        const ilen = Math.hypot(idx, idy) || 1
+        const iux = idx / ilen, iuy = idy / ilen
+        const midX = (isx + iex) / 2, midY = (isy + iey) / 2
+        const small = beside > 0 ? [16, -16, 24, -24, 32, -32] : []
+        for (const offset of [...small, baseBow, -baseBow, 24, -24, 36, -36, 52, -52, 70, -70, 90, -90, 120, -120, 155, -155, 195, -195, 235, -235]) {
+          const [kx, ky] = clampStage(midX - iuy * offset, midY + iux * offset)
+          list.push([kx, ky, isx, isy, iex, iey])
+        }
+        const laneLeft = width / 2 - (centerHalf + 28)
+        const laneRight = width / 2 + (centerHalf + 28)
+        const minSideX = Math.min(isx, iex) - 28
+        const maxSideX = Math.max(isx, iex) + 28
+        for (const [kx, ky] of [
+          [width / 2, height / 2 - 48],
+          [width / 2, height / 2 + 48],
+          [laneLeft, midY],
+          [laneRight, midY],
+          [laneLeft, height / 2 - 48],
+          [laneLeft, height / 2 + 48],
+          [laneRight, height / 2 - 48],
+          [laneRight, height / 2 + 48],
+          [minSideX, midY],
+          [maxSideX, midY],
+          [width / 2, 24],
+          [width / 2, height - 24],
+        ] as const) {
+          const [cxC, cyC] = clampStage(kx, ky)
+          list.push([cxC, cyC, isx, isy, iex, iey])
+        }
+        return list
+      })()
       let bestClear = -Infinity
       let bestCand: readonly [number, number, number, number, number, number] | undefined
-      for (const { useChord, offset } of [...bowCandidates, ...stepCandidates]) {
+      let found = false
+      for (const { useChord, offset } of [...shrinkCandidates, ...bowCandidates, ...stepCandidates]) {
         const cand = useChord ? chordBow(offset) : detourBow(offset)
         const [candX, candY, sx, sy, ex, ey] = cand
-        const forward = (ex - candX) * (b.x - ex) + (ey - candY) * (b.y - ey) > 0
-        if (!forward) continue
-        const clear = minClearance(candX, candY, sx, sy, ex, ey)
+        if (!isForward(candX, candY, ex, ey)) continue
+        const clear = obstacles.length > 0 ? minClearance(candX, candY, sx, sy, ex, ey) : Infinity
         if (clear >= pad) {
           cx = candX; cy = candY; x1 = sx; y1 = sy; x2 = ex; y2 = ey
-          bestCand = undefined
+          found = true
           break
         }
         if (clear > bestClear) {
@@ -348,7 +396,23 @@ export function graphSvg(
           bestCand = cand
         }
       }
-      if (bestCand) {
+      if (!found) {
+        for (const cand of corridorCandidates) {
+          const [candX, candY, sx, sy, ex, ey] = cand
+          if (!isForward(candX, candY, ex, ey)) continue
+          const clear = obstacles.length > 0 ? minClearance(candX, candY, sx, sy, ex, ey) : Infinity
+          if (clear >= pad) {
+            cx = candX; cy = candY; x1 = sx; y1 = sy; x2 = ex; y2 = ey
+            found = true
+            break
+          }
+          if (clear > bestClear) {
+            bestClear = clear
+            bestCand = cand
+          }
+        }
+      }
+      if (!found && bestCand) {
         [cx, cy, x1, y1, x2, y2] = bestCand
       }
     }

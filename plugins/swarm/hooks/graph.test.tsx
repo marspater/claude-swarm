@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import type { Post, Swarm } from '../types'
-import { edgesOf, graphHeight, graphSvg, isBroadcast } from './graph'
+import { edgesOf, graphHeight, graphSvg, isBroadcast, orderOuterMembers, visibleMembers } from './graph'
 import { statusDot } from './palette'
 
 test('the graph counts posts the pane no longer keeps', async () => {
@@ -328,4 +328,240 @@ test('a large team is drawn in two arcs: names keep their size and no two overla
     expect(a[1]).toBeLessThan(height - 50 - 18)
     for (const b of spots.slice(i + 1)) expect(Math.abs(a[0] - b[0]) >= 170 || Math.abs(a[1] - b[1]) >= 46).toBe(true)
   }
+})
+
+type PillBox = { name: string; x: number; y: number; half: number }
+
+function pillSignedDistance(x: number, y: number, pill: PillBox): number {
+  const qx = Math.abs(x - pill.x) - (pill.half - 13)
+  const qy = Math.abs(y - pill.y) - (19 - 13)
+  return Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - 13
+}
+
+function assertCleanGraphLayout(svg: string, expectedNames: string[], maxControlDeviation = 260) {
+  expect(svg).not.toMatch(/NaN|Infinity|undefined/)
+  const vb = svg.match(/viewBox="0 0 ([\d.]+) ([\d.]+)"/)
+  expect(vb).not.toBeNull()
+  const vw = Number(vb![1])
+  const vh = Number(vb![2]) - 50
+  const halfOf = (name: string) => Math.max(38, 22 + Math.min(15, name.length) * 4.7)
+
+  const boxes: PillBox[] = expectedNames.map(name => {
+    const match = svg.match(new RegExp(`translate\\(([\\d.]+) ([\\d.]+)\\)"><title>${name}(?:\\s·|</title>)`))
+    expect(match).not.toBeNull()
+    const x = Number(match![1])
+    const y = Number(match![2])
+    const half = halfOf(name)
+    expect(x - half - 2).toBeGreaterThanOrEqual(0)
+    expect(x + half + 2).toBeLessThanOrEqual(vw)
+    expect(y - 19 - 2).toBeGreaterThanOrEqual(0)
+    expect(y + 19 + 2).toBeLessThanOrEqual(vh)
+    return { name, x, y, half }
+  })
+
+  for (let i = 0; i < boxes.length; i++) {
+    for (let j = i + 1; j < boxes.length; j++) {
+      const a = boxes[i]!, b = boxes[j]!
+      const overlapX = Math.abs(a.x - b.x) < a.half + b.half
+      const overlapY = Math.abs(a.y - b.y) < 38
+      expect(overlapX && overlapY).toBe(false)
+    }
+  }
+
+  const posMap = new Map(boxes.map(box => [box.name, box]))
+  const edgeRegex = /<path class="(?:edge|route-base)[^"]*" d="M([\d.]+) ([\d.]+) Q([\d.]+) ([\d.]+) ([\d.]+) ([\d.]+)"[^>]*><title>([^<]+) to ([^<]+) · [^<]+<\/title><\/path>/g
+  let edgeCount = 0
+  for (const match of svg.matchAll(edgeRegex)) {
+    edgeCount++
+    const x1 = Number(match[1]), y1 = Number(match[2])
+    const cx = Number(match[3]), cy = Number(match[4])
+    const x2 = Number(match[5]), y2 = Number(match[6])
+    const from = match[7]!, to = match[8]!
+    expect(cx).toBeGreaterThanOrEqual(0)
+    expect(cx).toBeLessThanOrEqual(vw)
+    expect(cy).toBeGreaterThanOrEqual(0)
+    expect(cy).toBeLessThanOrEqual(vh)
+    const chordMidX = (x1 + x2) / 2
+    const chordMidY = (y1 + y2) / 2
+    const chordLen = Math.hypot(x2 - x1, y2 - y1)
+    expect(Math.hypot(cx - chordMidX, cy - chordMidY)).toBeLessThanOrEqual(Math.max(maxControlDeviation, chordLen * 1.1))
+
+    const obstacles = boxes.filter(box => box.name !== from && box.name !== to)
+    for (let step = 1; step < 24; step++) {
+      const t = step / 24
+      const x = (1 - t) ** 2 * x1 + 2 * (1 - t) * t * cx + t ** 2 * x2
+      const y = (1 - t) ** 2 * y1 + 2 * (1 - t) * t * cy + t ** 2 * y2
+      for (const obs of obstacles) {
+        expect(pillSignedDistance(x, y, obs)).toBeGreaterThanOrEqual(0)
+        const inInteriorBox = Math.abs(x - obs.x) < obs.half && Math.abs(y - obs.y) < 19
+        expect(inInteriorBox).toBe(false)
+      }
+    }
+  }
+  expect(edgeCount).toBeGreaterThan(0)
+
+  const tipRegex = /<title>([^<]+) to ([^<]+) · [^<]+<\/title><\/path><path class="tip[^"]*" d="M([\d.]+) ([\d.]+)L([\d.]+) ([\d.]+)L([\d.]+) ([\d.]+)z"\/>/g
+  let tipCount = 0
+  for (const match of svg.matchAll(tipRegex)) {
+    const dest = posMap.get(match[2]!)!
+    const x2 = Number(match[3]), y2 = Number(match[4])
+    const bx = (Number(match[5]) + Number(match[7])) / 2
+    const by = (Number(match[6]) + Number(match[8])) / 2
+    const dot = (x2 - bx) * (dest.x - x2) + (y2 - by) * (dest.y - y2)
+    expect(dot).toBeGreaterThan(0)
+    tipCount++
+  }
+  expect(tipCount).toBe(edgeCount)
+
+  return { vw, vh, boxes, posMap, edgeCount }
+}
+
+test('hiding inactive workers dynamically re-layouts visible members symmetrically around coordinator', async () => {
+  const baseMember = { id: undefined, profile: undefined, model: '', effort: '', depends: [], owns: '', detail: '', unread: 0, posts: 1 }
+  const wave1 = Array.from({ length: 21 }, (_, i) => `wave1-worker-${i + 1}`)
+  const wave2 = ['ac-tooling-2', 'release-docs-2', 'widgets-2', 'design-2', 'update-check-2', 'tests-fix-2', 'banner-photo-2']
+  const hidden = new Set(wave1)
+  const posts: Post[] = []
+  let seq = 1
+  for (const worker of wave2) {
+    posts.push({ seq: seq++, agent: 'coordinator', to: [worker], text: `@${worker} brief`, time: '' })
+    if (worker !== 'banner-photo-2') {
+      posts.push({ seq: seq++, agent: worker, to: ['coordinator'], text: '@coordinator [done]', time: '' })
+    }
+  }
+  const lastSeq = posts[posts.length - 1]!.seq
+  const swarm: Swarm = {
+    title: 'Wave 2', dir: '/project/.swarm/wave2-20261116-101010', isClosed: false, attention: [], budget: 0, tokens: {},
+    total: posts.length, earlierEdges: {}, posts,
+    members: [
+      { ...baseMember, name: 'coordinator', role: 'coordinator', type: 'coordinator', status: 'coordinating' },
+      ...wave1.map(name => ({ ...baseMember, name, role: 'worker', type: 'worker', status: 'killed' })),
+      ...wave2.map(name => ({ ...baseMember, name, role: 'worker', type: 'worker', status: 'working' })),
+    ],
+  }
+
+  const visible = visibleMembers(swarm, lastSeq, hidden, true)
+  expect(visible.map(m => m.name)).toEqual(['coordinator', ...wave2])
+  expect(visible).toHaveLength(8)
+
+  const svg = graphSvg(swarm, lastSeq, hidden, false, true)
+  for (const inactive of wave1) expect(svg).not.toContain(`<title>${inactive}`)
+
+  const { vw, vh, posMap } = assertCleanGraphLayout(svg, visible.map(m => m.name), 60)
+  expect(vh + 50).toBeLessThan(500)
+  expect(graphHeight(75, visible)).toBeLessThan(500)
+  expect(graphHeight(75, visible)).toBeLessThan(graphHeight(75, swarm.members))
+
+  const leftWorkers = wave2.filter(name => posMap.get(name)!.x < vw / 2)
+  const rightWorkers = wave2.filter(name => posMap.get(name)!.x > vw / 2)
+  expect(leftWorkers.length).toBeGreaterThanOrEqual(2)
+  expect(rightWorkers.length).toBeGreaterThanOrEqual(2)
+})
+
+test('large active swarms (N=15 and N=24) with dense hub, mutual, and peer edges route cleanly without overlap or clipping', async () => {
+  const baseMember = { id: undefined, profile: undefined, model: '', effort: '', depends: [], owns: '', detail: '', unread: 0, posts: 1 }
+  for (const n of [15, 24]) {
+    const workers = Array.from({ length: n - 1 }, (_, i) => `worker-${String(i + 1).padStart(2, '0')}`)
+    const members = [
+      { ...baseMember, name: 'coordinator', role: 'coordinator', type: 'coordinator', status: 'coordinating' },
+      ...workers.map(name => ({ ...baseMember, name, role: 'worker', type: 'worker', status: 'working' })),
+    ]
+    const posts: Post[] = []
+    let seq = 1
+    for (let i = 0; i < workers.length; i++) {
+      const w = workers[i]!
+      posts.push({ seq: seq++, agent: 'coordinator', to: [w], text: `@${w} go`, time: '' })
+      if (i % 2 === 0) posts.push({ seq: seq++, agent: w, to: ['coordinator'], text: '@coordinator ack', time: '' })
+      const next = workers[(i + 1) % workers.length]!
+      posts.push({ seq: seq++, agent: w, to: [next], text: `@${next} handoff`, time: '' })
+      if (i % 4 === 0) posts.push({ seq: seq++, agent: next, to: [w], text: `@${w} reply`, time: '' })
+      if (i < Math.floor(workers.length / 2) && i % 3 === 0) {
+        const across = workers[workers.length - 1 - i]!
+        posts.push({ seq: seq++, agent: w, to: [across], text: `@${across} sync`, time: '' })
+      }
+      if (i + 2 < Math.floor(workers.length / 2) && i % 4 === 1) {
+        const skip = workers[i + 2]!
+        posts.push({ seq: seq++, agent: w, to: [skip], text: `@${skip} skip`, time: '' })
+      }
+    }
+    const swarm: Swarm = {
+      title: `Dense-${n}`, dir: `/project/.swarm/dense-${n}-20261116-101010`, isClosed: false, attention: [], budget: 0, tokens: {},
+      total: posts.length, earlierEdges: {}, posts, members,
+    }
+    const svg = graphSvg(swarm, posts[posts.length - 1]!.seq, new Set(), false, true)
+    const { edgeCount } = assertCleanGraphLayout(svg, members.map(m => m.name), 260)
+    expect(edgeCount).toBeGreaterThanOrEqual(n * 2)
+  }
+})
+
+test('topology-aware peer ordering clusters communicating outer peers adjacent to each other', async () => {
+  const baseMember = { id: undefined, profile: undefined, model: '', effort: '', depends: [], owns: '', detail: '', unread: 0, posts: 1, status: 'waiting' }
+  const members = [
+    { ...baseMember, name: 'coordinator', role: 'coordinator', type: 'coordinator', status: 'coordinating' },
+    { ...baseMember, name: 'worker-a', role: 'worker', type: 'worker' },
+    { ...baseMember, name: 'worker-b', role: 'worker', type: 'worker' },
+    { ...baseMember, name: 'worker-c', role: 'worker', type: 'worker' },
+    { ...baseMember, name: 'worker-d', role: 'worker', type: 'worker' },
+    { ...baseMember, name: 'worker-e', role: 'worker', type: 'worker' },
+    { ...baseMember, name: 'verifier-z', role: 'worker', type: 'verifier' },
+  ]
+  const posts: Post[] = [
+    { seq: 1, agent: 'coordinator', to: ['worker-a'], text: '@worker-a start', time: '' },
+    { seq: 2, agent: 'coordinator', to: ['worker-b'], text: '@worker-b start', time: '' },
+    { seq: 3, agent: 'coordinator', to: ['worker-c'], text: '@worker-c start', time: '' },
+    { seq: 4, agent: 'coordinator', to: ['worker-d'], text: '@worker-d start', time: '' },
+    { seq: 5, agent: 'coordinator', to: ['worker-e'], text: '@worker-e start', time: '' },
+    { seq: 6, agent: 'worker-a', to: ['verifier-z'], text: '@verifier-z check', time: '' },
+    { seq: 7, agent: 'verifier-z', to: ['worker-a'], text: '@worker-a fix', time: '' },
+    { seq: 8, agent: 'worker-a', to: ['verifier-z'], text: '@verifier-z recheck', time: '' },
+    { seq: 9, agent: 'worker-b', to: ['coordinator'], text: '@coordinator done', time: '' },
+    { seq: 10, agent: 'worker-c', to: ['coordinator'], text: '@coordinator done', time: '' },
+    { seq: 11, agent: 'worker-d', to: ['coordinator'], text: '@coordinator done', time: '' },
+    { seq: 12, agent: 'worker-e', to: ['coordinator'], text: '@coordinator done', time: '' },
+  ]
+  const swarm: Swarm = {
+    title: 'Topology', dir: '/project/.swarm/topo-20261116-101010', isClosed: false, attention: [], budget: 0, tokens: {},
+    total: posts.length, earlierEdges: {}, posts, members,
+  }
+
+  // Without peer edges or depends, roster order is preserved exactly
+  const outer = members.slice(1)
+  expect(orderOuterMembers(outer, new Map([['coordinator>worker-a', 3]])).map(m => m.name))
+    .toEqual(['worker-a', 'worker-b', 'worker-c', 'worker-d', 'worker-e', 'verifier-z'])
+
+  // With peer mentions, verifier-z is placed directly after worker-a
+  expect(orderOuterMembers(outer, new Map([['worker-a>verifier-z', 2], ['verifier-z>worker-a', 1]])).map(m => m.name))
+    .toEqual(['worker-a', 'verifier-z', 'worker-b', 'worker-c', 'worker-d', 'worker-e'])
+
+  const svg = graphSvg(swarm, posts[posts.length - 1]!.seq, new Set(), false, true)
+  const { posMap } = assertCleanGraphLayout(svg, members.map(m => m.name), 120)
+  const posA = posMap.get('worker-a')!
+  const posZ = posMap.get('verifier-z')!
+  const posC = posMap.get('worker-c')!
+  // verifier-z sits directly adjacent to worker-a (next ring slot), closer than across-graph worker-c
+  const distAZ = Math.hypot(posZ.x - posA.x, posZ.y - posA.y)
+  const distAC = Math.hypot(posC.x - posA.x, posC.y - posA.y)
+  expect(distAZ).toBeLessThan(distAC)
+  expect(posZ.y).toBeLessThan(posMap.get('coordinator')!.y)
+
+  // Also verify clustering in facing-arcs regime (N=14)
+  const largeWorkers = [
+    { ...baseMember, name: 'worker-a', role: 'worker', type: 'worker' },
+    ...Array.from({ length: 11 }, (_, i) => ({ ...baseMember, name: `mid-worker-${i + 1}`, role: 'worker', type: 'worker' })),
+    { ...baseMember, name: 'verifier-z', role: 'worker', type: 'verifier' },
+  ]
+  const largeMembers = [members[0]!, ...largeWorkers]
+  const largePosts: Post[] = [
+    ...largeWorkers.map((w, i) => ({ seq: i + 1, agent: 'coordinator', to: [w.name], text: `@${w.name} go`, time: '' })),
+    { seq: 14, agent: 'worker-a', to: ['verifier-z'], text: '@verifier-z verify', time: '' },
+    { seq: 15, agent: 'verifier-z', to: ['worker-a'], text: '@worker-a ok', time: '' },
+  ]
+  const largeSvg = graphSvg({
+    ...swarm, members: largeMembers, posts: largePosts, total: largePosts.length,
+  }, 15, new Set(), false, true)
+  const largeLayout = assertCleanGraphLayout(largeSvg, largeMembers.map(m => m.name), 180)
+  const largeA = largeLayout.posMap.get('worker-a')!
+  const largeZ = largeLayout.posMap.get('verifier-z')!
+  expect(Math.sign(largeA.x - largeLayout.vw / 2)).toBe(Math.sign(largeZ.x - largeLayout.vw / 2))
+  expect(Math.abs(largeZ.y - largeA.y)).toBeLessThanOrEqual(55)
 })
