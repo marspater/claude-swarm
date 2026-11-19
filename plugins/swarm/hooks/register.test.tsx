@@ -2195,15 +2195,19 @@ test('wave 2 UI: off-tab clock, dimmed replay guards, markdown fences, hide-inac
   await term.unmount()
 })
 
-test('a post already opened is not announced again, a long conversation is named when a run is made, and a deleted run is no error', async ($, on) => {
+test('a post already opened is not announced again, a run made from memory is pointed at the skill, and a deleted run is no error', async ($, on) => {
   const RUN = '/project/.swarm/demo-20261116-101010'
   const board = [
     { seq: 1, agent: 'coordinator', to: ['parser'], text: '@parser BRIEF\nOwns: date.ts' },
-    { seq: 2, agent: 'parser', to: ['coordinator'], text: '@coordinator READY' },
+    { seq: 2, agent: 'parser', to: ['coordinator'], text: '@coordinator which file?' },
+    { seq: 3, agent: 'verifier', to: ['coordinator'], text: '@coordinator NOT PASSED: the test fails' },
   ].map(post => JSON.stringify({ ...post, time: '2026-11-16T14:03:22+0100' })).join('\n') + '\n'
   const roster = JSON.stringify({
     title: 'Demo swarm',
-    members: { coordinator: { role: 'coordinator', last_read_seq: 1 }, parser: { role: 'worker', id: 'a1', last_read_seq: 1 } },
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 }, parser: { role: 'worker', id: 'a1', last_read_seq: 1 },
+      verifier: { role: 'verifier', id: 'a2', last_read_seq: 1 },
+    },
   })
   const prompts: string[] = []
   let isGone = false
@@ -2221,7 +2225,7 @@ test('a post already opened is not announced again, a long conversation is named
     return { value: e.path === `${RUN}/board.jsonl` ? board : e.path === `${RUN}/members.json` ? roster : '' }
   })
   on('agent.list', () => ({ value: [{ id: 'a1', description: '@parser', type: 'swarm:worker', status: 'running' }] as never }))
-  on('tool.call', (_, e) => ({ result: e.tool === 'Bash' && String(e.command).includes(' init ') ? { stdout: `${RUN}\n`, stderr: '' } : {} }))
+  on('tool.call', (_, e) => ({ result: e.tool === 'Bash' && String(e.command).includes(' init ') ? { stdout: `made it\n${RUN}\nok\n`, stderr: '' } : {} }))
   on('turn.complete', () => ({ text: '' }))
   on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
   on('prompt.submit', (_, e) => {
@@ -2230,14 +2234,21 @@ test('a post already opened is not announced again, a long conversation is named
   })
 
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  // making a run in a conversation that already holds a lot says so once, in the result of `init`
-  const made = await $.tool.call({ tool: 'Bash', command: 'python3 /p/board.py /project/.swarm/demo init "Demo swarm"' })
+  // `init` always points at the skill, since a run can be made from memory; a long conversation is named with it.
+  // The run folder is found on whichever line of the output holds it.
+  const made = await $.tool.call({ tool: 'Bash', command: 'python3 /p/board.py /project/.swarm/demo init "Demo swarm" && echo ok' })
+  expect(made.context?.join(' ')).toContain('skills/swarm/SKILL.md')
   expect(made.context?.join(' ')).toContain('already holds about 300k tokens')
   held = 20_000
-  expect((await $.tool.call({ tool: 'Bash', command: 'python3 /p/board.py /project/.swarm/demo init "Demo swarm"' })).context).toBeUndefined()
+  const again = await $.tool.call({ tool: 'Bash', command: 'python3 /p/board.py /project/.swarm/demo init "Demo swarm"' })
+  expect(again.context?.join(' ')).toContain('name the token budget')
+  expect(again.context?.join(' ')).not.toContain('already holds')
   await clock.advance(2000)
-  // opening the post that addresses the coordinator is reading it: no reminder then, and no prompt when idle
-  const shown = await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py ${RUN} show --post=2` })
+  // one member's posts were shown: the other member's post is still owed, and said so on that very result
+  const some = await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py ${RUN} show parser` })
+  expect(some.context?.join(' ')).toContain('1 board post addresses you from #3')
+  // opening that post is reading it: no reminder then, and no prompt when idle
+  const shown = await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py ${RUN} show --post=3` })
   expect(shown.context).toBeUndefined()
   expect((await $.tool.call({ tool: 'Read', file_path: '/project/a.ts' })).context).toBeUndefined()
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' })
@@ -2249,4 +2260,61 @@ test('a post already opened is not announced again, a long conversation is named
   const after = await $.tool.call({ tool: 'Read', file_path: '/project/a.ts' })
   expect(after.context).toBeUndefined()
   expect(after.deny).toBeUndefined()
+})
+
+test('a READY is held while others still work, and a run made inside a command substitution is still bound', async ($, on) => {
+  const RUN = '/project/.swarm/demo-20261116-101010'
+  const board = [
+    { seq: 1, agent: 'coordinator', to: ['parser', 'lexer'], text: '@parser @lexer BRIEF' },
+    { seq: 2, agent: 'parser', to: ['coordinator'], text: 'READY\ndone' },
+  ].map(post => JSON.stringify({ ...post, time: '2026-11-16T14:03:22+0100' })).join('\n') + '\n'
+  const roster = JSON.stringify({
+    title: 'Demo swarm',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 }, parser: { role: 'worker', id: 'a1', last_read_seq: 1 },
+      lexer: { role: 'worker', id: 'a2', last_read_seq: 1 },
+    },
+  })
+  const prompts: string[] = []
+  const commands: string[] = []
+  let lexer = 'running'
+  const clock = mock.clock(on)
+  on('command.register', () => ({ value: { command: 'swarm-board' } }))
+  on('tool.register', (_, spec) => ({ value: { tool: `mcp__swarm__${spec.name}` } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 'fixture-conversation' }))
+  on('session.cwd', () => ({ value: '/project' }))
+  on('fs.exists', () => ({ value: false }))
+  on('fs.read', (_, e) => ({
+    value: e.path === `${RUN}/board.jsonl` ? board : e.path === `${RUN}/members.json` ? roster
+      : e.path === '/project/.swarm/current' ? 'demo-20261116-101010\n' : '',
+  }))
+  on('agent.list', () => ({ value: [
+    { id: 'a1', description: '@parser', type: 'swarm:worker', status: 'completed' },
+    { id: 'a2', description: '@lexer', type: 'swarm:worker', status: lexer },
+  ] as never }))
+  on('tool.call', () => ({ result: { stdout: '', stderr: '' } }))
+  on('turn.complete', () => ({ text: '' }))
+  on('process.run', (_, e) => {
+    const [, , directory, action] = e.argv
+    commands.push(`${action} ${directory}`)
+    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('prompt.submit', (_, e) => {
+    prompts.push(e.text)
+    return { text: e.text }
+  })
+
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  // the folder never reaches the output and no board call can be read off the command: the pointer names the run
+  await $.tool.call({ tool: 'Bash', command: 'R=$(python3 /p/board.py /project/.swarm/demo init "Demo swarm")' })
+  expect(commands).toContain(`bind ${RUN}`)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' })
+  // one of two workers reported: nothing the coordinator can act on, so it is left asleep while the other works
+  await clock.advance(60000)
+  expect(prompts.filter(text => text.includes('addresses you'))).toEqual([])
+  // the last worker stops: now the report is worth a turn
+  lexer = 'completed'
+  await clock.advance(16000)
+  expect(prompts.filter(text => text.includes('addresses you')).length).toBe(1)
 })

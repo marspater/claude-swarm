@@ -82,6 +82,7 @@ A member starts with nothing but its brief and the first two lines (`@name BRIEF
 - Choose the cheapest agent type that can do the piece (`agent-types.md`).
 - A member reads in full only the posts that mention it. Put what a member needs in its brief, or in a post that mentions it; do not expect it to have read the rest.
 - A waiting member costs nothing. A member that polls or chats does. Briefs should make chatter unnecessary.
+- A build or test suite that only one checkout can run at a time (a shared build folder, a machine-wide lock) makes parallel workers queue while each one's cache goes cold. Give each worktree its own build output where the tool allows it (`-derivedDataPath`, `CARGO_TARGET_DIR`); otherwise brief workers to run only the fast checks for their piece and leave the full suite to the verifier's one run. Do not invent a lock wrapper for the briefs: an isolated agent is refused a command built around `trap`.
 - `@all` wakes everyone. Use it for a change every member must act on, such as a shared contract that moved.
 - If you need the user's decision, run `BOARD pause <reason>` so the monitor stops calling you, and `BOARD resume` when they answer.
 - If the run is clearly going wrong (members undoing each other, the same defect failing verification twice), stop and tell the user rather than adding members.

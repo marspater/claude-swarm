@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -704,7 +705,34 @@ def audit(name):
     head = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
     took = subprocess.run([sys.executable, BOARD, quiet, "ready", "first", "HEAD"], input="done", text=True, capture_output=True, cwd=repo)
     assert took.returncode == 0, took.stderr
-    assert json.loads(open(os.path.join(quiet, "board.jsonl")).read().splitlines()[-1])["revision"] == head
+    with open(os.path.join(quiet, "board.jsonl"), encoding="utf-8") as f:
+        assert json.loads(f.read().splitlines()[-1])["revision"] == head
+    # HEAD of a checkout with edits in it is not what is being reported, and an inherited GIT_DIR does not redirect it
+    with open(os.path.join(repo, "file"), "w") as f:
+        f.write("one")
+    subprocess.run(["git", "-C", repo, "add", "file"], check=True, capture_output=True)
+    dirty = subprocess.run([sys.executable, BOARD, quiet, "ready", "first", "HEAD"], input="done", text=True, capture_output=True, cwd=repo)
+    assert dirty.returncode != 0 and "uncommitted changes" in dirty.stderr
+    subprocess.run(["git", "-C", repo, "reset", "-q", "--hard"], check=True, capture_output=True)
+    astray = subprocess.run([sys.executable, BOARD, quiet, "ready", "first", "HEAD"], input="done", text=True, capture_output=True, cwd=repo,
+                            env=dict(os.environ, GIT_DIR=os.path.join(os.path.dirname(quiet), "nowhere")))
+    assert astray.returncode == 0, astray.stderr
+    # a read-only member is told that first, wherever it stands
+    run(quiet, "member", "scout", "profile=explorer", "writes=0")
+    reader = subprocess.run([sys.executable, BOARD, quiet, "ready", "scout", "HEAD"], input="done", text=True, capture_output=True,
+                            cwd=os.path.dirname(quiet))
+    assert "read-only report cannot include a commit" in reader.stderr
+    # a candidate that holds a member's work is dead once the member takes it back: its verifier and the coordinator
+    # hear, mid-test or after VERIFIED; an accepted candidate, or one without this member, is nobody's concern
+    record = os.path.join(quiet, "verification.json")
+    for candidate, heard in (({"inputs": {"first": [1, None]}}, True), ({"inputs": {"first": [1, None]}, "accepted": True}, False),
+                             ({"inputs": {"other": [1, None]}}, False)):
+        run(quiet, "ready", "first", stdin="ready once more")
+        with open(record, "w") as f:
+            json.dump(candidate, f)
+        line = run(quiet, "revise", "first", "again").splitlines()[0]
+        assert ("@coordinator" in line and "@v" in line) == heard, (candidate, line)
+    os.unlink(record)
     # the plan says what the run has no guard against
     plan = run(team, "plan")
     assert "no token budget" in plan and "@all wakes all" in plan
@@ -794,6 +822,11 @@ def audit(name):
     with open(os.path.join(parent, "current")) as f:
         assert f.read().strip() == os.path.basename(loop)
     assert os.path.isdir(loop) and "archive 0 run(s)" in run(parent, "prune", "--days=0")
+    # a run folder deleted by hand leaves the pointer naming nothing: prune takes the pointer away too
+    shutil.rmtree(loop)
+    assert "would remove the pointer" in run(parent, "prune", "--dry-run") and os.path.exists(os.path.join(parent, "current"))
+    assert "remove the pointer to " + os.path.basename(loop) in run(parent, "prune")
+    assert not os.path.exists(os.path.join(parent, "current"))
 
 
 class BoardScenario(unittest.TestCase):
@@ -936,7 +969,9 @@ class BoardRegressions(unittest.TestCase):
         run(d, "member", "v", "role=verifier")
         run(d, "member", "adv", "profile=architect", "writes=0", "consult=1")
         out_des = run(d, "ready", "des", stdin="Spec ready.\nNeeds from others: @ui wire button")
-        assert "@ui" in out_des and "@v" in out_des
+        # the member the report names hears at once; the verifier hears when the last worker is ready
+        assert "@ui" in out_des and "@v" not in out_des
+        assert "@v" in run(d, "ready", "ui", stdin="Button wired.")
         out_adv = run(d, "ready", "adv", stdin="Advice ready")
         assert "@v" not in out_adv and "@coordinator" in out_adv
 

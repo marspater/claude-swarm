@@ -661,6 +661,11 @@ def prune(root, args):
                 os.rename(source, target)
             print("%sarchive %s" % (would, run))
             archived += 1
+        # A pointer to a run folder that is gone (deleted by hand) shows the pane nothing: it goes too.
+        if shown and not os.path.isdir(os.path.join(root, shown)):
+            if not would:
+                os.unlink(os.path.join(root, "current"))
+            print("%sremove the pointer to %s, which is gone" % (would, shown))
     print("%sremove %d worktree(s) and archive %d run(s)" % (would, removed, archived))
 
 
@@ -1096,18 +1101,22 @@ def main(argv):
                 if blocked:
                     sys.exit("waiting for " + ", ".join(blocked))
                 revision = args[1] if len(args) > 1 else None
+                if revision is not None and (member.get("writes") == "0" or kind_of(member) in READ_ONLY):
+                    sys.exit("a read-only report cannot include a commit")
                 if revision == "HEAD":
                     # Resolved here, in the member's own checkout: a worktree-isolated agent is refused a command
                     # that feeds `git rev-parse` into another, so it cannot pass the ID itself in one call.
-                    import subprocess
-                    found = subprocess.run(["git", "rev-parse", "--verify", "HEAD^{commit}"], capture_output=True, text=True)
-                    if found.returncode != 0:
+                    import verify  # late: verify.py imports this module; its git() ignores an inherited GIT_DIR
+                    here = os.getcwd()
+                    found = verify.git(here, "rev-parse", "--verify", "HEAD^{commit}", optional=True)
+                    if found is None:
                         sys.exit("HEAD is no commit here: run `ready` from your checkout, or give the full commit ID")
-                    revision = found.stdout.strip()
+                    # HEAD of a checkout with edits in it is not the work being reported: the edits are.
+                    if verify.git(here, "status", "--porcelain", "--untracked-files=no", optional=True):
+                        sys.exit("this checkout has uncommitted changes, so HEAD is not what you are reporting: commit first")
+                    revision = found.decode().strip()
                 if revision is not None and not COMMIT.fullmatch(revision):
                     sys.exit("expected a full commit ID")
-                if revision is not None and (member.get("writes") == "0" or kind_of(member) in READ_ONLY):
-                    sys.exit("a read-only report cannot include a commit")
                 report = sys.stdin.read().strip()
                 if not report:
                     sys.exit("READY needs a report on stdin")
@@ -1124,14 +1133,26 @@ def main(argv):
             recipients = [name for name, entry in members.items() if not entry.get("killed") and
                           name != sender and (name == COORDINATOR or (notify and (
                               (entry.get("role") == "verifier" and not is_consultant) or sender in dependencies(entry))))]
-            if cmd == "revise" and not any(
-                    members.get(p["agent"], {}).get("role") == "verifier" and (word := REPORT_WORD.match(p["text"])) and word[1] == "VERIFIED"
-                    for p in posts):
-                # Until something is VERIFIED a withdrawal costs nobody a turn: `prepare` already refuses a member
-                # that is not ready, and the READY that follows tells everyone. Only a member waiting on this one hears,
-                # and the coordinator when the finding it may be about to confirm is withdrawn.
+            try:
+                with open(os.path.join(d, "verification.json"), encoding="utf-8") as f:
+                    candidate = json.load(f)
+            except (OSError, ValueError):
+                candidate = None
+            in_play = isinstance(candidate, dict) and not candidate.get("accepted") and sender in (candidate.get("inputs") or {})
+            if cmd == "revise" and not in_play:
+                # With no candidate that holds this member's work, a withdrawal costs nobody a turn: `prepare` refuses a
+                # member that is not ready, and the READY that follows tells who needs it. A candidate being tested or
+                # waiting to be accepted is another matter: it is dead from here on, so its verifier and the coordinator hear.
+                # A member waiting on this one always hears, as does the coordinator when a finding it may confirm is withdrawn.
                 recipients = [name for name in recipients if sender in dependencies(members[name])
                               or (name == COORDINATOR and kind_of(member) == "investigator")]
+            if cmd == "ready" and not in_play:
+                # A verifier reviews when there is something whole to review. Woken for each READY of five it spends
+                # a turn per piece and is mid-review when the candidate arrives; it hears once the last worker is ready.
+                waiting = [name for name, entry in team_of(members).items() if entry.get("role") == "worker"
+                           and entry.get("consult") != "1" and name != sender and name not in through]
+                if waiting:
+                    recipients = [name for name in recipients if members[name].get("role") != "verifier"]
             if cmd == "ready" and kind_of(member) != "investigator":
                 recipients.extend(name for name in targets(report, members) if name != sender and name not in recipients)
             post_message(sender, text, recipients, kind=cmd, revision=revision)
@@ -1326,7 +1347,10 @@ def main(argv):
                 asking = {asker for _, asker, _ in unanswered(members, posts)}
                 verified_seq = max((p["seq"] for p in posts if members.get(p["agent"], {}).get("role") == "verifier"
                                     and (w := REPORT_WORD.match(p["text"])) and w[1] == "VERIFIED"), default=0)
-                unverified = any(p["seq"] > verified_seq for n, p in ready.items() if members.get(n, {}).get("consult") != "1")
+                # A verifier is told of the work once every worker is ready (see `ready`): before that it was not
+                # reviewing anything a pause could have stopped.
+                unverified = any(p["seq"] > verified_seq for n, p in ready.items() if members.get(n, {}).get("consult") != "1") and all(
+                    name in ready for name, entry in team_of(members).items() if entry.get("role") == "worker" and entry.get("consult") != "1")
                 halted = [name for name, member in team_of(members).items() if member.get("id") and name not in asking and (
                     (member.get("role") == "worker" and name not in ready and all(dep in ready for dep in dependencies(member))
                      and reports.get(name, {}).get("kind") != "finding" and not unread(name))

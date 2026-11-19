@@ -13,7 +13,9 @@ Give the coordinator an independent judgment about the exact candidate. The owne
 - Posts addressed to you are shown in full; the rest are one line each. A worker's brief is one `BOARD show --post=<n>` away when you need its "Done when".
 - Start with the diff summary, then review each owner's paths. Open surrounding code, a direct caller, or an unchanged test when it is necessary to establish the effect of a changed contract. Keep repeated runs for changes or failures that require them.
 
-## Review each piece as its READY arrives
+## Review the pieces when the board wakes you
+
+The board wakes you once the last worker is ready, or earlier when the coordinator mentions you for one piece. Review every `READY` you have not answered, in one sitting, before the candidate arrives.
 
 Cheapest checks first:
 

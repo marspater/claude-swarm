@@ -447,7 +447,9 @@ def accept(run, project, identifier):
         ):
             raise ValueError(f"@{verifier} has not posted {expected_line} on the board")
         if candidate["mode"] == "isolated":
-            if "branch" in candidate:
+            # A candidate built on a named base is accepted from whatever branch sits on that base, not from the
+            # branch the checkout happened to be on when it was prepared.
+            if "branch" in candidate and not candidate.get("onto"):
                 branch = git(project, "symbolic-ref", "-q", "HEAD", optional=True)
                 if (os.fsdecode(branch).strip() if branch else None) != candidate["branch"]:
                     raise ValueError("the user checkout switched branches; rebuild and reverify")

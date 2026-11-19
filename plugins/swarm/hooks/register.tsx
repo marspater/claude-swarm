@@ -317,11 +317,20 @@ let opened = ''
 // works, and once as a prompt when it is idle. Attention and `close` hold whatever it still skips.
 const NONE = { count: 0, first: 0, last: 0, since: 0 }
 const MENTION_GRACE_MS = 10_000
+// A READY while others still work changes nothing the coordinator can act on: it waits to be read with the next
+// one, or until the last member stops, or this long. Questions, findings and verdicts are never held.
+const ROUTINE_GRACE_MS = 600_000
+// The coordinator's conversation at this size makes every further wake dear: the person is told once per run.
+const HEAVY_CONVERSATION = 180_000
 let owed = NONE
 // A conversation this long is worth a word before a run starts in it: about half of what the coordinator's last run averaged.
 const LONG_CONVERSATION = 120_000
 // Posts the coordinator has opened with `show`: the board still counts them unread, but it is not told of them again.
 const shownPosts = { through: 0, posts: new Set<number>() }
+// The posts `owed` counts, and whether all of them are routine (see ROUTINE_GRACE_MS).
+let owedSeqs: number[] = []
+let isOwedRoutine = false
+let heavyTold = ''
 let hinted = 0
 let prompted = 0
 // A pause of the owned run that nobody was told about (the board pauses by itself when a member keeps failing
@@ -426,6 +435,8 @@ function resetMonitoring(): void {
   owed = NONE
   shownPosts.through = 0
   shownPosts.posts.clear()
+  owedSeqs = []
+  isOwedRoutine = false
   hinted = prompted = noticeHold = pauseQuiet = 0
   pauseSeen = undefined
   pauseOwed = ''
@@ -619,7 +630,15 @@ async function adopt($: EngineInterface, name: string | undefined, prompt = ''):
   }
 }
 
-async function bind($: EngineInterface, dir: string): Promise<boolean> {
+// Six members started at once ask for the same run at once: they share one answer.
+const binding = new Map<string, Promise<boolean>>()
+function bind($: EngineInterface, dir: string): Promise<boolean> {
+  const pending = binding.get(dir) ?? bindOnce($, dir).finally(() => binding.delete(dir))
+  binding.set(dir, pending)
+  return pending
+}
+
+async function bindOnce($: EngineInterface, dir: string): Promise<boolean> {
   try {
     const sEpoch = sessionEpoch
     const canonical = await resolveRunDir($, dir)
@@ -904,6 +923,9 @@ async function refresh($: EngineInterface): Promise<void> {
       : []
     const last = unread.at(-1)?.seq ?? 0
     owed = last === 0 ? NONE : { count: unread.length, first: unread[0]?.seq ?? last, last, since: last === owed.last ? owed.since : now }
+    owedSeqs = unread.map(post => post.seq)
+    isOwedRoutine = unread.length > 0 && unread.every(post => kindOf(post.text)?.label === 'READY') &&
+      full.members.some(member => member.role !== 'coordinator' && member.status === 'working')
     if (owned) {
       const reason = state.closed ? '' : state.paused ?? ''
       if (reason === '') budgetPauseNotifiedFor = ''
@@ -946,7 +968,7 @@ async function refresh($: EngineInterface): Promise<void> {
     const workers = full.members.filter(member => member.role !== 'coordinator' && member.status !== 'killed')
     const notices: string[] = []
     const askRelay = keyToRelay !== '' && keyToRelay !== relayPrompted
-    const answerThrough = owed.last > prompted && (askRelay || now - owed.since >= MENTION_GRACE_MS) ? owed.last : 0
+    const answerThrough = owed.last > prompted && (askRelay || now - owed.since >= (isOwedRoutine ? ROUTINE_GRACE_MS : MENTION_GRACE_MS)) ? owed.last : 0
     const askStall = !pending && !askRelay && workers.length > 0 &&
       workers.every(member => member.status !== 'working') && stalled !== progress && now - quietSince >= QUIET_MS
     if (askRelay) {
@@ -1411,10 +1433,14 @@ export const register: Register = on => {
         }
         for (const c of calls) {
           if (c.action !== 'show' || !RUN.test(c.dir) || await resolveRunDir($, c.dir) !== dir) continue
+          // One post, the whole board, or one member's posts: only what was printed counts as seen.
           const one = /--post=(\d+)/.exec(c.rest)
+          const who = c.rest.trim().split(/\s+/).slice(1).find(word => word !== '' && !word.startsWith('-'))?.replace(/^[@'"]+|['"]+$/g, '')
           if (one) shownPosts.posts.add(Number(one[1]))
-          else shownPosts.through = Math.max(shownPosts.through, snapshot?.posts.at(-1)?.seq ?? 0)
-          if (owed.last <= shownPosts.through || (owed.count === 1 && shownPosts.posts.has(owed.last))) owed = NONE
+          else if (who === undefined) shownPosts.through = Math.max(shownPosts.through, snapshot?.posts.at(-1)?.seq ?? 0)
+          else for (const post of snapshot?.posts ?? []) if (post.agent === who || post.to.includes(who)) shownPosts.posts.add(post.seq)
+          owedSeqs = owedSeqs.filter(seq => seq > shownPosts.through && !shownPosts.posts.has(seq))
+          owed = owedSeqs.length === 0 ? NONE : { ...owed, count: owedSeqs.length, first: owedSeqs[0]!, last: owedSeqs.at(-1)! }
         }
         const notices: string[] = []
         const key = relayKey(dir)
@@ -1436,6 +1462,20 @@ export const register: Register = on => {
     } catch {
       // A failed reminder must not change the tool's result.
     }
+    if (e.tool === 'Bash' && e.agentId === undefined && !result.isError && !result.deny && !calls.some(c => c.action === 'init') &&
+      /board\.py\b[^\n;|&]*\sinit\s/.test(command)) {
+      // `R=$(board.py … init …)` keeps the folder out of the output and the call out of what is read off the
+      // command. The pointer `init` just wrote names the run; the board refuses one another conversation owns.
+      try {
+        if (await read($, run) === '') {
+          const root = `${await $.session.cwd()}/.swarm`
+          const name = (await $.fs.read(`${root}/current`)).trim()
+          if (/^[\w.-]+$/.test(name) && RUN.test(`${root}/${name}`)) await bind($, `${root}/${name}`)
+        }
+      } catch {
+        // No pointer, no run to claim.
+      }
+    }
     if (e.tool !== 'Bash' || result.isError || result.deny || calls.length === 0) return result
     try {
       if (e.agentId === undefined && calls.some(c => c.action === 'member' || c.action === 'started' || c.action === 'replace')) {
@@ -1444,7 +1484,7 @@ export const register: Register = on => {
       for (const c of calls) {
         // `init` names the folder to make the run under and prints the run folder it made.
         const rawDir = c.action === 'init' && e.agentId === undefined
-          ? String((raw.result as { stdout?: unknown } | undefined)?.stdout ?? '').trim().split('\n').at(-1)?.trim() ?? ''
+          ? String((raw.result as { stdout?: unknown } | undefined)?.stdout ?? '').split('\n').map(line => line.trim()).findLast(line => RUN.test(line)) ?? ''
           : c.dir
         const isReadCoord = c.action === 'read' && COORDINATOR_READ.test(c.rest)
         // A read whose run could not be read off the command still changed what is owed: the roster is read again now.
@@ -1463,11 +1503,14 @@ export const register: Register = on => {
       }
       // Every wake of the coordinator re-reads its whole conversation, so a run started in a long one pays for
       // that history on each of them. Said once, when the run is made, while starting elsewhere is still cheap.
-      if (e.agentId === undefined && calls.some(c => c.action === 'init')) {
-        const held = (await $.session.usage()).context.tokens ?? 0
-        if (held >= LONG_CONVERSATION && result.deny === undefined && result.isError === undefined) {
-          result = { ...result, context: [...(result.context ?? []), `Swarm: This conversation already holds about ${compact(held)} tokens, and each time you are woken during the run all of them are read again. Before you start any member, tell the user that a fresh conversation, or /compact first, would make this run much cheaper, and ask whether to go on here.`] }
+      if (e.agentId === undefined && calls.some(c => c.action === 'init') && result.deny === undefined && result.isError === undefined) {
+        // A run can be started from memory, with no /swarm:swarm in the turn and so none of the skill's current rules.
+        const notes = [`Swarm: A run was made. If this turn did not start from /swarm:swarm, Read ${$.plugin.root}/skills/swarm/SKILL.md before going on: its rules are the current ones. Before you start a member, show the user the plan and name the token budget, or say that none is set.`]
+        const held = await $.session.usage().then(usage => usage.context.tokens ?? 0).catch(() => 0)
+        if (held >= LONG_CONVERSATION) {
+          notes.push(`Swarm: This conversation already holds about ${compact(held)} tokens, and each time you are woken during the run all of them are read again. Before you start any member, tell the user that a fresh conversation, or /compact first, would make this run much cheaper, and ask whether to go on here.`)
         }
+        result = { ...result, context: [...(result.context ?? []), ...notes] }
       }
     } catch {
       // A failed binding must not change the tool's result.
@@ -1748,6 +1791,14 @@ export const register: Register = on => {
         if (e.agentId === undefined) {
           isCoordinatorBusy = false
           quietSince = await $.clock.now()
+          const dir = await read($, run)
+          if (dir && heavyTold !== dir) {
+            const held = await $.session.usage().then(usage => usage.context.tokens ?? 0).catch(() => 0)
+            if (held >= HEAVY_CONVERSATION) {
+              heavyTold = dir
+              $.ui.toast(`Swarm: the coordinator's conversation now holds about ${compact(held)} tokens, and every wake re-reads them. /compact while it is idle makes the rest of this run cheaper.`)
+            }
+          }
         }
       }
       if (e.agentId !== undefined) {
@@ -2453,7 +2504,7 @@ export const register: Register = on => {
       const visibleGroups = groups.filter(([, list]) => list.length > 0)
       body = (
         <Box flexDirection="column" marginTop={1}>
-          {inactiveToggle(inactive.size)}
+          <Box flexDirection="row" justifyContent="flex-end">{inactiveToggle(inactive.size)}</Box>
           {visibleGroups.length === 0 && shown.members.length > 0 ? (
             <Box marginTop={1}>
               <Text dimColor>All members are inactive.</Text>
@@ -2536,16 +2587,15 @@ export const register: Register = on => {
           <Box flexDirection="row" gap="xs" alignItems="center" flexWrap="wrap">
             <Button key="replay-first" plain dimColor={index === 0} onPress={() => index > 0 ? seek($, shown.posts[0]!.seq) : undefined}>First</Button>
             <Button key="replay-back" plain dimColor={index === 0} onPress={() => index > 0 ? seek($, shown.posts[index - 1]!.seq) : undefined}>‹ Prev</Button>
-            <Box minWidth={8}>
-              <Button
-                key="replay-play"
-                variant={shown.posts.length <= 1 ? 'secondary' : 'primary'}
-                label={playing ? 'Pause' : 'Play'}
-                dimColor={shown.posts.length <= 1}
-                onPress={() => shown.posts.length > 1 ? play($) : undefined}
-              />
-            </Box>
             <Button key="replay-next" plain dimColor={index === shown.posts.length - 1} onPress={() => index < shown.posts.length - 1 ? seek($, shown.posts[index + 1]!.seq) : undefined}>Next ›</Button>
+            {/* Last in the row: its label changes width, and nothing after it is pushed around. */}
+            <Button
+              key="replay-play"
+              variant={shown.posts.length <= 1 ? 'secondary' : 'primary'}
+              label={playing ? 'Pause' : 'Play'}
+              dimColor={shown.posts.length <= 1}
+              onPress={() => shown.posts.length > 1 ? play($) : undefined}
+            />
           </Box>
           <Svg
             key="message-routes" source={graphSvg(shown, post.seq, hidden, animate, live, repeat, routeOffset, isExpanded)}

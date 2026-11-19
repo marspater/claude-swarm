@@ -85,6 +85,11 @@ def scenario():
                                  capture_output=True, text=True)
         assert refused.returncode != 0 and "was built on left-work, not on the checkout" in refused.stderr, refused.stderr
         assert git("rev-parse", "HEAD") == base
+        # ... and it is accepted from that base, whatever branch the checkout was on when it was prepared
+        git("switch", "-q", "--detach", "left-work")
+        gate("accept", elsewhere["candidate"])
+        assert git("rev-parse", "HEAD") == elsewhere["commit"]
+        git("switch", "-q", "main")
         good = json.loads(gate("prepare", "isolated", "--check", check))
         # The integration merges are the repository's own commits: its identity, never one of Swarm's.
         assert git("log", "-1", "--format=%an <%ae>", good["commit"]) == "Swarm Test <swarm@example.invalid>"
