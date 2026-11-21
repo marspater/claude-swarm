@@ -16,7 +16,7 @@ You are the coordinator. The roster in `<run>/members.json` is the team: who exi
 | `depends` | Members whose `READY` this one waits for | `depends=a,b`; must stay acyclic |
 | `owns` | The paths or the question it owns, for the plan and the pane | `owns='src/utils/date.*'` |
 | `effort` | The effort, when it is not the type's default: `low`, `medium`, `high`, `xhigh` or `max` | You, at registration and before the spawn: a start whose effort differs from the roster is refused |
-| `model` | The model, when it is not the type's default: a family (`haiku`, `sonnet`, `opus`, `fable`, which starts the newest model of it), an exact model id, or `inherit` for this conversation's model (`Agent.model` only accepts family names, so for `inherit` or exact IDs register `model=` here and omit `model` or pass the matching family on `Agent` so the hook applies the exact target) | You, at registration and before the spawn: a start on another model than the roster's is refused |
+| `model` | The model, when it is not the type's default: a family (`haiku`, `sonnet`, `opus`, `fable`, which starts the newest model of it), an exact model id, or `inherit` for this conversation's model (`Agent.model` only accepts family names, so for `inherit` or exact IDs register `model=` here and omit `model` or pass the matching family on `Agent` (for `inherit`, this conversation's own family) so the hook applies the exact target) | You, at registration and before the spawn: a start on another model than the roster's is refused |
 | `id` | The agent's address. Mentions are delivered to it | The hooks, when the agent starts. You, only when they are not loaded or missed it |
 | `killed` | `1`: removed for good | You |
 
@@ -84,7 +84,7 @@ A living member's model cannot be changed. Replacement is the only way.
 
 - Waiting for the user: `BOARD pause <reason>`, say what you need, `BOARD resume` when they answer. While paused nothing is delivered and the monitor stays quiet.
 - The monitor calls you once when an open run is quiet and no member can advance. Run the coordinator loop; do not just acknowledge it.
-- `BOARD attention` is the list of what is stuck: a paused run, posts you have not read, findings to review, unanswered questions, unstarted, unreachable or ignored members, a worker that failed verification twice in a row (rework), one member holding most of the spend, members waiting on a removed, unreachable or never-started member, and stale verification. The pane's Attention tab shows the same list to the user, plus `retired-running` when a retired member's agent is still alive.
+- `BOARD attention` is the list of what is stuck: a paused run, posts you have not read, findings to review, unanswered questions, unstarted, unreachable or ignored members, a worker that failed verification twice in a row (rework), one member holding most of the spend, members waiting on a member that is missing, removed, unreachable, ignoring its mentions or never started, and stale verification. The pane's Attention tab shows the same list to the user, plus `retired-running` when a retired member's agent is still alive and `silent` when a worker's agent ended without a report.
 - A member that is "waiting" with unread mentions should have been woken. If attention lists it as unreachable, retry once, then replace it.
 
 ## Recovery

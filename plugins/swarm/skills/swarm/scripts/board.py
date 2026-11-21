@@ -12,9 +12,9 @@ usage: board.py DIR init TITLE                    prints the run folder it creat
        board.py DIR read ME                       print posts ME has not read, mark them read: posts that mention ME in full, others as one line
        board.py DIR read ME --all                 the same, every post in full
        board.py DIR read ME --headers             the same, every post as one line
-       board.py DIR read ME --max-bytes=N          page the unread output without consuming the next unread post
+       board.py DIR read ME --max-bytes=N          page the unread output without consuming the next unread post; a post longer than a page is cut and names the show command that prints it whole
        board.py DIR show [NAME | --post=N [--json]]  print history, optionally for one member or post; marks nothing
-       board.py DIR ready NAME [COMMIT|HEAD]      record readiness and notify coordinator, verifiers and dependents; HEAD is the checkout's own commit
+       board.py DIR ready NAME [COMMIT|HEAD]      record readiness and tell the coordinator and dependents, and the verifiers once every worker is ready; HEAD is the checkout's own commit
        board.py DIR confirm NAME SEQ              accept an investigator finding and release its dependents
        board.py DIR revise NAME [REASON]           withdraw readiness before starting a fix
        board.py DIR wake                          list pending wakes, including the post sequence
@@ -69,8 +69,12 @@ BIND_KEY = re.compile(r"[a-f0-9]{64}")
 # The first line says what a post is. Mentions before the word stay on that line: a word on line two is prose.
 REPORT_WORD = re.compile(r"^(?:@[\w-]+[ \t,:]*)*(READY|REVISE|BRIEF|SHUTDOWN|FINDING|VERIFIED|NOT (?:PASSED|VERIFIED))\b")
 # Code spans and URLs carry question marks that ask nothing, as do `name?: type` and `a?.b` left outside a span.
-QUOTED = re.compile(r"```.*?```|(`+)[^\n]*?\1|\w+://\S+?(?=[.,;:!)]*(?:\?(?=\s|$))?(?:\s|$))", re.DOTALL)
-QUESTION = re.compile(r"(?<!\?)\?(?!\?|\.?\w|:|[ \t]+[^\n?]*[ \t]+:)")
+# A fence closes on a run at least as long as the one that opened it, so a longer fence can quote a shorter one.
+# What is taken out leaves a space: with nothing there, the words on either side would join into one.
+QUOTED = re.compile(r"(?P<f>`{3,}).*?(?P=f)|^ {0,3}(?P<t>~{3,}).*?^ {0,3}(?P=t)|(?P<s>`+)[^\n]*?(?P=s)"
+                    r"|\w+://\S+?(?=[.,;:!)]*(?:\?(?=\s|$))?(?:\s|$))", re.DOTALL | re.MULTILINE)
+# `c ? a : b` asks nothing, and neither does `a ?? b`; "sure??" and "A? (Option A : yes)" do.
+QUESTION = re.compile(r"(?<![ \t]\?)(?:(?<![ \t])\?|\?(?![ \t]+[^\n?]*[ \t]+:))(?!\?|\.?\w|:)")
 SUMMARY_CHARS = 200
 ARG_COUNTS = {
     "init": (1, None), "restore": (1, 1), "adopt": (2, None), "locate": (2, None),
@@ -112,6 +116,12 @@ def load_state(d):
     return state
 
 
+def is_post(post):
+    return (isinstance(post, dict) and type(post.get("seq")) is int
+            and all(isinstance(post.get(key), str) for key in ("agent", "text", "time"))
+            and ("to" not in post or (isinstance(post["to"], list) and all(isinstance(name, str) for name in post["to"]))))
+
+
 def load(d, *, repair=True):
     state = load_state(d)
     path = os.path.join(d, "board.jsonl")
@@ -137,15 +147,15 @@ def load(d, *, repair=True):
                 if writable:
                     f.truncate(f.tell() - len(line))
                 break
-            if not isinstance(post, dict) or type(post.get("seq")) is not int or post["seq"] != len(posts) + 1 or not all(
-                    isinstance(post.get(key), str) for key in ("agent", "text", "time")) or (
-                    "to" in post and (not isinstance(post["to"], list) or not all(isinstance(name, str) for name in post["to"]))):
+            if not is_post(post) or post["seq"] != len(posts) + 1:
                 raise ValueError(f"invalid board record after post #{len(posts)}")
             posts.append(post)
             if not line.endswith(b"\n") and writable:
                 f.write(b"\n")
     pending = state.pop("pending_post", None)
     if pending is not None:
+        if not is_post(pending):  # appended as it is, it would make the whole journal unreadable
+            raise ValueError("the pending board update in members.json is not a post")
         # A replacement commits its roster and brief together. Recover after either interrupted write.
         if pending["seq"] == len(posts) + 1:
             if writable:
@@ -296,6 +306,9 @@ def validate_member(name, member, changes, members):
         member["paths"] = ",".join(dict.fromkeys(cleaned))
     if "role" in changes and member["role"] not in ({COORDINATOR} if name == COORDINATOR else {"worker", "verifier"}):
         raise ValueError(f"invalid role for @{name}")
+    if member.get("role") == "verifier" and member.get("depends") and {"role", "depends"} & changes.keys():
+        raise ValueError("a verifier is told when every worker is ready and waits for no member: depends= is for workers. "
+                         "Clear it with depends=")
     if ("profile" in changes and member["profile"] not in {"", *PROFILES}) or (
             {"role", "profile"} & changes.keys() and member.get("profile") and member["role"] != "worker"):
         raise ValueError("specialist and designer profiles belong to workers")
@@ -478,6 +491,17 @@ def candidate_on_table(d):
     return candidate.get("candidate") if isinstance(candidate, dict) and not candidate.get("accepted") else None
 
 
+def in_play(d, name):
+    """True when the candidate being tested or waiting to be accepted holds NAME's report: a change to that report
+    kills the candidate, so its verifier has to hear."""
+    try:
+        with open(os.path.join(d, "verification.json"), encoding="utf-8") as f:
+            candidate = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return isinstance(candidate, dict) and not candidate.get("accepted") and name in (candidate.get("inputs") or {})
+
+
 def successor(name, members):
     seen = set()
     while name in members and members[name].get("killed") and members[name].get("replaced_by") and name not in seen:
@@ -493,6 +517,7 @@ def unanswered(members, posts):
         text = post["text"]
         if post.get("kind") or REPORT_WORD.match(text):
             continue
+        text = QUOTED.sub(" ", text)  # `re #99` in a code span cites nothing, and a `?` there asks nothing
         sender = post["agent"]
         responder = successor(sender, members)
         # "re #4", and every number of "re #4, #7 and #9" or "re #4 #7 #9"
@@ -510,7 +535,7 @@ def unanswered(members, posts):
             else:
                 pending.pop(pair, None)
             target = successor(recipient, members)
-            if QUESTION.search(QUOTED.sub("", text)) and target in members and not members[target].get("killed"):
+            if QUESTION.search(text) and target in members and not members[target].get("killed"):
                 pending.setdefault((sender, target), {})[str(post["seq"])] = post["seq"]
     # A removed member is waiting for nothing: its questions close with it.
     return sorted((seq, asker, recipient) for (asker, recipient), seqs in pending.items() for seq in seqs.values()
@@ -524,7 +549,9 @@ def rework(state, posts):
     members, failed, latest = state["members"], {}, {}
     for post in posts:
         if post.get("kind") == "ready":
-            latest.pop(post["agent"], None)  # new work: a verdict on it is a new failure, whatever candidate is on the table
+            # New work: a verdict on it is a new failure, whatever candidate is on the table. A confirmed finding is
+            # posted by the coordinator about its investigator.
+            latest.pop(post.get("subject", post["agent"]), None)
         word = REPORT_WORD.match(post["text"])
         if post["seq"] <= state.get("accepted_seq", 0) or not word or members.get(post["agent"], {}).get("role") != "verifier":
             continue
@@ -624,7 +651,7 @@ def attention(state, posts):
     view = {name: {"type": kind_of(member), "model": model_of(member), "effort": effort_of(member),
                    "depends": dependencies(member), "owns": member.get("owns", ""), "paths": claims(member),
                    "ready": name in ready,
-                   "blocked_on": [] if closed or name in ready else [d for d in dependencies(member) if d not in ready],
+                   "blocked_on": [] if closed or name in ready or member.get("killed") else [d for d in dependencies(member) if d not in ready],
                    "asked": asked.get(name, 0), "unreachable": not closed and name in team and unreachable(name, members, posts)}
             for name, member in members.items() if name != COORDINATOR}
     return {"items": items, "members": view, "limits": state.get("limits", {})}
@@ -692,15 +719,22 @@ def saved_runs(root):
 def prune(root, args):
     """Remove the integration checkouts no candidate needs any more and archive closed runs nobody has touched."""
     spans = [a.partition("=")[2] for a in args if re.fullmatch(r"--days=[0-9]{1,5}", a)]
-    if len(spans) > 1 or set(args) - {"--dry-run", *("--days=" + span for span in spans)}:
+    if len(spans) > 1 or len(set(args)) != len(args) or set(args) - {"--dry-run", *("--days=" + span for span in spans)}:
         sys.exit("prune accepts --days=N and --dry-run")
-    if os.path.basename(os.path.abspath(root)) != ".swarm" or not os.path.isdir(root):
+    root = os.path.abspath(root)  # Git is handed paths under it: a relative one that starts with "-" would read as an option
+    if os.path.basename(root) != ".swarm" or not os.path.isdir(root):
         sys.exit("prune takes the project's .swarm folder")
     would, older = "would " if "--dry-run" in args else "", time.time() - int(spans[0] if spans else 14) * 86400
     import verify  # late: verify.py imports this module
-    project = verify.Path(root).resolve().parent
+    project = verify.Path(root).parent  # the folder .swarm is in, also where .swarm is a link to somewhere else
     git_dir = verify.git(project, "rev-parse", "--absolute-git-dir", optional=True)
     removed = archived = 0
+
+    def registered():
+        listed = verify.git(project, "worktree", "list", "--porcelain", optional=True) or b""
+        return {os.path.realpath(line[len("worktree "):].strip()) for line in listed.decode(errors="replace").splitlines()
+                if line.startswith("worktree ")}
+
     gone = set()  # worktrees a dry run reports it would remove: a real prune has removed them before it looks
     with open(os.path.join(root, ".adopt.lock"), "w") as choosing:
         fcntl.flock(choosing, fcntl.LOCK_EX)  # no run is adopted or bound while runs move
@@ -708,6 +742,7 @@ def prune(root, args):
         if git_dir:
             # Held so that no candidate is being prepared: its checkout exists before its record does.
             with verify.verification_lock(verify.Path(os.fsdecode(git_dir.rstrip(b"\n")))):
+                known = registered()
                 for run, state in runs:
                     try:
                         with open(os.path.join(root, run, "verification.json"), encoding="utf-8") as f:
@@ -722,22 +757,18 @@ def prune(root, args):
                         # Only ever a folder of this name directly inside a run folder: never a member's own checkout.
                         if not name.startswith("integration-") or name == kept or os.path.islink(path) or not os.path.isdir(path):
                             continue
-                        if would or verify.git(project, "worktree", "remove", "--force", path, optional=True) is not None:
+                        # Asked before anything is removed, so a dry run reports exactly what a prune would do.
+                        if os.path.realpath(path) not in known:
+                            print("kept %s: Git does not know it as a worktree" % path)
+                        elif would or verify.git(project, "worktree", "remove", "--force", path, optional=True) is not None:
                             print("%sremove worktree %s" % (would, path))
                             gone.add(os.path.realpath(path))
                             removed += 1
                         else:
-                            print("kept %s: Git does not know it as a worktree" % path)
+                            print("kept %s: Git could not remove it" % path)
                 if not would:
                     verify.git(project, "worktree", "prune", optional=True)
-        worktrees = []
-        if git_dir:
-            wt_out = verify.git(project, "worktree", "list", "--porcelain", optional=True)
-            if wt_out:
-                for line in wt_out.decode(errors="replace").splitlines():
-                    if line.startswith("worktree "):
-                        worktrees.append(os.path.realpath(line[len("worktree "):].strip()))
-        worktrees = [wt for wt in worktrees if not would or wt not in gone]
+        worktrees = [wt for wt in (registered() if git_dir else ()) if not would or wt not in gone]
         try:  # the run the pane shows when a conversation has none of its own stays where the pointer says
             with open(os.path.join(root, "current"), encoding="utf-8") as f:
                 shown = f.read().strip()
@@ -750,6 +781,7 @@ def prune(root, args):
             except OSError:
                 return 0
 
+        moved = set()
         for run, state in runs:
             if run == shown:
                 continue
@@ -763,21 +795,45 @@ def prune(root, args):
                 continue
             if not would:
                 os.makedirs(os.path.dirname(target), exist_ok=True)
-                os.rename(source, target)
+                try:
+                    held = open(os.path.join(source, ".lock"), "a")
+                except OSError:  # a read-only copy has no board command writing in it
+                    held = open(os.path.join(source, "members.json"), "rb")
+                with held:
+                    # A board command at work in the folder finishes first: moved under it, its next write would fail.
+                    # Taken after the .swarm folder's lock, as `adopt` takes the two.
+                    fcntl.flock(held, fcntl.LOCK_EX)
+                    os.rename(source, target)
             print("%sarchive %s" % (would, run))
+            moved.add(run)
             archived += 1
         # A pointer to a run folder that is gone (deleted by hand) shows the pane nothing: it goes too.
         if shown and not os.path.isdir(os.path.join(root, shown)):
             if not would:
                 os.unlink(os.path.join(root, "current"))
             print("%sremove the pointer to %s, which is gone" % (would, shown))
+        # A conversation's pointer to a run that was archived or deleted finds nothing: `restore` looks the run up anew.
+        bindings, stale = os.path.join(root, ".bindings"), 0
+        for key in sorted(os.listdir(bindings)) if os.path.isdir(bindings) else []:
+            try:
+                with open(os.path.join(bindings, key), encoding="utf-8") as f:
+                    named = f.read().strip()
+            except (OSError, UnicodeError):
+                continue
+            if BIND_KEY.fullmatch(key) and (not RUN_NAME.fullmatch(named) or named in moved
+                                           or not os.path.isdir(os.path.join(root, named))):
+                if not would:
+                    os.unlink(os.path.join(bindings, key))
+                stale += 1
+        if stale:
+            print("%sremove %d stale binding(s)" % (would, stale))
     print("%sremove %d worktree(s) and archive %d run(s)" % (would, removed, archived))
 
 
 def targets(text, members, *, include_killed=False):
     """The names a post reaches: its @name, @group and @all mentions, expanded to live members (or all when include_killed)."""
     # the name as written reaches a roster made before names had to end in a letter or digit
-    mentioned = {form for m in MENTION.findall(QUOTED.sub("", text)) for form in (m.lower(), m.lower().rstrip("-_"))}
+    mentioned = {form for m in MENTION.findall(QUOTED.sub(" ", text)) for form in (m.lower(), m.lower().rstrip("-_"))}
     return [n for n, m in members.items() if (include_killed or not m.get("killed")) and mentioned & {"all", n, m.get("group")}]
 
 
@@ -793,26 +849,30 @@ def init(d, title):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}", name) or not title.strip():
         sys.exit("init requires a run name starting with a letter or digit and using letters, digits, dots, underscores or hyphens, and a nonempty title")
     os.makedirs(parent, exist_ok=True)
-    run = "%s-%s" % (name, time.strftime("%Y%m%d-%H%M%S"))
-    while True:  # mkdir is atomic, so two runs started in the same second get two folders
-        try:
-            os.mkdir(os.path.join(parent, run))
-            break
+    # Under the lock `prune` and `adopt` hold: the pointer written here is not one `prune` is about to take away,
+    # and of two runs started at once neither reads a .gitignore the other is still writing.
+    with open(os.path.join(parent, ".adopt.lock"), "w") as choosing:
+        fcntl.flock(choosing, fcntl.LOCK_EX)
+        run = "%s-%s" % (name, time.strftime("%Y%m%d-%H%M%S"))
+        while True:  # mkdir is atomic, so two runs started in the same second get two folders
+            try:
+                os.mkdir(os.path.join(parent, run))
+                break
+            except FileExistsError:
+                run += "x"
+        d = os.path.join(parent, run)
+        try:  # keeps the whole .swarm folder out of git; a file already there is the project's own
+            with open(os.path.join(parent, ".gitignore"), "x", encoding="utf-8") as f:
+                f.write("*\n")
         except FileExistsError:
-            run += "x"
-    d = os.path.join(parent, run)
-    try:  # keeps the whole .swarm folder out of git; a file already there is the project's own
-        with open(os.path.join(parent, ".gitignore"), "x", encoding="utf-8") as f:
-            f.write("*\n")
-    except FileExistsError:
-        with open(os.path.join(parent, ".gitignore"), encoding="utf-8") as f:
-            if "*" not in [line.strip() for line in f]:
-                print("note: %s does not ignore everything, so run data will show in git status. "
-                      "Verification leaves it out of the source fingerprint either way."
-                      % os.path.join(parent, ".gitignore"), file=sys.stderr)
-    open(os.path.join(d, "board.jsonl"), "a").close()
-    save(d, {"title": title, "members": {COORDINATOR: {"role": COORDINATOR, "last_read_seq": 0}}})
-    atomic_write(os.path.join(parent, "current"), run + "\n")
+            with open(os.path.join(parent, ".gitignore"), encoding="utf-8") as f:
+                if "*" not in [line.strip() for line in f]:
+                    print("note: %s does not ignore everything, so run data will show in git status. "
+                          "Verification leaves it out of the source fingerprint either way."
+                          % os.path.join(parent, ".gitignore"), file=sys.stderr)
+        open(os.path.join(d, "board.jsonl"), "a").close()
+        save(d, {"title": title, "members": {COORDINATOR: {"role": COORDINATOR, "last_read_seq": 0}}})
+        atomic_write(os.path.join(parent, "current"), run + "\n")
     print(d)
 
 
@@ -1030,9 +1090,16 @@ def main(argv):
             before_counts, before_family = roster_counts(state), set(family_limit_errors(state))
             was_fable_inv = (name in members and kind_of(members[name]) == "investigator"
                              and family(model_of(members[name])) == "fable")
+            created = name not in members
             member = members.setdefault(name, {"role": "worker", "last_read_seq": len(posts)})
             previous = member.copy()
             changes = assignments(args[1:], MEMBER_FIELDS)
+            if created and "killed" in changes:
+                sys.exit("@%s is not on the roster, so there is nobody to retire. Nothing was changed" % name)
+            # A retired member's record is history: its role still says whose verdicts and reports its posts were.
+            if previous.get("killed") and changes.keys() - {"killed"}:
+                sys.exit("@%s has been retired, so its assignment no longer changes. To put a member in its place: replace %s NEW"
+                         % (name, name))
             if "id" in changes and changes["id"] != member.get("id"):
                 for key in ("wake_claim", "last_nudged_seq", "told"):
                     member.pop(key, None)
@@ -1074,8 +1141,11 @@ def main(argv):
                 print(f"note: @{name} has model=inherit, which cannot be checked against family limits here", file=sys.stderr)
             if (not member.get("killed") and assignment_scope(previous) != assignment_scope(member)
                     and latest_reports(posts).get(name, {}).get("kind") in {"ready", "finding"}):
-                recipients = [name] + [n for n, entry in team_of(members).items() if name in dependencies(entry)]
-                return post_message(COORDINATOR, f"@{name} Your assignment changed. Review its scope and report again.",
+                recipients = [name] + [n for n, entry in team_of(members).items() if n != name and (
+                    name in dependencies(entry) or (entry.get("role") == "verifier" and in_play(d, name)))]
+                what = ("Review its scope and report again." if member.get("role") == "worker" else
+                        "You are a %s now: your earlier report is withdrawn, and a %s posts no READY." % (member["role"], member["role"]))
+                return post_message(COORDINATOR, f"@{name} Your assignment changed. {what}",
                                     recipients, kind="revise", subject=name, save_roster=True)
             save(d, state)
 
@@ -1084,6 +1154,10 @@ def main(argv):
             if any(changes[k] != "" and not re.fullmatch(r"[0-9]{1,15}", changes[k]) for k in changes if k in ("max_workers", "max_members", "budget")):
                 sys.exit("limits are max_workers=N max_members=N budget=TOKENS and <model>=<types>, for models: " + " ".join(FAMILIES))
             for model in FAMILIES:
+                if changes.get(model):  # stored as the list it is: "architect,,architect" and "," are not two more forms
+                    changes[model] = ",".join(dict.fromkeys(token for token in changes[model].split(",") if token))
+                    if not changes[model]:
+                        sys.exit("%s takes agent types (%s), member names, or none" % (model, ", ".join(DEFAULTS)))
                 for token in changes.get(model, "").split(","):
                     if token in {"", "none"} or token in DEFAULTS:
                         continue
@@ -1093,7 +1167,7 @@ def main(argv):
                         print("note: %s=%s names no agent type and no member yet. Types are: %s" % (model, token, ", ".join(DEFAULTS)))
             limits = state.setdefault("limits", {})
             for k, v in changes.items():
-                if v == "":
+                if v == "" or (k == "budget" and not int(v)):  # a budget of zero is no budget
                     limits.pop(k, None)
                 else:
                     limits[k] = v
@@ -1223,6 +1297,9 @@ def main(argv):
             protocol = REPORT_WORD.match(text)
             word = protocol[1] if protocol else ""
             if sender != COORDINATOR and (word in {"READY", "REVISE"} or (word == "FINDING" and kind_of(members[sender]) == "investigator")):
+                if members[sender].get("role") != "worker":
+                    sys.exit("%s is a worker's report and records nothing from a verifier, whose verdict is VERIFIED, "
+                             "NOT PASSED or NOT VERIFIED. Start the post with another word" % word)
                 how = "ready %s (report on stdin)" % sender if word in {"READY", "FINDING"} else "revise %s <reason>" % sender
                 sys.exit("this is a plain post, so it records no readiness. Use: board.py DIR %s" % how)
             # VERIFIED counts only as the line verify.py returns for a candidate it tested.
@@ -1278,8 +1355,13 @@ def main(argv):
                     # HEAD of a checkout with edits in it is not the work being reported: the edits are. A new file
                     # nobody added counts: verification merges the commit and would never see it.
                     try:
-                        root = verify.Path(os.fsdecode(verify.toplevel(here).rstrip(b"\n")))
-                        loose = verify.pending_changes(root)
+                        top = verify.toplevel(here)
+                        if top is None:
+                            raise ValueError("it is not inside a Git checkout")
+                        # Run data is the .swarm folder of this run's project, which need not be the top of the
+                        # repository: the same path is left out of the member's own checkout.
+                        project = verify.repository(verify.Path(os.path.dirname(os.path.dirname(os.path.abspath(d)))))
+                        loose = verify.pending_changes(verify.Path(os.fsdecode(top.rstrip(b"\n"))), project and project[1])
                     except (ValueError, OSError) as error:
                         sys.exit("git could not read this checkout, so HEAD cannot be reported: %s" % error)
                     if loose:
@@ -1293,7 +1375,14 @@ def main(argv):
                 if not report:
                     sys.exit("READY needs a report on stdin")
                 if kind_of(member) == "investigator":
-                    post_message(sender, "FINDING awaiting coordinator review\n" + report, [COORDINATOR], kind="finding")
+                    # A new finding withdraws the one the coordinator confirmed: whoever built on that one hears,
+                    # as it would of a `revise`.
+                    confirmed = sender in through
+                    told = [COORDINATOR] + [name for name, entry in team_of(members).items() if confirmed and name != sender and (
+                        sender in dependencies(entry) or (entry.get("role") == "verifier" and in_play(d, sender)))]
+                    note = ("This replaces the finding confirmed before: work built on that one waits until the "
+                            "coordinator confirms this one.\n" if confirmed else "")
+                    post_message(sender, "FINDING awaiting coordinator review\n" + note + report, told, kind="finding")
                     return
                 text = "READY" + (" " + revision if revision else "") + "\n" + report
             else:
@@ -1305,13 +1394,7 @@ def main(argv):
             recipients = [name for name, entry in members.items() if not entry.get("killed") and
                           name != sender and (name == COORDINATOR or (notify and (
                               (entry.get("role") == "verifier" and not is_consultant) or sender in dependencies(entry))))]
-            try:
-                with open(os.path.join(d, "verification.json"), encoding="utf-8") as f:
-                    candidate = json.load(f)
-            except (OSError, ValueError):
-                candidate = None
-            in_play = isinstance(candidate, dict) and not candidate.get("accepted") and sender in (candidate.get("inputs") or {})
-            if cmd == "revise" and not in_play:
+            if cmd == "revise" and not in_play(d, sender):
                 # With no candidate that holds this member's work, a withdrawal costs nobody a turn: `prepare` refuses a
                 # member that is not ready, and the READY that follows tells who needs it. A candidate being tested or
                 # waiting to be accepted is another matter: it is dead from here on, so its verifier and the coordinator hear.
@@ -1497,8 +1580,12 @@ def main(argv):
                 sys.exit("invalid run folder")
             if state.get("binding") not in (None, args[0]):
                 sys.exit("another conversation owns this run")
-            if state.get("closed") and state.get("binding") != args[0]:
-                sys.exit("the run is closed")
+            if state.get("closed"):
+                if state.get("binding") != args[0]:
+                    sys.exit("the run is closed")
+                # Still this conversation's, and nothing to restore: the pointer goes on naming its open run.
+                print(os.path.abspath(d))
+                return
             state["binding"] = args[0]
             save(d, state)
             os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
@@ -1507,7 +1594,7 @@ def main(argv):
 
         elif cmd in {"pause", "resume"}:
             if cmd == "pause":
-                state["paused"] = " ".join(args) or "awaiting coordinator"
+                state["paused"] = " ".join(args).strip() or "awaiting coordinator"
             else:
                 if over_budget:
                     sys.exit(f"token budget spent ({total} of {budget}); raise it with limit before resuming")

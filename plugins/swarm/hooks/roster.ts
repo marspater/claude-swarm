@@ -4,7 +4,7 @@ import type { AgentInfo } from 'claude-code'
 
 import type { AttentionItem, Member, Post, Swarm } from '../types'
 import { edgesOf } from './graph'
-import { clean } from './text'
+import { clean, unquoted } from './text'
 
 // ponytail: keeps the newest 300 posts; page through board.jsonl if a swarm outgrows that
 export const KEPT = 300
@@ -14,12 +14,19 @@ export type BudgetState = {
   usage?: { tokens?: Record<string, number> }
 }
 
-export function budgetOf(state: BudgetState): number {
-  return Number(state.limits?.budget ?? 0) || 0
+// A roster is a file anyone may have edited: a budget that is no positive number is no budget, and a count that is
+// none adds nothing, so neither can halt a run or keep one from halting.
+const positive = (value: unknown) => {
+  const n = typeof value === 'string' && value.trim() !== '' ? Number(value) : value
+  return typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : 0
 }
 
-export function tokensUsed(tokens: Record<string, number> = {}): number {
-  return Object.values(tokens).reduce((sum, count) => sum + count, 0)
+export function budgetOf(state: BudgetState): number {
+  return positive(state.limits?.budget)
+}
+
+export function tokensUsed(tokens?: Record<string, unknown> | null): number {
+  return Object.values(tokens ?? {}).reduce<number>((sum, count) => sum + positive(count), 0)
 }
 
 // The same rule as board.py: @name at a word start, never an email or a path.
@@ -73,21 +80,23 @@ export type Report = {
 export function detailOf(status: string, hint: Report['members'][string] | undefined, isPaused: boolean): string {
   if (status === 'working' || status === 'killed' || status === 'coordinating' || status === 'failed') return ''
   if (status === 'unreachable') return 'cannot be woken'
+  if (status === 'stopped') return 'its agent was stopped'
   if (isPaused) return 'run paused'
   if (hint?.asked) return `waiting for an answer to #${hint.asked}`
-  if (hint && hint.blocked_on.length > 0) return `waiting for ${hint.blocked_on.map(name => `@${name}`).join(', ')}`
+  if (hint?.blocked_on?.length) return `waiting for ${hint.blocked_on.map(name => `@${name}`).join(', ')}`
   if (hint?.ready) return 'reported ready'
 
   return ''
 }
 
+/** The names a text mentions, in lower case, code and URLs left out: members, groups and `all` alike. */
+export const mentions = (text: string) => new Set(
+  [...unquoted(text).matchAll(MENTION)].map(m => (m[1] ?? '').toLowerCase())
+    .flatMap(name => [name, name.replace(/[-_]+$/, '')]),
+)
+
 export function targets(text: string, roster: Roster): string[] {
-  const stripped = text.replace(/```[\s\S]*?```|(`+)[^\n]*?\1|\w+:\/\/\S+/g, ' ')
-  const mentioned = new Set(
-    [...stripped.matchAll(MENTION)].map(m =>
-      (m[1] ?? '').toLowerCase(),
-    ).flatMap(name => [name, name.replace(/[-_]+$/, '')]),
-  )
+  const mentioned = mentions(text)
 
   return Object.keys(roster).filter(name => {
     const member = roster[name]
@@ -102,13 +111,13 @@ export function targets(text: string, roster: Roster): string[] {
   })
 }
 
-const ACTIVE_AGENT_STATUSES = new Set(['running', 'pending', 'waiting', 'idle'])
+const RUNNING_AGENT_STATUSES = new Set(['running', 'pending', 'waiting'])
 
-/** Finds the newest agent matching `id`, preferring active statuses over ended ones. */
+/** Finds the newest agent matching `id`, preferring one that is running: an idle one is no newer than a later failure. */
 export function findAgent(agents: AgentInfo[], id: string | undefined): AgentInfo | undefined {
   if (id === undefined) return undefined
   const matches = agents.filter(one => one.id === id || one.teammateId === id)
-  return matches.findLast(one => ACTIVE_AGENT_STATUSES.has(one.status)) ?? matches.at(-1)
+  return matches.findLast(one => RUNNING_AGENT_STATUSES.has(one.status)) ?? matches.at(-1)
 }
 
 export function statusOf(
@@ -121,10 +130,11 @@ export function statusOf(
   if (!member.id) return 'not started'
   const agent = findAgent(agents, member.id)
   if (agent === undefined) return 'waiting'
-  if (agent.status === 'killed') return 'killed'
   if (agent.status === 'running' || agent.status === 'pending' || agent.status === 'waiting') return 'working'
 
-  return agent.status === 'failed' ? 'failed' : 'waiting'
+  // `killed` is the roster's word for a retired member. One still on the roster whose agent someone stopped is
+  // `stopped`, not failed: it stays in the stall check, and a wake it cannot take still shows as unreachable.
+  return agent.status === 'failed' ? 'failed' : agent.status === 'killed' ? 'stopped' : 'waiting'
 }
 
 export function parsePosts(board: string, roster: Roster): Post[] {
@@ -133,13 +143,13 @@ export function parsePosts(board: string, roster: Roster): Post[] {
     if (line.trim() === '') continue
     try {
       const post = JSON.parse(line) as Omit<Post, 'to'> & { to?: string[] }
-      if (!Number.isSafeInteger(post.seq) || post.seq <= (posts.at(-1)?.seq ?? 0) ||
+      if (!post || !Number.isSafeInteger(post.seq) || post.seq <= (posts.at(-1)?.seq ?? 0) ||
           typeof post.agent !== 'string' || typeof post.text !== 'string' || typeof post.time !== 'string' ||
           (post.to !== undefined && (!Array.isArray(post.to) || post.to.some(name => typeof name !== 'string')))) continue
       // board.py records the recipients; a board written before it did is read by its mentions
       const to =
         post.to ?? targets(post.text, roster).filter(name => name !== post.agent)
-      posts.push({ ...post, text: clean(post.text), to })
+      posts.push({ ...post, agent: clean(post.agent), time: clean(post.time), text: clean(post.text), to: to.map(clean) })
     } catch {
       // a line still being written; the next poll reads it whole
     }
@@ -156,13 +166,14 @@ export function parse(
   report?: Report,
   coordinating = false,
 ): Swarm {
-  const state = JSON.parse(rosterText) as {
-    title: string
+  const state = (JSON.parse(rosterText) ?? {}) as {
+    title?: string
     closed?: boolean
     paused?: string
-    members: Roster
+    members?: Roster
   } & BudgetState
-  const roster = state.members
+  // A roster cut short or edited by hand still draws what it holds: an entry that is no object is left out.
+  const roster: Roster = Object.fromEntries(Object.entries(state.members ?? {}).filter(([, member]) => member && typeof member === 'object'))
   const posts = parsePosts(board, roster)
   const activity = new Map<string, { sent: number; unread: number }>()
   const counts = (name: string) => {
@@ -206,7 +217,7 @@ export function parse(
     // nothing it waits for. While others work nobody notices, and whoever depends on it waits for good.
     const lastHeard = heard.get(name) ?? 0
     if (!isClosed && !state.paused && (member.role ?? 'worker') === 'worker' && member.id !== undefined && status === 'waiting' &&
-        hint !== undefined && !hint.ready && !hint.asked && hint.blocked_on.length === 0 &&
+        hint !== undefined && !hint.ready && !hint.asked && !hint.blocked_on?.length &&
         counts(name).unread === 0 && lastHeard > 0 && (said.get(name) ?? 0) < lastHeard) {
       zombieAttention.push({
         kind: 'silent',
@@ -233,17 +244,20 @@ export function parse(
     }
   })
 
+  // `slice(-0)` is the whole list, so a limit of none is spelled out.
+  const kept = limit > 0 ? posts.slice(-limit) : []
+
   return {
-    title: clean(state.title),
+    title: clean(String(state.title ?? '')),
     dir,
     isClosed,
     isPaused: Boolean(state.paused),
-    posts: posts.slice(-limit),
+    posts: kept,
     total: Math.max(posts.length, posts.at(-1)?.seq ?? 0),
-    earlierEdges: edgesOf(posts.slice(0, -limit)),
+    earlierEdges: edgesOf(posts.slice(0, posts.length - kept.length)),
     members,
     attention: [...(report?.items ?? []), ...zombieAttention],
     budget: budgetOf(state),
-    tokens: state.usage?.tokens ?? {},
+    tokens: Object.fromEntries(Object.entries(state.usage?.tokens ?? {}).map(([actor, count]) => [actor, positive(count)])),
   }
 }

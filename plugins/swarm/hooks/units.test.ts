@@ -1,12 +1,12 @@
 import { expect, test } from 'claude-code/testing'
 import type { Post } from '../types'
-import { BOARD_CALL, COORDINATOR_READ, RUN, boardCalls, runsNamed, scanShell, splitShellSegments, wakeMessage, wakeSequence } from './command'
+import { BOARD_CALL, COORDINATOR_READ, RUN, boardCalls, runsNamed, scanShell, shellWords, splitShellSegments, substitutions, unwrap, wakeMessage, wakeSequence } from './command'
 import { edgesOf, graphSvg, isBroadcast } from './graph'
-import { toolMood, toolSummary } from './hive'
+import { hiveArt, toolMood, toolSummary } from './hive'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, SWARM_AGENTS, familyOf, latestOf } from './models'
 import { statusCss, statusDot, statusKey } from './palette'
-import { detailOf, findAgent, parse, statusOf, targets, tokensUsed } from './roster'
-import { bodyOf, clean, clip, compact, head, kindOf, openedText, stripKind } from './text'
+import { budgetOf, detailOf, findAgent, mentions, parse, statusOf, targets, tokensUsed } from './roster'
+import { bodyOf, chipped, clean, clip, compact, fenceAfter, head, kindOf, openedText, stripKind, unquoted } from './text'
 
 const post = (text: string, to: string[] = []): Post => ({ seq: 1, agent: 'parser', to, text, time: '2026-11-16T14:03:22+0100' })
 
@@ -122,7 +122,7 @@ test('multi-segment board calls, wakeSequence bounds, and roster status/closed-r
   const tailedBoard = `${JSON.stringify({ seq: 500, agent: 'constructor', text: 'done', time: 't' })}\n`
   const closed = parse('/project/.swarm/demo-20261116-101010', tailedBoard, closedRoster, agents, 300, {
     items: [], limits: {},
-    members: { art: { type: 'worker', model: 'sonnet', effort: 'medium', depends: [], owns: '', ready: false, blocked_on: ['x'], asked: 0, unreachable: true } },
+    members: { constructor: { type: 'worker', model: 'sonnet', effort: 'medium', depends: [], owns: '', ready: false, blocked_on: ['x'], asked: 0, unreachable: true } },
   })
   expect(closed.total).toBe(500)
   expect(closed.members.find(m => m.name === 'constructor')?.status).toBe('waiting')
@@ -278,4 +278,166 @@ test('shell splitting: here-strings, arithmetic, comments, background, piped, tr
 
   expect(runsNamed('see .swarm/demo-20261116-101010.')).toEqual(['demo-20261116-101010'])
   expect(runsNamed('see .swarm/demo-20261116-101010.log')).toEqual([])
+})
+
+// The tests below are named for the findings of the 2026-11-21 bug analysis they pin.
+
+test('F1: a board command of repeated escapes is refused in linear time', () => {
+  const started = Date.now()
+  for (const n of [200, 2000]) {
+    expect(BOARD_CALL.exec('python3 board.py ' + '\\a'.repeat(n))).toBeNull()
+    expect(BOARD_CALL.exec('python3 ' + '\\a'.repeat(n) + ' x y')).toBeNull()
+    expect(boardCalls('python3 -c ' + '\\a'.repeat(n))).toEqual([])
+  }
+  expect(Date.now() - started).toBeLessThan(500)
+})
+
+test('F2: the shell scanner reads arithmetic, $\'…\' quoting, substitutions and joined heredoc delimiters', () => {
+  // (( … )) is arithmetic: its << is a shift, not a heredoc that swallows the next line
+  expect(splitShellSegments('(( 1 << 4 ))\ngit commit -m wip')).toEqual(['(( 1 << 4 ))', 'git commit -m wip'])
+  expect(splitShellSegments('for ((i=0; i<3; i++)); do echo $i; done')).toEqual(['for ((i=0; i<3; i++))', 'do echo $i', 'done'])
+  // \' inside $'…' does not end the string
+  expect(splitShellSegments("echo $'\\'' && git commit -m wip")).toEqual(["echo $'\\''", 'git commit -m wip'])
+  expect(splitShellSegments("echo $'a\\'b; c' ; git commit")).toEqual(["echo $'a\\'b; c'", 'git commit'])
+  // a substitution stays whole in its statement, quotes inside it and all, and its commands are listed with it
+  const quoted = scanShell('echo "$(cd /x && git commit -m "a; b")" && echo done')
+  expect(quoted.map(s => s.text)).toEqual(['echo "$(cd /x && git commit -m "a; b")"', 'echo done'])
+  expect(quoted[0]?.inner).toEqual(['cd /x && git commit -m "a; b"'])
+  expect(quoted[0]?.plain).toBe('echo "_"')
+  expect(scanShell('x=`git commit -m wip`')[0]?.inner).toEqual(['git commit -m wip'])
+  expect(scanShell('echo $((1 + $(git commit -m wip)))')[0]?.inner).toEqual(['git commit -m wip'])
+  expect(scanShell('diff <(git commit -m wip) b')[0]?.inner).toEqual(['git commit -m wip'])
+  expect(scanShell('echo $(echo $(git commit))')[0]?.inner).toEqual(['echo $(git commit)'])
+  expect(scanShell("echo '$(git commit)'")[0]?.inner).toBeUndefined()
+  // a heredoc delimiter is one word: its quoted and bare pieces join
+  for (const opener of ["<<'EO'F", "<<E'O'F", '<<""EOF', '<<\\EOF', '<<-EOF']) {
+    expect(splitShellSegments(`cat ${opener}\nx && git commit -m wip\nEOF\necho after`), opener).toEqual([`cat ${opener}`, 'echo after'])
+  }
+  // what stands before a command, and the words of it as the shell runs them
+  expect(unwrap('if ! env -u X git commit')).toEqual({ text: 'git commit', negated: true })
+  expect(shellWords(`"git" \\commit -m 'a b' $'c\\'d' e\\ f`)).toEqual(['git', 'commit', '-m', 'a b', "c'd", 'e f'])
+  // a board call inside a substitution is not a top-level call, and is found where the fallback looks for it
+  const made = 'R=$(python3 /p/board.py /project/.swarm/demo init "Demo swarm")'
+  expect(boardCalls(made)).toEqual([])
+  expect(substitutions(made)).toEqual(['python3 /p/board.py /project/.swarm/demo init "Demo swarm"'])
+  expect(substitutions('echo $(echo `uv run board.py x init y`)')).toEqual(['echo `uv run board.py x init y`', 'uv run board.py x init y'])
+  expect(substitutions("cat <<'EOF'\nR=$(board.py x init y)\nEOF\necho 'R=$(board.py x init y)'")).toEqual([])
+})
+
+test('F16: board calls are recognised quoted, wrapped, flagged and run directly, and python -c is none', () => {
+  const run = '/project/.swarm/demo-20261116-101010'
+  for (const [command, action] of [
+    [`python3 "board.py" ${run} read coordinator`, 'read'],
+    [`python3 'board.py' ${run} read coordinator`, 'read'],
+    [`python3 /p/board.py ${run} pause>/dev/null`, 'pause'],
+    [`python3 /p/board.py ${run} resume;`, 'resume'],
+    [`python3 /p/board.py /project/.swarm agent-run key id`, 'agent-run'],
+    [`python3 -Xutf8 /p/board.py ${run} status`, 'status'],
+    [`python3 -B -- /p/board.py ${run} status`, 'status'],
+    [`env PYTHONUTF8=1 python3 /p/board.py ${run} plan`, 'plan'],
+    [`nohup python3 /p/board.py ${run} wake`, 'wake'],
+    [`( python3 /p/board.py ${run} show )`, 'show'],
+    [`if python3 /p/board.py ${run} status; then echo ok; fi`, 'status'],
+    [`./board.py ${run} read coordinator`, 'read'],
+    [`/p/board.py ${run} read coordinator`, 'read'],
+  ] as const) {
+    expect(boardCalls(command).map(c => c.action), command).toEqual([action])
+  }
+  expect(boardCalls(`python3 -c "a/board.py" ${run} read coordinator`)).toEqual([])
+  expect(boardCalls(`python3 -m "a/board.py" ${run} read coordinator`)).toEqual([])
+  expect(boardCalls(`cat /p/board.py ${run} read coordinator`)).toEqual([])
+  expect(COORDINATOR_READ.test('read "--all" coordinator')).toBe(true)
+  // the member `show` names: a flag or a redirection names none
+  const shown = (c: string) => boardCalls(`python3 /p/board.py ${run} ${c}`)[0]?.subarg
+  expect([shown('show 2>&1'), shown('show --post=3'), shown('show @Parser 2>&1'), shown('show')]).toEqual([undefined, undefined, 'parser', undefined])
+  expect(COORDINATOR_READ.test("read '--max-bytes=4000' --headers coordinator>out")).toBe(true)
+  expect(COORDINATOR_READ.test('read --all coordinators')).toBe(false)
+})
+
+test('F17: only stdout sent away from the tool result counts as piped', () => {
+  const call = (c: string) => boardCalls(`python3 board.py /r/.swarm/x-20261116-101010 ${c}`)[0]?.piped
+  expect([call('show >&1.log'), call('show 1>&3'), call('show >&3')]).toEqual([true, true, true])
+  expect([call('show 10>out'), call('show <>in'), call('show >&1'), call('show 1>&2'), call('show 2>out')]).toEqual([false, false, false, false, false])
+})
+
+test('F18: a member whose agent was killed is stopped, not retired, and a newer failure is not hidden by an older idle agent', () => {
+  const agents = [
+    { id: 'a1', description: '@art', type: 'swarm:worker', status: 'idle' },
+    { id: 'a1', description: '@art', type: 'swarm:worker', status: 'failed' },
+  ] as never
+  expect(findAgent(agents, 'a1')?.status).toBe('failed')
+  expect(statusOf('worker', { id: 'a1', last_read_seq: 0 }, agents)).toBe('failed')
+  const killed = [{ id: 'k1', description: '@art', type: 'swarm:worker', status: 'killed' }] as never
+  expect(statusOf('worker', { id: 'k1', last_read_seq: 0 }, killed)).toBe('stopped')
+  expect([detailOf('stopped', undefined, false), statusKey('stopped')]).toEqual(['its agent was stopped', 'failed'])
+  expect(statusOf('worker', { id: 'k1', killed: '1', last_read_seq: 0 }, killed)).toBe('killed')
+  const roster = JSON.stringify({ title: 'T', members: { coordinator: { role: 'coordinator', last_read_seq: 0 }, art: { role: 'worker', id: 'k1', last_read_seq: 0 } } })
+  const hint = { type: 'worker', model: 'sonnet', effort: 'medium', depends: [], owns: '', ready: false, blocked_on: [], asked: 0, unreachable: true }
+  const shown = parse('/p/.swarm/x-20261116-101010', '', roster, killed, 300, { items: [], limits: {}, members: { art: hint } })
+  expect(shown.members.find(m => m.name === 'art')?.status).toBe('unreachable')
+})
+
+test('F19: a malformed roster, token count or report draws what it can, and no limit keeps no post', () => {
+  expect(tokensUsed(null)).toBe(0)
+  expect(tokensUsed({ a: '5', b: NaN, c: 3, d: -2, e: null } as never)).toBe(8)
+  expect([budgetOf({ limits: { budget: '-100' } }), budgetOf({ limits: { budget: 'Infinity' } }), budgetOf({ limits: { budget: 'x' } }), budgetOf({ limits: { budget: '100' } })]).toEqual([0, 0, 0, 100])
+  const empty = parse('/p/.swarm/x-20261116-101010', '', '{}', [])
+  expect([empty.title, empty.members, empty.posts]).toEqual(['', [], []])
+  const roster = JSON.stringify({ title: 'T', usage: { tokens: { a: '7', b: 'x' } }, members: { coordinator: { role: 'coordinator', last_read_seq: 0 }, bad: null, art: { role: 'worker', last_read_seq: 0 } } })
+  const board = [1, 2, 3].map(seq => JSON.stringify({ seq, agent: 'art', text: '@coordinator hi', time: 't' })).join('\n') + '\nnull\n'
+  const none = parse('/p/.swarm/x-20261116-101010', board, roster, [], 0, { items: [], limits: {}, members: { art: { type: 'worker' } } } as never)
+  expect(none.posts).toEqual([])
+  expect(none.earlierEdges).toEqual({ 'art>coordinator': 3 })
+  expect(none.members.map(m => m.name)).toEqual(['coordinator', 'art'])
+  expect(none.tokens).toEqual({ a: 7, b: 0 })
+  expect(parse('/p/.swarm/x-20261116-101010', board, roster, [], 2).posts.map(p => p.seq)).toEqual([2, 3])
+  expect(detailOf('waiting', { type: 'worker' } as never, false)).toBe('')
+})
+
+test('F21: a kind word on line two stays in the body, as the board reads it', () => {
+  const second = post('@parser\nNOT PASSED: line 4 fails', ['parser'])
+  expect(kindOf(second.text)).toBeUndefined()
+  expect(chipped(second)).toBe('NOT PASSED: line 4 fails')
+  const first = post('@parser NOT PASSED: line 4 fails', ['parser'])
+  expect([kindOf(first.text)?.label, chipped(first)]).toEqual(['NOT PASSED', 'line 4 fails'])
+  expect(chipped(first, openedText(first))).toBe('line 4 fails')
+})
+
+test('F22: a line of ```code``` opens no fence, and a cut inside a fence closes it before the footer', () => {
+  expect(fenceAfter(null, '```foo```')).toBeNull()
+  expect(fenceAfter(null, '```ts')).toEqual({ ch: '`', len: 3 })
+  expect(fenceAfter({ ch: '`', len: 4 }, '```')).toEqual({ ch: '`', len: 4 })
+  expect(fenceAfter({ ch: '`', len: 3 }, '````')).toBeNull()
+  expect(clip(`\`\`\`foo\`\`\` and ${'word '.repeat(120)}`).endsWith(' …')).toBe(true)
+  const long = openedText(post(`intro\n\`\`\`ts\n${'x = 1\n'.repeat(5000)}\`\`\`\nend`))
+  expect(long).toMatch(/\n```\n…\n\n\(\d+ more characters\./)
+  expect((long.match(/^```/gm) ?? []).length).toBe(2)
+})
+
+test('code and URLs carry no mention: longer fences, tilde fences, and a span between two words', () => {
+  const roster = { coordinator: { role: 'coordinator', last_read_seq: 0 }, parser: { role: 'worker', last_read_seq: 0 }, lexer: { role: 'worker', last_read_seq: 0 } }
+  expect(targets('````\n```\n@parser\n```\n````\n@lexer', roster)).toEqual(['lexer'])
+  expect(targets('~~~\n@parser\n~~~\n@lexer', roster)).toEqual(['lexer'])
+  expect(targets('a ~~~ b @parser', roster)).toEqual(['parser'])
+  // the span is replaced by a space, as board.py replaces it: the words on either side stay apart
+  expect(targets('foo`x`@parser', roster)).toEqual(['parser'])
+  expect(unquoted('see https://x.dev/@parser, then')).toBe('see  , then')
+  expect([...mentions('@All and `@lexer` and @parser-')]).toEqual(['all', 'parser-', 'parser'])
+  // an @all that reached nobody is an @all post, not a post with no mention
+  expect(edgesOf([post('@all anyone here', [])])).toEqual({ 'parser>@all': 1 })
+  expect(edgesOf([post('just a note', [])])).toEqual({ 'parser>@none': 1 })
+})
+
+test('the hive reads a lookup by its command, and draws whatever mood and time it is given', () => {
+  expect(toolMood('Bash', 'git diff skills/swarm/scripts/board.py HEAD main')).toBe('inspect')
+  expect(toolMood('Bash', 'cat test.py')).toBe('inspect')
+  expect(toolMood('Bash', 'grep -n check src')).toBe('inspect')
+  expect(toolMood('Bash', 'vim scripts/board.py notes later')).toBe('build')
+  expect(toolMood('Bash', '$PY "$S"/board.py "$RUN" post coordinator hi')).toBe('relay')
+  for (const elapsed of [-5, NaN, Infinity, 12.7]) {
+    const art = hiveArt('forage', elapsed)
+    expect(art).not.toMatch(/NaN|Infinity|--\d|\d\.\d+ms/)
+  }
+  expect(hiveArt('unknown' as never)).toBe(hiveArt('sleep'))
+  expect(graphSvg({ title: 'T', dir: 'd', isClosed: false, posts: [post('@coordinator hi', ['coordinator'])], members: [], attention: [], budget: 0, tokens: {} }, 1, new Set(), true, true, true, NaN)).not.toContain('NaN')
 })

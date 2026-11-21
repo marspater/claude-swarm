@@ -38,7 +38,7 @@ These are always candidates for one-shot help. Check that the Agent tool lists a
 | --- | --- | --- |
 | `Explore` | Read and search, fast and cheap | A quick sweep before you split: which packages are involved, where the tests live |
 | `Plan` | Read and search, at the conversation's model | A second opinion on your split or on an implementation approach, before any member is spawned |
-| `general-purpose` | Everything | The stand-in when a `swarm:` type is unavailable: pass the model for the role and put the text of the matching agent file above the launch prompt. Note that a `general-purpose` stand-in loses `disallowedTools` (verifier) and role-skill preload (worker/designer) |
+| `general-purpose` | Everything | The stand-in when a `swarm:` type is unavailable: pass the model for the role and put the text of the matching agent file above the launch prompt. A stand-in loses the `disallowedTools` and the role-skill preload of its agent file (worker, designer and verifier each have both), and the hooks do not record it: run `BOARD member <name> id=<agent id> isolated=<0|1>` yourself after the Agent call |
 | `Bash` | Shell only, where the session offers it | One command whose output you need, such as a failing-test list to group by package |
 | `claude-code-guide` | Docs and web | A question about Claude Code itself |
 

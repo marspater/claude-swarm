@@ -826,6 +826,140 @@ class VerifyRegressions(unittest.TestCase):
                 sys.path.remove(str(SCRIPTS))
 
 
+    # The findings of the 2026-11-21 review, each test named after its number there (`low` for the unnumbered ones).
+
+    def test_f09_ready_head_in_a_subfolder_project_leaves_out_its_run_data(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as t:
+            repo = Path(t).resolve()
+            g = self._init_git(repo)
+            proj = repo / "package"
+            (proj / ".swarm").mkdir(parents=True)
+            (proj / ".swarm" / ".gitignore").write_text("integration-*\n")  # the project's own: run data shows in git status
+            board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Subfolder")
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            run(*post, "member", "w")
+            (proj / "feature.py").write_text("x = 1\n")
+            refused = subprocess.run([*post, "ready", "w", "HEAD"], cwd=proj, input="added", capture_output=True, text=True)
+            assert refused.returncode != 0 and "package/feature.py" in refused.stderr and ".swarm" not in refused.stderr, refused.stderr
+            g("add", "package/feature.py")
+            g("commit", "-m", "feature")
+            assert "posted #1" in run(*post, "ready", "w", "HEAD", cwd=repo, text="added feature.py")
+            # A checkout Git stops answering for between the two questions is refused in words, not with a traceback.
+            sys.path.insert(0, str(SCRIPTS))
+            here = os.getcwd()
+            try:
+                import board as board_module
+                import verify
+                os.chdir(repo)
+                with mock.patch.object(verify, "toplevel", lambda path: None), self.assertRaises(SystemExit) as stopped:
+                    board_module.main(["board.py", board, "ready", "w", "HEAD"])
+                assert "HEAD cannot be reported" in str(stopped.exception.code), stopped.exception.code
+            finally:
+                os.chdir(here)
+                sys.path.remove(str(SCRIPTS))
+
+    def test_f15_linked_swarm_folder_empty_base_and_process_table_noise(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as t, tempfile.TemporaryDirectory() as elsewhere:
+            proj = Path(t).resolve()
+            (proj / "app.txt").write_text("ok")
+            (proj / ".swarm").symlink_to(Path(elsewhere).resolve(), target_is_directory=True)
+            board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Linked")
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            run(*post, "ready", "w", text="done")
+            cand = json.loads(run(*gate, "prepare", "shared", "--check", "test -s app.txt"))
+            assert run(*gate, "test", cand["candidate"], "v").splitlines()[-1].startswith("VERIFIED " + cand["candidate"])
+            for mode in ("shared", "isolated"):
+                refused = subprocess.run([*gate, "prepare", mode, "--check", "true", "--base", ""], capture_output=True, text=True)
+                assert refused.returncode != 0 and "--base" in refused.stderr, (mode, refused.stderr)
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import verify
+            table = "PID PPID PGID\nnot a row here\n 10 1 0\n 11 10 11\n 12 11 1\n 13 12 13\n"
+            with mock.patch.object(verify.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=table, returncode=0)):
+                assert verify.descendant_groups(10) == {11, 13}  # never group 0 (the caller's own) or 1 (init's)
+            with mock.patch.object(verify.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=table, returncode=1)):
+                assert verify.descendant_groups(10) == set()
+        finally:
+            sys.path.remove(str(SCRIPTS))
+
+    def _isolated_candidate(self, proj, change):
+        """A run with one worker whose commit CHANGE made, ready for `prepare isolated`."""
+        g = self._init_git(proj)
+        base = g("rev-parse", "HEAD")
+        board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Isolated")
+        post = [sys.executable, SCRIPTS / "board.py", board]
+        gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+        run(*post, "member", "w")
+        run(*post, "member", "v", "role=verifier")
+        g("switch", "-q", "-c", "work")
+        change(g)
+        g("commit", "-q", "-m", "work")
+        commit = g("rev-parse", "HEAD")
+        g("switch", "-q", "main")
+        run(*post, "ready", "w", commit, text="done")
+        return g, base, board, post, gate
+
+    def test_low_a_commit_that_writes_run_data_is_no_candidate(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+
+            def change(g):
+                (proj / ".swarm" / "note.txt").write_text("not source")
+                g("add", "-f", ".swarm/note.txt")
+            _, _, board, _, gate = self._isolated_candidate(proj, change)
+            refused = subprocess.run([*gate, "prepare", "isolated", "--check", "true"], capture_output=True, text=True)
+            assert refused.returncode != 0 and ".swarm/note.txt" in refused.stderr and "@w" in refused.stderr, refused.stderr
+            assert not list(Path(board).glob("integration-*")) and not (Path(board) / "verification.json").exists()
+
+    def test_low_acceptance_rolls_back_whatever_stops_it(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+
+            def change(g):
+                (proj / "file.txt").write_text("v2")
+                g("add", "file.txt")
+            g, base, board, post, gate = self._isolated_candidate(proj, change)
+            cand = json.loads(run(*gate, "prepare", "isolated", "--check", "true"))
+            run(*post, "post", "v", "@coordinator " + run(*gate, "test", cand["candidate"], "v").splitlines()[-1])
+            sys.path.insert(0, str(SCRIPTS))
+            try:
+                import verify
+                real = verify.source_digest
+
+                def interrupted(path, *args, **kwargs):
+                    if Path(path) == proj:
+                        raise KeyboardInterrupt
+                    return real(path, *args, **kwargs)
+                with mock.patch.object(verify, "source_digest", interrupted), self.assertRaises(KeyboardInterrupt):
+                    verify.accept(Path(board), proj, cand["candidate"])
+            finally:
+                sys.path.remove(str(SCRIPTS))
+            assert g("rev-parse", "HEAD") == base and (proj / "file.txt").read_text() == "v1"
+            run(*gate, "accept", cand["candidate"])
+            assert g("rev-parse", "HEAD") == cand["commit"]
+
+    def test_low_a_check_that_ends_leaves_nothing_running(self):
+        import time
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import verify
+            with tempfile.TemporaryDirectory() as t:
+                marker = Path(t) / "marker"
+                child = "import time, pathlib; time.sleep(1.2); pathlib.Path(%r).write_text('late')" % str(marker)
+                check = "%s -c %s & exit 3" % (shlex.quote(sys.executable), shlex.quote(child))
+                assert verify.run_check(check, t, None) == 3
+                time.sleep(1.8)
+                assert not marker.exists(), "what a finished check left in the background kept running"
+        finally:
+            sys.path.remove(str(SCRIPTS))
+
+
 if __name__ == "__main__":
-    scenario()
-    print("ok")
+    unittest.main()

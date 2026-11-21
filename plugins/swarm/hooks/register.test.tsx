@@ -1159,6 +1159,15 @@ test('Attention opens a post outside the recent window and a missing board clear
   await ui.press({ key: 'tab-attention' })
   await ui.press({ key: 'attention-open-question-coordinator-1' })
   expect(await ui.find({ type: 'Markdown', text: /Original question still open/ })).toBeDefined()
+  // a short post the pane no longer keeps has no "Show less" to close it with: it has a button of its own
+  await ui.press({ key: 'dismiss-1' })
+  expect(await ui.find({ type: 'Markdown', text: /Original question still open/ })).toBeUndefined()
+  expect(await ui.find({ key: 'dismiss-302' })).toBeUndefined()
+  // however often earlier posts are asked for, no more are drawn than one drawing may hold
+  for (let press = 0; press < 20 && await ui.find({ key: 'earlier-posts' }); press++) await ui.press({ key: 'earlier-posts' })
+  expect((await ui.findAll({ type: 'Markdown' })).length).toBe(100)
+  expect(await ui.find({ type: 'Text', text: /^Showing the newest 100 of 300\. Narrow the filter/ })).toBeDefined()
+  expect(await ui.find({ key: 'earlier-posts' })).toBeUndefined()
   current = '../other-workspace'
   await clock.advance(2000)
   expect(await ui.find({ type: 'Text', text: /could not read the board/ })).toBeDefined()
@@ -1749,6 +1758,8 @@ test('the run switcher shows the project\'s other runs read-only and leaves the 
     read: path => {
       reads.push(path)
       if (path.includes('/junk-')) throw new Error('no such file')
+      // F23: a roster cut short between the live run and an older one does not end the walk to that one
+      if (path === '/project/.swarm/broken-20261110-000000/members.json') return '{"title": "Bro'
       if (path === `${older}/members.json`) return JSON.stringify({ title: 'Older swarm', members: { coordinator: { role: 'coordinator', last_read_seq: 1 }, scout: { role: 'worker', id: 'gone', last_read_seq: 1 } } })
       // open, unpaused, and its member owed a mention: live in every way but being this conversation's run
       if (path === `${older}/board.jsonl`) return posts({ agent: 'scout', to: ['coordinator'], text: '@coordinator the old report' }, { agent: 'coordinator', to: ['scout'], text: '@scout go on' })
@@ -1756,7 +1767,7 @@ test('the run switcher shows the project\'s other runs read-only and leaves the 
     },
   })
   on('fs.list', () => ({
-    value: ['archive', 'junk-20261001-000000', 'older-20261101-090000', OWNED.slice(OWNED.lastIndexOf('/') + 1), '.bindings']
+    value: ['archive', 'junk-20261001-000000', 'older-20261101-090000', 'broken-20261110-000000', OWNED.slice(OWNED.lastIndexOf('/') + 1), '.bindings']
       .map(name => ({ name, kind: 'dir', size: 0 })) as never,
   }))
   on('process.run', (_, e) => {
@@ -1785,6 +1796,11 @@ test('the run switcher shows the project\'s other runs read-only and leaves the 
   await ui.press({ key: 'tab-graph' })
   expect(await ui.find({ type: 'Text', text: /^Latest post$/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /^Live$/ })).toBeUndefined()
+  // an open run that is only looked at has a latest post, never a "live" to go to
+  await ui.press({ key: 'replay-first' })
+  expect(await ui.find({ type: 'Button', text: 'Latest' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', text: 'Go live' })).toBeUndefined()
+  await ui.press({ key: 'replay-live' })
   await ui.press({ key: 'tab-board' })
   // it is read once: the poller, the wakes and the binding stay with the live run
   reads.length = 0
@@ -1940,6 +1956,8 @@ test('agent.spawn handles model=inherit, exact older IDs, spawnEfforts, parallel
       coordinator: {},
       none: { role: 'worker', model: 'opus' },
       inh: { role: 'worker', model: 'inherit' },
+      inh2: { role: 'worker', model: 'inherit' },
+      inh3: { role: 'worker', model: 'inherit' },
       exact: { role: 'worker', model: 'claude-opus-4-6' },
       bedrock: { role: 'worker', model: 'us.anthropic.claude-opus-4-6-v1' },
       w1: { role: 'worker' },
@@ -1997,11 +2015,21 @@ test('agent.spawn handles model=inherit, exact older IDs, spawnEfforts, parallel
   // `model=inherit` rewrites to parentModel and `background: true` when !isTeammate
   expect((await $.agent.spawn({ ...base, description: '@inh: test' })).agentId).toBe('id-1')
   expect(spawned.at(-1)).toEqual({ model: 'claude-sonnet-5-5', background: true })
+  // F7: the docs say to omit model or pass the matching family. A coordinator on an older model of that family
+  // still starts the member on its own model, and a refusal never advises model: "inherit", which Agent does not take.
+  const olderParent = { ...base, parentModel: 'claude-sonnet-4-5' }
+  const other = await $.agent.spawn({ ...olderParent, description: '@inh2: test', model: 'haiku' })
+  expect(other.deny).toContain('pass the coordinator\'s own family (model: "sonnet")')
+  expect(other.deny).not.toContain('"inherit"')
+  expect((await $.agent.spawn({ ...olderParent, description: '@inh2: test', model: 'sonnet' })).deny).toBeUndefined()
+  expect(spawned.at(-1)?.model).toBe('claude-sonnet-4-5')
+  expect((await $.agent.spawn({ ...olderParent, description: '@inh3: test', model: 'Sonnet' })).deny).toBeUndefined()
+  expect(spawned.at(-1)?.model).toBe('claude-sonnet-4-5')
   // exact older ID and Bedrock ID pass when e.model is omitted or matches family
   state1.limits = {} as never
-  expect((await $.agent.spawn({ ...base, description: '@exact: test' })).agentId).toBe('id-2')
+  expect((await $.agent.spawn({ ...base, description: '@exact: test' })).agentId).toBe('id-4')
   expect(spawned.at(-1)?.model).toBe('claude-opus-4-6')
-  expect((await $.agent.spawn({ ...base, description: '@bedrock: test', model: 'opus' })).agentId).toBe('id-3')
+  expect((await $.agent.spawn({ ...base, description: '@bedrock: test', model: 'opus' })).agentId).toBe('id-5')
   expect(spawned.at(-1)?.model).toBe('us.anthropic.claude-opus-4-6-v1')
   // spawnEfforts enforcement via tool.call('Agent')
   await $.tool.call({ tool: 'Agent', tool_use_id: 'eff-1', effort: 'high' } as never)
@@ -3001,4 +3029,257 @@ test('a member whose agent ended without a report is flagged while others work, 
   expect(notice).not.toMatch(/@(asker|busy|done) stopped/)
   await clock.advance(62_000)
   expect(await told()).not.toContain('stopped without reporting')
+})
+
+// The tests below are named for the findings of the 2026-11-21 bug analysis they pin. They run on the test kit's
+// engine, not a live one.
+
+test('F3: the shared-checkout commit guard reads a commit however it is quoted, wrapped, nested or pointed elsewhere', async ($, on) => {
+  const state = {
+    title: 'Guard swarm',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 },
+      alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '0', last_read_seq: 1 },
+    },
+  }
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['alice'], text: '@alice BRIEF' }),
+    read: path => (path === '/project/.claude/worktrees/w/.git' ? 'gitdir: /project/.git/worktrees/w\n' : undefined),
+    roster: () => JSON.stringify(state),
+  })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({ value: [{ id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  // /link is another name for the checkout
+  on('fs.stat', (_, e) => {
+    if (e.path === '/link' || e.path === '/project') return { value: { realPath: '/project' } as never }
+    throw new Error('ENOENT')
+  })
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const bash = (command: string) => $.tool.call({ tool: 'Bash', command, agentId: 'alice-1' })
+  for (const command of [
+    // quoted and escaped words
+    '"git" commit -m x', '\\git commit -m x', 'git "commit" -m x', "'git' 'commit'", '/usr/bin/git commit',
+    // keywords and prefixes before the command
+    'if git commit -m wip; then true; fi', 'while git commit -m x; do :; done', 'until git commit -m x; do :; done',
+    'FOO=1 env git commit -m x', 'true; elif git commit; then :',
+    // a repository named some other way than by the folder
+    'cd /tmp/wt && git --git-dir /project/.git commit -m x', 'cd /tmp/wt && git --git-dir=/project/.git --work-tree=/project commit',
+    'cd /tmp/wt && GIT_DIR=/project/.git git commit -m x', 'GIT_WORK_TREE=/project git -C /tmp/wt commit',
+    // a folder that cannot be followed
+    'cd -P src && git commit', 'cd /tmp/wt && cd - && git commit -m x', 'pushd src && git commit', 'cd /tmp/wt; popd; git commit -m x',
+    // the checkout by another name
+    'cd /link && git commit -m x', 'git -C /link/src commit',
+    // commands inside substitutions, arithmetic and nested shells
+    'echo "$(git commit -m x)"', 'x=`git commit -m x`', 'echo $((1 + $(git commit -m x | wc -l)))', 'diff <(git commit -m x) /dev/null',
+    'echo "$(cd /tmp/wt; true)" && git commit -m "a; b"', 'bash -c "git commit -m x"', "sh -lc 'cd src && git commit'", 'eval "git commit -m x"',
+    // what used to throw the scanner off the next line
+    '(( 1 << 4 ))\ngit commit -m wip', "echo $'\\'' && git commit -m wip", "cat <<'EO'F\nbody\nEOF\ngit commit -m wip",
+  ]) {
+    expect((await bash(command)).deny, command).toContain('Shared-checkout writers')
+  }
+  for (const command of [
+    'cd -P /tmp/wt && git commit -m x', 'pushd /tmp/wt && git commit', 'echo "$(cd /tmp/wt && git commit -m x)"',
+    'bash -c "cd /tmp/wt && git commit -m x"', 'git log --grep commit', 'echo git commit', 'echo "git commit"',
+    "echo '$(git commit)'", "cat <<'EOF'\ngit commit -m x\nEOF", 'git -C /project/.claude/worktrees/w commit -m x',
+    '(( 1 << 4 ))\ngit status',
+  ]) {
+    expect((await bash(command)).deny, command).toBeUndefined()
+  }
+})
+
+test('F4, F25, F28: an isolated member is guarded in its worktree wherever the coordinator runs, and only in its own', async ($, on) => {
+  const state = {
+    title: 'Guard swarm',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 },
+      alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '0', last_read_seq: 1 },
+      bob: { role: 'worker', id: 'bob-1', paths: 'src/bob', isolated: '1', last_read_seq: 1 },
+      carol: { role: 'worker', id: 'carol-1', paths: 'src/carol', isolated: '1', last_read_seq: 1 },
+      ver: { role: 'verifier', id: 'ver-1', last_read_seq: 1 },
+      exp: { role: 'worker', id: 'exp-1', profile: 'explorer', writes: '0', last_read_seq: 1 },
+    },
+  }
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['alice'], text: '@alice BRIEF' }),
+    // the coordinator's own conversation runs in a worktree of the main checkout
+    read: path => (path === '/project/.git' ? 'gitdir: /main/.git/worktrees/coordinator\n' : undefined),
+    roster: () => JSON.stringify(state),
+  })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({
+    value: ['alice', 'bob', 'carol', 'ver', 'exp'].map(n => ({ id: `${n}-1`, description: `@${n}`, type: n === 'ver' ? 'swarm:verifier' : n === 'exp' ? 'swarm:explorer' : 'swarm:worker', status: 'running' })) as never,
+  }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const edit = async (file_path: string, agentId: string) => (await $.tool.call({ tool: 'Edit', file_path, old_string: 'a', new_string: 'b', agentId })).deny
+  const own = '/main/.claude/worktrees/agent-bob-1'
+  // F4: beside the coordinator's worktree, under the main checkout, the roster's rules still hold
+  expect(await edit(`${own}/src/bob/b.ts`, 'bob-1')).toBeUndefined()
+  expect(await edit(`${own}/src/alice/a.ts`, 'bob-1')).toContain('claimed by @alice')
+  expect(await edit(`${own}/README.md`, 'bob-1')).toContain('claimed paths')
+  expect(await edit(`${own}/src/bob/b.ts`, 'ver-1')).toContain('read-only')
+  // the main checkout itself, and any other folder, is no member's worktree
+  expect(await edit('/main/src/bob/b.ts', 'bob-1')).toBeUndefined()
+  expect(await edit('/elsewhere/.claude/worktrees/agent-bob-1/README.md', 'bob-1')).toBeUndefined()
+  // F28: a worker has the board command, a specialist the board tool
+  expect(await edit(`${own}/.swarm/x`, 'bob-1')).toBe('Direct edits inside .swarm/ are not allowed. Read and post with the board command (board.py) in Bash.')
+  expect(await edit('/project/.swarm/x', 'exp-1')).toBe('Direct edits inside .swarm/ are not allowed. Use the board tool to read or post.')
+  // F25: a worktree is edited by its own member only
+  expect(await edit('/project/.claude/worktrees/bob/src/alice/a.ts', 'alice-1')).toContain("cannot edit inside another member's worktree")
+  expect(await edit('/main/.claude/worktrees/agent-carol-1/src/bob/b.ts', 'bob-1')).toContain("cannot edit inside @carol's worktree")
+  expect(await edit('/main/.claude/worktrees/agent-carol-1/src/carol/c.ts', 'carol-1')).toBeUndefined()
+})
+
+test('F25: a pause typed for a run this conversation does not own halts nobody here', async ($, on) => {
+  const other = '/project/.swarm/other-20261116-101010'
+  const { answer, board } = owning(on, {
+    board: () => '',
+    roster: () => JSON.stringify({ title: 'Other', paused: 'by its own coordinator', members: { coordinator: { role: 'coordinator', last_read_seq: 0 }, zed: { role: 'worker', id: 'zed-1', last_read_seq: 0 } } }),
+  })
+  on('process.run', (_, e) => answer(e.argv[3] === 'agent-run' ? other : board(e)))
+  on('agent.list', () => ({ value: [{ id: 'zed-1', description: '@zed', type: 'swarm:worker', status: 'running' }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${other}" pause` })
+  expect((await $.tool.call({ tool: 'Read', file_path: '/project/a.ts', agentId: 'zed-1' } as never)).deny).toBeUndefined()
+})
+
+test('F5: Show earlier in a member conversation still works after a poll', async ($, on) => {
+  const { answer, board } = owning(on, { board: () => BOARD, roster: () => ROSTER })
+  on('process.run', (_, e) => answer(board(e)))
+  on('tool.call', () => ({ result: {} }))
+  on('agent.list', () => ({ value: [{ id: 'a1', description: '@parser', type: 'swarm:worker', status: 'running' }] as never }))
+  on('ui.view', () => ({ value: { deny: 'no main view here' } }))
+  const said = Array.from({ length: 30 }, (_, i) => ({ role: 'assistant', text: `step ${i} ${'word '.repeat(60)}`, toolUses: [] }))
+  on('session.messages', () => ({ value: said as never }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-members' })
+  await ui.press({ key: 'view-parser' })
+  // two polls read the same rows again: what is drawn is still what is open
+  await clock.advance(4000)
+  const before = (await ui.findAll({ type: 'Markdown' })).length
+  expect(before).toBeLessThan(30)
+  await ui.press({ key: 'talk-earlier' })
+  expect((await ui.findAll({ type: 'Markdown' })).length).toBe(before + 6)
+  await clock.advance(2000)
+  await ui.press({ key: 'talk-earlier' })
+  expect((await ui.findAll({ type: 'Markdown' })).length).toBe(before + 12)
+  await ui.unmount()
+})
+
+test('F6: a run folder that is deleted takes its pause and its retired members with it', async ($, on) => {
+  let isGone = false
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['parser'], text: '@parser BRIEF' }),
+    roster: () => {
+      if (isGone) throw new Error('ENOENT')
+      return JSON.stringify({ title: 'Doomed', paused: 'awaiting the user', members: {
+        coordinator: { role: 'coordinator', last_read_seq: 1 },
+        parser: { role: 'worker', id: 'a1', last_read_seq: 1 },
+        old: { role: 'worker', id: 'a0', killed: '1', last_read_seq: 1 },
+      } })
+    },
+  })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({ value: [
+    { id: 'a1', description: '@parser', type: 'swarm:worker', status: 'running' },
+    { id: 'a0', description: '@old', type: 'swarm:worker', status: 'running' },
+  ] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const read = async (agentId: string) => (await $.tool.call({ tool: 'Read', file_path: '/project/a.ts', agentId } as never)).deny
+  expect(await read('a1')).toContain('paused (awaiting the user)')
+  expect(await read('a0')).toContain('has been retired')
+  isGone = true
+  await clock.advance(2000)
+  expect(await read('a1')).toBeUndefined()
+  expect(await read('a0')).toBeUndefined()
+})
+
+test('F24: the Board filter finds @all and group posts, and a kind is a whole word', async ($, on) => {
+  const roster = JSON.stringify({ title: 'Demo swarm', members: {
+    coordinator: { role: 'coordinator', last_read_seq: 9 },
+    parser: { role: 'worker', id: 'a1', group: 'backend', last_read_seq: 9 },
+    lexer: { role: 'worker', id: 'a2', group: 'backend', last_read_seq: 9 },
+    verifier: { role: 'verifier', id: 'a3', last_read_seq: 9 },
+  } })
+  const lines = posts(
+    { agent: 'coordinator', to: ['parser', 'lexer', 'verifier'], text: '@all stand by for the plan' },
+    { agent: 'coordinator', to: ['parser', 'lexer'], text: '@backend the schema changed' },
+    { agent: 'verifier', to: ['parser'], text: '@parser NOT PASSED: an extra line fails' },
+    { agent: 'parser', to: ['coordinator'], text: '@coordinator a note that says `@all` in code' },
+    { agent: 'lexer', to: ['lexer'], text: 'a note to self' },
+  )
+  const { answer, board } = owning(on, { board: () => lines, roster: () => roster })
+  on('process.run', (_, e) => answer(board(e)))
+  on('tool.call', () => ({ result: {} }))
+  // the coordinator and @parser stand by while @lexer works
+  on('agent.list', () => ({ value: [
+    { id: 'a1', description: '@parser', type: 'swarm:worker', status: 'completed' },
+    { id: 'a2', description: '@lexer', type: 'swarm:worker', status: 'running' },
+    { id: 'a3', description: '@verifier', type: 'swarm:verifier', status: 'running' },
+  ] as never }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' })
+  await clock.advance(2000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  for (const [filter, matches] of [['@all', 1], ['to:@all', 1], ['to:all', 1], ['@backend', 1], ['to:backend', 1], ['to:parser', 3], ['not passed', 1], ['not passedx', 0], ['kind:not-passed extra', 1]] as const) {
+    await ui.input({ key: 'board-search', text: filter })
+    expect(await ui.find({ type: 'Button', text: `Clear filter (${matches} of 5)` }), filter).toBeDefined()
+  }
+  await ui.unmount()
+  // the terminal's list of the graph: an idle coordinator is never hidden, and nobody addresses itself
+  const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await term.press({ key: 'tab-graph' })
+  expect(await term.find({ type: 'Text', text: /@lexer → @lexer/ })).toBeUndefined()
+  expect(await term.find({ type: 'Text', text: /@coordinator → @all/ })).toBeDefined()
+  await term.press({ key: 'hide-inactive' })
+  expect(await term.find({ type: 'Text', text: /@coordinator → @all/ })).toBeDefined()
+  expect(await term.find({ type: 'Text', text: /@verifier → @parser/ })).toBeUndefined()
+  await term.unmount()
+})
+
+test('a run made inside a command substitution takes the place of the closed run this conversation drove', async ($, on) => {
+  let isClosed = false
+  const { seen, answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: [], text: 'done' }),
+    read: path => (path === '/project/.swarm/current' ? 'next-20261117-101010\n' : undefined),
+    roster: () => JSON.stringify({ title: 'Demo swarm', closed: isClosed, members: { coordinator: { role: 'coordinator', last_read_seq: 1 } } }),
+  })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({ value: [] }))
+  on('tool.call', () => ({ result: { stdout: '', stderr: '' } }))
+  mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  expect(seen.restore).toBe(OWNED)
+  // text that only mentions an init, in a quoted string or a heredoc, makes no run
+  const noted = await $.tool.call({ tool: 'Bash', command: `cat <<'EOF'\nR=$(python3 /p/board.py /project/.swarm/next init "Next")\nEOF\necho 'board.py x init y'` })
+  expect(noted.context ?? []).toEqual([])
+  // while the owned run is open, a run made in a substitution does not take the conversation from it
+  await $.tool.call({ tool: 'Bash', command: 'R=$(python3 /p/board.py /project/.swarm/next init "Next")' })
+  expect(seen.restore).toBe(OWNED)
+  isClosed = true
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" close` })
+  // however the script is run inside the substitution
+  const made = await $.tool.call({ tool: 'Bash', command: 'R=$(uv run /p/board.py /project/.swarm/next init "Next")' })
+  expect(seen.restore).toBe('/project/.swarm/next-20261117-101010')
+  expect(made.context?.join(' ')).toContain('skills/swarm/SKILL.md')
 })

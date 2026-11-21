@@ -1,9 +1,7 @@
 import { statusCss, statusKey } from './palette'
-import { head as clipHead } from './text'
+import { head as clipHead, unquoted as stripCode } from './text'
 import type { Post, Swarm } from '../types'
 
-const stripCode = (text: string) =>
-  text.replace(/```[\s\S]*?```|(`+)[^\n]*?\1|\w+:\/\/\S+/g, ' ')
 const BROADCAST = /(?<![\w.@/])@all[-_]*(?![\w-])/i
 const named = (text: string, name: string) =>
   new RegExp(`(?<![\\w.@/])@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[-_]*(?![\\w-])`, 'i').test(stripCode(text))
@@ -21,8 +19,9 @@ export function edgesOf(posts: Post[]): Record<string, number> {
   const counts: Record<string, number> = {}
   const add = (key: string) => { counts[key] = (counts[key] ?? 0) + 1 }
   for (const post of posts) {
+    // An @all that reached nobody (a team of one, or all retired) is still an @all post, not one with no mention.
     if (isBroadcast(post)) add(`${post.agent}>@all`)
-    if (post.to.length === 0) add(`${post.agent}>@none`)
+    else if (post.to.length === 0) add(`${post.agent}>@none`)
     for (const to of post.to) add(viaAll(post, to) ? `${post.agent}>${to}>all` : `${post.agent}>${to}`)
   }
   return counts
@@ -196,7 +195,7 @@ export function graphSvg(
   elapsed = 0,
   expandAll = false,
 ): string {
-  const phase = elapsed % 3600
+  const phase = Number.isFinite(elapsed) && elapsed > 0 ? Math.floor(elapsed) % 3600 : 0
   const current = swarm.posts.find(post => post.seq === upTo)
   const earlier = Object.entries(swarm.earlierEdges ?? {})
   const members = visibleMembers(swarm, upTo, hidden, live)
@@ -217,7 +216,7 @@ export function graphSvg(
   for (const post of swarm.posts) {
     if (post.seq > upTo) break
     if (isBroadcast(post)) bump(broadcasts, post.agent)
-    if (post.to.length === 0) bump(unaddressed, post.agent)
+    else if (post.to.length === 0) bump(unaddressed, post.agent)
     for (const to of post.to) bump(viaAll(post, to) ? broadcastTo : direct, `${post.agent}>${to}`)
   }
 

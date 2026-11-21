@@ -1,12 +1,18 @@
 import { boardCalls } from './command'
 
 export type Mood = 'sleep' | 'forage' | 'inspect' | 'build' | 'verify' | 'relay'
+// The board's subcommands: a word after `board.py <folder>` that is none of these names a file, not a board call.
+const BOARD_ACTIONS = new Set(['init', 'member', 'limit', 'plan', 'attention', 'retry', 'replace', 'post', 'read', 'show', 'ready', 'confirm',
+  'revise', 'wake', 'claim', 'woke', 'rearm', 'pause', 'resume', 'bind', 'restore', 'adopt', 'locate', 'agent-run', 'started', 'close',
+  'account', 'status', 'prune', 'tail'])
 export function toolMood(tool: string, command = ''): Mood {
   // The board first, by its subcommand: a post that mentions tests or reading is still a post.
-  const board = tool === 'Bash' ? boardCalls(command)[0]?.action ?? /\bboard\.py\S*\s+\S+\s+([a-z-]+)/.exec(command)?.[1] : undefined
+  const loose = tool === 'Bash' ? /\bboard\.py\S*\s+\S+\s+([a-z-]+)/.exec(command)?.[1] : undefined
+  const board = tool === 'Bash' ? boardCalls(command)[0]?.action ?? (loose && BOARD_ACTIONS.has(loose) ? loose : undefined) : undefined
   if (board) return ['read', 'show', 'status', 'plan', 'attention', 'wake', 'tail'].includes(board) ? 'inspect' : 'relay'
-  if (tool === 'Bash' && /\bverify\.py\b|\b(test|pytest|vitest|jest|unittest|check|verify)\b/.test(command)) return 'verify'
+  // A command that only looks is a lookup whatever its arguments are called: `cat test.py` runs no test.
   if (tool === 'Bash' && /^(?:git (?:diff|log|show|status)|cat|rg|ls|find|grep)\b/.test(command.trim())) return 'inspect'
+  if (tool === 'Bash' && /\bverify\.py\b|\b(test|pytest|vitest|jest|unittest|check|verify)\b/.test(command)) return 'verify'
   if (['Read','Grep','Glob','LSP','WebSearch','WebFetch'].includes(tool)) return 'inspect'
   if (['Write','Edit','MultiEdit','NotebookEdit','Bash'].includes(tool)) return 'build'
   if (['Agent','SendMessage','mcp__swarm__board'].includes(tool)) return 'relay'
@@ -46,7 +52,11 @@ const scenes: Record<Mood, [string, [number, number], [number, number]]> = {
   relay: ['M0 0h7v5H0z', [3, -2], [-4, 2]],
   forage: ['M4 3h2v2H4zM2 5h2v2H2z', [3, -3], [-2, 2]],
 }
-export function hiveArt(mood: Mood, elapsed = 0): string {
+export function hiveArt(shown: Mood, elapsed = 0): string {
+  // The mood comes from stored state and the time from a clock: one this version does not know, or a time that is
+  // no count of milliseconds, must not break the drawing.
+  const mood: Mood = Object.hasOwn(scenes, shown) ? shown : 'sleep'
+  elapsed = Number.isFinite(elapsed) && elapsed > 0 ? Math.floor(elapsed) : 0
   const [prop, left, right] = scenes[mood]
   const sleeping = mood === 'sleep'
   const gesture = {

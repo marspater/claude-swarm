@@ -300,12 +300,14 @@ def is_run_data(name, run_data):
     return name.rstrip(b"/").split(b"/")[:len(run_data)] == run_data
 
 
-def pending_changes(project):
-    """Paths git reports as changed or untracked, other than Swarm's own run data."""
+def pending_changes(project, run_data=None):
+    """Paths git reports as changed or untracked, other than Swarm's own run data: the project's .swarm folder, or
+    RUN_DATA for a checkout whose top folder is not the run's project."""
     found = repository(project)
     if found is None:
         raise ValueError("not a git repository")
-    top, run_data = found
+    top, own = found
+    run_data = run_data or own
     worktrees = linked_worktrees(top)
     entries = git(project, "status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=none").split(b"\0")
     pending, index = [], 0
@@ -384,7 +386,17 @@ def prepare(run, project, mode, checks, onto=None):
                                          "or a signing key, configure it for this repository, then prepare again") from None
             commit = git(integration, "rev-parse", "HEAD").decode().strip()
             diff = git(integration, "diff", "--no-renames", "--ignore-submodules=none", "--raw", "-z", base, commit).split(b"\0")
+            _, run_data = repository(project)
             for meta, name in zip(diff[::2], diff[1::2]):
+                # The fingerprint leaves the project's .swarm folder out, so a commit that writes there would be
+                # merged into the board's own folder at acceptance without ever having been tested.
+                if is_run_data(name, run_data):
+                    raise ValueError("%s changes %s, which is Swarm's run data and no source. Its commit must leave the "
+                                     "project's .swarm folder alone" % (
+                                         ", ".join("@" + member for member, (_, revision) in recorded.items() if revision
+                                                   and git(integration, "diff", "--no-renames", "--name-only", "-z", base, revision,
+                                                           "--", os.fsdecode(name), optional=True)) or "a member's commit",
+                                         os.fsdecode(name)))
                 if b"160000" in meta.lstrip(b":").split()[:2]:
                     raise ValueError(f"cannot verify submodule update at {os.fsdecode(name)} in isolated mode; "
                                      "land submodule pointer changes by hand")
@@ -435,7 +447,9 @@ def run_check(command, cwd, timeout):
     try:
         process = subprocess.Popen(["/bin/sh", "-c", command], cwd=cwd, stdin=subprocess.DEVNULL,
                                    env=clean_env(), start_new_session=True)
-        return process.wait(timeout=timeout)
+        returncode = process.wait(timeout=timeout)
+        cleanup(process)  # what it left in the background ends with it too
+        return returncode
     except BaseException:
         if process is not None:
             cleanup(process)
@@ -448,10 +462,13 @@ def run_check(command, cwd, timeout):
 def descendant_groups(pid):
     """Process groups of everything below pid, found from one ps snapshot."""
     try:
-        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid="], capture_output=True, text=True).stdout
+        listed = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid="], capture_output=True, text=True)
     except OSError:
         return set()
-    rows = [tuple(map(int, line.split())) for line in out.splitlines() if len(line.split()) == 3]
+    if listed.returncode != 0:
+        return set()
+    rows = [tuple(map(int, fields)) for fields in map(str.split, listed.stdout.splitlines())
+            if len(fields) == 3 and all(field.isdigit() for field in fields)]
     below, grew = {pid}, True
     while grew:
         grew = False
@@ -459,7 +476,8 @@ def descendant_groups(pid):
             if parent in below and child not in below:
                 below.add(child)
                 grew = True
-    return {group for child, _, group in rows if child in below} - {os.getpgrp()}
+    # Group 0 is the caller's own to killpg, and group 1 is init's.
+    return {group for child, _, group in rows if child in below and group > 1} - {os.getpgrp()}
 
 
 def cleanup(process):
@@ -616,10 +634,10 @@ def accept(run, project, identifier):
                     raise ValueError("the checkout did not reach the verified commit")
                 if source_digest(project) != candidate["digest"]:
                     raise ValueError("the checkout reached the commit but its files differ from the tested candidate")
-            except (OSError, ValueError) as error:
+            except BaseException as error:  # an interrupt too
                 # A refused acceptance leaves the checkout where it found it; --keep never discards a local change.
                 if moved and git(project, "reset", "--keep", head, optional=True) is None:
-                    raise ValueError(f"{error}; the checkout could not be rolled back safely") from error
+                    raise ValueError(f"{error or type(error).__name__}; the checkout could not be rolled back safely") from error
                 raise
         state, posts = load(run)
         state["accepted_seq"] = len(posts)  # the board counts failed verification cycles from here again
@@ -651,7 +669,7 @@ def main():
     args = parser.parse_args()
     project = args.project.resolve(strict=True)
     run = args.run.resolve(strict=True)
-    if run.parent != project / ".swarm" or not (run / "members.json").is_file():
+    if run.parent != (project / ".swarm").resolve() or not (run / "members.json").is_file():
         raise ValueError("expected an initialized Swarm run in the specified project")
     git_dir = git(project, "rev-parse", "--absolute-git-dir", optional=True)
     lock_directory = Path(os.fsdecode(git_dir.rstrip(b"\n"))) if git_dir else run.parent
@@ -659,8 +677,10 @@ def main():
         if args.action == "prepare":
             if any(not check.strip() for check in args.check or []):
                 raise ValueError("each verification check must be a nonempty command")
-            if args.base and args.mode != "isolated":
+            if args.base is not None and args.mode != "isolated":
                 raise ValueError("--base is for an isolated candidate; a shared one is the checkout as it stands")
+            if args.base is not None and not args.base.strip():
+                raise ValueError("--base takes a ref, such as a branch name or a commit")
             prepare(run, project, args.mode, None if args.no_checks else args.check, args.base)
         elif args.action == "test":
             test_candidate(run, project, args.candidate, args.verifier, args.timeout)

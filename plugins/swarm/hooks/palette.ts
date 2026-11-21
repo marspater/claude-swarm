@@ -14,7 +14,7 @@ const darkColors: Record<keyof typeof colors, readonly [string, string]> = {
   inactive: ['#9ea2a9', 'color(display-p3 .6224 .6348 .6601)'],
 }
 export function statusKey(status: string): keyof typeof colors {
-  if (status === 'unreachable') return 'failed'
+  if (status === 'unreachable' || status === 'stopped') return 'failed'
   if (status === 'working' || status === 'waiting' || status === 'coordinating' || status === 'failed') return status
   return 'inactive'
 }

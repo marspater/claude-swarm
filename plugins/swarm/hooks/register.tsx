@@ -3,10 +3,10 @@ import { atom, read, update } from 'claude-code'
 import type { AgentInfo, EngineInterface, ModelUsage, Register, SessionMessage, Timer } from 'claude-code'
 
 import type { Member, Post, Swarm, Tab } from '../types'
-import { COORDINATOR_READ, RUN, boardCalls, runsNamed, scanShell, type Statement, wakeMessage, wakeSequence } from './command'
+import { COORDINATOR_READ, RUN, boardCalls, runsNamed, scanShell, shellWords, type Statement, substitutions, unwrap, wakeMessage, wakeSequence } from './command'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, LATEST, SPECIALISTS, SWARM_AGENTS, familyOf, latestOf } from './models'
-import { KEPT, budgetOf, findAgent, memberNamed, parse, parsePosts, targets, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
-import { CLIP, bodyOf, clean, clip, compact, head, kindOf, openedText, stripKind } from './text'
+import { KEPT, budgetOf, findAgent, memberNamed, mentions, parse, parsePosts, targets, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
+import { CLIP, bodyOf, chipped, clean, clip, compact, fenceAfter, head, kindOf, openedText, unquoted, type Fence } from './text'
 import { statusInk, statusDot } from './palette'
 import { hiveArt, toolMood, toolSummary, type Mood } from './hive'
 import { edgesOf, graphHeight, graphSvg, isBroadcast, pairOf, visibleMembers } from './graph'
@@ -22,25 +22,13 @@ const postTime = (post: Post) => post.time.length >= 16 ? post.time.slice(11, 16
 // Adds Markdown hard-break trailing spaces only outside fenced code blocks, on non-blank lines, and not on GFM table rows.
 function formatMarkdown(text: string): string {
   const lines = text.split('\n')
-  let fence: '`' | '~' | null = null
-  let fenceLen = 0
+  let fence: Fence = null
   return lines.map((line, idx) => {
-    const trimmed = line.trimStart()
-    const m = /^(`{3,}|~{3,})/.exec(trimmed)
-    if (m) {
-      const ch = m[1]![0] as '`' | '~'
-      const len = m[1]!.length
-      if (fence === null) {
-        fence = ch
-        fenceLen = len
-      } else if (fence === ch && len >= fenceLen && trimmed.slice(len).trim() === '') {
-        fence = null
-        fenceLen = 0
-      }
-      return line
-    }
-    if (fence !== null || idx === lines.length - 1) return line
-    if (line.trim() === '' || trimmed.startsWith('|')) return line
+    const before = fence
+    fence = fenceAfter(fence, line)
+    // A fence's own lines and what lies between them stay as they are.
+    if (before !== null || fence !== null || idx === lines.length - 1) return line
+    if (line.trim() === '' || line.trimStart().startsWith('|')) return line
     return line.endsWith('  ') ? line : `${line}  `
   }).join('\n')
 }
@@ -145,7 +133,8 @@ function scheduleLiveFrame($: EngineInterface): void {
       await update($, livePulse, () => next.seq)
       if (livePlayer === timer) scheduleLiveFrame($)
     } catch {
-      // Ignore transient read/update failures during teardown.
+      // A read or update that failed ends this animation, in a teardown or not: the next post starts another.
+      if (livePlayer === timer) livePlayer = undefined
     }
   }
 }
@@ -172,7 +161,11 @@ function scheduleFrame($: EngineInterface): void {
       await update($, replay, () => next.seq)
       if (player === timer) scheduleFrame($)
     } catch {
-      // Ignore transient read/update failures during teardown.
+      // A replay that cannot go on is stopped, so Play starts it again instead of pausing nothing.
+      if (player === timer) {
+        player = undefined
+        void update($, isPlaying, () => false).catch(() => undefined)
+      }
     }
   }
 }
@@ -313,9 +306,10 @@ const spawnEfforts = new Map<string, string | undefined>()
 const spawnIsolations = new Map<string, string | undefined>()
 const sharedAgents = new Set<string>()
 const isolatedAgents = new Set<string>()
-const QUOTED_TEXT = /```[\s\S]*?```|(`+)[^\n]*?\1|\w+:\/\/\S+?(?=[.,;:!)]*(?:\?(?=\s|$))?(?:\s|$))/g
-const QUESTION_MARK = /(?<!\?)\?(?!\?|\.?\w|:|[ \t]+[^\n?]*[ \t]+:)/
-const hasQuestion = (text: string) => QUESTION_MARK.test(text.replace(QUOTED_TEXT, ' '))
+// The board's QUESTION: a question mark that asks, in a run of them too ("sure??"), and none of `a ?? b`, `a?.b`,
+// `name?: type` or `c ? a : b`.
+const QUESTION_MARK = /(?<![ \t]\?)(?:(?<![ \t])\?|\?(?![ \t]+[^\n?]*[ \t]+:))(?!\?|\.?\w|:)/
+const hasQuestion = (text: string) => QUESTION_MARK.test(unquoted(text))
 const WATCHER_BG_RE = /\b(sleep|watch|tail\s+-f|while|until|pgrep|lsof)\b|\bboard\.py\b|\bverify\.py\b|\.swarm\b|\.lock\b/
 
 function parsePaths(raw?: string): string[] {
@@ -471,7 +465,7 @@ async function refreshTalk($: EngineInterface): Promise<void> {
     if (!talk || talk.dir !== open.dir || talk.agentId !== open.agentId || talk.name !== open.name) return
     const next = Array.isArray(messages) ? talkRows(messages) : talk
     const changed = next.key !== talk.key
-    talk = { ...talk, ...next, isOver }
+    if (changed || talk.isOver !== isOver) talk = { ...talk, ...next, isOver }
     if (changed) $.ui.invalidate('ui.render')
   } catch {
     // The next poll reads it again.
@@ -556,7 +550,7 @@ async function reportOf($: EngineInterface, dir: string): Promise<Report | undef
     const report = JSON.parse(answer.stdout) as Report
     if (answer.exitCode !== 0 || !Array.isArray(report.items) || !report.members) return undefined
 
-    return { ...report, items: report.items.map(item => ({ ...item, text: clean(String(item.text ?? '')) })) }
+    return { ...report, items: report.items.map(item => ({ ...item, kind: clean(String(item.kind ?? '')), member: clean(String(item.member ?? '')), text: clean(String(item.text ?? '')) })) }
   } catch {
     return undefined // no python, or an older board: the pane still draws what it can
   }
@@ -762,20 +756,24 @@ async function adopt($: EngineInterface, name: string | undefined, prompt = ''):
   }
 }
 
-async function commitsInSharedCheckout($: EngineInterface, command: string, cwd: string): Promise<boolean> {
-  const directoryAfter = (current: string | undefined, arg?: string) => {
-    if (arg === undefined) return undefined
-    const path = arg.replace(/^(['"])(.*)\1$/, '$2')
+// What may stand before a command and leaves it the same command, with its own flags.
+const PREFIXES = new Set(['time', 'command', 'exec', 'nohup', 'env'])
+async function commitsInSharedCheckout($: EngineInterface, command: string, checkout: string): Promise<boolean> {
+  // Compared as the file system names them: the run folder and a `cd` may spell one checkout two ways.
+  const cwd = await resolveRealPath($, checkout)
+  const directoryAfter = (current: string | undefined, path?: string) => {
+    if (path === undefined) return undefined
     if (!path || path === '.' || path === './') return current
     if (path.startsWith('/')) return normalizePath(path)
     return current && normalizePath(`${current}/${path}`)
   }
-  // Shell wrappers that may precede the real command: `(`, `{`, `!`, keywords, and env/time-style prefixes.
-  const WRAPPER = /^(?:[({!]|(?:then|do|else|time|command|exec|nohup|env)(?=\s|$)(?:\s+(?:-u\s+\S+|-\S+))*)\s*/
   // A folder under .claude/worktrees counts as an isolated worktree only when git made it one: a plain
   // folder there resolves to the main repository, so a commit from it lands in the shared checkout.
-  const insideCheckout = async (dir: string | undefined) => {
-    if (dir === undefined || (dir !== cwd && !dir.startsWith(`${cwd}/`))) return false
+  // A folder that cannot be told (`cd -`, `popd`) may be the checkout, so a commit from it is refused.
+  const insideCheckout = async (given: string | undefined) => {
+    if (given === undefined) return true
+    const dir = await resolveRealPath($, given)
+    if (dir !== cwd && !dir.startsWith(`${cwd}/`)) return false
     const name = /^\/\.claude\/worktrees\/([^/]+)/.exec(dir.slice(cwd.length))?.[1]
     if (name === undefined) return true
     const link = await $.fs.read(`${cwd}/.claude/worktrees/${name}/.git`).catch(() => '')
@@ -784,76 +782,100 @@ async function commitsInSharedCheckout($: EngineInterface, command: string, cwd:
   // Where the shell may be after the last statement succeeded (ok) or failed: `cd x || git commit` commits
   // exactly when the cd failed. A subshell, a pipeline stage or a background list keeps its cd to itself.
   type Dirs = Set<string | undefined>
-  let ok: Dirs = new Set([cwd])
-  let failed: Dirs = new Set()
-  let op: Statement['next'] = ';'
-  let listStart = ok
-  let pipeStart = ok
-  // A pipeline skipped by `&&` passes the failure on to a later `||`, and one skipped by `||` the success to `&&`.
-  let carryOk: Dirs = new Set()
-  let carryFailed: Dirs = new Set()
-  const subshells: Dirs[] = []
-  for (const { text, next } of scanShell(command)) {
-    const here: Dirs = op === '&&' ? ok : op === '||' ? failed : op === '|' ? pipeStart : new Set([...ok, ...failed])
-    if (op === ';') listStart = here
-    if (op !== '|') {
-      pipeStart = here
-      carryOk = op === '||' ? ok : new Set()
-      carryFailed = op === '&&' ? failed : new Set()
-    }
-    const bare = text.replace(/"[^"]*"|'[^']*'/g, '')
-    for (const _ of bare.matchAll(/\(/g)) subshells.push(here)
-    let segment = text.trim().replace(/[)}\s]+$/, '')
-    let negated = false
-    for (let prev = ''; prev !== segment;) {
-      prev = segment
-      if (segment.startsWith('!')) negated = !negated
-      segment = segment.replace(WRAPPER, '')
-    }
-    let okNext = here
-    let failedNext = here
-    const cd = /^cd\s+(?:--\s+)?("[^"]*"|'[^']*'|\S+)$/.exec(segment)
-    const gitMatch = /^(?:[A-Za-z_]\w*=(?:"[^"\n]*"|'[^'\n]*'|[^\s"'<>;]*)\s+)*(?:\S*\/)?git\b([\s\S]*)$/.exec(segment)
-    if (cd) {
-      okNext = new Set([...here].map(dir => directoryAfter(dir, cd[1])))
-    } else if (/^(?:exit|return)(?=\s|$)/.test(segment)) {
-      okNext = failedNext = new Set()
-    } else if (gitMatch) {
-      const tokens = gitMatch[1]?.match(/"[^"]*"|'[^']*'|\S+/g) ?? []
-      for (const dir of here) {
-        let gitDir = dir
-        for (let i = 0; i < tokens.length; i++) {
-          const tok = tokens[i]!
-          if (tok.startsWith('-C')) {
-            gitDir = directoryAfter(gitDir, tok === '-C' ? tokens[++i] : tok.slice(2))
-          } else if (['-c', '--git-dir', '--work-tree', '--namespace', '--super-prefix', '--config-env'].includes(tok)) {
-            i++
-          } else if (!tok.startsWith('-')) {
-            if (tok === 'commit' && await insideCheckout(gitDir)) return true
-            break
+  const commits = async (script: string, from: Dirs): Promise<boolean> => {
+    let ok: Dirs = from
+    let failed: Dirs = new Set()
+    let op: Statement['next'] = ';'
+    let listStart = ok
+    let pipeStart = ok
+    // A pipeline skipped by `&&` passes the failure on to a later `||`, and one skipped by `||` the success to `&&`.
+    let carryOk: Dirs = new Set()
+    let carryFailed: Dirs = new Set()
+    const subshells: Dirs[] = []
+    for (const { text, plain = text, inner = [], next } of scanShell(script)) {
+      const here: Dirs = op === '&&' ? ok : op === '||' ? failed : op === '|' ? pipeStart : new Set([...ok, ...failed])
+      if (op === ';') listStart = here
+      if (op !== '|') {
+        pipeStart = here
+        carryOk = op === '||' ? ok : new Set()
+        carryFailed = op === '&&' ? failed : new Set()
+      }
+      // What a substitution runs, it runs from here, and keeps its own cd to itself.
+      for (const body of inner) if (await commits(body, here)) return true
+      const bare = plain.replace(/"[^"]*"|'[^']*'/g, '')
+      for (const _ of bare.matchAll(/\(/g)) subshells.push(here)
+      const { text: segment, negated } = unwrap(plain.replace(/[)}\s]+$/, ''))
+      // Read as the shell runs it: `"git" commit`, `\git commit` and `git "commit"` are all a commit.
+      const words = shellWords(segment)
+      // A repository named by --git-dir, --work-tree or their variables cannot be told from the folder: refused.
+      let isElsewhere = false
+      let at = 0
+      for (let word = words[at]; word !== undefined; word = words[at]) {
+        if (/^[A-Za-z_]\w*=/.test(word)) {
+          if (/^GIT_(?:DIR|WORK_TREE)=/.test(word)) isElsewhere = true
+          at++
+        } else if (PREFIXES.has(word)) {
+          at++
+          while (words[at]?.startsWith('-')) at += words[at] === '-u' ? 2 : 1
+        } else break
+      }
+      const name = words[at]?.replace(/^.*\//, '')
+      const args = words.slice(at + 1)
+      let okNext = here
+      let failedNext = here
+      if (name === 'cd' || name === 'pushd' || name === 'popd') {
+        // `cd -`, `cd` alone and `popd` go somewhere this cannot follow.
+        const to = name === 'popd' ? undefined : args.find(arg => arg !== '--' && !/^-[LPe@]+$/.test(arg))
+        okNext = new Set([...here].map(dir => to === undefined || to === '-' ? undefined : directoryAfter(dir, to)))
+      } else if (name === 'exit' || name === 'return') {
+        okNext = failedNext = new Set()
+      } else if (name === 'git') {
+        for (const dir of here) {
+          let gitDir = dir
+          let isMoved = isElsewhere
+          for (let i = 0; i < args.length; i++) {
+            const tok = args[i]!
+            if (tok.startsWith('-C')) {
+              gitDir = directoryAfter(gitDir, tok === '-C' ? args[++i] : tok.slice(2))
+            } else if (/^--(?:git-dir|work-tree)(?:=|$)/.test(tok)) {
+              isMoved = true
+              if (!tok.includes('=')) i++
+            } else if (['-c', '--namespace', '--super-prefix', '--config-env'].includes(tok)) {
+              i++
+            } else if (!tok.startsWith('-')) {
+              if (tok === 'commit' && (isMoved || await insideCheckout(gitDir))) return true
+              break
+            }
           }
         }
+      } else if (name !== undefined && /^(?:ba|da|k|z)?sh$/.test(name)) {
+        // `sh -c '…'` runs its argument as a script of its own.
+        const flag = args.findIndex(arg => /^-[a-z]*c$/.test(arg))
+        if (flag >= 0 && args[flag + 1] !== undefined && await commits(args[flag + 1]!, here)) return true
+      } else if (name === 'eval') {
+        if (await commits(args.join(' '), here)) return true
       }
+      if (negated) [okNext, failedNext] = [failedNext, okNext]
+      if (op === '|' || next === '|') okNext = failedNext = here
+      for (const _ of bare.matchAll(/\)/g)) {
+        const outer = subshells.pop()
+        if (outer) okNext = failedNext = outer
+      }
+      if (next !== '|') {
+        okNext = new Set([...okNext, ...carryOk])
+        failedNext = new Set([...failedNext, ...carryFailed])
+      }
+      if (next === '&') {
+        okNext = listStart
+        failedNext = new Set()
+      }
+      ok = okNext
+      failed = failedNext
+      op = next === '&' ? ';' : next
     }
-    if (negated) [okNext, failedNext] = [failedNext, okNext]
-    if (op === '|' || next === '|') okNext = failedNext = here
-    for (const _ of bare.matchAll(/\)/g)) {
-      const outer = subshells.pop()
-      if (outer) okNext = failedNext = outer
-    }
-    if (next !== '|') {
-      okNext = new Set([...okNext, ...carryOk])
-      failedNext = new Set([...failedNext, ...carryFailed])
-    }
-    if (next === '&') {
-      okNext = listStart
-      failedNext = new Set()
-    }
-    ok = okNext
-    failed = failedNext
-    op = next === '&' ? ';' : next
+    return false
   }
-  return false
+  return commits(command, new Set([cwd]))
 }
 
 // What the coordinator is told when it makes a run. A run can be started from memory, with no /swarm:swarm in the
@@ -933,7 +955,7 @@ async function agentRun($: EngineInterface, id: string, agent?: AgentInfo): Prom
 async function viewAgent($: EngineInterface, member: Member | undefined): Promise<boolean> {
   if (member === undefined) return false
   if (member.role === 'coordinator') return !(await $.ui.view({}).catch(() => ({ deny: 'no main view' }))).deny
-  const agent = findAgent(await $.agent.list(), member.id)
+  const agent = findAgent(await $.agent.list().catch(() => []), member.id)
   if (agent && !(await $.ui.view({ agentId: agent.id }).catch(() => ({ deny: 'no main view' }))).deny) return true
   // No main view to move (the desktop app draws none) or no live agent: the pane shows what the session holds
   // of the conversation, which outlasts the agent. An ended teammate is read by its agent id, not its address.
@@ -1104,7 +1126,13 @@ async function refresh($: EngineInterface): Promise<void> {
     })
     if (rosterText === undefined) {
       if (epoch !== generation) return
-      if (owned) await update($, run, () => '')
+      if (owned) {
+        // The run is gone, and what was known of it goes with it: nobody is refused or reminded in its name.
+        resetMonitoring()
+        agentRuns.clear()
+        strangers.clear()
+        await update($, run, () => '')
+      }
       closeTalk($)
       if ((await read($, swarm)).dir) {
         await seek($, 0)
@@ -1161,7 +1189,9 @@ async function refresh($: EngineInterface): Promise<void> {
         const firstNew = next.posts.find(post => post.seq > lastPost)
         if (firstNew) {
           await update($, livePulse, () => firstNew.seq)
-          scheduleLiveFrame($)
+          // The session may have ended or the pane closed while the pulse was stored: no timer is started behind them.
+          if (epoch === generation && !isEnding && isPaneOpen && livePlayer === undefined) scheduleLiveFrame($)
+          else if (livePlayer === undefined) await update($, livePulse, () => 0)
         }
       }
       if (epoch !== generation || isEnding) return
@@ -1443,9 +1473,15 @@ async function browse($: EngineInterface, step: 1 | 0 | -1): Promise<void> {
       const roster = await $.fs.read(`${dir}/members.json`).catch(() => undefined)
       if (gen !== browseGen) return
       if (roster === undefined) continue
+      // A roster that cannot be read is no run to show either: one broken folder does not end the walk to the others.
+      let isClosed: boolean
+      try {
+        isClosed = (JSON.parse(roster) as { closed?: boolean } | null)?.closed === true
+      } catch {
+        continue
+      }
       const [board, report] = await Promise.all([readBoard($, dir).catch(() => ''), reportOf($, dir)])
       if (gen !== browseGen) return
-      const isClosed = (JSON.parse(roster) as { closed?: boolean }).closed === true
       const agents = isClosed ? [] : await $.agent.list().catch(() => [])
       if (gen !== browseGen) return
       browsed = { ...parse(dir, board, roster, agents, KEPT, report), mood: 'sleep', attentionUnavailable: !report }
@@ -1578,7 +1614,9 @@ async function specialistBoard($: EngineInterface, e: {
     return { result: `Earlier posts are left out: the history is longer than one page. Narrow it with a member filter, or open one post with seq.\n${body}` }
   }
   // The board cuts a post longer than the page and says how to see it whole, in shell words: a specialist has the tool.
-  return { result: result.stdout.replace(/\[cut to fit the page\. The whole post: show --post=(\d+)\]/g, '[cut to fit the page. The whole post: action "show" with seq $1]') }
+  return { result: result.stdout
+    .replace(/\[cut to fit the page\. The whole post: show --post=(\d+)\]/g, '[cut to fit the page. The whole post: action "show" with seq $1]')
+    .replace(/^(UNREAD: .*) Read them now: read \S+$/gm, '$1 Read them now: action "read"') }
 }
 
 // The band's button that opens the pane.
@@ -1746,6 +1784,12 @@ export const register: Register = on => {
             const memberDir = guarded ? activeDir : agentRuns.get(e.agentId) ?? await agentRun($, e.agentId, agent)
             if (memberDir === activeDir) {
               if (memberName && memberName !== 'coordinator' && member) {
+                const isIsolated = member.isolated === '1' || isolatedAgents.has(e.agentId)
+                const isShared = !isIsolated && (
+                  member.isolated === '0' ||
+                  sharedAgents.has(e.agentId) ||
+                  ownedRoster.members.coordinator?.backend === 'native'
+                )
                 if (e.tool === 'Edit' || e.tool === 'Write' || e.tool === 'NotebookEdit') {
                   const rawTarget = e.tool === 'NotebookEdit' ? String(e.notebook_path ?? '') : String(e.file_path ?? '')
                   const cwd = await $.session.cwd().catch(() => '')
@@ -1759,16 +1803,37 @@ export const register: Register = on => {
                       : realTarget.startsWith(`${realCwd}/`)
                         ? realTarget.slice(realCwd.length + 1)
                         : undefined
+                    if (rel === undefined) {
+                      // A coordinator in a worktree of its own has the members' worktrees beside its folder, under
+                      // the main checkout: they are guarded there as they are under this one.
+                      const link = await $.fs.read(`${normCwd}/.git`).catch(() => '')
+                      const main = /^gitdir:\s*(.+)\/\.git\/worktrees\/[^/]+$/.exec(link.trim())?.[1]
+                      const realMain = main ? await resolveRealPath($, normalizePath(main)) : undefined
+                      if (realMain && realTarget.startsWith(`${realMain}/.claude/worktrees/`)) rel = realTarget.slice(realMain.length + 1)
+                    }
                     // An isolated writer's paths= are relative to its own worktree, not to the shared checkout.
-                    const inWorktree = rel === undefined ? null : /^\.claude\/worktrees\/[^/]+\/(.*)$/.exec(rel)
-                    if (inWorktree) rel = inWorktree[1]!
+                    const inWorktree = rel === undefined ? null : /^\.claude\/worktrees\/([^/]+)\/(.*)$/.exec(rel)
+                    let foreign: string | undefined
+                    if (inWorktree) {
+                      // Its own only: not a worktree at all for a member of the shared checkout, and not the one
+                      // whose folder carries another member's agent id.
+                      const folder = /^agent-(.+)$/.exec(inWorktree[1]!)?.[1]
+                      const owner = folder === undefined ? undefined
+                        : Object.entries(ownedRoster.members).find(([name, other]) => name !== memberName && other.id === folder)?.[0]
+                      if (isShared || owner !== undefined) {
+                        foreign = `@${memberName} cannot edit inside ${owner ? `@${owner}'s` : "another member's"} worktree (.claude/worktrees/${inWorktree[1]}): ${isShared ? 'it works in the shared checkout' : 'an isolated member edits only its own'}.`
+                      }
+                      rel = inWorktree[2]!
+                    }
                     if (rel !== undefined) {
                       if (rel === '.swarm' || rel.startsWith('.swarm/')) {
-                        return { deny: 'Direct edits inside .swarm/ are not allowed. Use the board tool to read or post.' }
+                        // A specialist has the board tool; a worker, a designer and a verifier have the board command.
+                        return { deny: `Direct edits inside .swarm/ are not allowed. ${SPECIALISTS.includes(member.profile ?? '') ? 'Use the board tool to read or post.' : 'Read and post with the board command (board.py) in Bash.'}` }
                       }
                       if (member.role === 'verifier' || member.writes === '0') {
                         return { deny: `@${memberName} is read-only (${member.role === 'verifier' ? 'verifier' : 'writes=0'}), so it cannot edit files in the repository.` }
                       }
+                      if (foreign) return { deny: foreign }
                       for (const [otherName, other] of Object.entries(ownedRoster.members)) {
                         if (otherName === memberName || otherName === 'coordinator') continue
                         // Exactly the members the board's claimed_twice ignores.
@@ -1786,12 +1851,6 @@ export const register: Register = on => {
                     }
                   }
                 } else if (e.tool === 'Bash') {
-                  const isIsolated = member.isolated === '1' || isolatedAgents.has(e.agentId)
-                  const isShared = !isIsolated && (
-                    member.isolated === '0' ||
-                    sharedAgents.has(e.agentId) ||
-                    ownedRoster.members.coordinator?.backend === 'native'
-                  )
                   if (isShared && await commitsInSharedCheckout($, command, activeDir.slice(0, activeDir.lastIndexOf('/.swarm/')))) {
                     return { deny: `Shared-checkout writers must not run \`git commit\`: leave your edits in the working tree and report via \`BOARD ready ${memberName}\`.` }
                   }
@@ -1844,7 +1903,8 @@ export const register: Register = on => {
           if (c.action !== 'show' || c.piped || !RUN.test(c.dir) || await resolveRunDir($, c.dir) !== dir) continue
           // One post, the whole board, or one member's posts: only what was printed counts as seen.
           const one = /--post=(\d+)/.exec(c.rest)
-          const who = c.rest.trim().split(/\s+/).slice(1).find(word => word !== '' && !word.startsWith('-'))?.replace(/^[@'"]+|['"]+$/g, '').toLowerCase()
+          // The member named, if any: a flag or a redirection (`show 2>&1`) names none.
+          const who = c.subarg?.startsWith('-') ? undefined : c.subarg
           if (one) shownPosts.posts.add(Number(one[1]))
           else if (who === undefined) shownPosts.through = Math.max(shownPosts.through, snapshot?.posts.at(-1)?.seq ?? 0)
           else for (const post of snapshot?.posts ?? []) if (post.agent === who || post.to.includes(who)) shownPosts.posts.add(post.seq)
@@ -1876,11 +1936,15 @@ export const register: Register = on => {
       // A failed reminder must not change the tool's result.
     }
     if (e.tool === 'Bash' && e.agentId === undefined && !result.isError && !result.deny && !calls.some(c => c.action === 'init') &&
-      /board\.py\b[^\n;|&]*\sinit\s/.test(command)) {
+      substitutions(command).some(body => /\bboard\.py\b[^\n;|&]*\sinit\s/.test(body))) {
       // `R=$(board.py … init …)` keeps the folder out of the output and the call out of what is read off the
-      // command. The pointer `init` just wrote names the run; the board refuses one another conversation owns.
+      // command. Read loosely, however the script is run, but only inside a substitution: the same words in a
+      // quoted string or a heredoc make no run. The pointer `init` just wrote names the run; the board refuses
+      // one another conversation owns.
+      // The new run also takes the place of one this conversation drove and closed, as a plain `init` does.
       try {
-        if (await read($, run) === '') {
+        const ownedNow = await read($, run)
+        if (ownedNow === '' || (ownedRoster?.dir === ownedNow && ownedRoster.closed)) {
           const root = `${await $.session.cwd()}/.swarm`
           const name = (await $.fs.read(`${root}/current`)).trim()
           if (/^[\w.-]+$/.test(name) && RUN.test(`${root}/${name}`)) await bind($, `${root}/${name}`)
@@ -1918,13 +1982,12 @@ export const register: Register = on => {
         if (dir === owned || e.agentId === undefined) $.clock.after(0, () => void refresh($))
       }
       if (e.agentId === undefined && calls.some(c => ['member', 'replace', 'pause', 'resume', 'limit', 'close'].includes(c.action))) {
-        const ownedDir = await read($, run)
-        const syncDir = ownedDir || calls.map(c => c.dir).find(d => RUN.test(d))
-        if (syncDir) {
-          const resolvedSyncDir = ownedDir && syncDir === ownedDir ? ownedDir : await resolveRunDir($, syncDir)
+        // Only the run this conversation owns: another run's pause and roster are not this session's to enforce.
+        const resolvedSyncDir = await read($, run)
+        if (resolvedSyncDir) {
           await syncOwnedState($, resolvedSyncDir).catch(() => undefined)
           const retiredNames = calls
-            .filter(c => c.action === 'replace' || (c.action === 'member' && /\bkilled=1\b/.test(c.rest)))
+            .filter(c => c.action === 'replace' || (c.action === 'member' && /\bkilled=(["']?)1\1(?=\s|$)/.test(c.rest)))
             .map(c => c.subarg?.trim())
             .filter((n): n is string => Boolean(n))
           if (retiredNames.length > 0 && ownedRoster && ownedRoster.dir === resolvedSyncDir && !ownedRoster.closed) {
@@ -2177,7 +2240,10 @@ export const register: Register = on => {
       }
       const memberModel = member.model
       let actual: string
-      if (memberModel === 'inherit' && (e.model === undefined || e.model === 'inherit')) {
+      // `inherit` is the coordinator's own model, whichever of its family that is. Agent.model takes family names
+      // only, so the call leaves it out or names that family.
+      if (memberModel === 'inherit' && (e.model === undefined || e.model === 'inherit' ||
+          (!isExactModel(e.model) && familyOf(latestOf(e.model) ?? '') === familyOf(e.parentModel)))) {
         actual = e.parentModel
         modelToUse = e.parentModel
       } else if (memberModel && isExactModel(memberModel) && (e.model === undefined || (!isExactModel(e.model) && familyOf(latestOf(e.model) ?? '') === familyOf(memberModel)))) {
@@ -2196,12 +2262,12 @@ export const register: Register = on => {
       // The roster's model, or the type's default when it names none: a model passed only on the
       // Agent call would otherwise skip the plan the user saw and the board's rules for the type.
       if (memberModel === 'inherit' && e.model !== undefined && e.model !== 'inherit' && familyOf(e.parentModel) !== runsOn) {
-        return { deny: `The roster has @${named} on the coordinator's model. Omit model or pass model: "inherit" on the Agent call, or change the roster with the board's member command.` }
+        return { deny: `The roster has @${named} on the coordinator's model. Omit model on the Agent call or pass the coordinator's own family (model: "${familyOf(e.parentModel)}"), or change the roster with the board's member command.` }
       }
       const expected = memberModel === 'inherit' ? e.parentModel : memberModel || familyOf(DEFAULT_MODEL[kind] ?? '')
       if (expected && (isExactModel(expected) ? expected.toLowerCase() !== actual.toLowerCase() : familyOf(expected) !== runsOn)) {
         const guidance = memberModel === 'inherit'
-          ? 'Omit model or pass model: "inherit" on the Agent call'
+          ? `Omit model on the Agent call or pass the coordinator's own family (model: "${familyOf(e.parentModel)}")`
           : isExactModel(expected)
             ? `Omit model or pass model: "${familyOf(expected)}" on the Agent call`
             : `Pass model: "${expected}" on the Agent call`
@@ -2488,6 +2554,8 @@ export const register: Register = on => {
     const shown = await shownSwarm($)
     const error = await read($, loadError)
     if (e.props.placement === 'widget') {
+      // Minimised: nothing of the pane is in view, so no live animation is started for it.
+      isPaneOpen = false
       const active = shown.members.filter(member => member.status === 'working').length
       const coordinating = shown.members.filter(member => member.status === 'coordinating').length
       return (
@@ -2571,6 +2639,7 @@ export const register: Register = on => {
     const coordinating = shown.members.filter(m => m.status === 'coordinating').length
     const waiting = shown.members.filter(m => m.role !== 'coordinator' && m.status === 'waiting').length
     const failed = shown.members.filter(m => m.status === 'failed' || m.status === 'unreachable').length
+    const stopped = shown.members.filter(m => m.status === 'stopped').length
     const tokens = shown.tokens
     const total = tokensUsed(tokens)
     const openPost = async (seq: number) => {
@@ -2587,8 +2656,10 @@ export const register: Register = on => {
               const parsed = JSON.parse(rawOut) as Omit<Post, 'to'> & { to?: string[] }
               older = {
                 ...parsed,
-                text: clean(parsed.text),
-                to: parsed.to ?? targets(parsed.text, roster).filter(n => n !== parsed.agent),
+                agent: clean(String(parsed.agent)),
+                time: clean(String(parsed.time)),
+                text: clean(String(parsed.text)),
+                to: (parsed.to ?? targets(String(parsed.text), roster).filter(n => n !== parsed.agent)).map(name => clean(String(name))),
               }
             } else if (rawOut) {
               const m = /^#(\d+)\s+(\d{2}:\d{2}:\d{2})\s+@(\S+)\s+->\s+([^\n]*)(?:\n([\s\S]*))?$/.exec(rawOut)
@@ -2629,13 +2700,16 @@ export const register: Register = on => {
       const open = await read($, expanded)
       const collapsed = await read($, latestOnly)
       const more = await read($, earlier)
-      const preview = (post: Post) => clip(stripKind(bodyOf(post)))
+      const preview = (post: Post) => clip(chipped(post))
       // Fill the pane from the newest post back, so the feed follows the board.
       const rawQuery = await read($, query)
       const wanted = rawQuery.trim().toLowerCase()
       const inspectedPost = await read($, inspected)
       const available = inspectedPost && !shown.posts.some(post => post.seq === inspectedPost.seq) ? [inspectedPost, ...shown.posts] : shown.posts
-      const terms = (wanted.match(/(?:kind:)?not\s+(?:passed|verified)|\S+/g) ?? []).map(t => t.replace(/\s+/g, ' '))
+      const terms = (wanted.match(/(?:kind:)?not\s+(?:passed|verified)(?!\S)|\S+/g) ?? []).map(t => t.replace(/\s+/g, ' '))
+      // Whom a post is for: the members it reached, and the names it mentions. `all` and a group are only ever
+      // in the text: `to` holds the members they stood for.
+      const reaches = (post: Post, who: string) => post.to.some(name => name.toLowerCase() === who) || mentions(post.text).has(who)
       const matchesTerm = (post: Post, term: string): boolean => {
         if (term.startsWith('from:')) {
           const who = term.slice(5).replace(/^@/, '')
@@ -2643,11 +2717,11 @@ export const register: Register = on => {
         }
         if (term.startsWith('to:')) {
           const who = term.slice(3).replace(/^@/, '')
-          return who !== '' && post.to.some(name => name.toLowerCase() === who)
+          return who !== '' && reaches(post, who)
         }
         if (term.startsWith('@') && term.length > 1) {
           const who = term.slice(1)
-          return post.agent.toLowerCase() === who || post.to.some(name => name.toLowerCase() === who)
+          return post.agent.toLowerCase() === who || reaches(post, who)
         }
         if (/^#\d+$/.test(term)) {
           return post.seq === Number(term.slice(1))
@@ -2680,19 +2754,22 @@ export const register: Register = on => {
         </Box>
       )
       const selected = !collapsed && open > 0 ? matching.find(post => post.seq === open) : undefined
-      const selectedCost = selected ? 4 + estimateRows(stripKind(openedText(selected)), columns) : 0
+      const selectedCost = selected ? 4 + estimateRows(chipped(selected, openedText(selected)), columns) : 0
       const fitted: Post[] = []
       let used = 0
       for (const post of [...matching].reverse()) {
         // The opened post takes the rows it really draws, so the posts around it are fitted to what is left.
-        const text = post.seq === open ? stripKind(openedText(post)) : preview(post)
+        const text = post.seq === open ? chipped(post, openedText(post)) : preview(post)
         const cost = 4 + estimateRows(text, columns)
         const reserve = selected && !fitted.some(p => p.seq === open) && post.seq !== open ? selectedCost : 0
         if (fitted.length > 0 && used + cost + reserve > rows) break
         fitted.unshift(post)
         used += cost
       }
-      const visible = matching.slice(collapsed && terms.length === 0 ? -1 : -Math.max(1, fitted.length + more))
+      // A drawing over 100,000 characters is refused, and a post costs up to its clip and its frame: so many are drawn at once.
+      const DRAWN = 100
+      const visible = matching.slice(collapsed && terms.length === 0 ? -1 : -Math.min(DRAWN, Math.max(1, fitted.length + more)))
+      const isFull = visible.length >= DRAWN
       if (selected && !visible.some(post => post.seq === open)) {
         visible.unshift(selected)
       }
@@ -2720,7 +2797,10 @@ export const register: Register = on => {
             {(!collapsed || terms.length > 0) && older === 0 && (shown.total ?? 0) > shown.posts.length && (
               <Text dimColor>{`The pane keeps the newest ${shown.posts.length} of ${shown.total} posts. Earlier ones are on the board: show`}</Text>
             )}
-            {(!collapsed || terms.length > 0) && older > 0 && (
+            {(!collapsed || terms.length > 0) && older > 0 && isFull && (
+              <Text dimColor>{`Showing the newest ${visible.length} of ${matching.length}. Narrow the filter to reach earlier posts.`}</Text>
+            )}
+            {(!collapsed || terms.length > 0) && older > 0 && !isFull && (
               <Button
                 key="earlier-posts"
                 plain
@@ -2732,8 +2812,10 @@ export const register: Register = on => {
             {visible.map(post => {
               const kind = kindOf(post.text)
               const time = postTime(post)
-              const hasMore = stripKind(bodyOf(post)).length > CLIP
+              const hasMore = chipped(post).length > CLIP
               const canViewGraph = e.surface !== 'terminal' && shown.posts.some(p => p.seq === post.seq)
+              // A post opened from Attention that the pane no longer keeps: it stays until it is dismissed.
+              const isInspected = inspectedPost?.seq === post.seq && !shown.posts.some(p => p.seq === post.seq)
 
               return (
                 <Box
@@ -2764,9 +2846,21 @@ export const register: Register = on => {
                     </Box>
                     <Text dimColor tabular>{`#${post.seq}${time ? ` · ${time}` : ''}`}</Text>
                   </Box>
-                  <Markdown text={formatMarkdown(post.seq === open ? stripKind(openedText(post)) : preview(post))} />
-                  {(hasMore || canViewGraph) && (
+                  <Markdown text={formatMarkdown(post.seq === open ? chipped(post, openedText(post)) : preview(post))} />
+                  {(hasMore || canViewGraph || isInspected) && (
                     <Box flexDirection="row" gap="sm" flexWrap="wrap">
+                      {isInspected && (
+                        <Button
+                          key={`dismiss-${post.seq}`}
+                          plain
+                          dimColor
+                          label="✕ Dismiss"
+                          onPress={async () => {
+                            await update($, inspected, () => null)
+                            if (open === post.seq) await update($, expanded, () => 0)
+                          }}
+                        />
+                      )}
                       {hasMore && (
                         <Button
                           key={`more-${post.seq}`}
@@ -2947,7 +3041,8 @@ export const register: Register = on => {
               dimColor
               label={`↑ Show earlier (${hidden})`}
               onPress={() => {
-                if (talk === open) talk = { ...open, more: open.more + 6 }
+                // By what it shows, not by identity: a poll since this was drawn may have put a new object in its place.
+                if (talk && talk.dir === open.dir && talk.agentId === open.agentId) talk = { ...talk, more: talk.more + 6 }
                 $.ui.invalidate('ui.render')
               }}
             />
@@ -2963,7 +3058,7 @@ export const register: Register = on => {
       const card = (member: Member) => {
         const last = lastOf(member.name)
         const statusColor = statusInk(member.status)
-        const isBroken = member.status === 'failed' || member.status === 'unreachable'
+        const isBroken = ['failed', 'unreachable', 'stopped'].includes(member.status)
         const plan = [
           member.owns === '' ? '' : `owns ${member.owns}`,
           member.depends.length === 0 ? '' : `after ${member.depends.map(name => `@${name}`).join(', ')}`,
@@ -3028,7 +3123,7 @@ export const register: Register = on => {
         Number(b.role === 'coordinator') - Number(a.role === 'coordinator') ||
         a.name.localeCompare(b.name)
       const groups: [string, Member[]][] = [
-        ['Needs attention', shown.members.filter(m => ['failed', 'unreachable'].includes(m.status))],
+        ['Needs attention', shown.members.filter(m => ['failed', 'unreachable', 'stopped'].includes(m.status))],
         ['Active', shown.members.filter(m => ['working', 'coordinating'].includes(m.status))],
         ['Standing by', shown.members.filter(m => ['waiting', 'not started'].includes(m.status) && !(hiding && inactive.has(m.name)))],
         ['Retired', hiding ? [] : shown.members.filter(m => m.status === 'killed')],
@@ -3088,7 +3183,7 @@ export const register: Register = on => {
         [current, post.seq, animate, repeat, isExpanded, statusSig, ...hidden].join('/'), now)
       const postKind = kindOf(post.text)
       const time = postTime(post)
-      const strippedGraphBody = stripKind(bodyOf(post))
+      const strippedGraphBody = chipped(post)
       body = (
         <Box flexDirection="column" marginTop={1} gap={1}>
           <Box flexDirection="row" justifyContent="space-between" flexWrap="wrap" columnGap={1}>
@@ -3101,7 +3196,7 @@ export const register: Register = on => {
               <Box flexDirection="row" alignItems="center" gap="sm">
                 <Text dimColor tabular>{live ? (shown.isPaused && !shown.isClosed ? 'Paused' : 'Latest post') : `Post ${index + 1} of ${shown.posts.length}`}</Text>
                 {!live && (
-                  <Button key="replay-live" plain label={shown.isClosed ? 'Latest' : 'Go live'} onPress={() => seek($, 0)} />
+                  <Button key="replay-live" plain label={shown.isClosed || browsed ? 'Latest' : 'Go live'} onPress={() => seek($, 0)} />
                 )}
               </Box>
             )}
@@ -3152,7 +3247,7 @@ export const register: Register = on => {
               </Text>
               <Text dimColor tabular>{`#${post.seq}${time ? ` · ${time}` : ''}`}</Text>
             </Box>
-            <Markdown text={formatMarkdown(detailsOpen ? stripKind(openedText(post)) : clip(strippedGraphBody))} />
+            <Markdown text={formatMarkdown(detailsOpen ? chipped(post, openedText(post)) : clip(strippedGraphBody))} />
             {strippedGraphBody.length > CLIP && (
               <Button
                 key="graph-post-details"
@@ -3169,12 +3264,15 @@ export const register: Register = on => {
       const isExpanded = await read($, expandAll)
       const hasBroadcast = shown.posts.some(isBroadcast) || Object.keys(shown.earlierEdges ?? {}).some(edge => edge.endsWith('>@all'))
       const edges = new Map<string, number>()
+      // As in the diagram: the coordinator is never hidden for being idle, and nobody is drawn addressing itself.
+      const hideable = [...inactive].filter(name => memberOf(name)?.role !== 'coordinator')
+      const quiet = new Set(hiding ? hideable : [])
       // Posts older than the ones kept still count, as they do in the diagram.
       // The same keys the diagram counts: a pair by name, a pair reached through @all, and a sender's @all posts.
       for (const [edge, count] of Object.entries({ ...shown.earlierEdges, ...Object.fromEntries(
         Object.entries(edgesOf(shown.posts)).map(([key, more]) => [key, more + (shown.earlierEdges?.[key] ?? 0)])) })) {
         const [from = '', to = '', via] = edge.split('>')
-        if (to === '@none' || (via && !isExpanded) || (hiding && (inactive.has(from) || inactive.has(to)))) continue
+        if (to === '@none' || from === to || (via && !isExpanded) || quiet.has(from) || quiet.has(to)) continue
         edges.set(to === '@all' ? `@${from} → @all` : `@${from} → @${to}${via ? ' (via @all)' : ''}`, count)
       }
       const sorted = [...edges.entries()].sort((a, b) => b[1] - a[1])
@@ -3209,7 +3307,7 @@ export const register: Register = on => {
               label={isExpanded ? 'Collapse @all' : 'Expand @all'}
               onPress={() => update($, expandAll, isOn => !isOn)}
             />
-            {inactiveToggle(inactive.size)}
+            {inactiveToggle(hideable.length)}
           </Box>
           {summary}
         </Box>
@@ -3231,6 +3329,7 @@ export const register: Register = on => {
             <Text dimColor tabular wrap="truncate-end">
               {shown.isClosed ? 'Closed' : shown.isPaused ? 'Paused' : activeSummary}
               {!shown.isClosed && failed > 0 && <Text color="error">{` · ${failed} failed`}</Text>}
+              {!shown.isClosed && stopped > 0 && <Text color="error">{` · ${stopped} stopped`}</Text>}
               {` · ${counted(shown.total ?? shown.posts.length, 'post')}`}
               {total > 0 ? ` · ${compact(total)}${shown.budget > 0 ? ` of ${compact(shown.budget)}` : ''} tokens` : ''}
             </Text>

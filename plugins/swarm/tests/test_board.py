@@ -1425,6 +1425,193 @@ class BoardRegressions(unittest.TestCase):
             assert saved(d)["limits"] == {}
 
 
+    # The findings of the 2026-11-21 review, each test named after its number there (`low` for the unnumbered ones).
+
+    def items(self, d, kind):
+        return [item for item in json.loads(run(d, "attention", "--json"))["items"] if item["kind"] == kind]
+
+    def table(self, d, inputs):
+        """A candidate under test that holds these members' reports, as verify.py records one."""
+        with open(os.path.join(d, "verification.json"), "w", encoding="utf-8") as f:
+            json.dump({"candidate": "cand", "inputs": inputs}, f)
+
+    def test_f08_rework_counts_confirmed_findings(self):
+        d = self.init_run()
+        run(d, "member", "inv", "profile=investigator")
+        run(d, "member", "v", "role=verifier")
+        self.table(d, {"inv": [2, None]})
+        for _ in range(2):
+            finding = run(d, "ready", "inv", stdin="observed").split()[1][1:]
+            run(d, "confirm", "inv", finding)
+            run(d, "post", "v", "@inv NOT PASSED: the finding does not hold")
+        assert [item["member"] for item in self.items(d, "rework")] == ["inv"]
+
+    def test_f10_retired_members_and_verifier_dependencies_stay_fixed(self):
+        d = self.init_run()
+        run(d, "member", "base")
+        run(d, "member", "w", "depends=base")
+        run(d, "member", "v", "role=verifier")
+        run(d, "member", "v", "depends=base", ok=False)
+        run(d, "member", "w", "role=verifier", ok=False)  # it would keep its depends=
+        run(d, "member", "w", "role=verifier", "depends=")
+        run(d, "member", "w", "role=worker", "depends=base")
+        run(d, "member", "ghost", "killed=1", ok=False)
+        assert "ghost" not in saved(d)["members"]
+        run(d, "post", "v", "@base NOT PASSED: no")
+        assert not self.items(d, "rework") and len(json.loads(run(d, "attention", "--json"))["members"]) == 3
+        run(d, "member", "v", "killed=1")
+        run(d, "member", "v", "killed=1")  # said twice changes nothing
+        for change in ("role=worker", "owns=x", "id=late", "model=opus", "depends=base"):
+            run(d, "member", "v", change, ok=False)
+        assert saved(d)["members"]["v"] == {"role": "verifier", "last_read_seq": 0, "killed": "1"}
+        run(d, "member", "w", "killed=1")
+        assert json.loads(run(d, "attention", "--json"))["members"]["w"]["blocked_on"] == []
+
+    def test_f11_rebinding_a_closed_run_keeps_the_pointer(self):
+        key = "a" * 64
+        old = self.init_run("old")
+        run(old, "bind", key)
+        run(old, "close")
+        one, two = self.init_run("one"), self.init_run("two")
+        run(one, "bind", key)
+        run(two, "bind", key)
+        assert run(self.swarm, "restore", key).strip() == os.path.abspath(two)
+        assert run(old, "bind", key).strip() == os.path.abspath(old)
+        assert run(self.swarm, "restore", key).strip() == os.path.abspath(two)
+
+    def blocked(self, *command):
+        """Start a board command that must wait for a lock the test holds."""
+        waiting = subprocess.Popen([sys.executable, BOARD, *command], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            waiting.wait(timeout=0.8)
+        except subprocess.TimeoutExpired:
+            return waiting
+        raise AssertionError("%s did not wait: %s" % (command[1], waiting.stdout.read()))
+
+    def test_f12_init_and_prune_wait_for_their_locks(self):
+        d = self.init_run()
+        with open(os.path.join(self.swarm, ".adopt.lock"), "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            starting = self.blocked(os.path.join(self.swarm, "late"), "init", "Late")
+        late, _ = starting.communicate(timeout=20)
+        assert starting.returncode == 0 and os.path.isdir(late.strip())
+        run(d, "close")
+        with open(os.path.join(d, ".lock"), "a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            pruning = self.blocked(self.swarm, "prune", "--days=0")
+            assert os.path.isdir(d)
+        done, _ = pruning.communicate(timeout=20)
+        assert pruning.returncode == 0 and "archive " + os.path.basename(d) in done and not os.path.exists(d)
+
+    def test_f13_prune_dry_run_matches_prune_and_takes_any_path(self):
+        project = os.path.join(self.root, "-proj")
+        swarm = os.path.join(project, ".swarm")
+        d = run(os.path.join(swarm, "reg"), "init", "Prune").strip()
+
+        def git(*args):
+            subprocess.run(["git", "-C", project, "-c", "user.name=T", "-c", "user.email=t@example.invalid",
+                            "-c", "commit.gpgsign=false", *args], check=True, capture_output=True)
+        git("init", "-q", "-b", "main")
+        git("commit", "-q", "--allow-empty", "-m", "init")
+        stray, tree = os.path.join(d, "integration-stray"), os.path.join(d, "integration-old")
+        os.makedirs(stray)
+        git("worktree", "add", "-q", "--detach", tree)
+        plan = run(swarm, "prune", "--dry-run")
+        assert "would remove worktree " + tree in plan and "would remove worktree " + stray not in plan, plan
+        assert "would remove 1 worktree(s)" in plan and os.path.isdir(tree)
+        done = subprocess.run([sys.executable, BOARD, "-proj/.swarm", "prune"], cwd=self.root, capture_output=True, text=True)
+        assert done.returncode == 0 and "remove 1 worktree(s)" in done.stdout, (done.stdout, done.stderr)
+        assert not os.path.exists(tree) and os.path.isdir(stray)
+        run(swarm, "prune", "--dry-run", "--dry-run", ok=False)
+
+    def test_f14_code_and_urls_neither_cite_nor_ask_nor_fuse(self):
+        d = self.init_run()
+        run(d, "member", "a")
+        run(d, "member", "b")
+        run(d, "post", "a", "@b which parser do we keep?")
+        run(d, "post", "b", "@a the regex one, as `re #99` in the notes says")  # an answer: the code cites nothing
+        assert not self.items(d, "question")
+        for text in ("@b are you sure??", "@b should we use A? (Option A : yes)"):
+            run(d, "post", "a", text)
+            assert [item["member"] for item in self.items(d, "question")] == ["b"], text
+            run(d, "post", "b", "@a yes")
+        for text in ("@b it is a ?? b", "@b the type is name?: T, read as a?.b", "@b it is c ? a : b"):
+            run(d, "post", "a", text)
+            assert not self.items(d, "question"), text
+        assert "-> @b" in run(d, "post", "a", "see foo`x`@b")  # the span is a gap, not glue that makes an email of it
+        assert "nobody" in run(d, "post", "a", "````\n```\n@b\n```\n````")
+        assert "nobody" in run(d, "post", "a", "~~~\n@b\n~~~")
+        assert "-> @b" in run(d, "post", "a", "```\ncode\n```\n@b after the fence")
+
+    def test_low_a_changed_scope_tells_the_verifier_of_the_candidate_it_voids(self):
+        d = self.init_run()
+        run(d, "member", "w")
+        run(d, "member", "v", "role=verifier")
+        run(d, "ready", "w", stdin="done")
+        assert "@v" not in run(d, "member", "w", "owns=half")  # no candidate holds its work: nobody tests anything
+        run(d, "ready", "w", stdin="done again")
+        self.table(d, {"w": [3, None]})
+        assert "-> @w @v" in run(d, "member", "w", "owns=the other half")
+
+    def test_low_a_new_finding_tells_who_built_on_the_confirmed_one(self):
+        d = self.init_run()
+        run(d, "member", "inv", "profile=investigator")
+        run(d, "member", "next", "depends=inv")
+        run(d, "member", "v", "role=verifier")
+        assert run(d, "ready", "inv", stdin="observed").startswith("posted #1 -> @coordinator\n")
+        assert run(d, "ready", "inv", stdin="observed again").startswith("posted #2 -> @coordinator\n")  # nothing confirmed yet
+        run(d, "confirm", "inv", "2")
+        self.table(d, {"inv": [3, None]})
+        told = run(d, "ready", "inv", stdin="it is something else").splitlines()[0]
+        assert told == "posted #4 -> @coordinator @next @v", told
+        assert not json.loads(run(d, "attention", "--json"))["members"]["inv"]["ready"]
+
+    def test_low_a_verifier_is_never_told_to_report_ready(self):
+        d = self.init_run()
+        run(d, "member", "w")
+        run(d, "ready", "w", stdin="done")
+        run(d, "member", "w", "role=verifier")
+        assert "report again" not in run(d, "show", "--post=2")
+        for word in ("READY", "REVISE"):
+            refused = subprocess.run([sys.executable, BOARD, d, "post", "w", word + " all checks pass"], capture_output=True, text=True)
+            assert refused.returncode != 0 and "board.py DIR" not in refused.stderr and "NOT PASSED" in refused.stderr, refused.stderr
+        run(d, "member", "x")
+        refused = subprocess.run([sys.executable, BOARD, d, "post", "x", "READY done"], capture_output=True, text=True)
+        assert "Use: board.py DIR ready x (report on stdin)" in refused.stderr, refused.stderr
+
+    def test_low_limits_pause_and_a_pending_post_are_validated(self):
+        d = self.init_run()
+        assert run(d, "limit", "budget=0").startswith("limits: none")  # zero is no budget, and is not kept as one
+        assert "budget" not in saved(d)["limits"]
+        run(d, "limit", "opus=,", ok=False)
+        run(d, "limit", "opus=architect,,architect")
+        assert saved(d)["limits"] == {"opus": "architect"}
+        run(d, "pause", " ")
+        assert saved(d)["paused"] == "awaiting coordinator"
+        run(d, "resume")
+        state = saved(d)
+        state["pending_post"] = {"seq": 1, "agent": 7}
+        with open(os.path.join(d, "members.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        run(d, "status", ok=False)
+        assert os.path.getsize(os.path.join(d, "board.jsonl")) == 0
+
+    def test_low_prune_removes_bindings_to_runs_that_are_gone(self):
+        key, other = "a" * 64, "b" * 64
+        gone = self.init_run("gone")
+        run(gone, "bind", key)
+        run(gone, "close")
+        run(self.init_run("kept"), "bind", other)
+        bindings = os.path.join(self.swarm, ".bindings")
+        assert "would remove 1 stale binding(s)" in run(self.swarm, "prune", "--days=0", "--dry-run")
+        assert sorted(os.listdir(bindings)) == [key, other]
+        assert "remove 1 stale binding(s)" in run(self.swarm, "prune", "--days=0")
+        assert os.listdir(bindings) == [other] and not os.path.exists(gone)
+
+    def test_low_usage_says_when_verifiers_hear_and_what_a_page_cuts(self):
+        usage = subprocess.run([sys.executable, BOARD, self.swarm, "nonsense"], capture_output=True, text=True).stderr
+        assert "once every worker is ready" in usage and "notify coordinator, verifiers and dependents" not in usage
+
+
 if __name__ == "__main__":
-    scenario()
-    print("ok")
+    unittest.main()

@@ -4,6 +4,12 @@ import type { Post } from '../types'
 export const compact = (tokens: number) =>
   tokens >= 999_500 ? `${(tokens / 1e6).toFixed(1)}M` : tokens >= 1000 ? `${Math.round(tokens / 1000)}k` : String(tokens)
 
+// Code and URLs, where an @name or a ? is no mention and no question: a fence (closed by a run at least as long as
+// its opener, tildes at a line start), a code span, a URL up to its trailing punctuation. board.py holds the same
+// pattern as QUOTED; each is replaced by a space, so the words on either side stay apart.
+const QUOTED = /(`{3,})[\s\S]*?\1|^ {0,3}(~{3,})[\s\S]*?^ {0,3}\2|(`+)[^\n]*?\3|\w+:\/\/\S+?(?=[.,;:!)]*(?:\?(?=\s|$))?(?:\s|$))/gm
+export const unquoted = (text: string) => text.replace(QUOTED, ' ')
+
 // A long post is cut here until it is expanded.
 export const CLIP = 480
 // What a post is, read off its first line, for a chip beside the sender.
@@ -23,6 +29,10 @@ export function kindOf(text: string): { label: string; color: 'suggestion' | 'su
 export function stripKind(text: string): string {
   return text.replace(/^(?:@[\w-]+[ \t,:]*)*(BRIEF|NOT PASSED|NOT VERIFIED|VERIFIED|READY|REVISE|FINDING|SHUTDOWN)\b[ \t:,-]*(?:\n|$)?/, '')
 }
+
+// A post's body under a header that shows its kind as a chip. The word goes only when the chip really shows it:
+// a kind word on line two is prose to the board and to kindOf, so it stays in the body.
+export const chipped = (post: Post, text = bodyOf(post)) => kindOf(post.text) ? stripKind(text) : text
 
 // A post as the feed shows it: the header already names the recipients and the kind, and a full
 // commit id is noise, so the body starts at what the post says.
@@ -68,7 +78,25 @@ export const OPEN_LIMIT = 20_000
 export function openedText(post: Post): string {
   const body = bodyOf(post).replace(/\n{3,}/g, '\n\n')
   if (body.length <= OPEN_LIMIT) return body
-  return `${head(body, OPEN_LIMIT).trimEnd()} …\n\n(${body.length - OPEN_LIMIT} more characters. The board's \`show --post=${post.seq}\` prints the whole post.)`
+  const cut = head(body, OPEN_LIMIT).trimEnd()
+  const fence = openFence(cut)
+  return `${cut}${fence ? `\n${fence}\n` : ' '}…\n\n(${body.length - OPEN_LIMIT} more characters. The board's \`show --post=${post.seq}\` prints the whole post.)`
+}
+
+export type Fence = { ch: '`' | '~'; len: number } | null
+/** The fence state after `line`, as CommonMark reads it: a backtick opener's info string holds no backtick (that is a code span), and a closer is bare and at least as long as its opener. */
+export function fenceAfter(fence: Fence, line: string): Fence {
+  const m = /^(`{3,}|~{3,})(.*)$/.exec(line.trimStart())
+  if (!m) return fence
+  const ch = m[1]![0] as '`' | '~'
+  if (fence === null) return ch === '`' && m[2]!.includes('`') ? null : { ch, len: m[1]!.length }
+  return fence.ch === ch && m[1]!.length >= fence.len && m[2]!.trim() === '' ? null : fence
+}
+/** The line that closes the fence `text` leaves open, or '' when it leaves none. */
+function openFence(text: string): string {
+  let fence: Fence = null
+  for (const line of text.split('\n')) fence = fenceAfter(fence, line)
+  return fence ? fence.ch.repeat(fence.len) : ''
 }
 
 // Cuts a long text at a word, not inside one, and closes any unclosed code fence.
@@ -77,21 +105,6 @@ export function clip(text: string, length = CLIP): string {
   const cut = head(text, length)
   const space = cut.search(/\s\S*$/)
   const trimmed = (space > length / 2 ? cut.slice(0, space) : cut).trimEnd()
-  let fence: '`' | '~' | null = null
-  let fenceLen = 0
-  for (const line of trimmed.split('\n')) {
-    const start = line.trimStart()
-    const m = /^(`{3,}|~{3,})/.exec(start)
-    if (!m) continue
-    const ch = m[1]![0] as '`' | '~'
-    const len = m[1]!.length
-    if (fence === null) {
-      fence = ch
-      fenceLen = len
-    } else if (fence === ch && len >= fenceLen && start.slice(len).trim() === '') {
-      fence = null
-      fenceLen = 0
-    }
-  }
-  return fence !== null ? `${trimmed}\n${fence.repeat(fenceLen)}\n…` : `${trimmed} …`
+  const fence = openFence(trimmed)
+  return fence ? `${trimmed}\n${fence}\n…` : `${trimmed} …`
 }
