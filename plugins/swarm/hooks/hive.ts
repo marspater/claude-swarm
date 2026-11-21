@@ -4,12 +4,16 @@ export type Mood = 'sleep' | 'forage' | 'inspect' | 'build' | 'verify' | 'relay'
 // The board's subcommands: a word after `board.py <folder>` that is none of these names a file, not a board call.
 const BOARD_ACTIONS = new Set(['init', 'member', 'limit', 'plan', 'attention', 'retry', 'replace', 'post', 'read', 'show', 'ready', 'confirm',
   'revise', 'wake', 'claim', 'woke', 'rearm', 'pause', 'resume', 'bind', 'restore', 'adopt', 'locate', 'agent-run', 'started', 'close',
-  'account', 'status', 'prune', 'tail'])
+  'account', 'status', 'prune', 'tail', 'sync', 'export'])
+/** The board subcommand a Bash command runs, if it runs one. */
+const boardAction = (command: string) => {
+  const loose = /\bboard\.py\S*\s+\S+\s+([a-z-]+)/.exec(command)?.[1]
+  return boardCalls(command)[0]?.action ?? (loose && BOARD_ACTIONS.has(loose) ? loose : undefined)
+}
 export function toolMood(tool: string, command = ''): Mood {
   // The board first, by its subcommand: a post that mentions tests or reading is still a post.
-  const loose = tool === 'Bash' ? /\bboard\.py\S*\s+\S+\s+([a-z-]+)/.exec(command)?.[1] : undefined
-  const board = tool === 'Bash' ? boardCalls(command)[0]?.action ?? (loose && BOARD_ACTIONS.has(loose) ? loose : undefined) : undefined
-  if (board) return ['read', 'show', 'status', 'plan', 'attention', 'wake', 'tail'].includes(board) ? 'inspect' : 'relay'
+  const board = tool === 'Bash' ? boardAction(command) : undefined
+  if (board) return ['read', 'show', 'status', 'plan', 'attention', 'wake', 'tail', 'export'].includes(board) ? 'inspect' : 'relay'
   // A command that only looks is a lookup whatever its arguments are called: `cat test.py` runs no test.
   if (tool === 'Bash' && /^(?:git (?:diff|log|show|status)|cat|rg|ls|find|grep)\b/.test(command.trim())) return 'inspect'
   if (tool === 'Bash' && /\bverify\.py\b|\b(test|pytest|vitest|jest|unittest|check|verify)\b/.test(command)) return 'verify'
@@ -26,7 +30,7 @@ export function toolSummary(uses: readonly { tool: string; input?: Record<string
     const mood = toolMood(tool, command)
     const what = tool === 'Read' ? 'read|file'
       : tool === 'Grep' || tool === 'Glob' ? 'searched code|'
-      : tool === 'mcp__swarm__board' || /\bboard\.py\b/.test(command) ? 'used the board|'
+      : tool === 'mcp__swarm__board' || (command && boardAction(command)) ? 'used the board|'
       : mood === 'verify' ? 'ran|check'
       : tool === 'Bash' ? 'ran|command'
       : mood === 'build' ? 'edited|file'

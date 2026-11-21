@@ -3601,3 +3601,263 @@ test('a READY with a commit opens its diff, the run exports to Markdown, and the
   expect(told.context?.join(' ')).toContain("the board's show --post=3")
   await ui.unmount()
 })
+
+// The tests below pin the findings of the second 2026-11-21 scan.
+
+test('S1: a member started after the roster was cached is guarded from its first tool call', async ($, on) => {
+  const state = {
+    title: 'Team',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 },
+      alice: { role: 'worker', paths: 'src/alice', isolated: '0', last_read_seq: 0 } as Record<string, unknown>,
+      bob: { role: 'worker', id: 'bob-1', paths: 'src/bob', isolated: '0', last_read_seq: 0 } as Record<string, unknown>,
+    },
+  }
+  const { answer, board } = owning(on, { board: () => '', roster: () => JSON.stringify(state) })
+  on('process.run', (_, e) => {
+    if (e.argv[3] === 'started') state.members.alice.id = e.argv[5]
+    return answer(board(e))
+  })
+  on('agent.list', () => ({
+    value: [
+      ...(state.members.alice.id ? [{ id: 'alice-1', description: '@alice: parser', type: 'swarm:worker', status: 'running' }] : []),
+      { id: 'bob-1', description: '@bob: dates', type: 'swarm:worker', status: 'running' },
+    ] as never,
+  }))
+  on('agent.spawn', () => ({ model: 'sonnet', agentId: 'alice-1' }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  // the registration caches the roster while @alice has no agent yet, and no poll runs after its start
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" member alice paths=src/alice` })
+  const started = await $.agent.spawn({
+    tool_use_id: 'start-alice', prompt: 'Use the board.', description: '@alice: parser', subagentType: 'swarm:worker',
+    provider: { plugin: 'swarm', tier: 'core' as const }, parentModel: 'sonnet', background: true, fork: false,
+  })
+  expect(started.agentId).toBe('alice-1')
+  expect((await $.tool.call({ tool: 'Edit', file_path: '/project/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toContain('claimed by @bob')
+  expect((await $.tool.call({ tool: 'Bash', command: 'git commit -m x', agentId: 'alice-1' })).deny).toContain('Shared-checkout writers')
+  expect((await $.tool.call({ tool: 'Edit', file_path: '/project/src/alice/a.ts', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toBeUndefined()
+})
+
+test('S2: the commit guard follows escapes, case arms, env options and clustered shell flags', async ($, on) => {
+  const state = {
+    title: 'Guard swarm',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 },
+      alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '0', last_read_seq: 1 },
+    },
+  }
+  const { answer, board } = owning(on, { board: () => '', roster: () => JSON.stringify(state) })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({ value: [{ id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const bash = (command: string) => $.tool.call({ tool: 'Bash', command, agentId: 'alice-1' })
+  for (const command of [
+    '(echo \\) && cd /tmp/wt) && git commit -m x', '(echo "\\")" && cd /tmp/wt) && git commit -m x',
+    'case x in *) git commit -m x ;; esac', 'case x in a) true ;; *) git commit -m x ;; esac',
+    'cd /tmp/wt && env -C /project git commit -m x', 'cd /tmp/wt && env -C/project git commit -m x',
+    'cd /tmp/wt && env --chdir=/project git commit -m x', "env -S 'git commit -m x'", 'env -u FOO -P /usr/bin git commit -m x',
+    "sh -ce 'git commit -m x'", 'bash -ec "git commit -m x"', "bash -o pipefail -c 'git commit -m x'",
+    '/usr/bin/env git commit -m x',
+    // a pattern's `)` must not close the subshell the cd is kept in
+    'cd /tmp/wt; (case x in *) cd /project ;; esac; git commit -m x)',
+  ]) {
+    expect((await bash(command)).deny, command).toContain('Shared-checkout writers')
+  }
+  for (const command of [
+    '(echo "(" && cd /tmp/wt && git commit -m x)', 'env -C /tmp/wt git commit -m x', "sh -ce 'cd /tmp/wt && git commit -m x'",
+    'case x in *) echo commit ;; esac',
+  ]) {
+    expect((await bash(command)).deny, command).toBeUndefined()
+  }
+})
+
+test('S3: a member name that is only "@" is refused rather than read as no name', async ($, on) => {
+  const state = { title: 'Team', members: { coordinator: { role: 'coordinator', last_read_seq: 0 }, alice: { role: 'worker', id: 'alice-1', last_read_seq: 0 } } }
+  const { seen, answer, board } = owning(on, { board: () => '', roster: () => JSON.stringify(state) })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({ value: [] }))
+  on('tool.call', () => ({ result: {} }))
+  mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  for (const name of ['@', ' @ ']) {
+    expect((await $.tool.call({ tool: 'mcp__swarm__board', action: 'resume', name })).deny, name).toContain('A member name')
+  }
+  expect((await $.tool.call({ tool: 'mcp__swarm__board', action: 'replace', name: 'alice', newName: '@' })).deny).toContain('A member name')
+  expect(seen.commands.filter(command => /^(?:resume|replace)\b/.test(command))).toEqual([])
+  expect((await $.tool.call({ tool: 'mcp__swarm__board', action: 'resume', name: '@alice' })).deny).toBeUndefined()
+  expect(seen.commands).toContain('resume alice')
+})
+
+test('S4: a page of the board neither answers nor reminds, and a new run hears nothing owed by the old one', async ($, on) => {
+  const TWO = '/project/.swarm/two-20261121-101010'
+  const state = { title: 'Team', members: { coordinator: { role: 'coordinator', last_read_seq: 0 }, alice: { role: 'worker', id: 'alice-1', last_read_seq: 1 } } }
+  const list = [{ agent: 'coordinator', to: ['alice'], text: '@alice BRIEF' }, { agent: 'alice', to: ['coordinator'], text: '@coordinator which file?' }]
+  const { answer, board } = owning(on, { board: () => posts(...list), roster: () => JSON.stringify(state) })
+  on('process.run', (_, e) => {
+    const stdout = board(e)
+    return answer(e.argv[3] === 'read' ? '#2 @alice: which file?\n1 more post(s) remain. Run read again.\n' : e.argv[3] === 'init' ? `${TWO}\n` : stdout)
+  })
+  on('agent.list', () => ({ value: [{ id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const page = await $.tool.call({ tool: 'mcp__swarm__board', action: 'read' })
+  expect(page.result).toContain('1 more post(s) remain')
+  expect(page.context?.join(' ') ?? '').not.toContain('you have not read')
+  // what the page left out is still owed, and told with the next call
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).context?.join(' ')).toContain('you have not read it')
+
+  list.push({ agent: 'alice', to: ['coordinator'], text: '@coordinator and another thing' })
+  await clock.advance(2000)
+  const made = await $.tool.call({ tool: 'mcp__swarm__board', action: 'init', name: 'two', title: 'Two' })
+  expect(made.context?.join(' ')).toContain('A run was made')
+  expect(made.context?.join(' ')).not.toContain('you have not read')
+})
+
+test('S5: a member pause the coordinator settled is not told to it afterwards', async ($, on) => {
+  const state = {
+    title: 'Team',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 0 },
+      alice: { role: 'worker', id: 'alice-1', last_read_seq: 0 } as Record<string, unknown>,
+      bob: { role: 'worker', id: 'bob-1', last_read_seq: 0 } as Record<string, unknown>,
+    },
+  }
+  const { answer, board } = owning(on, { board: () => '', roster: () => JSON.stringify(state) })
+  let spender: 'alice' | 'bob' = 'alice'
+  on('process.run', (_, e) => {
+    const stdout = board(e)
+    if (e.argv[3] === 'account') {
+      const crossed = e.argv[5] !== 'coordinator' && state.members[spender].paused === undefined
+      if (crossed) state.members[spender].paused = 'token budget of 500 spent'
+      return answer(JSON.stringify({ title: 'Team', total: 600, budget: 0, paused: false, ...(crossed && { member_paused: spender }) }))
+    }
+    if (e.argv[3] === 'resume' && e.argv[4] === 'alice') delete state.members.alice.paused
+    return answer(stdout)
+  })
+  on('agent.list', () => ({
+    value: [
+      { id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' },
+      { id: 'bob-1', description: '@bob', type: 'swarm:worker', status: 'running' },
+    ] as never,
+  }))
+  on('tool.call', (_, e) => {
+    if (e.tool === 'Bash' && /member bob killed=1/.test(String(e.command))) state.members.bob.killed = '1'
+    return { result: {} }
+  })
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const usage = { model: 'm', input_tokens: 600, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+  const told = (result: { context?: readonly string[] }) => result.context?.join(' ') ?? ''
+
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'alice-turn', reason: 'answer', agentId: 'alice-1', usage })
+  expect(told(await $.tool.call({ tool: 'mcp__swarm__board', action: 'resume', name: 'alice' }))).not.toContain('has spent its own token budget')
+  expect(told(await $.tool.call({ tool: 'Bash', command: 'ls' }))).not.toContain('has spent its own token budget')
+
+  spender = 'bob'
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'bob-turn', reason: 'answer', agentId: 'bob-1', usage })
+  expect(told(await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" member bob killed=1` }))).not.toContain('has spent its own token budget')
+  expect(told(await $.tool.call({ tool: 'Bash', command: 'ls' }))).not.toContain('has spent its own token budget')
+})
+
+test('S6: a request sent from the pane holds the poll\'s own notice until its turn starts', async ($, on) => {
+  const state = { title: 'Team', members: { coordinator: { role: 'coordinator', last_read_seq: 0 }, alice: { role: 'worker', id: 'alice-1', last_read_seq: 1 } } }
+  const { seen, answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['alice'], text: '@alice BRIEF' }, { agent: 'alice', to: ['coordinator'], text: '@coordinator which file?' }),
+    roster: () => JSON.stringify(state),
+  })
+  on('process.run', (_, e) => {
+    const stdout = board(e)
+    return answer(e.argv[3] === 'attention'
+      ? JSON.stringify({ items: [{ kind: 'question', member: 'coordinator', seq: 2, text: '@alice asked @coordinator in #2 and has no answer.' }], members: {}, limits: {} })
+      : stdout)
+  })
+  on('agent.list', () => ({ value: [{ id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'coordinator-turn', reason: 'answer' })
+  await clock.advance(2000)
+  await clock.advance(6000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-attention' })
+  await ui.press({ key: 'attention-ask-question-coordinator-2' })
+  expect(seen.prompts.at(-1)).toContain('Swarm: Needs your attention')
+  // the mention's grace runs out before the asked turn has started: no second prompt beside the first
+  await clock.advance(6000)
+  expect(seen.prompts.filter(text => text.includes('Unread board mentions'))).toEqual([])
+  // held, not dropped
+  await clock.advance(6000)
+  expect(seen.prompts.filter(text => text.includes('Unread board mentions'))).toHaveLength(1)
+  await ui.unmount()
+})
+
+test('S7: a browsed run keeps its conversation when the live run goes, and a slow diff opens only under its own run', async ($, on) => {
+  const older = '/project/.swarm/older-20261101-090000'
+  const [mine, theirs] = ['c'.repeat(40), 'd'.repeat(40)]
+  const ready = (agent: string, sha: string) => [
+    { seq: 1, agent: 'coordinator', to: [agent], text: `@${agent} BRIEF`, time: '2026-11-16T14:03:22+0100' },
+    { seq: 2, agent, to: ['coordinator'], text: `READY ${sha}\ndone`, time: '2026-11-16T14:04:22+0100', kind: 'ready', revision: sha },
+  ].map(line => JSON.stringify(line)).join('\n') + '\n'
+  let isGone = false
+  const { answer, board } = owning(on, {
+    board: () => ready('alice', mine),
+    roster: () => {
+      if (isGone) throw new Error('ENOENT')
+      return JSON.stringify({ title: 'Team', members: { coordinator: { role: 'coordinator', last_read_seq: 2 }, alice: { role: 'worker', id: 'alice-1', last_read_seq: 1 } } })
+    },
+    read: path => path === `${older}/members.json`
+      ? JSON.stringify({ title: 'Older swarm', members: { coordinator: { role: 'coordinator', last_read_seq: 2 }, scout: { role: 'worker', id: 'gone', last_read_seq: 1 } } })
+      : path === `${older}/board.jsonl` ? ready('scout', theirs) : undefined,
+  })
+  on('fs.list', () => ({ value: ['older-20261101-090000', OWNED.slice(OWNED.lastIndexOf('/') + 1)].map(name => ({ name, kind: 'dir', size: 0 })) as never }))
+  let release: () => void = () => {}
+  const gate = new Promise<void>(resolve => { release = resolve })
+  on('process.run', async (_, e) => {
+    if (e.argv[0] === 'git') {
+      await gate
+      return answer('diff --git a/src/a.md b/src/a.md\n+late\n')
+    }
+    return answer(board(e))
+  })
+  on('agent.list', () => ({ value: [{ id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' }, { id: 'gone', description: '@scout', type: 'swarm:worker', status: 'completed' }] as never }))
+  on('ui.view', () => ({ value: { deny: 'no main view here' } }))
+  on('session.messages', () => ({ value: [{ role: 'user', text: 'Scout the parser', toolUses: [] }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  // the diff of the live run's #2 is still being read when the person steps to the older run, whose #2 is a READY too
+  const pressing = ui.press({ key: 'diff-2' })
+  await ui.press({ key: 'run-prev' })
+  release()
+  await pressing
+  expect(await ui.find({ type: 'Text', text: /^Older swarm$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Markdown', text: /\+late/ })).toBeUndefined()
+
+  await ui.press({ key: 'tab-members' })
+  await ui.press({ key: 'view-scout' })
+  expect(await ui.find({ key: 'talk-back' })).toBeDefined()
+  isGone = true
+  await clock.advance(2000)
+  await clock.advance(2000)
+  expect(await ui.find({ key: 'talk-back' })).toBeDefined()
+  await ui.unmount()
+})

@@ -84,7 +84,7 @@ The pane's **Attention** tab, and `board.py attention` for the coordinator, list
 | Silent | (Swarm pane only) A worker's agent ended after it read its mentions, and it has posted nothing since: no report, no question, nothing it waits for. The coordinator is told once, with its next tool call |
 | Stale | A worker or designer reported a change after the verifier's `VERIFIED` |
 | Rework | A worker failed verification twice in a row. A third failure pauses the run. The tab offers "Ask coordinator to intervene" |
-| Spend | One member has used more than half of the run's tokens, when three or more non-coordinator members have recorded usage, past 200,000 tokens. With exactly two, one that has used more than three quarters of the pair's tokens |
+| Spend | One member has used more than half of the run's tokens, once the run has used at least 200,000 tokens and three or more non-coordinator members have recorded usage. With exactly two, one that has used more than three quarters of the pair's tokens, once the pair has used at least 200,000 tokens |
 | Paused | The run is paused, with the reason. On a spent budget the tab offers "+500k & resume" |
 | Member paused | A member spent its own token budget (`member_budget`, or `budget=` on the member). Its tool calls are refused at once, the coordinator is told once, and the tab offers **+250k & resume**, which raises its budget and runs the board's `resume <name>` |
 | Loop | A worker has taken many turns or tokens since it last posted or read the board |

@@ -14,6 +14,8 @@ Everything a swarm says goes on one append-only board. There are no private mess
 | Withdraw a report | `BOARD revise <name> [<reason>]` | `action: "revise"`, `text` |
 | Read history without marking it read | `BOARD show [<name> \| --post=N]` | `action: "show"`, optional `member` or `seq` |
 
+`ready` and `revise` are a worker's reports, a designer's included. The board refuses them from a verifier, whose verdict is a post starting VERIFIED, NOT PASSED or NOT VERIFIED, and from you: you confirm a finding with `BOARD confirm <name> <seq>`.
+
 From a shell, pass the text with a quoted heredoc so nothing in it is expanded:
 
 ```

@@ -93,7 +93,7 @@ export function detailOf(status: string, hint: Report['members'][string] | undef
   if (status === 'stopped') return 'its agent was stopped'
   if (isPaused) return 'run paused'
   if (hint?.asked) return `waiting for an answer to #${hint.asked}`
-  if (hint?.blocked_on?.length) return `waiting for ${hint.blocked_on.map(name => `@${name}`).join(', ')}`
+  if (Array.isArray(hint?.blocked_on) && hint.blocked_on.length) return `waiting for ${hint.blocked_on.map(name => `@${name}`).join(', ')}`
   if (hint?.ready) return 'reported ready'
 
   return ''
@@ -252,7 +252,7 @@ export function parse(
       effort: hint?.effort ?? member.effort ?? '',
       type: hint?.type ?? (member.profile || member.role || 'worker'),
       depends: hint?.depends ?? [],
-      owns: clean(hint?.owns ?? ''),
+      owns: clean(typeof hint?.owns === 'string' ? hint.owns : ''),
       status,
       detail: isClosed ? '' : isZombie ? `still ${zombie.status} (${zombie.id})` : detailOf(status, hint, Boolean(state.paused), Boolean(member.paused) || hint?.paused === true),
       unread: counts(name).unread,

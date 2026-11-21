@@ -64,13 +64,122 @@ const quoteEnd = (command: string, i: number): number => {
   return -1
 }
 
-/** Index of the `)` closing a `(` whose body starts at `from`, or -1: quotes and nested parentheses are stepped over. */
+// `quoted`: any quoting in the delimiter word makes the body literal; a bare one leaves its substitutions live.
+type Heredoc = { delim: string; stripTabs: boolean; quoted: boolean }
+
+/** The heredoc the `<<` at `i` opens, if its delimiter is a word, and the index after that word. */
+const heredocAt = (command: string, i: number): { heredoc?: Heredoc; end: number } => {
+  let j = i + 2
+  let stripTabs = false
+  if (command[j] === '-') {
+    stripTabs = true
+    j++
+  }
+  while (j < command.length && (command[j] === ' ' || command[j] === '\t')) j++
+  // The delimiter is one shell word: its quoted and bare pieces join, as in <<E'O'F and <<""EOF.
+  const wordStart = j
+  let delim = ''
+  while (j < command.length && !/[\s;|&<>()]/.test(command[j]!)) {
+    const q = command[j]!
+    if (q === "'" || q === '"') {
+      for (j++; j < command.length && command[j] !== q && command[j] !== '\n'; j++) {
+        if (q === '"' && command[j] === '\\' && j + 1 < command.length) j++
+        delim += command[j]!
+      }
+      if (command[j] === q) j++
+    } else {
+      if (q === '\\' && j + 1 < command.length) j++
+      delim += command[j]!
+      j++
+    }
+  }
+  return { heredoc: j > wordStart ? { delim, stripTabs, quoted: /["'\\]/.test(command.slice(wordStart, j)) } : undefined, end: j }
+}
+
+/**
+ * Index after the bodies of the heredocs in `pending`, the first starting at `pos`; `pending` is emptied. Inside a
+ * substitution a delimiter line may go on with its `)`, as in `EOF)`: shells differ on it, and reading it as the
+ * delimiter then the close keeps the commands after it in view. The index of that `)` is returned.
+ */
+const heredocsEnd = (command: string, pos: number, pending: Heredoc[], inParen = false) => {
+  while (pending.length > 0 && pos < command.length) {
+    const { delim, stripTabs } = pending.shift()!
+    while (pos < command.length) {
+      const nl = command.indexOf('\n', pos)
+      const lineEnd = nl === -1 ? command.length : nl
+      const rawLine = command.slice(pos, lineEnd).replace(/\r$/, '')
+      const candidate = stripTabs ? rawLine.replace(/^\t+/, '') : rawLine
+      if (inParen && candidate.startsWith(`${delim})`)) {
+        pending.length = 0
+        return pos + rawLine.length - candidate.length + delim.length
+      }
+      pos = nl === -1 ? command.length : nl + 1
+      if (candidate === delim) break
+    }
+  }
+  pending.length = 0
+  return pos
+}
+
+/** The `$(…)` and backtick bodies in the text of an unquoted heredoc, where nothing but a backslash quotes. */
+const heredocSubstitutions = (body: string): string[] => {
+  const found: string[] = []
+  for (let i = 0; i < body.length; i++) {
+    if (body[i] === '\\') i++
+    else if (body[i] === '$' && body[i + 1] === '(') {
+      const end = parenEnd(body, i + 2)
+      // One that never closes is kept to the end: better read too much than lose a command.
+      found.push(body.slice(i + 2, end < 0 ? body.length : end))
+      i = end < 0 ? body.length : end
+    } else if (body[i] === '`') {
+      const end = body.indexOf('`', i + 1)
+      found.push(body.slice(i + 1, end < 0 ? body.length : end))
+      i = end < 0 ? body.length : end
+    }
+  }
+  return found
+}
+
+/** Index of the `)` closing a `(` whose body starts at `from`, or -1: quotes, heredoc bodies, arithmetic, case patterns and nested parentheses are stepped over. */
 const parenEnd = (command: string, from: number): number => {
   let depth = 0
+  const heredocs: Heredoc[] = []
+  // The case statements open here, by the depth each opened at: a pattern's `)` closes nothing.
+  const cases: Array<{ depth: number; state: 'word' | 'pattern' | 'body' }> = []
   for (let j = from; j < command.length; j++) {
-    const ch = command[j]
+    const ch = command[j]!
+    const open = cases.at(-1)
     if (ch === '\\') j++
-    else if (ch === "'") {
+    else if (ch === '\n' && heredocs.length > 0) {
+      j = heredocsEnd(command, j + 1, heredocs, true) - 1
+    } else if (ch === '<' && command[j + 1] === '<') {
+      if (command[j + 2] === '<') j += 2
+      else {
+        const { heredoc, end } = heredocAt(command, j)
+        if (heredoc) heredocs.push(heredoc)
+        j = end - 1
+      }
+    } else if (ch === '(' && command[j + 1] === '(' && arithEnd(command, j) > 0) {
+      // Its `<<` is a shift, not a heredoc.
+      j = arithEnd(command, j)
+    } else if (/[a-z]/.test(ch) && (j === from || /[\s;&|()]/.test(command[j - 1]!))) {
+      let end = j
+      while (end < command.length && /\w/.test(command[end]!)) end++
+      const word = /^(?:[\s;&|()<>]|$)/.test(command.slice(end, end + 1)) ? command.slice(j, end) : ''
+      // `case` and `esac` are keywords only where a command starts: `echo case in a)` is no case.
+      let p = j - 1
+      while (p >= from && (command[p] === ' ' || command[p] === '\t')) p--
+      const atCommand = p < from || /[;&|()\n{!]/.test(command[p]!) ||
+        /(?:^|[\s;&|()])(?:then|do|else|elif|if|while|until|time)$/.test(command.slice(Math.max(from, p - 5), p + 1))
+      if (word === 'case' && atCommand) cases.push({ depth, state: 'word' })
+      else if (word === 'in' && open?.state === 'word') open.state = 'pattern'
+      else if (word === 'esac' && open && open.depth === depth && (open.state === 'pattern' || atCommand)) cases.pop()
+      j = end - 1
+    } else if (ch === ';' && open?.state === 'body' && (command[j + 1] === ';' || command[j + 1] === '&')) {
+      // `;;`, `;&` and `;;&` end a clause: a pattern comes next.
+      open.state = 'pattern'
+      j += command[j + 1] === ';' && command[j + 2] === '&' ? 2 : 1
+    } else if (ch === "'") {
       // $'…' takes escapes; a plain single quote takes none.
       if (command[j - 1] === '$') {
         for (j++; j < command.length && command[j] !== "'"; j++) if (command[j] === '\\') j++
@@ -82,16 +191,31 @@ const parenEnd = (command: string, from: number): number => {
     } else if (ch === '"' || ch === '`') {
       j = ch === '"' ? quoteEnd(command, j) : tickEnd(command, j)
       if (j < 0) return -1
-    } else if (ch === '(') depth++
-    else if (ch === ')' && depth-- === 0) return j
+    } else if (ch === '(') {
+      // A pattern may open with `(`, as in `(a|b)`, which nests nothing.
+      if (!(open?.state === 'pattern' && open.depth === depth && /\s/.test(command[j - 1]!))) depth++
+    } else if (ch === ')') {
+      if (open?.state === 'pattern' && open.depth === depth) open.state = 'body'
+      else if (depth-- === 0) return j
+    }
   }
   return -1
 }
 
+/**
+ * A statement with its backslash-newlines taken out, as the shell joins the lines before it reads the words. One in
+ * single quotes or `$'…'` is kept. Heredoc bodies and comments never reach a statement's text.
+ */
+const fold = (text: string) =>
+  text.includes('\\\n')
+    ? text.replace(/\$'(?:\\[\s\S]|[^\\'])*'?|'[^']*'?|"(?:\\[\s\S]|[^\\"])*"?|\\[\s\S]/g, m =>
+      m[0] === "'" || m[0] === '$' ? m : m[0] === '"' ? m.replace(/\\[\s\S]/g, e => e === '\\\n' ? '' : e) : m === '\\\n' ? '' : m)
+    : text
+
 /** Splits a shell line into statements, flagging those whose stdout goes to a pipe or a redirect. */
 export function scanShell(command: string): Statement[] {
   const segments: Statement[] = []
-  const pendingHeredocs: Array<{ delim: string; stripTabs: boolean }> = []
+  const pendingHeredocs: Heredoc[] = []
   let quote: "'" | '"' | undefined
   let start = 0
   let textEnd = -1
@@ -99,9 +223,18 @@ export function scanShell(command: string): Statement[] {
   let dollar = -2
   let inner: string[] = []
   let holes: Array<[number, number]> = []
+  // Where the last backslash-newline ended, and the character before it: `a\<newline>#b` is the word `a#b`.
+  let joined = -1
+  let beforeJoin = -1
+  // The statements at which each open `(` or `{` group started, and the first group this statement closes: what
+  // the group writes goes where its close sends it, `{ a; b; } | head` pipes `a` too.
+  const groups: number[] = []
+  let closes: number | undefined
+  let redirectedAfterClose = false
   const push = (end: number, piped: boolean, next: Statement['next']) => {
     const stop = textEnd >= 0 ? textEnd : end
-    const statement: Statement = { text: command.slice(start, stop), piped: piped || redirected, next }
+    const statement: Statement = { text: fold(command.slice(start, stop)), piped: piped || redirected, next }
+    if (closes !== undefined && (piped || redirectedAfterClose)) for (const s of segments.slice(closes)) s.piped = true
     if (inner.length > 0) statement.inner = inner
     if (holes.length > 0) {
       let plain = ''
@@ -111,11 +244,13 @@ export function scanShell(command: string): Statement[] {
         plain += `${command.slice(at, from)}_`
         at = Math.min(stop, to + 1)
       }
-      statement.plain = plain + command.slice(at, stop)
+      statement.plain = fold(plain + command.slice(at, stop))
     }
     segments.push(statement)
     textEnd = -1
     redirected = false
+    closes = undefined
+    redirectedAfterClose = false
     inner = []
     holes = []
   }
@@ -133,6 +268,10 @@ export function scanShell(command: string): Statement[] {
   for (let i = 0; i < command.length; i++) {
     const ch = command[i]!
     if (ch === '\\' && quote !== "'") {
+      if (command[i + 1] === '\n') {
+        beforeJoin = i === joined ? beforeJoin : i - 1
+        joined = i + 2
+      }
       i++
       continue
     }
@@ -179,7 +318,8 @@ export function scanShell(command: string): Statement[] {
       quote = ch
       continue
     }
-    if (ch === '#' && (i === 0 || /[\s;&|(]/.test(command[i - 1]!))) {
+    const before = i === joined ? beforeJoin : i - 1
+    if (ch === '#' && (before < 0 || /[\s;&|(]/.test(command[before]!))) {
       textEnd = i
       const nl = command.indexOf('\n', i)
       i = nl === -1 ? command.length : nl - 1
@@ -201,7 +341,21 @@ export function scanShell(command: string): Statement[] {
       // `>&2` and `1>&2` still reach the tool result, and `>&1` changes nothing. `>&3`, `>&file`, `>&1.log`,
       // `1>&-` (closed) and `&>file` do not; `<>file` opens stdin.
       const toResult = /^&\s*[12](?=$|[\s;|&)<>])/.test(command.slice(i + 1, i + 12))
-      if (prev !== '>' && prev !== '<' && (fd === undefined || fd === '1') && !toResult) redirected = true
+      if (prev !== '>' && prev !== '<' && (fd === undefined || fd === '1') && !toResult) {
+        redirected = true
+        if (closes !== undefined) redirectedAfterClose = true
+      }
+      continue
+    }
+    // ponytail: `(…)` and `{ …; }` only; `done | head` and `fi | head` leave the loop's or the if's statements unpiped
+    const isBrace = (ch === '{' || ch === '}') && (i === 0 || /[\s;&|(]/.test(command[i - 1]!)) && /^(?:[\s;&|<>)]|$)/.test(command.slice(i + 1, i + 2))
+    if (ch === '(' || (ch === '{' && isBrace)) {
+      groups.push(segments.length)
+      continue
+    }
+    if (ch === ')' || (ch === '}' && isBrace)) {
+      const open = groups.pop()
+      if (open !== undefined) closes = Math.min(closes ?? open, open)
       continue
     }
     if (ch === '<' && command[i + 1] === '<' && command[i + 2] === '<') {
@@ -209,32 +363,9 @@ export function scanShell(command: string): Statement[] {
       continue
     }
     if (ch === '<' && command[i + 1] === '<') {
-      let j = i + 2
-      let stripTabs = false
-      if (command[j] === '-') {
-        stripTabs = true
-        j++
-      }
-      while (j < command.length && (command[j] === ' ' || command[j] === '\t')) j++
-      // The delimiter is one shell word: its quoted and bare pieces join, as in <<E'O'F and <<""EOF.
-      const wordStart = j
-      let delim = ''
-      while (j < command.length && !/[\s;|&<>()]/.test(command[j]!)) {
-        const q = command[j]!
-        if (q === "'" || q === '"') {
-          for (j++; j < command.length && command[j] !== q && command[j] !== '\n'; j++) {
-            if (q === '"' && command[j] === '\\' && j + 1 < command.length) j++
-            delim += command[j]!
-          }
-          if (command[j] === q) j++
-        } else {
-          if (q === '\\' && j + 1 < command.length) j++
-          delim += command[j]!
-          j++
-        }
-      }
-      if (j > wordStart) pendingHeredocs.push({ delim, stripTabs })
-      i = j - 1
+      const { heredoc, end } = heredocAt(command, i)
+      if (heredoc) pendingHeredocs.push(heredoc)
+      i = end - 1
       continue
     }
     const isAnd = ch === '&' && command[i + 1] === '&'
@@ -246,20 +377,13 @@ export function scanShell(command: string): Statement[] {
       if (isAnd || isOr || (isPipe && command[i + 1] === '&')) i++
       start = i + 1
       if (ch === '\n' && pendingHeredocs.length > 0) {
-        let pos = i + 1
-        while (pendingHeredocs.length > 0 && pos < command.length) {
-          const { delim, stripTabs } = pendingHeredocs.shift()!
-          while (pos < command.length) {
-            const nl = command.indexOf('\n', pos)
-            const lineEnd = nl === -1 ? command.length : nl
-            const rawLine = command.slice(pos, lineEnd).replace(/\r$/, '')
-            const candidate = stripTabs ? rawLine.replace(/^\t+/, '') : rawLine
-            pos = nl === -1 ? command.length : nl + 1
-            if (candidate === delim) break
-          }
-        }
-        i = pos - 1
-        start = pos
+        const live = pendingHeredocs.some(heredoc => !heredoc.quoted)
+        const bodies = i + 1
+        i = heredocsEnd(command, bodies, pendingHeredocs) - 1
+        // The shell runs what an unquoted heredoc's body substitutes: it belongs to the statement that reads it.
+        const ran = live ? heredocSubstitutions(command.slice(bodies, i + 1)) : []
+        if (ran.length > 0) (segments.at(-1)!.inner ??= []).push(...ran)
+        start = i + 1
       }
     }
   }
@@ -267,12 +391,14 @@ export function scanShell(command: string): Statement[] {
   return segments.map(s => ({ ...s, text: s.text.trim(), ...(s.plain === undefined ? {} : { plain: s.plain.trim() }) })).filter(s => s.text)
 }
 
-// What may stand before the command a statement runs: `(`, `{`, `!`, a shell keyword, or an env/time-style prefix with its flags.
-const WRAPPER = /^(?:[({!]|(?:if|elif|while|until|then|do|else|time|command|exec|nohup|env)(?=\s|$)(?:\s+(?:-u\s+\S+|-\S+))*)\s*/
+// What may stand before the command a statement runs: `(`, `{`, `!`, a shell keyword, an env/time-style prefix with
+// its flags, `case WORD in`, or a case pattern such as `*)` or `a|b)`: a clause after `;;` is a statement of its own.
+// A word and `)` before a redirect is a subshell's last command, `(a; b) > out`, not a pattern.
+const WRAPPER = /^(?:[({!]|(?:if|elif|while|until|then|do|else|time|command|exec|nohup|env)(?=\s|$)(?:\s+(?:-u\s+\S+|-\S+))*|case\s+(?:"[^"]*"|'[^']*'|\S+)\s+in(?=\s|$)|[^\s()|;&"'`]+(?:\s*\|\s*[^\s()|;&"'`]+)*\)(?!\s*\d*[<>]))\s*/
 
 /** A statement without the wrappers before its command, and whether an odd number of `!` negates it. */
 export function unwrap(statement: string): { text: string; negated: boolean } {
-  let text = statement.trim()
+  let text = fold(statement).trim()
   let negated = false
   for (let prev = ''; prev !== text;) {
     prev = text
@@ -284,6 +410,7 @@ export function unwrap(statement: string): { text: string; negated: boolean } {
 
 /** A statement's words with their quotes and escapes taken off: `"git" commit` and `\git commit` read as they run. */
 export function shellWords(text: string): string[] {
+  text = fold(text)
   const words: string[] = []
   let word: string | undefined
   for (let i = 0; i < text.length; i++) {

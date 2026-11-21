@@ -5,7 +5,7 @@ usage: board.py DIR init TITLE                    prints the run folder it creat
        board.py DIR member NAME [key=value ...]   add or update (role= profile= writes= consult= group= depends= owns= paths= model= effort= id= backend= isolated= budget=<tokens> killed=1)
        board.py DIR limit [key=value ...]         set run limits: max_workers= max_members= budget=<tokens> member_budget=<tokens> <model>=<types>
        board.py DIR plan                          the team as a table: type, model, effort, dependencies, ownership
-       board.py DIR attention [--json]            what needs someone: unanswered questions, blocked or unreachable members, stale verification
+       board.py DIR attention [--json]            what needs someone: a paused run or member, unread posts, unanswered questions, findings to review, rework, heavy spend, loops, unstarted, unreachable, ignoring or blocked members, stale verification, conflicting commits
        board.py DIR retry NAME                    let delivery try an unreachable or unresponsive member again
        board.py DIR replace OLD NEW [key=value ...]  retire OLD and register NEW with its brief, dependencies and history
        board.py DIR post FROM [TEXT]              TEXT from stdin when omitted; @all, @group, @verifiers and @dependents (of FROM) reach several
@@ -75,12 +75,15 @@ BIND_KEY = re.compile(r"[a-f0-9]{64}")
 # The first line says what a post is. Mentions before the word stay on that line: a word on line two is prose.
 REPORT_WORD = re.compile(r"^(?:@[\w-]+[ \t,:]*)*(READY|REVISE|BRIEF|SHUTDOWN|FINDING|VERIFIED|NOT (?:PASSED|VERIFIED))\b")
 # Code spans and URLs carry question marks that ask nothing, as do `name?: type` and `a?.b` left outside a span.
-# A fence closes on a run at least as long as the one that opened it, so a longer fence can quote a shorter one.
+# A fence closes on a run at least as long as the one that opened it, and the whole run goes with it, so a longer
+# fence can quote a shorter one.
 # What is taken out leaves a space: with nothing there, the words on either side would join into one.
-QUOTED = re.compile(r"(?P<f>`{3,}).*?(?P=f)|^ {0,3}(?P<t>~{3,}).*?^ {0,3}(?P=t)|(?P<s>`+)[^\n]*?(?P=s)"
+QUOTED = re.compile(r"(?P<f>`{3,}).*?(?P=f)`*|^ {0,3}(?P<t>~{3,}).*?^ {0,3}(?P=t)~*|(?P<s>`+)[^\n]*?(?P=s)"
                     r"|\w+://\S+?(?=[.,;:!)]*(?:\?(?=\s|$))?(?:\s|$))", re.DOTALL | re.MULTILINE)
 # `c ? a : b` asks nothing, and neither does `a ?? b`; "sure??" and "A? (Option A : yes)" do.
-QUESTION = re.compile(r"(?<![ \t]\?)(?:(?<![ \t])\?|\?(?![ \t]+[^\n?]*[ \t]+:))(?!\?|\.?\w|:)")
+# One blank after the mark and one before the colon are enough to look for: the class between them takes any more,
+# and a quantifier on each blank would backtrack cubically on a long run of spaces.
+QUESTION = re.compile(r"(?<![ \t]\?)(?:(?<![ \t])\?|\?(?![ \t][^\n?]*[ \t]:))(?!\?|\.?\w|:)")
 SUMMARY_CHARS = 200
 ARG_COUNTS = {
     "init": (1, None), "restore": (1, 1), "adopt": (2, None), "locate": (2, None),
@@ -480,13 +483,29 @@ def verified_line(d, verifier, first):
     return candidate
 
 
-def void_pass(d):
-    """A verifier's rejection withdraws the pass of the candidate on the table: only a fresh test restores it."""
+def held(candidate, members):
+    """The workers whose work CANDIDATE holds: those whose reports it records, and every worker they depend on, since a
+    dependent's commit contains its dependency's and its readiness falls with it."""
+    names, frontier = set(), list(candidate.get("inputs") or {})
+    while frontier:
+        name = frontier.pop()
+        if name not in names:
+            names.add(name)
+            frontier += dependencies(members.get(name, {}))
+    return names
+
+
+def void_pass(d, members, rejected_names=()):
+    """A verifier's rejection withdraws the pass of the candidate on the table: only a fresh test restores it. A NOT
+    PASSED naming only workers a partial candidate does not hold leaves that candidate's pass alone."""
     path = os.path.join(d, "verification.json")
     try:
         with open(path, encoding="utf-8") as f:
             candidate = json.load(f)
     except (FileNotFoundError, ValueError):
+        return
+    if (isinstance(candidate, dict) and candidate.get("partial") and rejected_names
+            and not set(rejected_names) & held(candidate, members)):
         return
     if isinstance(candidate, dict) and not candidate.get("accepted") and ("verified_by" in candidate or "attempt" in candidate):
         candidate.pop("verified_by", None)
@@ -504,15 +523,15 @@ def candidate_on_table(d):
     return candidate.get("candidate") if isinstance(candidate, dict) and not candidate.get("accepted") else None
 
 
-def in_play(d, name):
-    """True when the candidate being tested or waiting to be accepted holds NAME's report: a change to that report
+def in_play(d, name, members):
+    """True when the candidate being tested or waiting to be accepted holds NAME's work: a change to that report
     kills the candidate, so its verifier has to hear."""
     try:
         with open(os.path.join(d, "verification.json"), encoding="utf-8") as f:
             candidate = json.load(f)
     except (OSError, ValueError):
         return False
-    return isinstance(candidate, dict) and not candidate.get("accepted") and name in (candidate.get("inputs") or {})
+    return isinstance(candidate, dict) and not candidate.get("accepted") and name in held(candidate, members)
 
 
 def successor(name, members):
@@ -533,8 +552,8 @@ def unanswered(members, posts):
         text = QUOTED.sub(" ", text)  # `re #99` in a code span cites nothing, and a `?` there asks nothing
         sender = post["agent"]
         responder = successor(sender, members)
-        # "re #4", and every number of "re #4, #7 and #9" or "re #4 #7 #9"
-        cited = [seq for run in re.findall(r"\bre\s+((?:#[0-9]+(?:\s*(?:,|and|&)?\s*))+)", text, re.IGNORECASE)
+        # "re #4" or "re: #4", and every number of "re #4, #7 and #9" or "re #4 #7 #9"
+        cited = [seq for run in re.findall(r"\bre(?:\s+|\s*:\s*)((?:#[0-9]+(?:\s*(?:,|and|&)?\s*))+)", text, re.IGNORECASE)
                  for seq in re.findall(r"#([0-9]+)", run)]
         for recipient in post["to"]:
             pair = (recipient, responder)
@@ -728,9 +747,11 @@ def pause_over_budget(state, names):
         member = state["members"][name]
         own = member_budget(state, member)
         if (name != COORDINATOR and not member.get("killed") and member.get("id") and own
-                and tokens.get(usage_key(member), 0) >= own and not member.get("paused")):
-            member["paused"] = spent(own)
-            print("paused: @%s, %s. Raise it with member %s budget=<tokens>, then resume %s" % (name, member["paused"], name, name))
+                and tokens.get(usage_key(member), 0) >= own):
+            # Already paused, it keeps its pause, under the budget now in force, as the run's own pause does.
+            was, member["paused"] = member.get("paused"), spent(own)
+            if not was:
+                print("paused: @%s, %s. Raise it with member %s budget=<tokens>, then resume %s" % (name, member["paused"], name, name))
 
 
 def progress(state, member):
@@ -1237,8 +1258,6 @@ def main(argv):
             if member.get("killed"):  # a retired member runs no more turns: nothing is paused
                 member.pop("paused", None)
             validate_member(name, member, changes, members)
-            if "budget" in changes:
-                pause_over_budget(state, [name])
             if changes.get("group") in {"", "-"}:
                 member.pop("group", None)
             if "role" in changes or "consult" in changes:
@@ -1267,12 +1286,14 @@ def main(argv):
             errors = added_limit_errors(state, before_counts, before_family)
             if errors:
                 sys.exit("over the run's limits, nothing was changed: " + "; ".join(errors))
+            if "budget" in changes:  # only now, when nothing above can refuse the change it reports
+                pause_over_budget(state, [name])
             if model_of(member).lower() == "inherit" and any(f in state.get("limits", {}) for f in FAMILIES):
                 print(f"note: @{name} has model=inherit, which cannot be checked against family limits here", file=sys.stderr)
             if (not member.get("killed") and assignment_scope(previous) != assignment_scope(member)
                     and latest_reports(posts).get(name, {}).get("kind") in {"ready", "finding"}):
                 recipients = [name] + [n for n, entry in team_of(members).items() if n != name and (
-                    name in dependencies(entry) or (entry.get("role") == "verifier" and in_play(d, name)))]
+                    name in dependencies(entry) or (entry.get("role") == "verifier" and in_play(d, name, members)))]
                 what = ("Review its scope and report again." if member.get("role") == "worker" else
                         "You are a %s now: your earlier report is withdrawn, and a %s posts no READY." % (member["role"], member["role"]))
                 return post_message(COORDINATOR, f"@{name} Your assignment changed. {what}",
@@ -1455,7 +1476,7 @@ def main(argv):
                 if tested:
                     verdict = {"candidate": tested}
             if word in {"NOT PASSED", "NOT VERIFIED"} and members[sender].get("role") == "verifier":
-                void_pass(d)
+                void_pass(d, members, rejected({"agent": sender, "text": text, "to": recipients}, members))
             if word == "NOT PASSED" and members[sender].get("role") == "verifier" and not state.get("paused"):
                 # Paused by the verdict itself, so a resumed run is stopped again only by a further one. Counted as the
                 # board will count it once posted: a second verdict on one candidate is no new failure.
@@ -1492,15 +1513,22 @@ def main(argv):
                     sys.exit("expected a full commit ID")
                 conflicts = {}
                 if revision is not None:
+                    import verify  # late: verify.py imports this module
+                    # A mistyped ID would otherwise stand as a report until verification failed to merge it.
+                    if verify.git(repo, "cat-file", "-e", revision + "^{commit}", optional=True) is None:
+                        sys.exit("%s is no commit in the project's repository. Commit your work and give its full ID, or HEAD "
+                                 "from your checkout" % revision)
                     # A dependency's commit missing from this one would be merged beside it, untested with it.
                     behind = unmerged(repo, {dep: through[dep] for dep in dependencies(member)}, revision)
                     if behind:
                         sys.exit("your commit does not contain the READY commit of %s. Run `board.py DIR sync %s` from your "
                                  "checkout, check the result, then report again" % (", ".join("@" + n for n in behind), sender))
-                    import verify  # late: verify.py imports this module
-                    for peer, files in verify.trial_merge(repo, None, revision, {n: p["revision"] for n, p in through.items()
+                    # Compared with the reports that stay current once this one is posted: a member that depends on the
+                    # sender loses its READY to it and will sync this commit anyway.
+                    stays = readiness(members, [*posts, {"seq": len(posts) + 1, "agent": sender, "text": "READY", "kind": "ready"}])
+                    for peer, files in verify.trial_merge(repo, None, revision, {n: p["revision"] for n, p in stays.items()
                                                                                 if n != sender and p.get("revision")}).items():
-                        conflicts[peer] = {"seq": through[peer]["seq"], "files": files}
+                        conflicts[peer] = {"seq": stays[peer]["seq"], "files": files}
                 report = sys.stdin.read().strip()
                 if not report:
                     sys.exit("READY needs a report on stdin")
@@ -1509,7 +1537,7 @@ def main(argv):
                     # as it would of a `revise`.
                     confirmed = sender in through
                     told = [COORDINATOR] + [name for name, entry in team_of(members).items() if confirmed and name != sender and (
-                        sender in dependencies(entry) or (entry.get("role") == "verifier" and in_play(d, sender)))]
+                        sender in dependencies(entry) or (entry.get("role") == "verifier" and in_play(d, sender, members)))]
                     note = ("This replaces the finding confirmed before: work built on that one waits until the "
                             "coordinator confirms this one.\n" if confirmed else "")
                     post_message(sender, "FINDING awaiting coordinator review\n" + note + report, told, kind="finding")
@@ -1524,7 +1552,7 @@ def main(argv):
             recipients = [name for name, entry in members.items() if not entry.get("killed") and
                           name != sender and (name == COORDINATOR or (notify and (
                               (entry.get("role") == "verifier" and not is_consultant) or sender in dependencies(entry))))]
-            if cmd == "revise" and not in_play(d, sender):
+            if cmd == "revise" and not in_play(d, sender, members):
                 # With no candidate that holds this member's work, a withdrawal costs nobody a turn: `prepare` refuses a
                 # member that is not ready, and the READY that follows tells who needs it. A candidate being tested or
                 # waiting to be accepted is another matter: it is dead from here on, so its verifier and the coordinator hear.
@@ -1545,6 +1573,8 @@ def main(argv):
                 sys.exit("sync accepts only --check-only")
             if state.get("closed") or member.get("role") != "worker" or member.get("killed"):
                 sys.exit("only an active worker of an open run can sync")
+            if member.get("writes") == "0" or kind_of(member) in READ_ONLY:  # as `ready` refuses it a commit
+                sys.exit("a read-only member reports no commit, so it has nothing to sync")
             through = readiness(members, posts)
             blocked = [dep for dep in dependencies(member) if dep not in through]
             if blocked:

@@ -762,6 +762,14 @@
   {
    "text": "```\nunclosed fence",
    "expect": " `\nunclosed fence"
+  },
+  {
+   "text": "~~~\ntilde\n~~~~\nout",
+   "expect": " \nout"
+  },
+  {
+   "text": "```\nfence\n````\nout",
+   "expect": " \nout"
   }
  ],
  "question": [
@@ -823,6 +831,14 @@
   },
   {
    "text": "ok ? fine",
+   "expect": true
+  },
+  {
+   "text": "it is c  ?\ta  :  b",
+   "expect": false
+  },
+  {
+   "text": "use A?  (Option A  : yes)",
    "expect": true
   }
  ],

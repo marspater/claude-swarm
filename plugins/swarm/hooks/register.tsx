@@ -3,7 +3,7 @@ import { atom, read, update } from 'claude-code'
 import type { AgentInfo, EngineInterface, ModelUsage, Register, SessionMessage, Timer, ToolCallResult } from 'claude-code'
 
 import type { Member, Post, Swarm, Tab } from '../types'
-import { COORDINATOR_READ, RUN, boardCalls, type ParsedBoardCall, runsNamed, scanShell, shellWords, type Statement, substitutions, unwrap, wakeMessage, wakeSequence } from './command'
+import { COORDINATOR_READ, RUN, boardCalls, type ParsedBoardCall, runsNamed, scanShell, shellWords, type Statement, substitutions, wakeMessage, wakeSequence } from './command'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, LATEST, SPECIALISTS, SWARM_AGENTS, familyOf, latestOf } from './models'
 import { KEPT, budgetOf, findAgent, memberNamed, mentions, parse, parsePosts, targets, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
 import { CLIP, bodyOf, chipped, clean, clip, compact, fenceAfter, hasQuestion, head, kindOf, openedText, type Fence } from './text'
@@ -352,8 +352,10 @@ function agentIdsOf(members: Roster, agents: AgentInfo[], pick: (member: Roster[
   return ids
 }
 /** Whom the roster stops: retired members, and members paused on their own budget, whose notice is owed again once resumed. */
-function rosterIds(members: Roster, agents: AgentInfo[]) {
+function rosterIds(members: Roster, agents: AgentInfo[], read: number) {
   for (const name of memberPausesTold) if (!memberNamed(members, name)?.paused) memberPausesTold.delete(name)
+  // A notice owed for a member resumed, replaced or retired since is dropped, but only by a roster read begun after it was owed.
+  memberPausesOwed = memberPausesOwed.filter(owed => owed.read >= read || (memberNamed(members, owed.name)?.paused && !memberNamed(members, owed.name)?.killed))
   return {
     retired: agentIdsOf(members, agents, member => Boolean(member.killed)),
     memberPaused: agentIdsOf(members, agents, member => !member.killed && Boolean(member.paused)),
@@ -401,7 +403,9 @@ let silentTold = new Set<string>()
 // under a shared-checkout writer, a post the person made in its name from the pane.
 let notesOwed: string[] = []
 // Members that spent their own token budget, told once each as a paused run is: with the next tool call, or a prompt when idle.
-let memberPausesOwed: string[] = []
+let memberPausesOwed: { name: string; read: number }[] = []
+// Each read of the owned roster, numbered as it begins.
+let rosterReads = 0
 let memberPausesTold = new Set<string>()
 const memberPauseNotice = (name: string) =>
   `@${name} has spent its own token budget and is paused: its tool calls are refused. Raise its budget with the board's member command (budget=<tokens>) and then run resume ${name}, or replace it.`
@@ -415,6 +419,12 @@ const pauseNotice = (title: string, reason: string) =>
 // A submitted notice is held until the turn it starts: a poll before that turn.start would submit a second beside it.
 const NOTICE_HOLD_MS = 10_000
 let noticeHold = 0
+/** A prompt the person sends from the pane, held as a notice is: the coordinator is not yet busy, and a poll would add a second. */
+async function submitHeld($: EngineInterface, text: string, failed: () => void): Promise<void> {
+  noticeHold = (await $.clock.now()) + NOTICE_HOLD_MS
+  const fail = () => { noticeHold = 0; failed() }
+  void $.prompt.submit({ text }).then(result => { if (result.drop) fail() }).catch(fail)
+}
 type SpecialistWake = { name: string; id: string; seq: number; attempts: number; told: number; native: boolean }
 let specialistWakes: SpecialistWake[] = []
 // Specialists owed a mention with no agent address on the roster: named in a relay notice, never the cause of one.
@@ -708,6 +718,8 @@ async function syncOwnedState(
   agents?: AgentInfo[],
 ): Promise<void> {
   const sEpoch = sessionEpoch
+  // A roster the caller read some time before drops no owed notice.
+  const read = loaded ? 0 : ++rosterReads
   const state = loaded ?? await $.fs.read(`${dir}/members.json`)
     .then(text => JSON.parse(text) as { closed?: boolean; paused?: string; members?: Roster } & BudgetState)
     .catch(() => undefined)
@@ -721,7 +733,7 @@ async function syncOwnedState(
   if (!isClosed && state.members) {
     const live = agents ?? await $.agent.list().catch(() => [])
     if (sEpoch !== sessionEpoch || isEnding) return
-    const stops = rosterIds(state.members, live)
+    const stops = rosterIds(state.members, live, read)
     retired = stops.retired
     memberPaused = stops.memberPaused
   } else {
@@ -787,6 +799,7 @@ const headOf = ($: EngineInterface, checkout: string) =>
 
 // What may stand before a command and leaves it the same command, with its own flags.
 const PREFIXES = new Set(['time', 'command', 'exec', 'nohup', 'env'])
+const KEYWORDS = new Set(['if', 'elif', 'while', 'until', 'then', 'do', 'else'])
 async function commitsInSharedCheckout($: EngineInterface, command: string, checkout: string): Promise<boolean> {
   // Compared as the file system names them: the run folder and a `cd` may spell one checkout two ways.
   const cwd = await resolveRealPath($, checkout)
@@ -831,27 +844,58 @@ async function commitsInSharedCheckout($: EngineInterface, command: string, chec
       }
       // What a substitution runs, it runs from here, and keeps its own cd to itself.
       for (const body of inner) if (await commits(body, here)) return true
-      const bare = plain.replace(/"[^"]*"|'[^']*'/g, '')
+      // Only parentheses the shell sees open or close a subshell: not quoted ones, nor `\)`.
+      const bare = plain.replace(/\\[\s\S]|\$'(?:\\[\s\S]|[^'\\])*'|"(?:\\[\s\S]|[^"\\])*"|'[^']*'/g, '')
       for (const _ of bare.matchAll(/\(/g)) subshells.push(here)
-      const { text: segment, negated } = unwrap(plain.replace(/[)}\s]+$/, ''))
       // Read as the shell runs it: `"git" commit`, `\git commit` and `git "commit"` are all a commit.
-      const words = shellWords(segment)
+      const words = shellWords(plain.replace(/[)}\s]+$/, ''))
       // A repository named by --git-dir, --work-tree or their variables cannot be told from the folder: refused.
       let isElsewhere = false
+      let negated = false
+      // Folders `env -C` moves the command to, in order.
+      const chdirs: string[] = []
       let at = 0
+      // What stands before the command, read off the words rather than with unwrap: unwrap drops env's options
+      // with the command, and `env -C dir` takes the command to another folder.
       for (let word = words[at]; word !== undefined; word = words[at]) {
-        if (/^[A-Za-z_]\w*=/.test(word)) {
+        if (/^[({!]/.test(word)) {
+          if (word.startsWith('!')) negated = !negated
+          words[at] = word.slice(1)
+          if (words[at] === '') at++
+        } else if (KEYWORDS.has(word)) {
+          at++
+        } else if (/^[A-Za-z_]\w*=/.test(word)) {
           if (/^GIT_(?:DIR|WORK_TREE)=/.test(word)) isElsewhere = true
           at++
-        } else if (PREFIXES.has(word)) {
-          at++
-          while (words[at]?.startsWith('-')) at += words[at] === '-u' ? 2 : 1
+        } else if (PREFIXES.has(word.replace(/^.*\//, ''))) {
+          // The options that take a value, alone, clustered or attached: env's -C changes the folder and -S
+          // splits a command line of its own into the words that follow.
+          const prefix = word.replace(/^.*\//, '')
+          const valued = prefix === 'env' ? 'uCSP' : prefix === 'exec' ? 'a' : ''
+          for (at++; words[at]?.startsWith('-');) {
+            const flag = words[at++]!
+            if (flag === '--') break
+            const long = prefix === 'env' ? /^--(chdir|split-string|unset)(?:=([\s\S]*))?$/.exec(flag) : null
+            const index = long || flag.startsWith('--') ? -1 : [...flag.slice(1)].findIndex(ch => valued.includes(ch))
+            const option = long ? (long[1] === 'chdir' ? 'C' : long[1] === 'unset' ? 'u' : 'S') : flag[index + 1]
+            if (!long && index < 0) continue
+            const value = long ? long[2] ?? words[at++] : flag.slice(index + 2) || words[at++]
+            if (value === undefined) break
+            if (option === 'C') chdirs.push(value)
+            if (option === 'S') words.splice(at, 0, ...shellWords(value))
+          }
         } else break
       }
       const name = words[at]?.replace(/^.*\//, '')
       const args = words.slice(at + 1)
+      // Where the command itself runs: here, or where env -C took it.
+      const from: Dirs = chdirs.length === 0 ? here
+        : new Set([...here].map(dir => chdirs.reduce<string | undefined>((current, path) => directoryAfter(current, path), dir)))
       let okNext = here
       let failedNext = here
+      // ponytail: a case statement's arms are not followed (scanShell gives `pat) cmd` with `;;` dropped), so a
+      // script with one is a commit when it names git and commit anywhere, as a failed check is. Parse arms if it over-refuses.
+      if (name === 'case' && /\bgit\b/.test(script) && /commit/.test(script)) return true
       if (name === 'cd' || name === 'pushd' || name === 'popd') {
         // `cd -`, `cd` alone and `popd` go somewhere this cannot follow.
         const to = name === 'popd' ? undefined : args.find(arg => arg !== '--' && !/^-[LPe@]+$/.test(arg))
@@ -859,7 +903,7 @@ async function commitsInSharedCheckout($: EngineInterface, command: string, chec
       } else if (name === 'exit' || name === 'return') {
         okNext = failedNext = new Set()
       } else if (name === 'git') {
-        for (const dir of here) {
+        for (const dir of from) {
           let gitDir = dir
           let isMoved = isElsewhere
           for (let i = 0; i < args.length; i++) {
@@ -878,11 +922,13 @@ async function commitsInSharedCheckout($: EngineInterface, command: string, chec
           }
         }
       } else if (name !== undefined && /^(?:ba|da|k|z)?sh$/.test(name)) {
-        // `sh -c '…'` runs its argument as a script of its own.
-        const flag = args.findIndex(arg => /^-[a-z]*c$/.test(arg))
-        if (flag >= 0 && args[flag + 1] !== undefined && await commits(args[flag + 1]!, here)) return true
+        // `sh -c '…'` runs its argument as a script of its own, with the c anywhere in a cluster (`-ec`, `-ce`).
+        // Which operand is the script depends on options that take a value (`-o pipefail`): each one is read as one.
+        if (args.some(arg => /^-[a-zA-Z]*c/.test(arg))) {
+          for (const arg of args) if (!arg.startsWith('-') && await commits(arg, from)) return true
+        }
       } else if (name === 'eval') {
-        if (await commits(args.join(' '), here)) return true
+        if (await commits(args.join(' '), from)) return true
       }
       if (negated) [okNext, failedNext] = [failedNext, okNext]
       if (op === '|' || next === '|') okNext = failedNext = here
@@ -1133,9 +1179,10 @@ async function refresh($: EngineInterface): Promise<void> {
       const root = `${await $.session.cwd()}/.swarm`
       if (!(await $.fs.exists(`${root}/current`))) {
         if (epoch !== generation) return
-        closeTalk($)
+        // A run browsed meanwhile keeps its conversation and replay: only the live run is gone.
+        if (!browsed) closeTalk($)
         if ((await read($, swarm)).dir) {
-          await seek($, 0)
+          if (!browsed) await seek($, 0)
           await update($, swarm, () => EMPTY)
         }
         seen = seenBoard = ''
@@ -1150,6 +1197,7 @@ async function refresh($: EngineInterface): Promise<void> {
     // A run folder that was deleted or archived is no run: the pane says so instead of failing to load one forever.
     // Any other failure to read the roster is still an error.
     const roster = `${dir}/members.json`
+    const rosterRead = ++rosterReads
     const rosterText = await $.fs.read(roster).catch(async error => {
       if (await $.fs.exists(roster).catch(() => true)) throw error
       return undefined
@@ -1163,9 +1211,9 @@ async function refresh($: EngineInterface): Promise<void> {
         strangers.clear()
         await update($, run, () => '')
       }
-      closeTalk($)
+      if (!browsed) closeTalk($)
       if ((await read($, swarm)).dir) {
-        await seek($, 0)
+        if (!browsed) await seek($, 0)
         await update($, swarm, () => EMPTY)
       }
       seen = seenBoard = ''
@@ -1177,7 +1225,7 @@ async function refresh($: EngineInterface): Promise<void> {
     if (epoch !== generation) return
     const state = JSON.parse(rosterText) as { members: Roster; paused?: string; closed?: boolean } & BudgetState
     const isSpent = budgetOf(state) > 0 && tokensUsed(state.usage?.tokens) >= budgetOf(state)
-    const stops = owned && !state.closed ? rosterIds(state.members, agents) : undefined
+    const stops = owned && !state.closed ? rosterIds(state.members, agents, rosterRead) : undefined
     retired = stops?.retired ?? new Set()
     memberPaused = stops?.memberPaused ?? new Set()
     // Read anew on every poll, so a resume or a raised budget lets the members' tools through again.
@@ -1283,7 +1331,7 @@ async function refresh($: EngineInterface): Promise<void> {
       if ((pauseOwed || memberPausesOwed.length > 0) && !isCoordinatorBusy && now >= noticeHold) {
         const what = pauseOwed ? `"${full.title}": ${reason}` : 'a member on its own token budget'
         const text = `Swarm: ${pauseOwed ? 'Run paused' : 'Member paused'}\n${[
-          ...(pauseOwed ? [pauseNotice(full.title.replace(/\s+/g, ' '), pauseOwed)] : []), ...memberPausesOwed].join('\n\n')}`
+          ...(pauseOwed ? [pauseNotice(full.title.replace(/\s+/g, ' '), pauseOwed)] : []), ...memberPausesOwed.map(owed => memberPauseNotice(owed.name))].join('\n\n')}`
         const unheard = () => $.ui.toast(`Swarm paused ${what}. The coordinator could not be told.`)
         pauseOwed = ''
         memberPausesOwed = []
@@ -1419,7 +1467,7 @@ async function account($: EngineInterface, report: string, agentId: string | und
     memberPaused = new Set([...memberPaused, ...(id ? [id] : []), ...(agentId && (!id || id === address) ? [agentId] : [])])
     if (!memberPausesTold.has(pausedName)) {
       memberPausesTold.add(pausedName)
-      memberPausesOwed.push(memberPauseNotice(pausedName))
+      memberPausesOwed.push({ name: pausedName, read: rosterReads })
     }
   }
   if (!entry.paused || dir !== await read($, run)) return true
@@ -1485,12 +1533,13 @@ async function pauseAware<T>($: EngineInterface, calls: ParsedBoardCall[], agent
 }
 
 /** After a coordinator's tool call: what its board commands read of the posts owed it, and the notes it is owed. */
-async function coordinatorNotes<R extends ToolCallResult>($: EngineInterface, calls: ParsedBoardCall[], isRelay: boolean, raw: ToolCallResult, result: R): Promise<R> {
+async function coordinatorNotes<R extends ToolCallResult>($: EngineInterface, calls: ParsedBoardCall[], isRelay: boolean, raw: ToolCallResult, result: R, isCut = false): Promise<R> {
   if (raw.deny !== undefined || raw.isError !== undefined) return result
   try {
     const dir = await read($, run)
     // Only a real read of this run's board answers its mentions: the words alone may sit in a commit message.
-    for (const c of calls) {
+    // A page cut short (`isCut`) printed only part of them, so it answers none.
+    for (const c of isCut ? [] : calls) {
       if (c.action === 'read' && COORDINATOR_READ.test(c.rest)) {
         const calledDir = RUN.test(c.dir) ? await resolveRunDir($, c.dir) : c.dir
         if (calledDir === dir) {
@@ -1499,7 +1548,7 @@ async function coordinatorNotes<R extends ToolCallResult>($: EngineInterface, ca
         }
       }
     }
-    for (const c of calls) {
+    for (const c of isCut ? [] : calls) {
       if (c.action !== 'show' || c.piped || !RUN.test(c.dir) || await resolveRunDir($, c.dir) !== dir) continue
       // One post, the whole board, or one member's posts: only what was printed counts as seen.
       const one = /--post=(\d+)/.exec(c.rest)
@@ -1517,8 +1566,9 @@ async function coordinatorNotes<R extends ToolCallResult>($: EngineInterface, ca
       relayHinted = key
       notices.push(relayNotice())
     }
-    // A read of the board is never told to read it, however it named the run (a shell variable, a relative path).
-    if (dir && owed.last > hinted && !calls.some(c => c.action === 'read' && COORDINATOR_READ.test(c.rest))) {
+    // A read of the board is never told to read it, however it named the run (a shell variable, a relative path),
+    // and neither is a page of it: the page itself says what remains.
+    if (dir && owed.last > hinted && !isCut && !calls.some(c => c.action === 'read' && COORDINATOR_READ.test(c.rest))) {
       hinted = owed.last
       notices.push(`Swarm: ${unreadNotice($, dir)}`)
     }
@@ -1527,7 +1577,7 @@ async function coordinatorNotes<R extends ToolCallResult>($: EngineInterface, ca
       pauseOwed = ''
     }
     if (dir && memberPausesOwed.length > 0) {
-      notices.push(...memberPausesOwed.map(text => `Swarm: ${text}`))
+      notices.push(...memberPausesOwed.map(owed => `Swarm: ${memberPauseNotice(owed.name)}`))
       memberPausesOwed = []
     }
     if (dir && notesOwed.length > 0) {
@@ -1856,7 +1906,8 @@ async function coordinatorBoard($: EngineInterface, e: BoardInput) {
   const one = (value: string | undefined) => value?.trim().replace(/^@/, '').toLowerCase() ?? ''
   const name = one(e.name)
   const newName = one(e.newName)
-  if (action !== 'init' && [name, newName].some(value => value !== '' && !/^[a-z][a-z0-9_-]*$/.test(value))) {
+  // Checked as stripped: "@" alone would otherwise pass as no name, and `resume` would resume the whole run.
+  if (action !== 'init' && ([['name', name], ['newName', newName]] as const).some(([field, value]) => given.includes(field) && !/^[a-z][a-z0-9_-]*$/.test(value))) {
     return { deny: 'A member name is lowercase letters, digits, underscores and hyphens, such as "parser".' }
   }
   if (action === 'init' && !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/.test(e.name?.trim() ?? '')) {
@@ -1895,8 +1946,9 @@ async function coordinatorBoard($: EngineInterface, e: BoardInput) {
     // A whole-board show cut to its newest page printed none of the older posts: they are not marked as seen.
     // Nor is a read that stopped at a page with more to come the end of what the coordinator is owed.
     const isCut = 'result' in answer && (answer.result.startsWith('Earlier posts are left out') || /^\d+ more post\(s\) remain\./m.test(answer.result))
-    const told = await coordinatorNotes($, isCut ? [] : [call], false, answer, answer)
-    return boardCallsRan($, undefined, [call], 'result' in answer ? answer.result : '', told)
+    // The roster sync and a new run's bind come first: what is owed then is this run's and current.
+    const ran = await boardCallsRan($, undefined, [call], 'result' in answer ? answer.result : '', answer)
+    return coordinatorNotes($, [call], false, answer, ran, isCut)
   })
 }
 
@@ -1935,6 +1987,7 @@ let headNoted = ''
  * member's merge commit, which is its dependency's work or nothing at all. */
 async function showDiff($: EngineInterface, dir: string, seq: number, revision: string): Promise<void> {
   const project = dir.slice(0, dir.lastIndexOf('/.swarm/'))
+  const sEpoch = sessionEpoch
   let shown = await $.process.run(['git', '-C', project, 'diff', '--stat', '--patch', '--no-color', '--no-ext-diff', `HEAD...${revision}`], { timeoutMs: 10_000 })
     .catch(error => ({ exitCode: 1, stdout: '', stderr: String(error) }))
   // Once the commit is in HEAD (an accepted run, an older one) it adds nothing to it: its own change is shown then.
@@ -1942,6 +1995,8 @@ async function showDiff($: EngineInterface, dir: string, seq: number, revision: 
     shown = await $.process.run(['git', '-C', project, 'show', '--first-parent', '--stat', '--patch', '--no-color', '--no-ext-diff', revision], { timeoutMs: 10_000 })
       .catch(error => ({ exitCode: 1, stdout: '', stderr: String(error) }))
   }
+  // git may take seconds: a diff for a run no longer shown would open under another run's post of the same number.
+  if (sEpoch !== sessionEpoch || (await shownSwarm($)).dir !== dir) return
   if (shown.exitCode !== 0) {
     $.ui.toast(`Swarm could not show ${revision.slice(0, 12)}: ${clean(shown.stderr).trim().split('\n')[0] || 'git failed'}`)
     return
@@ -2125,8 +2180,21 @@ export const register: Register = on => {
             const agent = agents.find(one => one.id === e.agentId)
             // A member the owned roster names is identified before any lookup that can throw, so a failure fails closed.
             const address = teammateOf($, e.agentId, agent)
-            const found = Object.entries(ownedRoster.members).find(([, m]) =>
-              m.id === e.agentId || (address !== undefined && m.id === address))
+            const named = () => ownedRoster?.dir === activeDir
+              ? Object.entries(ownedRoster.members).find(([, m]) => m.id === e.agentId || (address !== undefined && m.id === address))
+              : undefined
+            let found = named()
+            // A member started since the roster was cached (its `started` is on disk, the poll that reads it is not
+            // yet run) is no stranger: read the roster again before the guard decides it names nobody.
+            if (!found && (agentRuns.get(e.agentId) ?? await agentRun($, e.agentId, agent)) === activeDir) {
+              await syncOwnedState($, activeDir).catch(() => undefined)
+              found = named()
+              // Still unrecorded (its start is in flight): known by its description, by the rule agentRun took it in with.
+              const described = parseDescribedName(agent?.description)
+              const starting = !found && ownedRoster?.dir === activeDir ? memberNamed(ownedRoster.members, described) : undefined
+              if (described && starting && (!starting.id || pendingStarts.has(`${activeDir}/${described}`)) && !starting.killed &&
+                  agent?.type === `swarm:${starting.profile || starting.role || 'worker'}`) found = [described, starting]
+            }
             const [memberName, member] = found ?? []
             if (memberName && memberName !== 'coordinator' && member) guarded = memberName
             // The owned roster naming this agent settles its run: a lookup that fails, by throwing or by an
@@ -2243,9 +2311,6 @@ export const register: Register = on => {
         notesOwed.push(`${moved} while @${headWatch.name} ran a Bash command. Another actor may have moved it, and nothing was undone: check git log before the next candidate.`)
       }
     }
-    if (e.agentId === undefined) {
-      result = await coordinatorNotes($, calls, e.tool === 'SendMessage' && Number.isSafeInteger(wakeSequence(String(e.message))), raw, result)
-    }
     if (e.tool === 'Bash' && e.agentId === undefined && !result.isError && !result.deny && !calls.some(c => c.action === 'init') &&
       substitutions(command).some(body => /\bboard\.py\b[^\n;|&]*\sinit\s/.test(body))) {
       // `R=$(board.py … init …)` keeps the folder out of the output and the call out of what is read off the
@@ -2267,8 +2332,11 @@ export const register: Register = on => {
       const notes = await initNotes($).catch(() => [])
       if (notes.length > 0 && result.deny === undefined && result.isError === undefined) result = { ...result, context: [...(result.context ?? []), ...notes] }
     }
-    if (e.tool !== 'Bash') return result
-    return boardCallsRan($, e.agentId, calls, String((raw.result as { stdout?: unknown } | undefined)?.stdout ?? ''), result)
+    if (e.tool === 'Bash') result = await boardCallsRan($, e.agentId, calls, String((raw.result as { stdout?: unknown } | undefined)?.stdout ?? ''), result)
+    // After the board commands took effect: a new run's bind leaves nothing of the old one's owed, and a resume or
+    // replace drops the pause notices it settled.
+    if (e.agentId !== undefined) return result
+    return coordinatorNotes($, calls, e.tool === 'SendMessage' && Number.isSafeInteger(wakeSequence(String(e.message))), raw, result)
   }).catch((_, e, next) => {
     if (next.called) return next(e)
     if (e.agentId !== undefined) {
@@ -3021,7 +3089,7 @@ export const register: Register = on => {
               // Mid-turn it rides on the next tool result. An idle coordinator is in no post's `to`, so nothing
               // would ever wake it to what was said in its name: it is told now.
               if (isCoordinatorBusy) notesOwed.push(note)
-              else void $.prompt.submit({ text: `Swarm: ${note}` }).then(result => { if (result.drop) notesOwed.push(note) }).catch(() => { notesOwed.push(note) })
+              else await submitHeld($, `Swarm: ${note}`, () => { notesOwed.push(note) })
               await refresh($)
             }}
           />
@@ -3188,10 +3256,7 @@ export const register: Register = on => {
         ['unreachable', 'ignored', 'stale', 'rework', 'retired-running', 'conflict'].includes(kind) ? 'error' : kind === 'paused' || kind === 'member_paused' ? 'suggestion'
           : ['unread', 'review', 'question', 'unstarted', 'blocked', 'spend', 'silent', 'loop'].includes(kind) ? 'warning' : undefined
       const isSpent = shown.budget > 0 && total >= shown.budget
-      const ask = (text: string) => {
-        const fail = () => $.ui.toast('Swarm could not send that request to the coordinator.')
-        void $.prompt.submit({ text }).then(res => { if (res.drop) fail() }).catch(fail)
-      }
+      const ask = (text: string) => submitHeld($, text, () => $.ui.toast('Swarm could not send that request to the coordinator.'))
       const seenKeys = new Map<string, number>()
       body = shown.attention.length === 0 ? (
         <Box marginTop={1}>

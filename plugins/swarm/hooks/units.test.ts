@@ -498,3 +498,71 @@ test('the hooks read targets, quoting, questions and kinds exactly as board.py d
   for (const one of parity.question ?? []) expect([one.text, hasQuestion(one.text)]).toEqual([one.text, one.expect])
   for (const one of parity.kind ?? []) expect([one.text, kindOf(one.text)?.label ?? '']).toEqual([one.text, one.expect])
 })
+
+test('F23: a question mark before a long run of blanks is read in linear time', () => {
+  const started = Date.now()
+  expect(hasQuestion('a ?' + ' '.repeat(5000) + 'b')).toBe(true)
+  expect(hasQuestion('c ?' + ' '.repeat(5000) + ': b')).toBe(false)
+  expect(Date.now() - started).toBeLessThan(200)
+})
+
+test('F24: a heredoc or a case inside a substitution keeps it whole, and its commands are listed', () => {
+  // an apostrophe or a `1)` in a heredoc body is text, not a quote or a close
+  const hd = scanShell("x=\"$(git commit -m y; cat <<'EOF'\ndon't 1)\nEOF\n)\"\necho after")
+  expect(hd.map(s => s.text)).toEqual(["x=\"$(git commit -m y; cat <<'EOF'\ndon't 1)\nEOF\n)\"", 'echo after'])
+  expect(hd[0]?.inner).toEqual(["git commit -m y; cat <<'EOF'\ndon't 1)\nEOF\n"])
+  expect(boardCalls("x=$(cat <<'EOF'\na 1)\npython3 board.py .swarm/r-20260101-000000 show\nEOF\n)")).toEqual([])
+  // `EOF)` ends the body and the substitution, so what follows is read
+  expect(splitShellSegments("x=$(cat <<'EOF'\nit's\nEOF)\ngit commit -m y")).toEqual(["x=$(cat <<'EOF'\nit's\nEOF)", 'git commit -m y'])
+  // arithmetic's << is a shift, a here-string opens no body
+  expect(splitShellSegments('echo $(echo $((1<<4)) <<< x)\ngit commit')).toEqual(['echo $(echo $((1<<4)) <<< x)', 'git commit'])
+  // a case pattern's `)` closes nothing, and the clause's command is read through the case
+  const run = (c: string) => scanShell(c).flatMap(s => [s, ...(s.inner ?? []).flatMap(body => scanShell(body))]).map(s => shellWords(unwrap(s.text).text).join(' '))
+  expect(run('echo "$(case x in a) git commit -m x;; esac)" ; echo b')).toContain('git commit -m x')
+  expect(run('x=$(if true; then case x in (a|b) true;; *) git commit;; esac; fi) && b')).toContain('git commit')
+  expect(run('case x in *) git commit -m x ;; esac')).toEqual(['git commit -m x', 'esac'])
+  expect(run('case "$v" in a) true ;; b) git commit ;; esac')).toEqual(['true', 'git commit', 'esac'])
+  // `case` is a keyword only where a command starts
+  expect(scanShell('x=$(echo case in a) && git commit')[0]?.inner).toEqual(['echo case in a'])
+})
+
+test('F25: a backslash-newline joins the lines, outside single quotes and comments', () => {
+  expect(shellWords('git \\\ncommit -m x')).toEqual(['git', 'commit', '-m', 'x'])
+  expect(shellWords('echo "a\\\nb" \'c\\\nd\' \\\\\ne')).toEqual(['echo', 'ab', 'c\\\nd', '\\', 'e'])
+  expect(unwrap('if \\\n git commit').text).toBe('git commit')
+  const call = boardCalls('python3 board.py .swarm/r-20260101-000000 \\\nread coordinator')
+  expect(call.map(c => [c.action, c.subarg, c.rest])).toEqual([['read', 'coordinator', 'read coordinator']])
+  // a comment's backslash continues nothing; a `#` the join puts inside a word starts none
+  expect(splitShellSegments('echo a # note \\\ngit commit')).toEqual(['echo a', 'git commit'])
+  expect(splitShellSegments('echo x\\\n#; git commit -m y')).toEqual(['echo x#', 'git commit -m y'])
+})
+
+test('F26: what a group writes goes where its close sends it', () => {
+  const piped = (c: string) => scanShell(c).map(s => [s.text, s.piped])
+  expect(boardCalls('{ python3 board.py DIR show; } | head')[0]?.piped).toBe(true)
+  expect(boardCalls('(python3 board.py DIR show; echo) > out')[0]?.piped).toBe(true)
+  expect(boardCalls('{ python3 board.py DIR show; } 2>&1; x')[0]?.piped).toBe(false)
+  // a redirect inside the group sends only its own statement away
+  expect(piped('(a; b > x) ; c')).toEqual([['(a', false], ['b > x)', true], ['c', false]])
+  expect(piped('{ { a; } ; b; } | c')).toEqual([['{ { a', true], ['}', true], ['b', true], ['}', true], ['c', false]])
+})
+
+test('F27: a malformed attention report, the board subcommands, and a kind word after a no-break space', () => {
+  const roster = JSON.stringify({ members: { a: { role: 'worker', id: 'x', last_read_seq: 0 } } })
+  const shown = parse('/r', '', roster, [], 300, { items: [], limits: {}, members: { a: { owns: 123, blocked_on: 'b' } as never } })
+  expect(shown.members[0]?.owns).toBe('')
+  expect(toolMood('Bash', '$PY "$S"/board.py "$RUN" export')).toBe('inspect')
+  expect(toolMood('Bash', '$PY "$S"/board.py "$RUN" sync parser')).toBe('relay')
+  expect(toolSummary([{ tool: 'Bash', input: { command: 'git diff board.py' } }])).toBe('Ran 1 command')
+  expect(toolSummary([{ tool: 'Bash', input: { command: '$PY "$S"/board.py "$RUN" export' } }])).toBe('Used the board')
+  // board.py's REPORT_WORD takes blanks and tabs after a mention, so a no-break space makes no kind
+  const nbsp = post('@coordinator READY all good', ['coordinator'])
+  expect([kindOf(nbsp.text), chipped(nbsp)]).toEqual([undefined, ' READY all good'])
+  expect(kindOf('@coordinator\tREADY')?.label).toBe('READY')
+})
+
+test('an unquoted heredoc body runs its substitutions; a quoted one is text', () => {
+  expect(scanShell('cat <<EOF\n$(git commit -m x) and `git push`\nEOF\necho done')[0]?.inner).toEqual(['git commit -m x', 'git push'])
+  expect(scanShell("cat <<'EOF'\n$(git commit -m x)\nEOF")[0]?.inner).toBeUndefined()
+  expect(scanShell('cat <<EOF\n\\$(git commit -m x)\nEOF')[0]?.inner).toBeUndefined()
+})

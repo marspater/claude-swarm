@@ -145,7 +145,10 @@ def scenario():
         assert saved(d)["members"]["art"].get("writes") != "0"
         run(d, "member", "art", "role=verifier", ok=False)  # the profile belongs to a worker
         run(d, "member", "art", "consult=1", ok=False)
-        run(d, "ready", "art", "a" * 40, stdin="icons drawn")  # unlike a specialist, its report may carry a commit
+        # unlike a specialist, its report may carry a commit: this one is refused only because the project has no such commit
+        assert "no commit in the project's repository" in subprocess.run(
+            [sys.executable, BOARD, d, "ready", "art", "a" * 40], input="icons drawn", capture_output=True, text=True).stderr
+        run(d, "ready", "art", stdin="icons drawn")
         # a specialist turned designer writes again; one registered writes=0 stays read-only
         run(d, "member", "art", "profile=architect")
         run(d, "member", "art", "profile=designer")
@@ -1805,6 +1808,117 @@ class BoardRegressions(unittest.TestCase):
         assert board.rework({"members": members}, posts) == {"b": [1]}
         posts[1].pop("partial")
         assert board.rework({"members": members}, posts) == {}
+
+    # The audit of 0.3.46.
+
+    def test_question_check_is_linear_in_a_run_of_spaces(self):
+        sys.path.insert(0, os.path.dirname(BOARD))
+        import board  # noqa: E402
+        start = time.monotonic()
+        assert board.QUESTION.search("a ?" + " " * 3000 + "b")  # seconds under a pattern that backtracks
+        assert time.monotonic() - start < 1
+
+    def test_a_revise_tells_the_verifier_of_a_partial_candidate_built_on_it(self):
+        d = self.init_run()
+        run(d, "member", "a")
+        run(d, "member", "b", "depends=a")
+        run(d, "member", "v", "role=verifier")
+        run(d, "ready", "a", stdin="done")
+        run(d, "ready", "b", stdin="done on a")
+        self.table(d, {"b": [2, None]})  # `--members b`: a's work is in it through b
+        assert "@v" in run(d, "revise", "a", "a flaw")
+
+    def test_a_refused_member_change_pauses_nobody(self):
+        d = self.init_run()
+        run(d, "member", "a", "id=agent-a")
+        self.account(d, "agent-a", 5_000)
+        assert "paused" not in run(d, "member", "a", "budget=4000", "depends=ghost", ok=False)
+        assert not saved(d)["members"]["a"].get("paused")
+
+    def test_a_rejection_outside_a_partial_candidate_keeps_its_pass(self):
+        d = self.init_run()
+        for who, extra in (("a", []), ("b", []), ("v", ["role=verifier"])):
+            run(d, "member", who, *extra)
+        path = os.path.join(d, "verification.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"candidate": "cand", "inputs": {"b": [1, None]}, "partial": True, "members": ["b"], "verified_by": "v"}, f)
+        run(d, "post", "v", "@a NOT PASSED: the parser drops zeros")
+        with open(path, encoding="utf-8") as f:
+            assert json.load(f)["verified_by"] == "v"
+        run(d, "post", "v", "@b NOT PASSED: the printer drops them too")
+        with open(path, encoding="utf-8") as f:
+            assert "verified_by" not in json.load(f)
+
+    def git_project(self):
+        """A project in its own repository, and a helper that commits one file on a branch and returns the commit."""
+        project = os.path.join(self.root, "proj")
+        os.makedirs(project)
+
+        def git(*args):
+            return subprocess.run(["git", "-C", project, *args], check=True, capture_output=True, text=True).stdout.strip()
+
+        def commit(branch, start, name, text):
+            git("switch", "-q", "-C", branch, start)
+            with open(os.path.join(project, name), "w") as f:
+                f.write(text)
+            git("add", name)
+            git("commit", "-q", "-m", "change " + name)
+            return git("rev-parse", "HEAD")
+
+        git("init", "-q", "-b", "main")
+        for key, value in (("user.name", "T"), ("user.email", "t@example.invalid"), ("commit.gpgsign", "false")):
+            git("config", key, value)
+        with open(os.path.join(project, "a"), "w") as f:
+            f.write("0\n")
+        git("add", ".")
+        git("commit", "-q", "-m", "base")
+        return project, commit
+
+    def test_ready_compares_only_with_reports_that_stay_current(self):
+        project, commit = self.git_project()
+        d = run(os.path.join(project, ".swarm", "reg"), "init", "Merge").strip()
+        run(d, "member", "up")
+        run(d, "member", "down", "depends=up")
+        run(d, "ready", "up", commit("up", "main", "a", "up\n"), stdin="a is up")
+        run(d, "ready", "down", commit("down", "up", "b", "down\n"), stdin="b is down, on up")
+        # down's READY falls with this one and down syncs it anyway: its old commit is no conflict
+        told = run(d, "ready", "up", commit("up2", "main", "a", "up again\n"), stdin="a rewritten")
+        assert "conflict" not in told and not self.items(d, "conflict"), told
+
+    def test_ready_needs_a_commit_the_project_has_and_sync_a_writer(self):
+        project, commit = self.git_project()
+        d = run(os.path.join(project, ".swarm", "reg"), "init", "Commits").strip()
+        run(d, "member", "w")
+        run(d, "member", "scout", "writes=0")
+        refused = subprocess.run([sys.executable, BOARD, d, "ready", "w", "f" * 40], input="done", capture_output=True, text=True)
+        assert refused.returncode != 0 and "no commit in the project's repository" in refused.stderr, refused.stderr
+        run(d, "ready", "w", commit("w", "main", "a", "w\n"), stdin="done")
+        run(d, "member", "art", "profile=designer")
+        run(d, "ready", "art", commit("art", "main", "icon", "drawn\n"), stdin="icons drawn")  # a designer's report may carry one
+        refused = subprocess.run([sys.executable, BOARD, d, "sync", "scout"], capture_output=True, text=True, cwd=project)
+        assert refused.returncode != 0 and "read-only" in refused.stderr, refused.stderr
+
+    def test_a_lower_budget_restates_a_members_pause(self):
+        d = self.init_run()
+        run(d, "member", "a", "id=agent-a")
+        run(d, "member", "b", "id=agent-b")
+        self.account(d, "agent-a", 5_000)
+        self.account(d, "agent-b", 5_000)
+        run(d, "member", "a", "budget=4000")
+        assert "paused" not in run(d, "member", "a", "budget=3000")  # already paused: said once
+        assert saved(d)["members"]["a"]["paused"] == "token budget of 3000 spent"
+        run(d, "limit", "member_budget=4500")
+        run(d, "limit", "member_budget=4000")
+        assert saved(d)["members"]["b"]["paused"] == "token budget of 4000 spent"
+
+    def test_a_citation_after_re_colon_answers_only_that_question(self):
+        d = self.init_run()
+        run(d, "member", "a")
+        run(d, "member", "b")
+        run(d, "post", "a", "@b which parser?")
+        run(d, "post", "a", "@b which printer?")
+        run(d, "post", "b", "@a re: #1 the regex one")
+        assert [item["seq"] for item in self.items(d, "question")] == [2]
 
     def test_parity_vectors_match_the_board(self):
         sys.path.insert(0, os.path.dirname(BOARD))
