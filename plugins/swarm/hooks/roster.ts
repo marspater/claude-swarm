@@ -48,6 +48,11 @@ export type Roster = Record<
     isolated?: string
     id?: string
     killed?: string
+    /** The members whose READY it waits for, comma-separated. */
+    depends?: string
+    /** Its own token budget, and why it was paused once that was spent: its tool calls are refused until `resume NAME`. */
+    budget?: string
+    paused?: string
     replaced_by?: string
     last_read_seq: number
     last_nudged_seq?: number
@@ -72,13 +77,18 @@ export type Report = {
     blocked_on: string[]
     asked: number
     unreachable: boolean
+    /** It spent its own token budget. */
+    paused?: boolean
   }>
   limits: Record<string, string>
 }
 
 // What a member that is not working is waiting for, in words.
-export function detailOf(status: string, hint: Report['members'][string] | undefined, isPaused: boolean): string {
-  if (status === 'working' || status === 'killed' || status === 'coordinating' || status === 'failed') return ''
+export function detailOf(status: string, hint: Report['members'][string] | undefined, isPaused: boolean, isMemberPaused = false): string {
+  if (status === 'killed' || status === 'coordinating' || status === 'failed') return ''
+  // Said while it still works too: its next tool call is refused.
+  if (isMemberPaused) return 'its token budget is spent'
+  if (status === 'working') return ''
   if (status === 'unreachable') return 'cannot be woken'
   if (status === 'stopped') return 'its agent was stopped'
   if (isPaused) return 'run paused'
@@ -95,7 +105,8 @@ export const mentions = (text: string) => new Set(
     .flatMap(name => [name, name.replace(/[-_]+$/, '')]),
 )
 
-export function targets(text: string, roster: Roster): string[] {
+/** The live members a post reaches, as board.py's targets reads them: `@verifiers` is every verifier, `@dependents` whoever waits for the sender. */
+export function targets(text: string, roster: Roster, sender?: string): string[] {
   const mentioned = mentions(text)
 
   return Object.keys(roster).filter(name => {
@@ -106,7 +117,9 @@ export function targets(text: string, roster: Roster): string[] {
       !member.killed &&
       (mentioned.has('all') ||
         mentioned.has(name) ||
-        (member.group !== undefined && mentioned.has(member.group)))
+        (member.group !== undefined && mentioned.has(member.group)) ||
+        (mentioned.has('verifiers') && member.role === 'verifier') ||
+        (mentioned.has('dependents') && sender !== undefined && (member.depends ?? '').split(',').includes(sender)))
     )
   })
 }
@@ -142,14 +155,17 @@ export function parsePosts(board: string, roster: Roster): Post[] {
   for (const line of board.split('\n')) {
     if (line.trim() === '') continue
     try {
-      const post = JSON.parse(line) as Omit<Post, 'to'> & { to?: string[] }
+      const post = JSON.parse(line) as Omit<Post, 'to' | 'revision'> & { to?: string[]; revision?: unknown }
       if (!post || !Number.isSafeInteger(post.seq) || post.seq <= (posts.at(-1)?.seq ?? 0) ||
           typeof post.agent !== 'string' || typeof post.text !== 'string' || typeof post.time !== 'string' ||
           (post.to !== undefined && (!Array.isArray(post.to) || post.to.some(name => typeof name !== 'string')))) continue
       // board.py records the recipients; a board written before it did is read by its mentions
       const to =
-        post.to ?? targets(post.text, roster).filter(name => name !== post.agent)
-      posts.push({ ...post, agent: clean(post.agent), time: clean(post.time), text: clean(post.text), to: to.map(clean) })
+        post.to ?? targets(post.text, roster, post.agent).filter(name => name !== post.agent)
+      // A READY's commit goes into a git command line when its diff is opened: only a full commit id is kept.
+      const { revision, ...rest } = post
+      const commit = typeof revision === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(revision) ? { revision } : {}
+      posts.push({ ...rest, ...commit, agent: clean(post.agent), time: clean(post.time), text: clean(post.text), to: to.map(clean) })
     } catch {
       // a line still being written; the next poll reads it whole
     }
@@ -216,7 +232,7 @@ export function parse(
     // Its agent ended, it has read everything addressed to it, and it answered none of it: no report, no question,
     // nothing it waits for. While others work nobody notices, and whoever depends on it waits for good.
     const lastHeard = heard.get(name) ?? 0
-    if (!isClosed && !state.paused && (member.role ?? 'worker') === 'worker' && member.id !== undefined && status === 'waiting' &&
+    if (!isClosed && !state.paused && !member.paused && (member.role ?? 'worker') === 'worker' && member.id !== undefined && status === 'waiting' &&
         hint !== undefined && !hint.ready && !hint.asked && !hint.blocked_on?.length &&
         counts(name).unread === 0 && lastHeard > 0 && (said.get(name) ?? 0) < lastHeard) {
       zombieAttention.push({
@@ -238,7 +254,7 @@ export function parse(
       depends: hint?.depends ?? [],
       owns: clean(hint?.owns ?? ''),
       status,
-      detail: isClosed ? '' : isZombie ? `still ${zombie.status} (${zombie.id})` : detailOf(status, hint, Boolean(state.paused)),
+      detail: isClosed ? '' : isZombie ? `still ${zombie.status} (${zombie.id})` : detailOf(status, hint, Boolean(state.paused), Boolean(member.paused) || hint?.paused === true),
       unread: counts(name).unread,
       posts: counts(name).sent,
     }

@@ -38,7 +38,7 @@ Many similar small jobs: failing tests grouped by package, lint fixes by directo
 
 ### Pipeline
 
-Stages that need the previous result: locate, then implement, then verify. Register the order with `BOARD member <later> depends=<earlier>` and name it in both briefs. `BOARD ready` wakes dependents for ordinary assignments. For an investigator, you review the finding and use `BOARD confirm NAME SEQ` to release dependents. In an isolated-worktree pipeline between writers, either instruct the downstream writer to inspect (`git show <commit>:<path>`) or merge (`git merge --no-ff <commit>`) the upstream `READY <commit>` before building/testing, or land upstream stages before spawning dependent isolated writers. Keep the chain short so workers spend their turns on independent work where possible.
+Stages that need the previous result: locate, then implement, then verify. Register the order with `BOARD member <later> depends=<earlier>` and name it in both briefs. `BOARD ready` wakes dependents for ordinary assignments. For an investigator, you review the finding and use `BOARD confirm NAME SEQ` to release dependents. In an isolated-worktree pipeline between writers, the downstream writer's commit must contain the upstream `READY <commit>`, or its `BOARD ready` is refused: brief it to run `BOARD sync <its name>` from its worktree before building and testing on the upstream work, and again after any new upstream `READY`. Keep the chain short so workers spend their turns on independent work where possible.
 
 ### Investigate, then fix
 

@@ -11,7 +11,7 @@ You own a bounded piece. Use its acceptance criteria to decide what to read, cha
 ## Read only what the piece needs
 
 - Your brief is shown in full. Other members' posts arrive as one line each. Open one with `BOARD show --post=<n>` only when your work depends on it.
-- Verify the checkout and assigned paths before touching a file. In a shared checkout, inspect the current diff for changes you need to preserve. For isolated work, identify the worktree from which your result will be handed off; when depending on an upstream writer's `READY <commit>`, inspect (`git show <commit>:<path>`) or merge (`git merge --no-ff <commit>`) that commit into your worktree before building or testing.
+- Verify the checkout and assigned paths before touching a file. In a shared checkout, inspect the current diff for changes you need to preserve. For isolated work, identify the worktree from which your result will be handed off; when depending on an upstream writer's `READY <commit>`, run `BOARD sync <your-name>` from your worktree before building or testing: it merges that commit, and `ready` refuses a commit that lacks it.
 - Read your files, their tests, and the callers or contracts that the change affects. Start from the normal entry point so a local fix also works through the feature's usual path.
 - Locate before you read: search for the symbol, then read the range around it. Read a whole file only when it is short or you own it.
 - Do not read a file twice in one turn unless it changed.

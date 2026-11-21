@@ -1612,6 +1612,204 @@ class BoardRegressions(unittest.TestCase):
         usage = subprocess.run([sys.executable, BOARD, self.swarm, "nonsense"], capture_output=True, text=True).stderr
         assert "once every worker is ready" in usage and "notify coordinator, verifiers and dependents" not in usage
 
+    # The feature wave after 0.3.44.
+
+    def test_sync_merges_dependencies_and_ready_requires_them(self):
+        project = os.path.join(self.root, "proj")
+        os.makedirs(project)
+
+        def git(*args):
+            return subprocess.run(["git", "-C", project, *args], check=True, capture_output=True, text=True).stdout.strip()
+
+        def board(*args, ok=True, stdin=None):
+            r = subprocess.run([sys.executable, BOARD, d, *args], input=stdin, capture_output=True, text=True, cwd=project)
+            assert (r.returncode == 0) == ok, (args, r.stdout, r.stderr)
+            return r.stdout + r.stderr
+
+        def commit(branch, start, name, text):
+            git("switch", "-q", "-C", branch, start)
+            with open(os.path.join(project, name), "w") as f:
+                f.write(text)
+            git("add", name)
+            git("commit", "-q", "-m", "change " + name)
+            return git("rev-parse", "HEAD")
+
+        git("init", "-q", "-b", "main")
+        for key, value in (("user.name", "T"), ("user.email", "t@example.invalid"), ("commit.gpgsign", "false")):
+            git("config", key, value)
+        for name in ("a", "b"):
+            with open(os.path.join(project, name), "w") as f:
+                f.write("0\n")
+        git("add", ".")
+        git("commit", "-q", "-m", "base")
+        d = run(os.path.join(project, ".swarm", "reg"), "init", "Sync").strip()
+        # a member merges in its own worktree: from the project checkout, sync would land on the user's branch
+        git("worktree", "add", "-q", "--detach", os.path.join(self.root, "wt"), "main")
+        main, project = project, os.path.join(self.root, "wt")
+        for who, extra in (("up", []), ("down", ["depends=up"]), ("clash", ["depends=up"]), ("side", [])):
+            run(d, "member", who, *extra)
+        board("sync", "down", ok=False)  # its dependency has not reported
+        up = commit("up", "main", "a", "up\n")
+        run(d, "ready", "up", up, stdin="a is up")
+        commit("down", "main", "b", "down\n")
+        assert "sync down" in board("ready", "down", "HEAD", ok=False, stdin="b is down")
+        assert "unmerged: @up " + up in board("sync", "down", "--check-only", ok=False)
+        with open(os.path.join(project, "stray"), "w") as f:
+            f.write("x")
+        assert "uncommitted changes" in board("sync", "down", ok=False)
+        os.unlink(os.path.join(project, "stray"))
+        refused = subprocess.run([sys.executable, BOARD, d, "sync", "down"], capture_output=True, text=True, cwd=main)
+        assert refused.returncode != 0 and "not your worktree" in refused.stderr
+        assert "merged @up's commit" in board("sync", "down")
+        assert saved(d)["members"]["down"]["synced_deps"] == {"up": up}
+        assert "in sync" in board("sync", "down", "--check-only")
+        board("ready", "down", "HEAD", stdin="b is down, on top of up")
+        # a full commit ID is checked in the project's repository
+        assert "sync clash" in board("ready", "clash", commit("clash", "main", "a", "clash\n"), ok=False, stdin="a too")
+        assert "@up" in board("sync", "clash", ok=False)  # both change a: the merge is aborted, the checkout left clean
+        assert git("status", "--porcelain") == "" and git("rev-parse", "HEAD") == git("rev-parse", "clash")
+        # a READY whose commit would conflict with another current READY says so, and attention lists it while both stand
+        side = commit("side", "main", "a", "side\n")
+        git("switch", "-q", "--detach", "main")
+        told = board("ready", "side", side, stdin="a on the side")
+        assert told.startswith("posted #") and "conflict: @up's READY #1 and this commit both change a." in told, told
+        conflicts = [item for item in self.items(d, "conflict") if item["member"] == "side"]
+        assert conflicts and "@up" in conflicts[0]["text"] and conflicts[0]["seq"] == int(told.split()[1][1:])
+        run(d, "revise", "side", "rethinking")
+        assert not self.items(d, "conflict")
+        # with two dependencies, a merge that fails after one that worked leaves that one merged and on record
+        apart = commit("apart", "main", "b", "apart\n")
+        git("switch", "-q", "--detach", "main")
+        run(d, "ready", "side", apart, stdin="b on the side")
+        run(d, "member", "both", "depends=side,up")
+        commit("both", "main", "a", "both\n")
+        assert "@up" in board("sync", "both", ok=False)
+        assert saved(d)["members"]["both"]["synced_deps"] == {"side": apart}
+        git("merge-base", "--is-ancestor", apart, "HEAD")
+        assert git("status", "--porcelain") == ""
+
+    def test_verifiers_and_dependents_aliases(self):
+        d = self.init_run()
+        for who, extra in (("up", []), ("down", ["depends=up"]), ("other", []), ("v1", ["role=verifier"]),
+                           ("v2", ["role=verifier"]), ("old", ["role=verifier"])):
+            run(d, "member", who, *extra)
+        run(d, "member", "old", "killed=1")
+        assert "-> @v1 @v2\n" in run(d, "post", "coordinator", "@verifiers please look")
+        assert "-> @down\n" in run(d, "post", "up", "@dependents the API moved")
+        assert "-> nobody" in run(d, "post", "coordinator", "@dependents nobody depends on the coordinator")
+        assert "@down" in run(d, "ready", "up", stdin="done, @dependents rebase").splitlines()[0]
+        for bad in (("member", "verifiers"), ("member", "dependents"), ("member", "other", "group=verifiers"),
+                    ("member", "other", "group=dependents"), ("replace", "other", "dependents")):
+            run(d, *bad, ok=False)
+
+    def account(self, d, member_id, tokens):
+        self.turns = getattr(self, "turns", 0) + 1
+        key = hashlib.sha256(("swarm-agent:" + member_id).encode()).hexdigest()
+        return json.loads(run(d, "account", "%064x" % self.turns, key, str(tokens)))
+
+    def test_member_budget_pauses_one_member(self):
+        d = self.init_run()
+        run(d, "member", "w", "id=agent-w", "budget=100")
+        run(d, "member", "x", "id=agent-x")
+        run(d, "member", "coordinator", "budget=5", ok=False)
+        run(d, "member", "x", "budget=lots", ok=False)
+        assert "member_paused" not in self.account(d, "agent-w", 60)
+        assert self.account(d, "agent-w", 60)["member_paused"] == "w"
+        assert saved(d)["members"]["w"]["paused"] == "token budget of 100 spent"
+        assert "member_paused" not in self.account(d, "agent-w", 1)  # already paused
+        run(d, "post", "coordinator", "@w @x news")
+        assert woken(d) == ["@x"]
+        run(d, "member", "after", "depends=w")
+        assert "@after waits for @w, which is paused: token budget of 100 spent" in [item["text"] for item in self.items(d, "blocked")]
+        run(d, "member", "after", "depends=")
+        report = json.loads(run(d, "attention", "--json"))
+        assert report["members"]["w"]["paused"] and not report["members"]["x"]["paused"]
+        assert [item["member"] for item in report["items"] if item["kind"] == "member_paused"] == ["w"]
+        refused = subprocess.run([sys.executable, BOARD, d, "resume", "w"], capture_output=True, text=True)
+        assert refused.returncode != 0 and "121 of its 100 tokens" in refused.stderr, refused.stderr
+        run(d, "resume", "x", ok=False)  # not paused
+        run(d, "member", "w", "budget=-")
+        assert "budget" not in saved(d)["members"]["w"]
+        assert "-> @w" in run(d, "resume", "w")
+        assert "paused" not in saved(d)["members"]["w"] and "@w" in woken(d)
+        # the run's member_budget applies to a member without its own, and retiring a member drops its pause
+        run(d, "limit", "member_budget=50")
+        assert self.account(d, "agent-x", 50)["member_paused"] == "x"
+        run(d, "member", "x", "killed=1")
+        assert "paused" not in saved(d)["members"]["x"]
+        run(d, "member", "y", "id=agent-y")
+        assert self.account(d, "agent-y", 50)["member_paused"] == "y"
+        run(d, "replace", "y", "y2")
+        assert "paused" not in saved(d)["members"]["y"] and "paused" not in saved(d)["members"]["y2"]
+        run(d, "limit", "member_budget=0")
+        assert "member_budget" not in saved(d).get("limits", {})
+
+    def test_spend_of_a_pair_and_loops(self):
+        d = self.init_run()
+        run(d, "member", "a", "id=agent-a")
+        run(d, "member", "b", "id=agent-b")
+        self.account(d, "agent-a", 140_000)
+        self.account(d, "agent-b", 60_000)
+        assert not self.items(d, "spend")  # 70% of the pair
+        self.account(d, "agent-a", 50_000)
+        assert [item["member"] for item in self.items(d, "spend")] == ["a"]  # 76%
+        assert [item["member"] for item in self.items(d, "loop")] == ["a"]  # 190,000 tokens without a post or a read
+        run(d, "post", "a", "@b still on it")
+        assert not self.items(d, "loop")
+        for _ in range(148):  # its 149th step since it began
+            self.account(d, "agent-b", 10)
+        assert not self.items(d, "loop")
+        self.account(d, "agent-b", 10)
+        assert [item["member"] for item in self.items(d, "loop")] == ["b"]
+        run(d, "read", "b")
+        assert not self.items(d, "loop")
+
+    def test_export_writes_a_report_and_changes_nothing(self):
+        d = self.init_run()
+        run(d, "member", "w", "owns=a|b")
+        run(d, "member", "v", "role=verifier")
+        run(d, "post", "coordinator", "@w BRIEF\nOwns: a")
+        run(d, "ready", "w", stdin="done")
+        with open(os.path.join(d, "members.json"), "rb") as f:
+            before = f.read()
+        path = run(d, "export").strip()
+        assert path == os.path.join(os.path.abspath(d), "summary.md")
+        with open(path, encoding="utf-8") as f:
+            report = f.read()
+        for part in ("# Regression", "Status: open. 2 posts.", "| @w | worker | sonnet | medium | a\\|b | yes | 0 |",
+                     "No candidate was prepared.", "## Transcript", "> @w BRIEF", "> Owns: a", "-> @w"):
+            assert part in report, (part, report)
+        out = os.path.join(self.root, "elsewhere.md")
+        assert run(d, "export", "--out=" + out).strip() == out and os.path.isfile(out)
+        run(d, "export", "--bogus", ok=False)
+        with open(os.path.join(d, "members.json"), "rb") as f:
+            assert f.read() == before
+
+    def test_a_partial_pass_clears_rework_only_for_its_workers(self):
+        sys.path.insert(0, os.path.dirname(BOARD))
+        import board  # noqa: E402
+        members = {"coordinator": {"role": "coordinator"}, "a": {"role": "worker"}, "b": {"role": "worker"}, "v": {"role": "verifier"}}
+        posts = [{"seq": 1, "agent": "v", "text": "@a @b NOT PASSED: both", "to": ["a", "b"], "candidate": "c1"},
+                 {"seq": 2, "agent": "v", "text": "@coordinator VERIFIED c2 x", "to": ["coordinator"], "partial": True, "members": ["a"]}]
+        assert board.rework({"members": members}, posts) == {"b": [1]}
+        posts[1].pop("partial")
+        assert board.rework({"members": members}, posts) == {}
+
+    def test_parity_vectors_match_the_board(self):
+        sys.path.insert(0, os.path.dirname(BOARD))
+        import board  # noqa: E402
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "parity.json"), encoding="utf-8") as f:
+            vectors = json.load(f)
+        for case in vectors["targets"]:
+            assert board.targets(case["text"], case["members"], sender=case["sender"]) == case["expect"], case
+        for case in vectors["quoted"]:
+            assert board.QUOTED.sub(" ", case["text"]) == case["expect"], case
+        for case in vectors["question"]:
+            assert bool(board.QUESTION.search(board.QUOTED.sub(" ", case["text"]))) == case["expect"], case
+        for case in vectors["kind"]:
+            word = board.REPORT_WORD.match(case["text"])
+            assert (word[1] if word else "") == case["expect"], case
+
 
 if __name__ == "__main__":
     unittest.main()

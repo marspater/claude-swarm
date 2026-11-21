@@ -945,6 +945,59 @@ class VerifyRegressions(unittest.TestCase):
             run(*gate, "accept", cand["candidate"])
             assert g("rev-parse", "HEAD") == cand["commit"]
 
+    def test_a_partial_candidate_is_tested_and_never_accepted(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+
+            def change(g):
+                (proj / "file.txt").write_text("v2")
+                g("add", "file.txt")
+            g, base, board, post, gate = self._isolated_candidate(proj, change)
+            run(*post, "member", "other")
+            run(*gate, "prepare", "isolated", "--check", "true", ok=False)  # @other has not reported
+            for bad in ("ghost", "v", " , "):
+                run(*gate, "prepare", "isolated", "--check", "true", "--members", bad, ok=False)
+            cand = json.loads(run(*gate, "prepare", "isolated", "--check", "true", "--members", "@w"))
+            record = json.loads((Path(board) / "verification.json").read_text())
+            assert cand["partial"] and record["partial"] and record["members"] == ["w"] and list(record["inputs"]) == ["w"]
+            line = run(*gate, "test", cand["candidate"], "v").splitlines()[-1]
+            assert "note: this pass is of a partial candidate holding @w" in run(*post, "post", "v", "@coordinator " + line)
+            with open(Path(board) / "board.jsonl", encoding="utf-8") as f:
+                assert json.loads(f.read().splitlines()[-1])["partial"] is True
+            refused = subprocess.run([*gate, "accept", cand["candidate"]], capture_output=True, text=True)
+            assert refused.returncode != 0 and "partial candidate" in refused.stderr, refused.stderr
+            assert g("rev-parse", "HEAD") == base
+            # a worker outside it reporting leaves the partial pass standing, and no stale verification is claimed
+            run(*post, "ready", "other", text="done")
+            run(*post, "post", "v", "@coordinator " + line)
+            kinds = [item["kind"] for item in json.loads(run(*post, "attention", "--json"))["items"]]
+            assert "stale" not in kinds, kinds
+            run(*post, "revise", "w", "one more thing")
+            run(*post, "post", "v", "@coordinator " + line, ok=False)
+            run(*post, "read", "coordinator")
+            assert "passed but was partial: it held only @w" in run(*post, "close")
+
+    def test_trial_merge_names_conflicting_files_per_peer(self):
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import verify
+            with tempfile.TemporaryDirectory() as t:
+                proj = Path(t).resolve()
+                g = self._init_git(proj)
+                base = g("rev-parse", "HEAD")
+                commits = {}
+                for branch, name in (("mine", "file.txt"), ("theirs", "file.txt"), ("apart", "other.txt")):
+                    g("switch", "-q", "-c", branch, base)
+                    (proj / name).write_text(branch)
+                    g("add", name)
+                    g("commit", "-q", "-m", branch)
+                    commits[branch] = g("rev-parse", "HEAD")
+                others = {"theirs": commits["theirs"], "apart": commits["apart"], "unknown": "0" * 40}
+                assert verify.trial_merge(proj, None, commits["mine"], others) == {"theirs": ["file.txt"]}
+                assert verify.trial_merge(proj, base, commits["mine"], others) == {"theirs": ["file.txt"]}
+        finally:
+            sys.path.remove(str(SCRIPTS))
+
     def test_low_a_check_that_ends_leaves_nothing_running(self):
         import time
         sys.path.insert(0, str(SCRIPTS))

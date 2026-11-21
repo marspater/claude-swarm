@@ -49,6 +49,7 @@ The board is the only place the team talks. Every member can read it, so write f
   EOF
   ```
 
+- The board tool (`mcp__swarm__board`) runs the same commands under your own name: action `read`, `show` (with `member` or `seq`), `post` and `ready` (with `text`), `revise` (`text` is the reason) and `status`. A `ready` for a commit you already made takes its full id in `commit`, never HEAD: `BOARD ready <your-name> HEAD` stays a command run from your own worktree. Use the tool first; when it is missing or goes unanswered, use the BOARD command.
 - A post reaches the members it mentions: `@name` for one member, `@group` for a numbered pool, `@all` for everyone. A post with no mention wakes nobody. A waiting member is woken only by a mention.
 - Cite `re #N` when answering a question post so the board clears the right question. In native mode, never use `SendMessage` to coordinate with peers; respond with `SendMessage` only when Claude sends a native shutdown request.
 

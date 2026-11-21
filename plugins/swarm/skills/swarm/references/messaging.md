@@ -24,7 +24,7 @@ EOF
 
 ## Addressing
 
-- `@name` reaches one member. `@group` reaches a numbered pool. `@all` reaches everyone.
+- `@name` reaches one member. `@group` reaches a numbered pool. `@verifiers` reaches every verifier, `@dependents` every member whose `depends=` names the sender (nobody, for you). `@all` reaches everyone. No member or group can be named `all`, `verifiers` or `dependents`.
 - A post reaches exactly the members it mentions. A post with no mention is a note on the record: nobody is woken for it.
 - A member reads in full only what mentions it. Anything a member must know has to be in a post that mentions it.
 - Recipients are fixed when the post is written. A member removed later stays in the history.
@@ -88,3 +88,4 @@ These hold for you too. When a member breaks one, say so on the board and have i
 | Attention shows `ignored` | The member was woken three times and did not read. Run `BOARD retry <name>` so delivery tries again, or replace it |
 | A member never saw an old post | A new member's unread posts start at its own brief. It reads earlier history with `show` |
 | The run is paused | `BOARD resume` |
+| One member is paused (attention shows `member_paused`) | Its own token budget is spent and nobody wakes it. Ask the user, then `BOARD member <name> budget=<tokens>` and `BOARD resume <name>` |

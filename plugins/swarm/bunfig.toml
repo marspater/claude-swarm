@@ -1,0 +1,4 @@
+# `bun test hooks/units.test.ts hooks/graph.test.tsx` runs the pure tests without the claude CLI; the rest need
+# `claude plugin test .`, whose kit gives each test the engine.
+[test]
+preload = ["./hooks/testing-shim.ts"]

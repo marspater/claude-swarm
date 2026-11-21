@@ -5,8 +5,8 @@ import { edgesOf, graphSvg, isBroadcast } from './graph'
 import { hiveArt, toolMood, toolSummary } from './hive'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, SWARM_AGENTS, familyOf, latestOf } from './models'
 import { statusCss, statusDot, statusKey } from './palette'
-import { budgetOf, detailOf, findAgent, mentions, parse, statusOf, targets, tokensUsed } from './roster'
-import { bodyOf, chipped, clean, clip, compact, fenceAfter, head, kindOf, openedText, stripKind, unquoted } from './text'
+import { budgetOf, detailOf, findAgent, mentions, parse, parsePosts, statusOf, targets, tokensUsed } from './roster'
+import { bodyOf, chipped, clean, clip, compact, fenceAfter, hasQuestion, head, kindOf, openedText, stripKind, unquoted } from './text'
 
 const post = (text: string, to: string[] = []): Post => ({ seq: 1, agent: 'parser', to, text, time: '2026-11-16T14:03:22+0100' })
 
@@ -440,4 +440,61 @@ test('the hive reads a lookup by its command, and draws whatever mood and time i
   }
   expect(hiveArt('unknown' as never)).toBe(hiveArt('sleep'))
   expect(graphSvg({ title: 'T', dir: 'd', isClosed: false, posts: [post('@coordinator hi', ['coordinator'])], members: [], attention: [], budget: 0, tokens: {} }, 1, new Set(), true, true, true, NaN)).not.toContain('NaN')
+})
+
+test('@verifiers reaches every live verifier and @dependents whoever waits for the sender, as board.py reads them', () => {
+  const roster = {
+    coordinator: { role: 'coordinator', last_read_seq: 0 },
+    parser: { role: 'worker', last_read_seq: 0 },
+    lexer: { role: 'worker', depends: 'parser', last_read_seq: 0 },
+    docs: { role: 'worker', depends: 'lexer,parser', last_read_seq: 0 },
+    ver: { role: 'verifier', last_read_seq: 0 },
+    old: { role: 'verifier', killed: '1', last_read_seq: 0 },
+  }
+  expect(targets('@verifiers please look', roster, 'parser')).toEqual(['ver'])
+  expect(targets('@dependents rebase on me', roster, 'parser')).toEqual(['lexer', 'docs'])
+  expect(targets('@dependents rebase on me', roster, 'lexer')).toEqual(['docs'])
+  // without a sender nobody depends on it; in code it is no mention at all
+  expect(targets('@dependents', roster)).toEqual([])
+  expect(targets('`@verifiers`', roster, 'parser')).toEqual([])
+  // a board written before `to` was recorded is read with its sender
+  expect(parsePosts(JSON.stringify({ seq: 1, agent: 'parser', text: '@dependents go', time: 't' }), roster)[0]?.to).toEqual(['lexer', 'docs'])
+})
+
+test('a READY keeps its commit only when it is a full id, and a member paused on its own budget says so', () => {
+  const line = (revision: unknown) => JSON.stringify({ seq: 1, agent: 'parser', text: 'READY', time: 't', to: [], revision })
+  expect(parsePosts(line('a'.repeat(40)), {})[0]?.revision).toBe('a'.repeat(40))
+  expect(parsePosts(line('b'.repeat(64)), {})[0]?.revision).toBe('b'.repeat(64))
+  for (const bad of [null, 'HEAD', 'abc123', '--output=/tmp/x', 'A'.repeat(40)]) expect('revision' in parsePosts(line(bad), {})[0]!).toBe(false)
+  expect(detailOf('waiting', undefined, false, true)).toBe('its token budget is spent')
+  expect(detailOf('working', undefined, true, true)).toBe('its token budget is spent')
+  expect(detailOf('working', undefined, false, false)).toBe('')
+  const roster = JSON.stringify({ title: 'T', members: { coordinator: { role: 'coordinator', last_read_seq: 0 }, parser: { role: 'worker', id: 'a1', paused: 'budget', last_read_seq: 0 } } })
+  expect(parse('/r', '', roster, []).members.find(member => member.name === 'parser')?.detail).toBe('its token budget is spent')
+  expect(hasQuestion('which file? `a ?? b`')).toBe(true)
+  expect(hasQuestion('`which file?` and c ? a : b')).toBe(false)
+})
+
+// The cases board.py and these hooks must read alike, kept by the Python side in tests/parity.json. The claude kit
+// reads no files and refuses a dynamic import, so only `bun test` (see bunfig.toml) checks them; anywhere else, and
+// while the file is absent, the test passes with nothing checked. `kind` compares kindOf's label, '' for none.
+test('the hooks read targets, quoting, questions and kinds exactly as board.py does', async () => {
+  type Parity = {
+    targets?: { text: string; members: Record<string, { last_read_seq?: number }>; sender?: string; expect: string[] }[]
+    quoted?: { text: string; expect: string }[]
+    question?: { text: string; expect: boolean }[]
+    kind?: { text: string; expect: string }[]
+  }
+  const bun = (globalThis as { Bun?: { file: (path: string) => { exists: () => Promise<boolean>; json: () => Promise<unknown> } } }).Bun
+  if (bun === undefined) return
+  const file = bun.file(`${decodeURIComponent((import.meta as unknown as { url: string }).url.replace(/^file:\/\//, '').replace(/\/[^/]*$/, ''))}/../tests/parity.json`)
+  if (!(await file.exists())) return
+  const parity = await file.json() as Parity
+  for (const one of parity.targets ?? []) {
+    const members = Object.fromEntries(Object.entries(one.members).map(([name, member]) => [name, { last_read_seq: 0, ...member }]))
+    expect([one.text, targets(one.text, members, one.sender ?? undefined)]).toEqual([one.text, one.expect])
+  }
+  for (const one of parity.quoted ?? []) expect([one.text, unquoted(one.text)]).toEqual([one.text, one.expect])
+  for (const one of parity.question ?? []) expect([one.text, hasQuestion(one.text)]).toEqual([one.text, one.expect])
+  for (const one of parity.kind ?? []) expect([one.text, kindOf(one.text)?.label ?? '']).toEqual([one.text, one.expect])
 })

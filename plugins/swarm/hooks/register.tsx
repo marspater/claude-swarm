@@ -1,12 +1,12 @@
 // The Swarm pane and its session hooks. board.py owns the board files.
 import { atom, read, update } from 'claude-code'
-import type { AgentInfo, EngineInterface, ModelUsage, Register, SessionMessage, Timer } from 'claude-code'
+import type { AgentInfo, EngineInterface, ModelUsage, Register, SessionMessage, Timer, ToolCallResult } from 'claude-code'
 
 import type { Member, Post, Swarm, Tab } from '../types'
-import { COORDINATOR_READ, RUN, boardCalls, runsNamed, scanShell, shellWords, type Statement, substitutions, unwrap, wakeMessage, wakeSequence } from './command'
+import { COORDINATOR_READ, RUN, boardCalls, type ParsedBoardCall, runsNamed, scanShell, shellWords, type Statement, substitutions, unwrap, wakeMessage, wakeSequence } from './command'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, LATEST, SPECIALISTS, SWARM_AGENTS, familyOf, latestOf } from './models'
 import { KEPT, budgetOf, findAgent, memberNamed, mentions, parse, parsePosts, targets, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
-import { CLIP, bodyOf, chipped, clean, clip, compact, fenceAfter, head, kindOf, openedText, unquoted, type Fence } from './text'
+import { CLIP, bodyOf, chipped, clean, clip, compact, fenceAfter, hasQuestion, head, kindOf, openedText, type Fence } from './text'
 import { statusInk, statusDot } from './palette'
 import { hiveArt, toolMood, toolSummary, type Mood } from './hive'
 import { edgesOf, graphHeight, graphSvg, isBroadcast, pairOf, visibleMembers } from './graph'
@@ -88,6 +88,8 @@ const expandAll = atom({ plugin: 'swarm', key: 'expandAll' } as const, false)
 // The seq of the one long post shown in full; 0 for none.
 const expanded = atom({ plugin: 'swarm', key: 'expanded' } as const, 0)
 const inspected = atom({ plugin: 'swarm', key: 'inspected' } as const, null as Post | null)
+// The READY whose commit's diff is open under it, and that diff as git printed it; seq 0 for none.
+const diff = atom({ plugin: 'swarm', key: 'diff' } as const, { seq: 0, text: '' })
 // What the Board tab is narrowed to: text matched against sender, recipients, kind and body.
 const query = atom({ plugin: 'swarm', key: 'query' } as const, '')
 
@@ -229,6 +231,8 @@ const agentRuns = new Map<string, string>()
 const strangers = new Set<string>()
 // The agents of the owned run's retired members, as the last poll read them.
 let retired: ReadonlySet<string> = new Set()
+// The agents of the owned run's members that spent their own token budget: refused like a paused run, one by one.
+let memberPaused: ReadonlySet<string> = new Set()
 // Cached roster of the owned run for immediate runtime enforcement before the next poll.
 let ownedRoster: { dir: string; closed: boolean; members: Roster } | undefined
 // The run this conversation drove until it closed: its members are still refused by name.
@@ -308,8 +312,6 @@ const sharedAgents = new Set<string>()
 const isolatedAgents = new Set<string>()
 // The board's QUESTION: a question mark that asks, in a run of them too ("sure??"), and none of `a ?? b`, `a?.b`,
 // `name?: type` or `c ? a : b`.
-const QUESTION_MARK = /(?<![ \t]\?)(?:(?<![ \t])\?|\?(?![ \t]+[^\n?]*[ \t]+:))(?!\?|\.?\w|:)/
-const hasQuestion = (text: string) => QUESTION_MARK.test(unquoted(text))
 const WATCHER_BG_RE = /\b(sleep|watch|tail\s+-f|while|until|pgrep|lsof)\b|\bboard\.py\b|\bverify\.py\b|\.swarm\b|\.lock\b/
 
 function parsePaths(raw?: string): string[] {
@@ -331,10 +333,11 @@ function pathsOverlap(a: string[], b: string[]): boolean {
   return a.some(pa => b.some(pb => pathCovers(pa, pb) || pathCovers(pb, pa)))
 }
 
-function computeRetired(members: Roster, agents: AgentInfo[]): Set<string> {
+/** The agent ids and addresses of the members `pick` chooses: retired ones, or ones paused on their own budget. */
+function agentIdsOf(members: Roster, agents: AgentInfo[], pick: (member: Roster[string]) => boolean): Set<string> {
   const ids = new Set<string>()
   for (const member of Object.values(members)) {
-    if (!member.killed || !member.id) continue
+    if (!pick(member) || !member.id) continue
     ids.add(member.id)
     for (const agent of agents) {
       if (agent.id === member.id || agent.teammateId === member.id) {
@@ -347,6 +350,14 @@ function computeRetired(members: Roster, agents: AgentInfo[]): Set<string> {
     }
   }
   return ids
+}
+/** Whom the roster stops: retired members, and members paused on their own budget, whose notice is owed again once resumed. */
+function rosterIds(members: Roster, agents: AgentInfo[]) {
+  for (const name of memberPausesTold) if (!memberNamed(members, name)?.paused) memberPausesTold.delete(name)
+  return {
+    retired: agentIdsOf(members, agents, member => Boolean(member.killed)),
+    memberPaused: agentIdsOf(members, agents, member => !member.killed && Boolean(member.paused)),
+  }
 }
 let quietSince = 0
 // The newest action of each participant lasts through its turn. Agent ids are
@@ -381,12 +392,19 @@ let prompted = 0
 // `pausing` while their command runs, `pauseQuiet` until a poll that began after it has looked.
 let pauseSeen: string | undefined  // undefined until the first look at a run: the pause it starts with is not news
 let pauseOwed = ''
-// Members that stopped without reporting: when each was first seen so, which the coordinator has been told of, and
-// what it is owed with its next tool call. Told once per member and post, with no wake of its own.
+// Members that stopped without reporting: when each was first seen so, and which the coordinator has been told of.
+// Told once per member and post, with no wake of its own.
 const SILENT_GRACE_MS = 60_000
 let silentSince = new Map<string, number>()
 let silentTold = new Set<string>()
-let silentOwed: string[] = []
+// What the coordinator is owed with its next tool call, none of it worth a wake: a silent member, a HEAD that moved
+// under a shared-checkout writer, a post the person made in its name from the pane.
+let notesOwed: string[] = []
+// Members that spent their own token budget, told once each as a paused run is: with the next tool call, or a prompt when idle.
+let memberPausesOwed: string[] = []
+let memberPausesTold = new Set<string>()
+const memberPauseNotice = (name: string) =>
+  `@${name} has spent its own token budget and is paused: its tool calls are refused. Raise its budget with the board's member command (budget=<tokens>) and then run resume ${name}, or replace it.`
 let budgetPauseNotifiedFor = ''
 let pausing = 0
 let pauseQuiet = 0
@@ -476,6 +494,7 @@ async function refreshTalk($: EngineInterface): Promise<void> {
 
 function resetMonitoring(): void {
   retired = new Set()
+  memberPaused = new Set()
   ownedRoster = undefined
   moods.clear()
   generation++
@@ -493,7 +512,9 @@ function resetMonitoring(): void {
   pauseOwed = ''
   silentSince = new Map()
   silentTold = new Set()
-  silentOwed = []
+  notesOwed = []
+  memberPausesOwed = []
+  memberPausesTold = new Set()
   budgetPauseNotifiedFor = ''
   halted = undefined
   unaddressed = []
@@ -699,9 +720,11 @@ async function syncOwnedState(
   if (!isClosed && state.members) {
     const live = agents ?? await $.agent.list().catch(() => [])
     if (sEpoch !== sessionEpoch || isEnding) return
-    retired = computeRetired(state.members, live)
+    const stops = rosterIds(state.members, live)
+    retired = stops.retired
+    memberPaused = stops.memberPaused
   } else {
-    retired = new Set()
+    retired = memberPaused = new Set()
   }
 }
 
@@ -755,6 +778,11 @@ async function adopt($: EngineInterface, name: string | undefined, prompt = ''):
     return WRONG_RUN
   }
 }
+
+/** The checkout's HEAD commit, or '' when git cannot say: a read that fails changes nothing. */
+const headOf = ($: EngineInterface, checkout: string) =>
+  $.process.run(['git', '-C', checkout, 'rev-parse', 'HEAD'], { timeoutMs: 5000 })
+    .then(answer => answer.exitCode === 0 && COMMIT_ID.test(answer.stdout.trim()) ? answer.stdout.trim() : '', () => '')
 
 // What may stand before a command and leaves it the same command, with its own flags.
 const PREFIXES = new Set(['time', 'command', 'exec', 'nohup', 'env'])
@@ -996,7 +1024,8 @@ async function deliver(
   for (const [name, member] of Object.entries(roster)) {
     if (epoch !== generation) break
     const id = member.id
-    if (member.killed || member.role === 'coordinator') continue
+    // A member paused on its own budget is woken by nobody, as the board's own wake list has it: its turn would be refused.
+    if (member.killed || member.paused || member.role === 'coordinator') continue
     const from = Math.max(member.last_read_seq, member.last_nudged_seq ?? 0)
     // `older`: what the board itself says is owed, for a mention that lies before the tail read of a large board.
     const before = older.get(name) ?? 0
@@ -1147,7 +1176,9 @@ async function refresh($: EngineInterface): Promise<void> {
     if (epoch !== generation) return
     const state = JSON.parse(rosterText) as { members: Roster; paused?: string; closed?: boolean } & BudgetState
     const isSpent = budgetOf(state) > 0 && tokensUsed(state.usage?.tokens) >= budgetOf(state)
-    retired = owned && !state.closed ? computeRetired(state.members, agents) : new Set()
+    const stops = owned && !state.closed ? rosterIds(state.members, agents) : undefined
+    retired = stops?.retired ?? new Set()
+    memberPaused = stops?.memberPaused ?? new Set()
     // Read anew on every poll, so a resume or a raised budget lets the members' tools through again.
     halted = owned && !state.closed && (state.paused || isSpent)
       ? { dir, why: state.paused ? `paused (${state.paused})` : 'over its token budget' }
@@ -1182,6 +1213,7 @@ async function refresh($: EngineInterface): Promise<void> {
         closeTalk($)
         await seek($, 0)
         await update($, expanded, () => 0)
+        await update($, diff, () => ({ seq: 0, text: '' }))
         await update($, inspected, () => null)
         await update($, earlier, () => 0)
         await update($, query, () => '')
@@ -1210,7 +1242,7 @@ async function refresh($: EngineInterface): Promise<void> {
         // A turn that ends and the wake that starts the next one can be a poll apart.
         if (!silentTold.has(key) && now - first >= SILENT_GRACE_MS) {
           silentTold.add(key)
-          silentOwed.push(item.text)
+          notesOwed.push(item.text)
         }
       }
       silentSince = since
@@ -1247,10 +1279,13 @@ async function refresh($: EngineInterface): Promise<void> {
       pauseSeen = reason
       if (poll > pauseQuiet) pauseQuiet = 0
       // Mid-turn it rides on the coordinator's next tool result instead.
-      if (pauseOwed && !isCoordinatorBusy && now >= noticeHold) {
-        const text = `Swarm: Run paused\n${pauseNotice(full.title.replace(/\s+/g, ' '), pauseOwed)}`
-        const unheard = () => $.ui.toast(`Swarm paused "${full.title}": ${reason}. The coordinator could not be told.`)
+      if ((pauseOwed || memberPausesOwed.length > 0) && !isCoordinatorBusy && now >= noticeHold) {
+        const what = pauseOwed ? `"${full.title}": ${reason}` : 'a member on its own token budget'
+        const text = `Swarm: ${pauseOwed ? 'Run paused' : 'Member paused'}\n${[
+          ...(pauseOwed ? [pauseNotice(full.title.replace(/\s+/g, ' '), pauseOwed)] : []), ...memberPausesOwed].join('\n\n')}`
+        const unheard = () => $.ui.toast(`Swarm paused ${what}. The coordinator could not be told.`)
         pauseOwed = ''
+        memberPausesOwed = []
         noticeHold = (await $.clock.now()) + NOTICE_HOLD_MS
         void $.prompt.submit({ text }).then(result => {
           if (epoch !== generation) return
@@ -1375,7 +1410,17 @@ async function account($: EngineInterface, report: string, agentId: string | und
   ])
   const result = await boardCommand($, dir, ['account', turn, actor, String(amount)])
   if (result.exitCode !== 0 || result.stdout.trim() === '') return false
-  const entry = JSON.parse(result.stdout) as { title: string; total: number; budget: number; paused: boolean }
+  const entry = JSON.parse(result.stdout) as { title: string; total: number; budget: number; paused: boolean; member_paused?: unknown }
+  const pausedName = typeof entry.member_paused === 'string' ? entry.member_paused : ''
+  if (pausedName && dir === await read($, run)) {
+    // Known at once, as a run's pause is: the member this turn charged is refused from its next tool call on.
+    const id = ownedRoster?.dir === dir ? memberNamed(ownedRoster.members, pausedName)?.id : undefined
+    memberPaused = new Set([...memberPaused, ...(id ? [id] : []), ...(agentId && (!id || id === address) ? [agentId] : [])])
+    if (!memberPausesTold.has(pausedName)) {
+      memberPausesTold.add(pausedName)
+      memberPausesOwed.push(memberPauseNotice(pausedName))
+    }
+  }
   if (!entry.paused || dir !== await read($, run)) return true
   const reason = `token budget of ${compact(entry.budget)} spent`
   const rawReason = `token budget of ${entry.budget} spent`
@@ -1397,13 +1442,21 @@ async function account($: EngineInterface, report: string, agentId: string | und
 
 // A member of a paused or spent run is refused its next tool call, so a turn in flight ends there instead of
 // spending on. The coordinator is never refused: it has to report, raise the budget and resume.
+const MEMBER_PAUSED = 'This Swarm member has spent its own token budget, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped. The coordinator decides whether you go on.'
+/** The refusal the roster alone settles, with no lookup that can fail: a retired member, or one paused on its own budget. */
+function stoppedMember(agentId: string): string | undefined {
+  const address = teammates.get(agentId)
+  const has = (ids: ReadonlySet<string>) => ids.has(agentId) || (address !== undefined && ids.has(address))
+  // A member that was replaced or removed may still be mid-turn: it builds and edits beside the team that took over.
+  if (has(retired)) return 'This Swarm member has been retired, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped.'
+  if (has(memberPaused)) return MEMBER_PAUSED
+  return undefined
+}
+
 async function refusal($: EngineInterface, agentId: string | undefined): Promise<string | undefined> {
   if (agentId === undefined) return undefined
-  // A member that was replaced or removed may still be mid-turn: it builds and edits beside the team that took over.
-  const address = teammates.get(agentId)
-  if (retired.has(agentId) || (address !== undefined && retired.has(address))) {
-    return 'This Swarm member has been retired, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped.'
-  }
+  const stopped = stoppedMember(agentId)
+  if (stopped) return stopped
   if (!halted) return undefined
   try {
     const dir = agentRuns.get(agentId) ??
@@ -1413,6 +1466,154 @@ async function refusal($: EngineInterface, agentId: string | undefined): Promise
   } catch {
     return undefined // a check that failed stops nobody's tools
   }
+}
+
+/** A command that may pause or resume the run: the coordinator's own doing, which it reads in the output, so not news to tell it. */
+async function pauseAware<T>($: EngineInterface, calls: ParsedBoardCall[], agentId: string | undefined, command: () => Promise<T>): Promise<T> {
+  const mayPause = agentId === undefined && calls.some(c => c.action === 'pause' || c.action === 'resume' || c.action === 'limit')
+  if (mayPause) pausing++
+  try {
+    return await command()
+  } finally {
+    if (mayPause) {
+      pausing--
+      pauseExpected()
+      $.clock.after(0, () => void refresh($))
+    }
+  }
+}
+
+/** After a coordinator's tool call: what its board commands read of the posts owed it, and the notes it is owed. */
+async function coordinatorNotes<R extends ToolCallResult>($: EngineInterface, calls: ParsedBoardCall[], isRelay: boolean, raw: ToolCallResult, result: R): Promise<R> {
+  if (raw.deny !== undefined || raw.isError !== undefined) return result
+  try {
+    const dir = await read($, run)
+    // Only a real read of this run's board answers its mentions: the words alone may sit in a commit message.
+    for (const c of calls) {
+      if (c.action === 'read' && COORDINATOR_READ.test(c.rest)) {
+        const calledDir = RUN.test(c.dir) ? await resolveRunDir($, c.dir) : c.dir
+        if (calledDir === dir) {
+          owed = NONE
+          break
+        }
+      }
+    }
+    for (const c of calls) {
+      if (c.action !== 'show' || c.piped || !RUN.test(c.dir) || await resolveRunDir($, c.dir) !== dir) continue
+      // One post, the whole board, or one member's posts: only what was printed counts as seen.
+      const one = /--post=(\d+)/.exec(c.rest)
+      // The member named, if any: a flag or a redirection (`show 2>&1`) names none.
+      const who = c.subarg?.startsWith('-') ? undefined : c.subarg
+      if (one) shownPosts.posts.add(Number(one[1]))
+      else if (who === undefined) shownPosts.through = Math.max(shownPosts.through, snapshot?.posts.at(-1)?.seq ?? 0)
+      else for (const post of snapshot?.posts ?? []) if (post.agent === who || post.to.includes(who)) shownPosts.posts.add(post.seq)
+      owedSeqs = owedSeqs.filter(seq => seq > shownPosts.through && !shownPosts.posts.has(seq))
+      owed = owedSeqs.length === 0 ? NONE : { ...owed, count: owedSeqs.length, first: owedSeqs[0]!, last: owedSeqs.at(-1)! }
+    }
+    const notices: string[] = []
+    const key = relayKey(dir)
+    if (key && key !== relayHinted && !isRelay) {
+      relayHinted = key
+      notices.push(relayNotice())
+    }
+    // A read of the board is never told to read it, however it named the run (a shell variable, a relative path).
+    if (dir && owed.last > hinted && !calls.some(c => c.action === 'read' && COORDINATOR_READ.test(c.rest))) {
+      hinted = owed.last
+      notices.push(`Swarm: ${unreadNotice($, dir)}`)
+    }
+    if (dir && pauseOwed) {
+      notices.push(`Swarm: ${pauseNotice('This run', pauseOwed)}`)
+      pauseOwed = ''
+    }
+    if (dir && memberPausesOwed.length > 0) {
+      notices.push(...memberPausesOwed.map(text => `Swarm: ${text}`))
+      memberPausesOwed = []
+    }
+    if (dir && notesOwed.length > 0) {
+      notices.push(...notesOwed.map(text => `Swarm: ${text}`))
+      notesOwed = []
+    }
+    if (notices.length > 0 && result.deny === undefined) result = { ...result, context: [...(result.context ?? []), ...notices] }
+  } catch {
+    // A failed reminder must not change the tool's result.
+  }
+  return result
+}
+
+/** What board commands change here, typed in Bash or made through the board tool: the run they bind, the roster they sync. */
+async function boardCallsRan<R extends ToolCallResult>($: EngineInterface, agentId: string | undefined, calls: ParsedBoardCall[], stdout: string, result: R): Promise<R> {
+  if (result.isError || result.deny || calls.length === 0) return result
+  try {
+    if (agentId === undefined && calls.some(c => c.action === 'member' || c.action === 'started' || c.action === 'replace')) {
+      strangers.clear()
+    }
+    for (const c of calls) {
+      // `init` names the folder to make the run under and prints the run folder it made.
+      const rawDir = c.action === 'init' && agentId === undefined
+        ? stdout.split('\n').map(line => line.trim()).findLast(line => RUN.test(line)) ?? ''
+        : c.dir
+      const isReadCoord = c.action === 'read' && COORDINATOR_READ.test(c.rest)
+      // A read whose run could not be read off the command still changed what is owed: the roster is read again now.
+      if (isReadCoord && agentId === undefined && !RUN.test(rawDir)) $.clock.after(0, () => void refresh($))
+      if (!RUN.test(rawDir)) continue
+      const dir = await resolveRunDir($, rawDir)
+      const owned = await read($, run)
+      // The coordinator's own planning shows whose run it is as surely as its first read, which it may skip: the
+      // run is bound from `init` on, so that planning is charged to it. `plan` only reads, so it claims a run only
+      // while none is owned. The board refuses a run another conversation owns.
+      const claims = isReadCoord || c.action === 'init' || c.action === 'member' || (c.action === 'plan' && owned === '')
+      if (agentId === undefined && claims && dir !== owned) await bind($, dir)
+      // The roster may now record an agent that was looked up before it was on it.
+      if (agentId === undefined) strangers.clear()
+      if (dir === owned || agentId === undefined) $.clock.after(0, () => void refresh($))
+    }
+    if (agentId === undefined && calls.some(c => ['member', 'replace', 'pause', 'resume', 'limit', 'close'].includes(c.action))) {
+      // Only the run this conversation owns: another run's pause and roster are not this session's to enforce.
+      const resolvedSyncDir = await read($, run)
+      if (resolvedSyncDir) {
+        await syncOwnedState($, resolvedSyncDir).catch(() => undefined)
+        const retiredNames = calls
+          .filter(c => c.action === 'replace' || (c.action === 'member' && /\bkilled=(["']?)1\1(?=\s|$)/.test(c.rest)))
+          .map(c => c.subarg?.trim())
+          .filter((n): n is string => Boolean(n))
+        if (retiredNames.length > 0 && ownedRoster && ownedRoster.dir === resolvedSyncDir && !ownedRoster.closed) {
+          const liveAgents = await $.agent.list().catch(() => [])
+          const zombieNotices: string[] = []
+          // Every process's working folder, read once for the command however many members it retires. lsof exits 1
+          // when it could not read every process and still lists the rest; -b keeps it off a mount that does not answer.
+          const listing = await $.process.run(['lsof', '-b', '-w', '-a', '-d', 'cwd', '-Fpn'], { timeoutMs: 5000 })
+            .then(listed => listed.stdout, () => '')
+          const replaced = new Set(calls.filter(c => c.action === 'replace').map(c => c.subarg?.trim()))
+          for (const oldName of retiredNames) {
+            const entry = memberNamed(ownedRoster.members, oldName)
+            const live = entry?.killed && entry.id ? findAgent(liveAgents, entry.id) : undefined
+            if (live && ['running', 'pending', 'waiting'].includes(live.status)) {
+              zombieNotices.push(`Swarm: @${oldName} was retired, but agent ${live.id} is still ${live.status}. Stop it before spawning a successor.`)
+            }
+            // Refusing its tools stops the agent, not a build it had already launched.
+            const left = entry?.killed && entry.id ? await leftRunning($, entry.id, listing) : []
+            if (left.length > 0) {
+              zombieNotices.push(`Swarm: @${oldName} was retired, but ${left.length} process${left.length === 1 ? '' : 'es'} it started ${left.length === 1 ? 'is' : 'are'} still running in its worktree: ${left.map(one => `${one.pid} (${one.command})`).join(', ')}. Unless the user wants ${left.length === 1 ? 'it' : 'them'} to finish, stop ${left.length === 1 ? 'it' : 'them'}: kill ${left.map(one => one.pid).join(' ')}`)
+            } else if (replaced.has(oldName) && entry?.killed && entry.id && entry.isolated !== '1' &&
+                entry.role === 'worker' && entry.writes !== '0' && !['explorer', 'investigator', 'architect'].includes(entry.profile ?? '')) {
+              zombieNotices.push(`Swarm: @${oldName} was retired. A build or test it started in the shared folder cannot be told from the team's own, so nothing was checked: look for one before its successor builds.`)
+            }
+          }
+          if (zombieNotices.length > 0 && result.deny === undefined) {
+            result = { ...result, context: [...(result.context ?? []), ...zombieNotices] }
+          }
+        }
+      }
+    }
+    // Every wake of the coordinator re-reads its whole conversation, so a run started in a long one pays for
+    // that history on each of them. Said once, when the run is made, while starting elsewhere is still cheap.
+    if (agentId === undefined && calls.some(c => c.action === 'init') && result.deny === undefined && result.isError === undefined) {
+      result = { ...result, context: [...(result.context ?? []), ...await initNotes($)] }
+    }
+  } catch {
+    // A failed binding must not change the tool's result.
+  }
+  return result
 }
 
 /** Runs board commands for the owned run straight from a pane button, with no coordinator turn; the first that fails is told. */
@@ -1441,6 +1642,7 @@ async function resetView($: EngineInterface): Promise<void> {
   talk = undefined
   await seek($, 0)
   await update($, expanded, () => 0)
+  await update($, diff, () => ({ seq: 0, text: '' }))
   await update($, inspected, () => null)
   await update($, earlier, () => 0)
   await update($, query, () => '')
@@ -1503,17 +1705,44 @@ async function browse($: EngineInterface, step: 1 | 0 | -1): Promise<void> {
 
 // What one board tool answer may hold: the `read` page, and the cut `show` gets.
 const PAGE = 48000
-async function specialistBoard($: EngineInterface, e: {
+/** What the board tool takes: a member's fields, then the ones only the coordinator's actions take. */
+type BoardInput = {
   agentId?: string
   action: string
   member?: string
   seq?: number
   text?: string
-}) {
-  if (!e.agentId) return { deny: 'The Swarm board tool is for Swarm specialists. The coordinator uses the board command.' }
+  commit?: string
+  title?: string
+  name?: string
+  newName?: string
+  options?: string[]
+  out?: string
+}
+const BOARD_FIELDS = ['member', 'seq', 'text', 'commit', 'title', 'name', 'newName', 'options', 'out'] as const
+// What answers without changing the board: the hive shows its caller inspecting.
+const BOARD_READS = ['read', 'show', 'status', 'plan', 'attention']
+const COMMIT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
+
+/** A show's arguments from its `member` filter or `seq`, taken as a member would write them; a deny for any other use of the two. */
+function showArgs(e: BoardInput): string[] | { deny: string } {
+  // A name as a member would write it: with its @, in any case.
+  const rawMember = typeof e.member === 'string' ? e.member.trim() : ''
+  const who = rawMember ? rawMember.replace(/^@/, '').toLowerCase() : undefined
+  if (who !== undefined && (e.action !== 'show' || !/^[a-z][a-z0-9_-]*$/.test(who))) {
+    return { deny: e.action === 'show' ? 'The member filter is a member\'s name, such as "parser".' : 'A member filter is only valid for show.' }
+  }
+  if (e.seq !== undefined && (e.action !== 'show' || who !== undefined || !Number.isSafeInteger(e.seq) || e.seq < 1)) {
+    return { deny: 'Use a positive post number with show, without a member filter.' }
+  }
+  return who ? ['show', who] : e.seq ? ['show', `--post=${e.seq}`] : ['show']
+}
+
+// A member acts on the run it was started for, as itself: its own reads and reports, never another's or the run's setup.
+async function memberBoard($: EngineInterface, e: BoardInput & { agentId: string }) {
   const agents = await $.agent.list()
   const agent = findAgent(agents, e.agentId)
-  if (!agent || !SPECIALISTS.some(role => agent.type === `swarm:${role}`)) return { deny: 'The Swarm board tool requires a read-only Swarm specialist.' }
+  if (!agent || !SWARM_AGENTS.has(agent.type)) return { deny: 'The Swarm board tool requires a Swarm member agent.' }
   const describedName = parseDescribedName(agent?.description)
   let dir = await agentRun($, e.agentId, agent)
   let needsBinding = false
@@ -1551,13 +1780,19 @@ async function specialistBoard($: EngineInterface, e: {
   const assignment = assigned ?? (uniqueStarter && describedName ? [describedName, starting] as const : undefined)
   const member = assignment?.[1]
   const kind = agent?.type.slice('swarm:'.length) ?? ''
+  // The type the roster gives it, as the spawn hook reads it.
+  const registered = member ? member.profile || member.role || 'worker' : ''
   const fault = !assignment || !member
     ? `the roster has no member for this agent. It must be registered under the name its description starts with ("@<name>: ")`
     : member.killed
       ? `@${assignment[0]} was removed from the run`
-      : member.role !== 'worker' || member.writes !== '0' || member.profile !== kind || !SPECIALISTS.includes(kind)
-        ? `@${assignment[0]} is not registered as a read-only ${kind}. The coordinator fixes it with: member ${assignment[0]} profile=${kind} writes=0`
-        : ''
+      : SPECIALISTS.includes(kind)
+        ? member.role !== 'worker' || member.writes !== '0' || member.profile !== kind
+          ? `@${assignment[0]} is not registered as a read-only ${kind}. The coordinator fixes it with: member ${assignment[0]} profile=${kind} writes=0`
+          : ''
+        : registered !== kind || member.role === 'coordinator'
+          ? `the roster has @${assignment[0]} as ${registered}, but this agent is a ${kind}. The coordinator fixes the roster with its member command`
+          : ''
   if (!assignment || !member || fault) {
     return { deny: `The board refused this call: ${fault}. End your turn and report this sentence to the coordinator.` }
   }
@@ -1571,18 +1806,19 @@ async function specialistBoard($: EngineInterface, e: {
     if (dir === await read($, run)) halted = { dir, why }
     return { deny: `This Swarm run is ${why}, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped. The coordinator decides what happens when the run resumes.` }
   }
+  if (!closed && member.paused) return { deny: MEMBER_PAUSED }
   const { action } = e
-  // A name as a member would write it: with its @, in any case.
-  const rawMember = typeof e.member === 'string' ? e.member.trim() : ''
-  const who = rawMember ? rawMember.replace(/^@/, '').toLowerCase() : undefined
-  if (who !== undefined && (action !== 'show' || !/^[a-z][a-z0-9_-]*$/.test(who))) {
-    return { deny: action === 'show' ? 'The member filter is a member\'s name, such as "parser".' : 'A member filter is only valid for show.' }
+  const setup = (['title', 'name', 'newName', 'options', 'out'] as const).filter(field => e[field] !== undefined)
+  if (setup.length > 0) return { deny: `${setup.join(', ')} ${setup.length === 1 ? 'belongs' : 'belong'} to the coordinator's actions: a member acts as itself, on its own posts.` }
+  const shown = showArgs(e)
+  if ('deny' in shown) return shown
+  // A verifier's verdict is a post: readiness is a worker's to record and withdraw.
+  if (!['read', 'show', 'status', 'post', ...(member.role === 'verifier' ? [] : ['ready', 'revise'])].includes(action)) {
+    return { deny: member.role === 'verifier' && (action === 'ready' || action === 'revise') ? 'A verifier reports with action "post": VERIFIED, NOT PASSED or NOT VERIFIED.' : 'Unknown board action.' }
   }
-  if (e.seq !== undefined && (action !== 'show' || who !== undefined || !Number.isSafeInteger(e.seq) || e.seq < 1)) {
-    return { deny: 'Use a positive post number with show, without a member filter.' }
-  }
-  if (!['read', 'show', 'post', 'ready', 'revise'].includes(action)) {
-    return { deny: 'Unknown board action.' }
+  // The board resolves HEAD in the checkout it runs in, which is not the member's own: only a full id is taken here.
+  if (e.commit !== undefined && (action !== 'ready' || !COMMIT_ID.test(e.commit))) {
+    return { deny: action === 'ready' ? 'commit is a full 40- or 64-character commit id. HEAD is read only by the board command run from your own checkout: BOARD ready <your name> HEAD' : 'A commit is only valid for ready.' }
   }
 
   const text = typeof e.text === 'string' ? e.text.trim() : ''
@@ -1590,12 +1826,82 @@ async function specialistBoard($: EngineInterface, e: {
   if (writesPost && (closed || !text || text.length > 12000)) {
     return { deny: 'Use a nonempty report of at most 12,000 characters on an open run.' }
   }
-  const args = action === 'show'
-    ? (who ? [action, who] : e.seq ? [action, `--post=${e.seq}`] : [action])
-    : [action, name]
+  const args = action === 'show' ? shown : action === 'status' ? [action] : [action, name]
   if (action === 'read') args.push(`--max-bytes=${PAGE}`)
   if (action === 'revise') args.push(text)
-  const result = await boardCommand($, dir, args, action === 'post' || action === 'ready' ? text : undefined)
+  if (action === 'ready' && e.commit) args.push(e.commit)
+  return boardAnswer($, dir, args, action === 'post' || action === 'ready' ? text : undefined, e)
+}
+
+// What each of the coordinator's actions needs and may take, beside its action; board.py checks the values.
+const COORDINATOR_TAKES: Record<string, [needs: string[], may: string[]]> = {
+  init: [['name', 'title'], []], member: [['name'], ['options']], limit: [[], ['options']], plan: [[], []], attention: [[], []],
+  post: [['text'], []], read: [[], []], show: [[], ['member', 'seq']], confirm: [['name', 'seq'], []], retry: [['name'], []],
+  replace: [['name', 'newName'], ['options']], pause: [[], ['text']], resume: [[], ['name']], status: [[], []], close: [[], []],
+  export: [[], ['out']],
+}
+// The coordinator drives the run this conversation owns, or makes one with init.
+async function coordinatorBoard($: EngineInterface, e: BoardInput) {
+  const { action } = e
+  const takes = Object.hasOwn(COORDINATOR_TAKES, action) ? COORDINATOR_TAKES[action] : undefined
+  if (!takes) return { deny: `Unknown board action. The coordinator's are ${Object.keys(COORDINATOR_TAKES).join(', ')}.` }
+  const [needs, may] = takes
+  const given = BOARD_FIELDS.filter(field => e[field] !== undefined && !(typeof e[field] === 'string' && (e[field] as string).trim() === ''))
+  const missing = needs.filter(field => !given.includes(field as typeof given[number]))
+  const extra = given.filter(field => !needs.includes(field) && !may.includes(field))
+  if (missing.length > 0 || extra.length > 0) {
+    return { deny: `${action} takes ${[...needs, ...may.map(field => `${field} (optional)`)].join(', ') || 'no fields'}${missing.length ? `; ${missing.join(', ')} missing` : ''}${extra.length ? `; not ${extra.join(', ')}` : ''}.` }
+  }
+  const one = (value: string | undefined) => value?.trim().replace(/^@/, '').toLowerCase() ?? ''
+  const name = one(e.name)
+  const newName = one(e.newName)
+  if (action !== 'init' && [name, newName].some(value => value !== '' && !/^[a-z][a-z0-9_-]*$/.test(value))) {
+    return { deny: 'A member name is lowercase letters, digits, underscores and hyphens, such as "parser".' }
+  }
+  if (action === 'init' && !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/.test(e.name?.trim() ?? '')) {
+    return { deny: 'name is the run\'s folder name under .swarm: a letter or digit, then letters, digits, dots, underscores or hyphens.' }
+  }
+  const options = e.options ?? []
+  if (!Array.isArray(options) || options.length > 40 || options.some(option => typeof option !== 'string' || !/^[A-Za-z_]\w*=[^\n]*$/.test(option))) {
+    return { deny: 'options are key=value strings, such as "role=verifier" or "paths=src/a,src/b".' }
+  }
+  if (e.seq !== undefined && (!Number.isSafeInteger(e.seq) || e.seq < 1)) return { deny: 'seq is a positive post number.' }
+  const text = typeof e.text === 'string' ? e.text.trim() : ''
+  const oneLine = [e.title, e.out].find(value => typeof value === 'string' && /\n/.test(value))
+  if (oneLine !== undefined || text.length > 12000) return { deny: 'title and out are one line each, and text at most 12,000 characters.' }
+  const owned = await read($, run)
+  if (action !== 'init' && !owned) {
+    return { deny: 'No Swarm run is bound to this conversation. Make one with action "init", or run the board command in Bash naming the run folder.' }
+  }
+  const dir = action === 'init' ? `${await $.session.cwd()}/.swarm/${e.name!.trim()}` : owned
+  const shown = action === 'show' ? showArgs(e) : []
+  if ('deny' in shown) return shown
+  const args = action === 'init' ? [action, e.title!.trim()]
+    : action === 'member' || action === 'retry' ? [action, name, ...options]
+    : action === 'limit' ? [action, ...options]
+    : action === 'post' || action === 'read' ? [action, 'coordinator', ...(action === 'read' ? [`--max-bytes=${PAGE}`] : [])]
+    : action === 'show' ? shown
+    : action === 'confirm' ? [action, name, String(e.seq)]
+    : action === 'replace' ? [action, name, newName, ...options]
+    : action === 'pause' ? [action, ...(text ? [text] : [])]
+    : action === 'resume' ? [action, ...(name ? [name] : [])]
+    : action === 'export' ? [action, ...(e.out ? [`--out=${e.out.trim()}`] : [])]
+    : [action]
+  // The same record a board command typed in Bash makes, so everything that follows one follows this too.
+  const call: ParsedBoardCall = { dir, action, subarg: /^@?[\w-]+$/.test(args[1] ?? '') ? args[1]!.replace(/^@/, '').toLowerCase() : undefined, rest: args.join(' '), piped: false }
+  return pauseAware($, [call], undefined, async () => {
+    const answer = await boardAnswer($, dir, args, action === 'post' ? text : undefined, e)
+    // A whole-board show cut to its newest page printed none of the older posts: they are not marked as seen.
+    const isCut = 'result' in answer && answer.result.startsWith('Earlier posts are left out')
+    const told = await coordinatorNotes($, isCut ? [] : [call], false, answer, answer)
+    return boardCallsRan($, undefined, [call], 'result' in answer ? answer.result : '', told)
+  })
+}
+
+/** Runs one board command for the tool and answers in the tool's words: a failure is a deny, a long answer is cut to a page. */
+async function boardAnswer($: EngineInterface, dir: string, args: string[], stdin: string | undefined, e: BoardInput): Promise<{ deny: string } | { result: string }> {
+  const { action } = e
+  const result = await boardCommand($, dir, args, stdin)
   if (result.exitCode !== 0) {
     const err = result.stderr.trim()
       .replace(/show --post=(\d+)/g, 'action "show" with seq $1')
@@ -1603,7 +1909,7 @@ async function specialistBoard($: EngineInterface, e: {
     return { deny: err || 'The board action failed.' }
   }
   if (result.isStdoutTruncated) return { deny: 'The board response exceeded the tool limit. Use show with a post number, or ask the coordinator for help if it is a single long post.' }
-  if (writesPost || action === 'read') $.clock.after(0, () => void refresh($))
+  if (action === 'read' || !BOARD_READS.includes(action)) $.clock.after(0, () => void refresh($))
   if (action === 'show' && result.stdout.length > PAGE) {
     if (e.seq) return { result: `${head(result.stdout, PAGE)}\n(Cut here: the post is longer than one page.)` }
     // `show` has no page of its own: the newest posts are kept, from the start of a line.
@@ -1613,10 +1919,37 @@ async function specialistBoard($: EngineInterface, e: {
     if (body.length > 0 && body.charCodeAt(0) >= 0xdc00 && body.charCodeAt(0) <= 0xdfff) body = body.slice(1)
     return { result: `Earlier posts are left out: the history is longer than one page. Narrow it with a member filter, or open one post with seq.\n${body}` }
   }
-  // The board cuts a post longer than the page and says how to see it whole, in shell words: a specialist has the tool.
+  // The board cuts a post longer than the page and says how to see it whole, in shell words: the caller has the tool.
   return { result: result.stdout
     .replace(/\[cut to fit the page\. The whole post: show --post=(\d+)\]/g, '[cut to fit the page. The whole post: action "show" with seq $1]')
     .replace(/^(UNREAD: .*) Read them now: read \S+$/gm, '$1 Read them now: action "read"') }
+}
+
+// ponytail: a diff past this many characters is cut; `git diff HEAD...<commit>` prints it whole.
+const DIFF_CLIP = 12_000
+// The HEAD the coordinator was last told the shared checkout moved to.
+let headNoted = ''
+/** Opens a READY's commit under its post: all it adds to the project's HEAD. `git show` would print a synced
+ * member's merge commit, which is its dependency's work or nothing at all. */
+async function showDiff($: EngineInterface, dir: string, seq: number, revision: string): Promise<void> {
+  const project = dir.slice(0, dir.lastIndexOf('/.swarm/'))
+  const shown = await $.process.run(['git', '-C', project, 'diff', '--stat', '--patch', '--no-color', '--no-ext-diff', `HEAD...${revision}`], { timeoutMs: 10_000 })
+    .catch(error => ({ exitCode: 1, stdout: '', stderr: String(error) }))
+  if (shown.exitCode !== 0) {
+    $.ui.toast(`Swarm could not show ${revision.slice(0, 12)}: ${clean(shown.stderr).trim().split('\n')[0] || 'git failed'}`)
+    return
+  }
+  const text = clip(clean(shown.stdout).trimEnd(), DIFF_CLIP)
+  // A fence longer than any run of backticks in the diff, so a Markdown file's own fences stay inside it.
+  const fence = '`'.repeat(Math.max(3, ...[...text.matchAll(/`+/g)].map(run => run[0].length + 1)))
+  await update($, diff, () => ({ seq, text: `${fence}diff\n${text}\n${fence}` }))
+}
+
+/** Writes the shown run's Markdown summary with the board's export and says where. */
+async function exportRun($: EngineInterface, dir: string): Promise<void> {
+  const written = await boardCommand($, dir, ['export']).catch(error => ({ exitCode: 1, stdout: '', stderr: String(error) }))
+  const path = clean(written.stdout).trim().split('\n').at(-1) ?? ''
+  $.ui.toast(written.exitCode === 0 && path ? `Swarm wrote ${path}` : `Swarm: ${clean(written.stderr).trim() || 'the board\'s export command failed'}`)
 }
 
 // The band's button that opens the pane.
@@ -1685,16 +2018,23 @@ export const register: Register = on => {
       })
       await $.tool.register({
         name: 'board',
-        description: 'Swarm specialist board. Read unread posts, show history, post a message, report ready, or withdraw readiness. The tool uses your own assignment.',
+        description: 'The Swarm board, as the caller: a member reads its unread posts, shows history, posts, and sees status; a worker also reports ready or withdraws readiness. ' +
+          'The coordinator drives its run: init, member, limit, plan, attention, post, read, show, confirm, retry, replace, pause, resume, status, close, export.',
         isDeferred: false,
         inputSchema: {
           type: 'object',
           additionalProperties: false,
           properties: {
-            action: { enum: ['read', 'show', 'post', 'ready', 'revise'] },
+            action: { enum: ['read', 'show', 'post', 'ready', 'revise', 'status', 'init', 'member', 'limit', 'plan', 'attention', 'confirm', 'retry', 'replace', 'pause', 'resume', 'close', 'export'] },
             member: { type: 'string', description: 'Optional member filter for show.' },
-            seq: { type: 'integer', minimum: 1, description: 'Optional single post number for show.' },
-            text: { type: 'string', maxLength: 12000, description: 'Report, message, or reason.' },
+            seq: { type: 'integer', minimum: 1, description: 'A post number: one post for show, the finding for confirm.' },
+            text: { type: 'string', maxLength: 12000, description: 'Report, message, or reason (post, ready, revise, pause).' },
+            commit: { type: 'string', description: 'ready: the full 40- or 64-character commit id the report covers. Never HEAD.' },
+            title: { type: 'string', description: 'init: the run\'s title.' },
+            name: { type: 'string', description: 'init: the run\'s folder name under .swarm. member, retry, replace (the old one), confirm, resume: the member.' },
+            newName: { type: 'string', description: 'replace: the successor\'s name.' },
+            options: { type: 'array', items: { type: 'string' }, description: 'member, limit, replace: key=value settings, such as "role=verifier".' },
+            out: { type: 'string', description: 'export: where to write the Markdown summary; the run folder\'s summary.md when left out.' },
           },
           required: ['action'],
         },
@@ -1716,14 +2056,15 @@ export const register: Register = on => {
   // The board tool has a hook of its own, as the engine asks of a registered tool. Seen live: served
   // from the general hook below, a specialist resumed by a wake got "no tool.call hook answered".
   on('tool.call', { tool: BOARD_TOOL }, async ($, e) => {
-    if (e.agentId) {
-      moods.delete(e.agentId)
-      moods.set(e.agentId, ['read', 'show'].includes(e.action) ? 'inspect' : 'relay')
-    }
+    // The coordinator's call means it is mid-turn, as any tool call of its own does in the hook below.
+    if (e.agentId === undefined) isCoordinatorBusy = true
+    const actor = e.agentId ?? 'coordinator'
+    moods.delete(actor)
+    moods.set(actor, BOARD_READS.includes(e.action) ? 'inspect' : 'relay')
     try {
       const stopped = await refusal($, e.agentId)
       if (stopped) return { deny: stopped }
-      return await specialistBoard($, e)
+      return e.agentId === undefined ? await coordinatorBoard($, e) : await memberBoard($, { ...e, agentId: e.agentId })
     } catch (error) {
       return { deny: `The board tool failed (${error instanceof Error ? error.message : String(error)}). End your turn and report this sentence to the coordinator.` }
     }
@@ -1753,6 +2094,8 @@ export const register: Register = on => {
     const isMemberGuard = e.agentId !== undefined && (e.tool === 'Edit' || e.tool === 'Write' || e.tool === 'NotebookEdit' || e.tool === 'Bash')
     let bgWarning: string | undefined
     let guarded: string | undefined
+    // A shared-checkout writer's command whose HEAD is read before and after it.
+    let headWatch: { checkout: string; name: string } | undefined
     try {
       if (isCoordinatorBg || isMemberGuard) {
         const activeDir = await read($, run)
@@ -1827,8 +2170,8 @@ export const register: Register = on => {
                     }
                     if (rel !== undefined) {
                       if (rel === '.swarm' || rel.startsWith('.swarm/')) {
-                        // A specialist has the board tool; a worker, a designer and a verifier have the board command.
-                        return { deny: `Direct edits inside .swarm/ are not allowed. ${SPECIALISTS.includes(member.profile ?? '') ? 'Use the board tool to read or post.' : 'Read and post with the board command (board.py) in Bash.'}` }
+                        // A specialist has the board tool alone; a worker, a designer and a verifier have the board command as well.
+                        return { deny: `Direct edits inside .swarm/ are not allowed. ${SPECIALISTS.includes(member.profile ?? '') ? 'Use the board tool to read or post.' : 'Read and post with the board tool, or the board command (board.py) in Bash.'}` }
                       }
                       if (member.role === 'verifier' || member.writes === '0') {
                         return { deny: `@${memberName} is read-only (${member.role === 'verifier' ? 'verifier' : 'writes=0'}), so it cannot edit files in the repository.` }
@@ -1851,9 +2194,13 @@ export const register: Register = on => {
                     }
                   }
                 } else if (e.tool === 'Bash') {
-                  if (isShared && await commitsInSharedCheckout($, command, activeDir.slice(0, activeDir.lastIndexOf('/.swarm/')))) {
+                  const checkout = activeDir.slice(0, activeDir.lastIndexOf('/.swarm/'))
+                  if (isShared && await commitsInSharedCheckout($, command, checkout)) {
                     return { deny: `Shared-checkout writers must not run \`git commit\`: leave your edits in the working tree and report via \`BOARD ready ${memberName}\`.` }
                   }
+                  // A commit the guard cannot read (a script, a tool that commits) still moves HEAD. A background
+                  // command ends after this call does, so there is no after to read.
+                  if (isShared && e.run_in_background !== true) headWatch = { checkout, name: memberName }
                 }
               }
             }
@@ -1867,73 +2214,30 @@ export const register: Register = on => {
         return { deny: `Swarm could not check @${guarded}'s call against the run's roster (${error instanceof Error ? error.message : String(error)}), so it was refused. Report this sentence to the coordinator.` }
       }
     }
-    const isCoordinatorRead = calls.some(c => c.action === 'read' && COORDINATOR_READ.test(c.rest))
-    // A pause the coordinator's own command makes (`pause`, `resume`, or `limit` under what is spent) it reads in the output.
-    const mayPause = e.agentId === undefined && calls.some(c => c.action === 'pause' || c.action === 'resume' || c.action === 'limit')
-    if (mayPause) pausing++
-    const raw = await next(e).finally(() => {
+    const headBefore = headWatch ? await headOf($, headWatch.checkout) : ''
+    const raw = await pauseAware($, calls, e.agentId, () => next(e)).finally(() => {
       if (agentCall) {
         spawnEfforts.delete(agentCall)
         spawnIsolations.delete(agentCall)
-      }
-      if (mayPause) {
-        pausing--
-        pauseExpected()
-        $.clock.after(0, () => void refresh($))
       }
     })
     let result = raw
     if (bgWarning && result.deny === undefined && result.isError === undefined) {
       result = { ...result, context: [...(result.context ?? []), bgWarning] }
     }
-    try {
-      if (e.agentId === undefined && raw.deny === undefined && raw.isError === undefined) {
-        const dir = await read($, run)
-        // Only a real read of this run's board answers its mentions: the words alone may sit in a commit message.
-        for (const c of calls) {
-          if (c.action === 'read' && COORDINATOR_READ.test(c.rest)) {
-            const calledDir = RUN.test(c.dir) ? await resolveRunDir($, c.dir) : c.dir
-            if (calledDir === dir) {
-              owed = NONE
-              break
-            }
-          }
-        }
-        for (const c of calls) {
-          if (c.action !== 'show' || c.piped || !RUN.test(c.dir) || await resolveRunDir($, c.dir) !== dir) continue
-          // One post, the whole board, or one member's posts: only what was printed counts as seen.
-          const one = /--post=(\d+)/.exec(c.rest)
-          // The member named, if any: a flag or a redirection (`show 2>&1`) names none.
-          const who = c.subarg?.startsWith('-') ? undefined : c.subarg
-          if (one) shownPosts.posts.add(Number(one[1]))
-          else if (who === undefined) shownPosts.through = Math.max(shownPosts.through, snapshot?.posts.at(-1)?.seq ?? 0)
-          else for (const post of snapshot?.posts ?? []) if (post.agent === who || post.to.includes(who)) shownPosts.posts.add(post.seq)
-          owedSeqs = owedSeqs.filter(seq => seq > shownPosts.through && !shownPosts.posts.has(seq))
-          owed = owedSeqs.length === 0 ? NONE : { ...owed, count: owedSeqs.length, first: owedSeqs[0]!, last: owedSeqs.at(-1)! }
-        }
-        const notices: string[] = []
-        const key = relayKey(dir)
-        if (key && key !== relayHinted && !(e.tool === 'SendMessage' && Number.isSafeInteger(wakeSequence(String(e.message))))) {
-          relayHinted = key
-          notices.push(relayNotice())
-        }
-        // A read of the board is never told to read it, however it named the run (a shell variable, a relative path).
-        if (dir && owed.last > hinted && !isCoordinatorRead) {
-          hinted = owed.last
-          notices.push(`Swarm: ${unreadNotice($, dir)}`)
-        }
-        if (dir && pauseOwed) {
-          notices.push(`Swarm: ${pauseNotice('This run', pauseOwed)}`)
-          pauseOwed = ''
-        }
-        if (dir && silentOwed.length > 0) {
-          notices.push(...silentOwed.map(text => `Swarm: ${text}`))
-          silentOwed = []
-        }
-        if (notices.length > 0 && result.deny === undefined) result = { ...result, context: [...(result.context ?? []), ...notices] }
+    const headAfter = headWatch && headBefore ? await headOf($, headWatch.checkout) : ''
+    if (headWatch && headAfter && headAfter !== headBefore) {
+      // Said as what was seen, not who did it: another member or the person may have moved it. Nothing is undone.
+      const moved = `HEAD of the shared checkout moved from ${headBefore.slice(0, 12)} to ${headAfter.slice(0, 12)}`
+      // A refused command moved nothing, and one move seen by several members' commands is one piece of news.
+      if (result.deny === undefined && headNoted !== headAfter) {
+        headNoted = headAfter
+        result = { ...result, context: [...(result.context ?? []), `Swarm: ${moved} during this command. Shared-checkout writers must not commit; nothing was undone. Tell the coordinator in your report that HEAD moved.`] }
+        notesOwed.push(`${moved} while @${headWatch.name} ran a Bash command. Another actor may have moved it, and nothing was undone: check git log before the next candidate.`)
       }
-    } catch {
-      // A failed reminder must not change the tool's result.
+    }
+    if (e.agentId === undefined) {
+      result = await coordinatorNotes($, calls, e.tool === 'SendMessage' && Number.isSafeInteger(wakeSequence(String(e.message))), raw, result)
     }
     if (e.tool === 'Bash' && e.agentId === undefined && !result.isError && !result.deny && !calls.some(c => c.action === 'init') &&
       substitutions(command).some(body => /\bboard\.py\b[^\n;|&]*\sinit\s/.test(body))) {
@@ -1956,85 +2260,13 @@ export const register: Register = on => {
       const notes = await initNotes($).catch(() => [])
       if (notes.length > 0 && result.deny === undefined && result.isError === undefined) result = { ...result, context: [...(result.context ?? []), ...notes] }
     }
-    if (e.tool !== 'Bash' || result.isError || result.deny || calls.length === 0) return result
-    try {
-      if (e.agentId === undefined && calls.some(c => c.action === 'member' || c.action === 'started' || c.action === 'replace')) {
-        strangers.clear()
-      }
-      for (const c of calls) {
-        // `init` names the folder to make the run under and prints the run folder it made.
-        const rawDir = c.action === 'init' && e.agentId === undefined
-          ? String((raw.result as { stdout?: unknown } | undefined)?.stdout ?? '').split('\n').map(line => line.trim()).findLast(line => RUN.test(line)) ?? ''
-          : c.dir
-        const isReadCoord = c.action === 'read' && COORDINATOR_READ.test(c.rest)
-        // A read whose run could not be read off the command still changed what is owed: the roster is read again now.
-        if (isReadCoord && e.agentId === undefined && !RUN.test(rawDir)) $.clock.after(0, () => void refresh($))
-        if (!RUN.test(rawDir)) continue
-        const dir = await resolveRunDir($, rawDir)
-        const owned = await read($, run)
-        // The coordinator's own planning shows whose run it is as surely as its first read, which it may skip: the
-        // run is bound from `init` on, so that planning is charged to it. `plan` only reads, so it claims a run only
-        // while none is owned. The board refuses a run another conversation owns.
-        const claims = isReadCoord || c.action === 'init' || c.action === 'member' || (c.action === 'plan' && owned === '')
-        if (e.agentId === undefined && claims && dir !== owned) await bind($, dir)
-        // The roster may now record an agent that was looked up before it was on it.
-        if (e.agentId === undefined) strangers.clear()
-        if (dir === owned || e.agentId === undefined) $.clock.after(0, () => void refresh($))
-      }
-      if (e.agentId === undefined && calls.some(c => ['member', 'replace', 'pause', 'resume', 'limit', 'close'].includes(c.action))) {
-        // Only the run this conversation owns: another run's pause and roster are not this session's to enforce.
-        const resolvedSyncDir = await read($, run)
-        if (resolvedSyncDir) {
-          await syncOwnedState($, resolvedSyncDir).catch(() => undefined)
-          const retiredNames = calls
-            .filter(c => c.action === 'replace' || (c.action === 'member' && /\bkilled=(["']?)1\1(?=\s|$)/.test(c.rest)))
-            .map(c => c.subarg?.trim())
-            .filter((n): n is string => Boolean(n))
-          if (retiredNames.length > 0 && ownedRoster && ownedRoster.dir === resolvedSyncDir && !ownedRoster.closed) {
-            const liveAgents = await $.agent.list().catch(() => [])
-            const zombieNotices: string[] = []
-            // Every process's working folder, read once for the command however many members it retires. lsof exits 1
-            // when it could not read every process and still lists the rest; -b keeps it off a mount that does not answer.
-            const listing = await $.process.run(['lsof', '-b', '-w', '-a', '-d', 'cwd', '-Fpn'], { timeoutMs: 5000 })
-              .then(listed => listed.stdout, () => '')
-            const replaced = new Set(calls.filter(c => c.action === 'replace').map(c => c.subarg?.trim()))
-            for (const oldName of retiredNames) {
-              const entry = memberNamed(ownedRoster.members, oldName)
-              const live = entry?.killed && entry.id ? findAgent(liveAgents, entry.id) : undefined
-              if (live && ['running', 'pending', 'waiting'].includes(live.status)) {
-                zombieNotices.push(`Swarm: @${oldName} was retired, but agent ${live.id} is still ${live.status}. Stop it before spawning a successor.`)
-              }
-              // Refusing its tools stops the agent, not a build it had already launched.
-              const left = entry?.killed && entry.id ? await leftRunning($, entry.id, listing) : []
-              if (left.length > 0) {
-                zombieNotices.push(`Swarm: @${oldName} was retired, but ${left.length} process${left.length === 1 ? '' : 'es'} it started ${left.length === 1 ? 'is' : 'are'} still running in its worktree: ${left.map(one => `${one.pid} (${one.command})`).join(', ')}. Unless the user wants ${left.length === 1 ? 'it' : 'them'} to finish, stop ${left.length === 1 ? 'it' : 'them'}: kill ${left.map(one => one.pid).join(' ')}`)
-              } else if (replaced.has(oldName) && entry?.killed && entry.id && entry.isolated !== '1' &&
-                  entry.role === 'worker' && entry.writes !== '0' && !['explorer', 'investigator', 'architect'].includes(entry.profile ?? '')) {
-                zombieNotices.push(`Swarm: @${oldName} was retired. A build or test it started in the shared folder cannot be told from the team's own, so nothing was checked: look for one before its successor builds.`)
-              }
-            }
-            if (zombieNotices.length > 0 && result.deny === undefined) {
-              result = { ...result, context: [...(result.context ?? []), ...zombieNotices] }
-            }
-          }
-        }
-      }
-      // Every wake of the coordinator re-reads its whole conversation, so a run started in a long one pays for
-      // that history on each of them. Said once, when the run is made, while starting elsewhere is still cheap.
-      if (e.agentId === undefined && calls.some(c => c.action === 'init') && result.deny === undefined && result.isError === undefined) {
-        result = { ...result, context: [...(result.context ?? []), ...await initNotes($)] }
-      }
-    } catch {
-      // A failed binding must not change the tool's result.
-    }
-    return result
+    if (e.tool !== 'Bash') return result
+    return boardCallsRan($, e.agentId, calls, String((raw.result as { stdout?: unknown } | undefined)?.stdout ?? ''), result)
   }).catch((_, e, next) => {
     if (next.called) return next(e)
     if (e.agentId !== undefined) {
-      const address = teammates.get(e.agentId)
-      if (retired.has(e.agentId) || (address !== undefined && retired.has(address))) {
-        return { deny: 'This Swarm member has been retired, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped.' }
-      }
+      const stopped = stoppedMember(e.agentId)
+      if (stopped) return { deny: stopped }
       if (halted && agentRuns.get(e.agentId) === halted.dir) {
         return { deny: `This Swarm run is ${halted.why}, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped. The coordinator decides what happens when the run resumes.` }
       }
@@ -2052,7 +2284,7 @@ export const register: Register = on => {
     }).catch(() => undefined)
     if (!state) return { isDelivered: false, reason: 'Swarm could not read the run state. Retry after checking the board.' }
     const native = state.members.coordinator?.backend === 'native'
-    const matches = Object.entries(state.members).filter(([, member]) => member.id && !member.killed &&
+    const matches = Object.entries(state.members).filter(([, member]) => member.id && !member.killed && !member.paused &&
       SPECIALISTS.includes(member.profile ?? '') && (member.id === e.to || (native && teammateName(member.id) === e.to)))
     const [name, member] = matches.length === 1 ? matches[0]! : []
     const budget = budgetOf(state)
@@ -2659,7 +2891,7 @@ export const register: Register = on => {
                 agent: clean(String(parsed.agent)),
                 time: clean(String(parsed.time)),
                 text: clean(String(parsed.text)),
-                to: (parsed.to ?? targets(String(parsed.text), roster).filter(n => n !== parsed.agent)).map(name => clean(String(name))),
+                to: (parsed.to ?? targets(String(parsed.text), roster, String(parsed.agent)).filter(n => n !== parsed.agent)).map(name => clean(String(name))),
               }
             } else if (rawOut) {
               const m = /^#(\d+)\s+(\d{2}:\d{2}:\d{2})\s+@(\S+)\s+->\s+([^\n]*)(?:\n([\s\S]*))?$/.exec(rawOut)
@@ -2698,6 +2930,7 @@ export const register: Register = on => {
     let body
     if (current === 'board') {
       const open = await read($, expanded)
+      const openDiff = await read($, diff)
       const collapsed = await read($, latestOnly)
       const more = await read($, earlier)
       const preview = (post: Post) => clip(chipped(post))
@@ -2753,6 +2986,32 @@ export const register: Register = on => {
           )}
         </Box>
       )
+      // The person posts in the coordinator's name, and the coordinator is told with its next tool call.
+      const compose = isDriven && (
+        <Box flexDirection="row" alignItems="center" marginTop={1}>
+          <Input
+            key="board-compose"
+            placeholder="Post to the board as the coordinator"
+            value=""
+            submitLabel="Post"
+            onSubmit={async value => {
+              const text = value.trim()
+              if (text === '' || shown.dir !== await read($, run)) return
+              const posted = await boardCommand($, shown.dir, ['post', 'coordinator'], `(from the user, in the pane)\n${text}`)
+                .catch(error => ({ exitCode: 1, stdout: '', stderr: String(error) }))
+              if (posted.exitCode !== 0) {
+                $.ui.toast(`Swarm: ${clean(posted.stderr).trim() || 'the board\'s post command failed'}`)
+                return
+              }
+              const seq = /^posted #(\d+)/m.exec(posted.stdout)?.[1]
+              notesOwed.push(seq
+                ? `The user posted #${seq} to the board in your name from the Swarm pane. Read it before going on: the board's show --post=${seq}`
+                : 'The user posted to the board in your name from the Swarm pane. Read the newest posts with the board\'s show before going on.')
+              await refresh($)
+            }}
+          />
+        </Box>
+      )
       const selected = !collapsed && open > 0 ? matching.find(post => post.seq === open) : undefined
       const selectedCost = selected ? 4 + estimateRows(chipped(selected, openedText(selected)), columns) : 0
       const fitted: Post[] = []
@@ -2777,6 +3036,7 @@ export const register: Register = on => {
       body =
         visible.length === 0 ? (
           <Box flexDirection="column">
+            {compose}
             {shown.posts.length > 0 && search}
             <Box marginTop={1}>
               <Text dimColor>{shown.posts.length === 0 ? 'No posts yet.' : 'No posts match the filter.'}</Text>
@@ -2784,6 +3044,7 @@ export const register: Register = on => {
           </Box>
         ) : (
           <Box flexDirection="column" gap={1}>
+            {compose}
             {search}
             {terms.length === 0 && shown.posts.length > 1 && (
               <Button
@@ -2814,6 +3075,9 @@ export const register: Register = on => {
               const time = postTime(post)
               const hasMore = chipped(post).length > CLIP
               const canViewGraph = e.surface !== 'terminal' && shown.posts.some(p => p.seq === post.seq)
+              // Checked again here: a post opened from Attention may come from `show --json`, not parsePosts, and the id goes on git's command line.
+              const revision = kind?.label === 'READY' && typeof post.revision === 'string' && COMMIT_ID.test(post.revision) ? post.revision : undefined
+              const isDiffOpen = revision !== undefined && openDiff.seq === post.seq
               // A post opened from Attention that the pane no longer keeps: it stays until it is dismissed.
               const isInspected = inspectedPost?.seq === post.seq && !shown.posts.some(p => p.seq === post.seq)
 
@@ -2847,7 +3111,8 @@ export const register: Register = on => {
                     <Text dimColor tabular>{`#${post.seq}${time ? ` · ${time}` : ''}`}</Text>
                   </Box>
                   <Markdown text={formatMarkdown(post.seq === open ? chipped(post, openedText(post)) : preview(post))} />
-                  {(hasMore || canViewGraph || isInspected) && (
+                  {isDiffOpen && <Markdown key={`diff-text-${post.seq}`} text={openDiff.text} />}
+                  {(hasMore || canViewGraph || isInspected || revision !== undefined) && (
                     <Box flexDirection="row" gap="sm" flexWrap="wrap">
                       {isInspected && (
                         <Button
@@ -2874,6 +3139,15 @@ export const register: Register = on => {
                           label={post.seq === open ? '▴ Show less' : '▾ Show more'}
                         />
                       )}
+                      {revision !== undefined && (
+                        <Button
+                          key={`diff-${post.seq}`}
+                          plain
+                          dimColor
+                          label={isDiffOpen ? '▴ Hide diff' : 'View diff'}
+                          onPress={() => isDiffOpen ? update($, diff, () => ({ seq: 0, text: '' })) : showDiff($, shown.dir, post.seq, revision)}
+                        />
+                      )}
                       {canViewGraph && (
                         <Button
                           key={`graph-post-${post.seq}`}
@@ -2896,8 +3170,8 @@ export const register: Register = on => {
     } else if (current === 'attention') {
       // A kind this version does not know is still shown, uncoloured.
       const tone = (kind: string) =>
-        ['unreachable', 'ignored', 'stale', 'rework', 'retired-running'].includes(kind) ? 'error' : kind === 'paused' ? 'suggestion'
-          : ['unread', 'review', 'question', 'unstarted', 'blocked', 'spend', 'silent'].includes(kind) ? 'warning' : undefined
+        ['unreachable', 'ignored', 'stale', 'rework', 'retired-running', 'conflict'].includes(kind) ? 'error' : kind === 'paused' || kind === 'member_paused' ? 'suggestion'
+          : ['unread', 'review', 'question', 'unstarted', 'blocked', 'spend', 'silent', 'loop'].includes(kind) ? 'warning' : undefined
       const isSpent = shown.budget > 0 && total >= shown.budget
       const ask = (text: string) => {
         const fail = () => $.ui.toast('Swarm could not send that request to the coordinator.')
@@ -2917,9 +3191,10 @@ export const register: Register = on => {
             const itemKey = count === 0 ? baseKey : `${baseKey}-${count}`
             // Every item can be put in front of the coordinator: the kinds below have a request of their own, a
             // paused run waits for the person, and an ignored member is retried on the board itself.
-            const isPlainAsk = !['unreachable', 'review', 'rework', 'paused', 'ignored'].includes(item.kind)
+            const isPlainAsk = !['unreachable', 'review', 'rework', 'paused', 'ignored', 'member_paused'].includes(item.kind)
             const hasActions = item.seq > 0 || (isDriven && (
               item.kind === 'unreachable' ||
+              item.kind === 'member_paused' ||
               (item.kind === 'paused' && isSpent) ||
               item.kind === 'ignored' ||
               item.kind === 'review' ||
@@ -2964,6 +3239,15 @@ export const register: Register = on => {
                     label="+500k & resume"
                     onPress={() => control($, shown.dir, ['limit', `budget=${Math.max(shown.budget, total) + 500_000}`], ['resume'])}
                   />
+                )}
+                {item.kind === 'member_paused' && isDriven && (
+                  <Button key={`attention-resume-${itemKey}`} plain label="+250k & resume"
+                    onPress={async () => {
+                      // The board refuses a resume while the member is at its budget, so the two go together.
+                      const id = shown.members.find(member => member.name === item.member)?.id
+                      const used = shown.tokens[id ? await digest(`swarm-agent:${id}`) : ''] ?? 0
+                      await control($, shown.dir, ['member', item.member, `budget=${used + 250_000}`], ['resume', item.member])
+                    }} />
                 )}
                 {item.kind === 'ignored' && isDriven && (
                   <Button key={`attention-retry-${itemKey}`} plain label="Retry" onPress={() => control($, shown.dir, ['retry', item.member])} />
@@ -3339,6 +3623,7 @@ export const register: Register = on => {
         <Box flexDirection="row" gap="sm" flexWrap="wrap" alignItems="center">
           <Button key="run-prev" plain dimColor label="‹ Prev run" onPress={() => browse($, 1)} />
           <Button key="run-next" plain dimColor label="Next run ›" onPress={() => browse($, -1)} />
+          <Button key="run-export" plain dimColor label="Export MD" onPress={() => exportRun($, shown.dir)} />
           {isDriven && (
             <Button
               key="run-pause"

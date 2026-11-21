@@ -35,7 +35,9 @@ The hooks record each address when its agent starts. Check `BOARD status` after 
 
 ## Limits
 
-The `swarm` skill's step 1 says how limits are recorded and what the board refuses. Here, only what follows from them for the roster: `BOARD member` and `BOARD replace` refuse a change that breaks a limit, and say which. Passing an empty value (`budget=`, `max_workers=`, `max_members=`, `fable=`) clears that limit. When the budget is spent the plugin pauses the run and calls you: report what is done and what is left, and ask the user before you raise the budget and resume. Never raise a limit on your own.
+The `swarm` skill's step 1 says how limits are recorded and what the board refuses. Here, only what follows from them for the roster: `BOARD member` and `BOARD replace` refuse a change that breaks a limit, and say which. Passing an empty value (`budget=`, `member_budget=`, `max_workers=`, `max_members=`, `fable=`) clears that limit. When the budget is spent the plugin pauses the run and calls you: report what is done and what is left, and ask the user before you raise the budget and resume. Never raise a limit on your own.
+
+A member's own budget (`BOARD member <name> budget=<tokens>`, else the run's `member_budget=`) pauses only that member when its tokens reach it: nobody wakes it, it is never listed as unreachable or ignored, and attention shows `member_paused`. The others keep running; members that depend on it are listed as blocked. With the user's agreement, raise it and run `BOARD resume <name>`, which tells it to go on; `resume <name>` is refused while the member is still at or over its budget. A replacement does not inherit the budget, and retiring a member drops its pause.
 
 ## Workspaces
 
@@ -43,9 +45,10 @@ The `swarm` skill's step 1 says how limits are recorded and what the board refus
 | --- | --- | --- |
 | How | Shared checkout; hooks enforce `paths=` on edits and refuse bare `git commit` for shared writers | `isolation: "worktree"` on every writer's Agent call, a designer's included, in a git repository |
 | Use when | Pieces touch different files and do not build into the same output | Writers would break each other: one build directory, generated files, a lockfile |
-| A writer reports with | `BOARD ready <name>` (does not commit; runs only narrow fast checks, skipping any filtered test that triggers the whole build and naming it in `READY` for the verifier; never invents a build lock or queue; one commit follows `VERIFY accept`) | `BOARD ready <name> HEAD` from its worktree (or `<full commit id>`), after committing on its branch; a downstream isolated writer inspects (`git show <commit>:<path>`) or merges (`git merge --no-ff <commit>`) upstream `READY <commit>`s before building/testing |
+| A writer reports with | `BOARD ready <name>` (does not commit; runs only narrow fast checks, skipping any filtered test that triggers the whole build and naming it in `READY` for the verifier; never invents a build lock or queue; one commit follows `VERIFY accept`) | `BOARD ready <name> HEAD` from its worktree (or `<full commit id>`), after committing on its branch; a downstream isolated writer runs `BOARD sync <name>` from its worktree to merge the upstream `READY <commit>`s before building and testing, since `ready` refuses a commit that lacks them |
 | Read-only members | No difference | Mark them `writes=0` so readiness does not expect a commit |
 | Verification | `VERIFY prepare shared` | `VERIFY prepare isolated` merges the exact commits into an integration worktree |
+| Testing some pieces early | Not available: the folder holds every worker's edits | `--members <a,b>` merges only those members' commits |
 
 Do not mix: if one writer is isolated, all writers are. Never push, and never land anything except through `VERIFY accept`.
 
@@ -84,7 +87,7 @@ A living member's model cannot be changed. Replacement is the only way.
 
 - Waiting for the user: `BOARD pause <reason>`, say what you need, `BOARD resume` when they answer. While paused nothing is delivered and the monitor stays quiet.
 - The monitor calls you once when an open run is quiet and no member can advance. Run the coordinator loop; do not just acknowledge it.
-- `BOARD attention` is the list of what is stuck: a paused run, posts you have not read, findings to review, unanswered questions, unstarted, unreachable or ignored members, a worker that failed verification twice in a row (rework), one member holding most of the spend, members waiting on a member that is missing, removed, unreachable, ignoring its mentions or never started, and stale verification. The pane's Attention tab shows the same list to the user, plus `retired-running` when a retired member's agent is still alive and `silent` when a worker's agent ended without a report.
+- `BOARD attention` is the list of what is stuck: a paused run, a member paused by its own budget (`member_paused`), posts you have not read, findings to review, unanswered questions, unstarted, unreachable or ignored members, a worker that failed verification twice in a row (rework), one member holding most of the spend, a worker going round in circles (`loop`: 15 turns or 150,000 tokens since it last posted or read; ask it where it stands), two current `READY` commits that would conflict when merged (`conflict`), members waiting on a member that is missing, removed, paused, unreachable, ignoring its mentions or never started, and stale verification. A partial candidate's `VERIFIED` is not the run's verification. The pane's Attention tab shows the same list to the user, plus `retired-running` when a retired member's agent is still alive and `silent` when a worker's agent ended without a report.
 - A member that is "waiting" with unread mentions should have been woken. If attention lists it as unreachable, retry once, then replace it.
 
 ## Recovery

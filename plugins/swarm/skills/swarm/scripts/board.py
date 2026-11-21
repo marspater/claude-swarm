@@ -2,19 +2,20 @@
 """Shared message board for a swarm: numbered posts, @mentions, unread cursors.
 
 usage: board.py DIR init TITLE                    prints the run folder it created; use that as DIR from then on
-       board.py DIR member NAME [key=value ...]   add or update (role= profile= writes= consult= group= depends= owns= paths= model= effort= id= backend= isolated= killed=1)
-       board.py DIR limit [key=value ...]         set run limits: max_workers= max_members= budget=<tokens> <model>=<types>
+       board.py DIR member NAME [key=value ...]   add or update (role= profile= writes= consult= group= depends= owns= paths= model= effort= id= backend= isolated= budget=<tokens> killed=1)
+       board.py DIR limit [key=value ...]         set run limits: max_workers= max_members= budget=<tokens> member_budget=<tokens> <model>=<types>
        board.py DIR plan                          the team as a table: type, model, effort, dependencies, ownership
        board.py DIR attention [--json]            what needs someone: unanswered questions, blocked or unreachable members, stale verification
        board.py DIR retry NAME                    let delivery try an unreachable or unresponsive member again
        board.py DIR replace OLD NEW [key=value ...]  retire OLD and register NEW with its brief, dependencies and history
-       board.py DIR post FROM [TEXT]              TEXT from stdin when omitted
+       board.py DIR post FROM [TEXT]              TEXT from stdin when omitted; @all, @group, @verifiers and @dependents (of FROM) reach several
        board.py DIR read ME                       print posts ME has not read, mark them read: posts that mention ME in full, others as one line
        board.py DIR read ME --all                 the same, every post in full
        board.py DIR read ME --headers             the same, every post as one line
        board.py DIR read ME --max-bytes=N          page the unread output without consuming the next unread post; a post longer than a page is cut and names the show command that prints it whole
        board.py DIR show [NAME | --post=N [--json]]  print history, optionally for one member or post; marks nothing
        board.py DIR ready NAME [COMMIT|HEAD]      record readiness and tell the coordinator and dependents, and the verifiers once every worker is ready; HEAD is the checkout's own commit
+       board.py DIR sync NAME [--check-only]      from NAME's checkout, merge the READY commits of its dependencies that HEAD lacks; --check-only lists them
        board.py DIR confirm NAME SEQ              accept an investigator finding and release its dependents
        board.py DIR revise NAME [REASON]           withdraw readiness before starting a fix
        board.py DIR wake                          list pending wakes, including the post sequence
@@ -22,7 +23,7 @@ usage: board.py DIR init TITLE                    prints the run folder it creat
        board.py DIR woke NAME SEQ TOKEN           acknowledge a successful delivery
        board.py DIR rearm TURN_MS ID...           after agent ID's turn of TURN_MS: wake it again for mentions it left unread
        board.py DIR pause [REASON]                 pause automation while awaiting a decision
-       board.py DIR resume                         resume automation
+       board.py DIR resume [NAME]                  resume automation, or one member its own token budget paused
        board.py DIR bind KEY                       bind this run to a private lookup key
        board.py .swarm restore KEY                 find the run for a private lookup key
        board.py .swarm adopt KEY NAME [HINT]       bind the one open run that has member NAME; exit 3 when ambiguous, 4 when an open run lacks it, 5 when HINT names an ineligible run
@@ -32,13 +33,14 @@ usage: board.py DIR init TITLE                    prints the run folder it creat
        board.py DIR close                         mark the run finished
        board.py DIR account TURN_HASH ACTOR_KEY TOKENS  record a completed turn once
        board.py DIR status                        members, unread counts, who mentioned whom
+       board.py DIR export [--out=PATH]           write a Markdown report of the run (default DIR/summary.md) and print its path
        board.py .swarm prune [--days=N] [--dry-run]  remove integration checkouts no candidate needs, archive closed runs idle for N days (default 14)
        board.py DIR tail [BYTES]                  the newest whole posts of board.jsonl within BYTES (default 3000000), raw
 
 `init` takes <project>/.swarm/<name> and creates <project>/.swarm/<name>-<timestamp>, so every
 run has its own folder. A run folder holds board.jsonl, one {"seq","agent","text","time","to"}
 per line, and members.json: {"title","closed","members":{name:{role,group,model,id,
-last_read_seq,last_nudged_seq,killed}}}.
+last_read_seq,last_nudged_seq,killed,budget,paused,synced_deps}}}.
 """
 import hashlib
 import fcntl  # ponytail: POSIX only; swap in msvcrt.locking if Windows support is needed
@@ -62,6 +64,10 @@ WAKE_LEASE_SECONDS = 15
 WAKE_ATTEMPTS = 3
 REWORK_WARNING, REWORK_PAUSE = 2, 3  # failed verification cycles in a row
 SPEND_FLOOR = 200_000  # a share of less says nothing about the run
+SPEND_SHARE, PAIR_SHARE = 1 / 2, 3 / 4  # of the run's tokens with three or more members using any, of the pair's with two
+# Spent by a worker without posting or reading: it is going round in circles. A step is one model response,
+# so a long stretch of honest edits stays well under it.
+LOOP_STEPS, LOOP_TOKENS = 150, 150_000
 TURNS_KEPT = 2000
 COMMIT = re.compile(r"(?:[a-f0-9]{40}|[a-f0-9]{64})")
 RUN_NAME = re.compile(r"[a-zA-Z0-9_.-]+-\d{8}-\d{6}x*")
@@ -83,10 +89,10 @@ ARG_COUNTS = {
     "replace": (2, None), "post": (1, None), "ready": (1, 2), "revise": (1, None),
     "confirm": (2, 2), "read": (1, 4), "show": (0, 2), "wake": (0, 0),
     "claim": (3, 3), "woke": (3, 3), "rearm": (2, None), "bind": (1, 1),
-    "pause": (0, None), "resume": (0, 0), "close": (0, 0), "status": (0, 0), "account": (3, 3), "tail": (0, 1),
-    "prune": (0, 2),
+    "pause": (0, None), "resume": (0, 1), "close": (0, 0), "status": (0, 0), "account": (3, 3), "tail": (0, 1),
+    "prune": (0, 2), "sync": (1, 2), "export": (0, 1),
 }
-READ_COMMANDS = {"show", "status", "plan", "attention", "wake"}
+READ_COMMANDS = {"show", "status", "plan", "attention", "wake", "export"}
 USAGE = __doc__.split("\n\n")[1]
 
 
@@ -167,7 +173,7 @@ def load(d, *, repair=True):
             save(d, state)
     for post in posts:
         if "to" not in post:
-            post["to"] = [name for name in targets(post["text"], state["members"]) if name != post["agent"]]
+            post["to"] = [name for name in targets(post["text"], state["members"], sender=post["agent"]) if name != post["agent"]]
     return state, posts
 
 
@@ -210,7 +216,7 @@ def rejected(post, members):
     if not word or word[1] != "NOT PASSED" or members.get(post["agent"], {}).get("role") != "verifier":
         return []
     reached = post.get("to", [])
-    first = [name for name in targets(post["text"].split("\n", 1)[0], members, include_killed=True)
+    first = [name for name in targets(post["text"].split("\n", 1)[0], members, include_killed=True, sender=post["agent"])
              if name in reached and members.get(name, {}).get("role") == "worker"]
     return first or [name for name in reached if members.get(name, {}).get("role") == "worker"]
 
@@ -238,9 +244,10 @@ DEFAULTS = {"worker": ("sonnet", "medium"), "verifier": ("sonnet", "medium"), "e
 READ_ONLY = {"explorer", "investigator", "architect"}
 PROFILES = {*READ_ONLY, "designer"}
 FAMILIES = ("haiku", "sonnet", "opus", "fable")
-LIMITS = {"max_workers", "max_members", "budget", *FAMILIES}
+LIMITS = {"max_workers", "max_members", "budget", "member_budget", *FAMILIES}
 INHERITED = ("role", "group", "profile", "writes", "depends", "owns", "paths", "model", "effort", "consult")
-MEMBER_FIELDS = {*INHERITED, "backend", "id", "killed", "isolated"}
+MEMBER_FIELDS = {*INHERITED, "backend", "id", "killed", "isolated", "budget"}
+RESERVED = {"all", "verifiers", "dependents"}  # mentions that reach several members, so no member or group takes them
 
 
 def assignments(args, allowed):
@@ -315,9 +322,15 @@ def validate_member(name, member, changes, members):
     if name == COORDINATOR and changes.keys() - {"backend", "role", "id", "killed", "depends"}:
         raise ValueError("the coordinator is the conversation itself: only backend= can be set on it")
     if changes.get("group") not in (None, "", "-") and (
-            not NAME.fullmatch(changes["group"]) or changes["group"] == "all"
+            not NAME.fullmatch(changes["group"]) or changes["group"] in RESERVED
             or changes["group"] == name or changes["group"] in members):
-        raise ValueError("a group name uses lowercase letters, digits, underscores and hyphens, and is neither 'all' nor a member's name")
+        raise ValueError("a group name uses lowercase letters, digits, underscores and hyphens, and is neither %s nor a "
+                         "member's name" % ", ".join(sorted(RESERVED)))
+    if "budget" in changes:  # 0 or - clears it, as budget=0 clears the run's
+        if changes["budget"] in {"", "-"} or (re.fullmatch(r"[0-9]{1,15}", changes["budget"]) and not int(changes["budget"])):
+            member.pop("budget", None)
+        elif not re.fullmatch(r"[0-9]{1,15}", changes["budget"]):
+            raise ValueError("budget= takes a token count; 0 or - clears it")
     if "model" in changes and changes["model"] not in {"", "inherit", *FAMILIES} and (
             any(c.isspace() for c in changes["model"]) or not any(f in changes["model"].lower() for f in FAMILIES)):
         raise ValueError("model must be inherit, a model family (%s), or a model ID containing one" % ", ".join(FAMILIES))
@@ -350,7 +363,7 @@ def validate_member(name, member, changes, members):
 
 def usable_name(name, members):
     """A new member's name: one a mention can carry, that no group already answers to."""
-    return bool(NAME.fullmatch(name)) and name != "all" and all(entry.get("group") != name for entry in members.values())
+    return bool(NAME.fullmatch(name)) and name not in RESERVED and all(entry.get("group") != name for entry in members.values())
 
 
 def stranded(name, members):
@@ -447,7 +460,7 @@ def ignored(name, members, posts):
 
 
 def verified_line(d, verifier, first):
-    """True when FIRST carries the line verify.py printed for the current candidate, passed by this verifier."""
+    """The current candidate when FIRST carries the line verify.py printed for it, passed by this verifier; else False."""
     try:
         with open(os.path.join(d, "verification.json"), encoding="utf-8") as f:
             candidate = json.load(f)
@@ -464,7 +477,7 @@ def verified_line(d, verifier, first):
         verify.check_current(verify.Path(d), candidate)
     except (ValueError, OSError, KeyError, TypeError) as error:
         sys.exit("that VERIFIED is void: %s. Post NOT VERIFIED or a note, and wait for a new candidate." % error)
-    return True
+    return candidate
 
 
 def void_pass(d):
@@ -555,7 +568,11 @@ def rework(state, posts):
         word = REPORT_WORD.match(post["text"])
         if post["seq"] <= state.get("accepted_seq", 0) or not word or members.get(post["agent"], {}).get("role") != "verifier":
             continue
-        if word[1] == "VERIFIED":
+        if word[1] == "VERIFIED" and post.get("partial"):  # a partial pass clears only the workers it held
+            for name in post.get("members", []):
+                failed.pop(name, None)
+                latest.pop(name, None)
+        elif word[1] == "VERIFIED":
             failed, latest = {}, {}
         elif word[1] == "NOT PASSED":
             for name in rejected(post, members):
@@ -593,14 +610,31 @@ def attention(state, posts):
             items.append({"kind": "rework", "member": name, "seq": failed[-1],
                           "text": "@%s failed verification %d times in a row. Stop the rework and ask the user how to go on"
                                   % (name, len(failed))})
-    tokens = state.get("usage", {}).get("tokens", {})
-    if total >= SPEND_FLOOR and len(tokens.keys() - {COORDINATOR}) >= 3:
-        for name, member in team.items():  # usage is kept under a hash of the member's agent address
-            used = tokens.get(hashlib.sha256(("swarm-agent:" + member.get("id", "")).encode()).hexdigest(), 0)
-            if used * 2 > total:
+    usage = state.get("usage", {})
+    tokens = usage.get("tokens", {})
+    actors = tokens.keys() - {COORDINATOR}
+    # Two members are compared with each other: one doing most of a pair's work is common, nearly all of it is not.
+    pair = sum(tokens[key] for key in actors) if len(actors) == 2 else 0
+    if (total >= SPEND_FLOOR and len(actors) >= 3) or pair >= SPEND_FLOOR:
+        whole, share, of = (pair, PAIR_SHARE, "the %s tokens the run's two members used") if pair else (total, SPEND_SHARE, "the run's %s tokens")
+        for name, member in team.items():
+            used = tokens.get(usage_key(member), 0)
+            if used > whole * share:
                 items.append({"kind": "spend", "member": name, "seq": 0,
-                              "text": "@%s has used %s of the run's %s tokens (%d%%)"
-                                      % (name, f"{used:,}", f"{total:,}", used * 100 // total)})
+                              "text": "@%s has used %s of %s (%d%%)" % (name, f"{used:,}", of % f"{whole:,}", used * 100 // whole)})
+    for name, member in team.items():
+        if member.get("paused"):
+            items.append({"kind": "member_paused", "member": name, "seq": 0,
+                          "text": "@%s is paused: %s. Raise it with member %s budget=<tokens>, then resume %s"
+                                  % (name, member["paused"], name, name)})
+        elif member.get("role") == "worker" and member.get("id"):
+            key = usage_key(member)
+            mark = usage.get("marks", {}).get(key, [0, 0])  # steps and tokens when it last posted or read
+            turns, used = usage.get("steps", {}).get(key, 0) - mark[0], tokens.get(key, 0) - mark[1]
+            if turns >= LOOP_STEPS or used > LOOP_TOKENS:
+                items.append({"kind": "loop", "member": name, "seq": 0,
+                              "text": "@%s has taken %d model steps and %s tokens since it last posted or read the board. "
+                                      "Ask it where it stands, or stop it" % (name, turns, f"{used:,}")})
     for seq, asker, recipient in unanswered(members, posts):
         items.append({"kind": "question", "member": recipient, "seq": seq,
                       "text": "@%s has not answered @%s" % (recipient, asker)})
@@ -610,11 +644,12 @@ def attention(state, posts):
         if not member.get("id") and owed:
             items.append({"kind": "unstarted", "member": name, "seq": owed[0],
                           "text": "@%s has a brief and no agent. Start it once and record its id" % name})
-    for name in team:
+    awake = [name for name, member in team.items() if not member.get("paused")]  # a paused member is woken by nobody
+    for name in awake:
         if unreachable(name, members, posts):
             items.append({"kind": "unreachable", "member": name, "seq": unwoken_of(name, members, posts)[-1],
                           "text": "@%s could not be woken after %d attempts. Retry it or replace it" % (name, WAKE_ATTEMPTS)})
-    for name in team:
+    for name in awake:
         if ignored(name, members, posts):
             items.append({"kind": "ignored", "member": name, "seq": unread_of(name, members, posts)[-1],
                           "text": "@%s was woken %d times and has not read its mentions. Run retry %s, or replace it" % (name, WAKE_ATTEMPTS, name)})
@@ -626,6 +661,7 @@ def attention(state, posts):
                 continue
             upstream = members.get(dep, {})
             why = ("is missing" if not upstream else "was removed" if upstream.get("killed")
+                   else "is paused: %s" % upstream["paused"] if upstream.get("paused")
                    else "is unreachable" if unreachable(dep, members, posts)
                    else "is ignoring its mentions" if ignored(dep, members, posts)
                    else "was never started" if "id" not in upstream and "id" in member else None)
@@ -633,9 +669,10 @@ def attention(state, posts):
                 last = [p["seq"] for p in posts if p["agent"] == dep]
                 items.append({"kind": "blocked", "member": name, "seq": last[-1] if last else 0,
                               "text": "@%s waits for @%s, which %s" % (name, dep, why)})
-    def passed(post):
+    def passed(post):  # a partial candidate's pass is not the run's
         protocol = REPORT_WORD.match(post["text"])
-        return members.get(post["agent"], {}).get("role") == "verifier" and protocol and protocol[1] == "VERIFIED"
+        return (members.get(post["agent"], {}).get("role") == "verifier" and protocol and protocol[1] == "VERIFIED"
+                and not post.get("partial"))
 
     verified = [p for p in posts if passed(p)]
     if verified:
@@ -645,6 +682,12 @@ def attention(state, posts):
             subj = changed[0].get("subject", changed[0]["agent"])
             items.append({"kind": "stale", "member": verified[-1]["agent"], "seq": verified[-1]["seq"],
                           "text": "VERIFIED (#%d) is older than @%s's change (#%d)" % (verified[-1]["seq"], subj, changed[0]["seq"])})
+    for name, post in ready.items():  # a trial merge `ready` ran, while both reports it compared are current
+        for peer, clash in post.get("conflicts", {}).items():
+            if ready.get(peer, {}).get("seq") == clash["seq"]:
+                items.append({"kind": "conflict", "member": name, "seq": post["seq"],
+                              "text": "@%s's commit and @%s's (#%d) both change %s, so merging them will conflict. "
+                                      "Have them agree who changes what" % (name, peer, clash["seq"], ", ".join(clash["files"]))})
     closed = bool(state.get("closed"))
     if closed:  # a finished run asks for nothing: what was left open is history
         items, asked = [], {}
@@ -652,7 +695,8 @@ def attention(state, posts):
                    "depends": dependencies(member), "owns": member.get("owns", ""), "paths": claims(member),
                    "ready": name in ready,
                    "blocked_on": [] if closed or name in ready or member.get("killed") else [d for d in dependencies(member) if d not in ready],
-                   "asked": asked.get(name, 0), "unreachable": not closed and name in team and unreachable(name, members, posts)}
+                   "asked": asked.get(name, 0), "unreachable": not closed and name in awake and unreachable(name, members, posts),
+                   "paused": bool(member.get("paused"))}
             for name, member in members.items() if name != COORDINATOR}
     return {"items": items, "members": view, "limits": state.get("limits", {})}
 
@@ -665,6 +709,25 @@ def budget_usage(state):
 
 def spent(budget):
     return f"token budget of {budget} spent"
+
+
+def usage_key(member):
+    """The key a member's usage is kept under: a hash of its agent address, which the hooks report turns by."""
+    return hashlib.sha256(("swarm-agent:" + member.get("id", "")).encode()).hexdigest()
+
+
+def member_budget(state, member):
+    return int(member.get("budget") or state.get("limits", {}).get("member_budget", "0"))
+
+
+def progress(state, member):
+    """Note that MEMBER posted or read: the loop check counts its turns and tokens from here. True when that changed."""
+    usage, key = state.get("usage", {}), usage_key(member)
+    mark = [usage.get("steps", {}).get(key, 0), usage.get("tokens", {}).get(key, 0)]
+    if not member.get("id") or mark == usage.get("marks", {}).get(key, [0, 0]):
+        return False
+    usage.setdefault("marks", {})[key] = mark
+    return True
 
 
 def account(d, args):
@@ -687,6 +750,8 @@ def account(d, args):
     if recorded:
         turns[turn] = True
         tokens[actor] = tokens.get(actor, 0) + int(count)
+        steps = usage.setdefault("steps", {})
+        steps[actor] = steps.get(actor, 0) + 1
         # Only a retried report repeats a turn, and it does so at once: the oldest entries are never asked about again.
         for old in list(turns)[:-TURNS_KEPT]:
             del turns[old]
@@ -694,9 +759,17 @@ def account(d, args):
     paused = bool(budget and total >= budget and not state.get("paused"))
     if paused:
         state["paused"] = spent(budget)
-    if recorded or paused:
+    result = {"title": state["title"], "total": total, "budget": budget, "paused": paused}
+    # A member over its own budget stops alone: the others keep running.
+    for name, member in state["members"].items():
+        own = member_budget(state, member)
+        if (name != COORDINATOR and not member.get("killed") and member.get("id") and usage_key(member) == actor
+                and own and tokens.get(actor, 0) >= own and not member.get("paused")):
+            member["paused"] = spent(own)
+            result["member_paused"] = name
+    if recorded or paused or "member_paused" in result:
         save(d, state)
-    print(json.dumps({"title": state["title"], "total": total, "budget": budget, "paused": paused}))
+    print(json.dumps(result))
 
 
 def binding_file(root, key):
@@ -830,11 +903,14 @@ def prune(root, args):
     print("%sremove %d worktree(s) and archive %d run(s)" % (would, removed, archived))
 
 
-def targets(text, members, *, include_killed=False):
-    """The names a post reaches: its @name, @group and @all mentions, expanded to live members (or all when include_killed)."""
+def targets(text, members, *, include_killed=False, sender=None):
+    """The names a post reaches: its @name, @group and @all mentions, @verifiers (every verifier) and @dependents (whoever
+    depends on SENDER), expanded to live members (or all when include_killed)."""
     # the name as written reaches a roster made before names had to end in a letter or digit
     mentioned = {form for m in MENTION.findall(QUOTED.sub(" ", text)) for form in (m.lower(), m.lower().rstrip("-_"))}
-    return [n for n, m in members.items() if (include_killed or not m.get("killed")) and mentioned & {"all", n, m.get("group")}]
+    return [n for n, m in members.items() if (include_killed or not m.get("killed")) and (
+        mentioned & {"all", n, m.get("group")} or ("verifiers" in mentioned and m.get("role") == "verifier")
+        or ("dependents" in mentioned and sender is not None and sender in dependencies(m)))]
 
 
 def show(post):
@@ -1031,12 +1107,14 @@ def main(argv):
                        for name, entry in team_of(members).items()):
                     recipients = [name for name in recipients if members[name].get("role") != "verifier"]
                     post["to"] = recipients
+            marked = progress(state, members[sender])
             if save_roster:
                 state["pending_post"] = post
                 save(d, state)
             append_post(d, post)
             if save_roster:
                 del state["pending_post"]
+            if save_roster or marked:
                 save(d, state)
             print("posted #%d -> %s" % (post["seq"], " ".join("@" + t for t in recipients) or "nobody"))
             owed = unread(sender)
@@ -1045,7 +1123,41 @@ def main(argv):
                       % (len(owed), sender, owed[0], sender))
 
         def waiting(member):
-            return not state.get("closed") and not state.get("paused") and not over_budget and not member.get("killed")
+            return (not state.get("closed") and not state.get("paused") and not over_budget and not member.get("killed")
+                    and not member.get("paused"))
+
+        def checkout_head(why, tail):
+            """This checkout's HEAD commit, refused while it has edits HEAD does not hold: WHY says what they would spoil."""
+            # Resolved here, in the member's own checkout: a worktree-isolated agent is refused a command
+            # that feeds `git rev-parse` into another, so it cannot pass the ID itself in one call.
+            import verify  # late: verify.py imports this module; its git() ignores an inherited GIT_DIR
+            here = os.getcwd()
+            found = verify.git(here, "rev-parse", "--verify", "HEAD^{commit}", optional=True)
+            if found is None:
+                sys.exit("HEAD is no commit here: run `%s` from your checkout%s" % (cmd, tail))
+            # HEAD of a checkout with edits in it is not the work being reported: the edits are. A new file
+            # nobody added counts: verification merges the commit and would never see it.
+            try:
+                top = verify.toplevel(here)
+                if top is None:
+                    raise ValueError("it is not inside a Git checkout")
+                # Run data is the .swarm folder of this run's project, which need not be the top of the
+                # repository: the same path is left out of the member's own checkout.
+                project = verify.repository(verify.Path(os.path.dirname(os.path.dirname(os.path.abspath(d)))))
+                loose = verify.pending_changes(verify.Path(os.fsdecode(top.rstrip(b"\n"))), project and project[1])
+            except (ValueError, OSError) as error:
+                sys.exit("git could not read this checkout, so HEAD cannot be %s: %s" % ("reported" if cmd == "ready" else "used", error))
+            if loose:
+                names = ", ".join(os.fsdecode(path) for path in loose[:5]) + (" and more" if len(loose) > 5 else "")
+                sys.exit("this checkout has uncommitted changes or untracked files, so %s: %s. "
+                         "Commit them or add them to .gitignore first%s" % (why, names, tail))
+            return here, found.decode().strip()
+
+        def unmerged(repo, deps, revision):
+            """The dependencies, of {name: READY post}, whose READY commit REVISION does not contain."""
+            import verify  # late: verify.py imports this module
+            return [dep for dep, post in deps.items() if post.get("revision") and verify.git(
+                repo, "merge-base", "--is-ancestor", post["revision"], revision, optional=True) is None]
 
         if cmd == "started":
             name = known(args[0])
@@ -1086,7 +1198,8 @@ def main(argv):
             name = args[0].lstrip("@").lower()
             # a member registered before names had to end in a letter or digit stays manageable
             if name not in members and not usable_name(name, members):
-                sys.exit("bad member name %r: use lowercase letters, digits, underscores and hyphens, ending in a letter or digit, and not a group's name" % name)
+                sys.exit("bad member name %r: use lowercase letters, digits, underscores and hyphens, ending in a letter or digit, and not a group's name or %s"
+                         % (name, ", ".join(sorted(RESERVED))))
             before_counts, before_family = roster_counts(state), set(family_limit_errors(state))
             was_fable_inv = (name in members and kind_of(members[name]) == "investigator"
                              and family(model_of(members[name])) == "fable")
@@ -1108,6 +1221,8 @@ def main(argv):
             if member.get("profile") in READ_ONLY and "profile" in changes and changes["profile"] not in READ_ONLY and "writes" not in changes:
                 member.pop("writes", None)  # a specialist turned worker or designer writes again unless told otherwise
             member.update(changes)
+            if member.get("killed"):  # a retired member runs no more turns: nothing is paused
+                member.pop("paused", None)
             validate_member(name, member, changes, members)
             if changes.get("group") in {"", "-"}:
                 member.pop("group", None)
@@ -1151,8 +1266,10 @@ def main(argv):
 
         elif cmd == "limit":
             changes = assignments(args, LIMITS)
-            if any(changes[k] != "" and not re.fullmatch(r"[0-9]{1,15}", changes[k]) for k in changes if k in ("max_workers", "max_members", "budget")):
-                sys.exit("limits are max_workers=N max_members=N budget=TOKENS and <model>=<types>, for models: " + " ".join(FAMILIES))
+            if any(changes[k] != "" and not re.fullmatch(r"[0-9]{1,15}", changes[k])
+                   for k in changes if k in ("max_workers", "max_members", "budget", "member_budget")):
+                sys.exit("limits are max_workers=N max_members=N budget=TOKENS member_budget=TOKENS and <model>=<types>, "
+                         "for models: " + " ".join(FAMILIES))
             for model in FAMILIES:
                 if changes.get(model):  # stored as the list it is: "architect,,architect" and "," are not two more forms
                     changes[model] = ",".join(dict.fromkeys(token for token in changes[model].split(",") if token))
@@ -1167,7 +1284,7 @@ def main(argv):
                         print("note: %s=%s names no agent type and no member yet. Types are: %s" % (model, token, ", ".join(DEFAULTS)))
             limits = state.setdefault("limits", {})
             for k, v in changes.items():
-                if v == "" or (k == "budget" and not int(v)):  # a budget of zero is no budget
+                if v == "" or (k in ("budget", "member_budget") and not int(v)):  # a budget of zero is no budget
                     limits.pop(k, None)
                 else:
                     limits[k] = v
@@ -1241,6 +1358,7 @@ def main(argv):
             entry["last_read_seq"] = len(posts)
             members[old]["killed"] = "1"
             members[old]["replaced_by"] = new
+            members[old].pop("paused", None)
             validate_member(new, entry, given, members)
             if given.get("group") in {"", "-"}:
                 entry.pop("group", None)
@@ -1270,7 +1388,7 @@ def main(argv):
             briefs = [p for p in posts if p["agent"] == COORDINATOR and old in p["to"]
                       and (word := REPORT_WORD.match(p["text"])) and word[1] == "BRIEF"]
             # A brief addressed to the old member in its first line, not one that only mentions it further down.
-            briefs = [p for p in briefs if old in targets(p["text"].split("\n")[0], members, include_killed=True)] or briefs
+            briefs = [p for p in briefs if old in targets(p["text"].split("\n")[0], members, include_killed=True, sender=COORDINATOR)] or briefs
             lines = briefs[-1]["text"].split("\n") if briefs else []
             first = lines[0][REPORT_WORD.match(lines[0]).end():].strip() if lines else ""
             body = "\n".join(([first] if first else []) + lines[1:]) if briefs else "(@%s had no brief on the board)" % old
@@ -1306,12 +1424,15 @@ def main(argv):
             first = text.split("\n")[0]
             if word == "VERIFIED" and members[sender].get("role") != "verifier":
                 sys.exit("only a verifier can post VERIFIED")
-            if word == "VERIFIED" and not verified_line(d, sender, first):
+            passed = word == "VERIFIED" and verified_line(d, sender, first)
+            if word == "VERIFIED" and not passed:
                 sys.exit("VERIFIED must be the line the coordinator's verify command returns: VERIFIED <candidate> <digest>. "
                          "Wait for the candidate; report anything else as NOT VERIFIED or as a note. "
                          "A pass a later NOT PASSED or NOT VERIFIED withdrew is restored only by running the test again.")
-            recipients = [name for name in targets(text, members) if name != sender]
+            recipients = [name for name in targets(text, members, sender=sender) if name != sender]
             stuck, verdict = "", {}
+            if passed and passed.get("partial"):  # a pass of some workers' pieces, never the run's
+                verdict = {"partial": True, "members": passed.get("members", [])}
             if word == "NOT PASSED" and members[sender].get("role") == "verifier":
                 tested = candidate_on_table(d)
                 if tested:
@@ -1328,6 +1449,9 @@ def main(argv):
                 if stuck:
                     state["paused"] = stuck
             post_message(sender, text, recipients, save_roster=bool(stuck), **verdict)
+            if verdict.get("partial"):
+                print("note: this pass is of a partial candidate holding %s. It is not the run's pass, and verify.py never "
+                      "accepts it" % ", ".join("@" + name for name in verdict["members"]))
             if stuck:
                 print("paused: %s. The coordinator asks the user how to go on" % stuck)
 
@@ -1344,33 +1468,22 @@ def main(argv):
                 revision = args[1] if len(args) > 1 else None
                 if revision is not None and (member.get("writes") == "0" or kind_of(member) in READ_ONLY):
                     sys.exit("a read-only report cannot include a commit")
+                repo = os.path.dirname(os.path.dirname(os.path.abspath(d)))  # the project, which holds every member's commits
                 if revision == "HEAD":
-                    # Resolved here, in the member's own checkout: a worktree-isolated agent is refused a command
-                    # that feeds `git rev-parse` into another, so it cannot pass the ID itself in one call.
-                    import verify  # late: verify.py imports this module; its git() ignores an inherited GIT_DIR
-                    here = os.getcwd()
-                    found = verify.git(here, "rev-parse", "--verify", "HEAD^{commit}", optional=True)
-                    if found is None:
-                        sys.exit("HEAD is no commit here: run `ready` from your checkout, or give the full commit ID")
-                    # HEAD of a checkout with edits in it is not the work being reported: the edits are. A new file
-                    # nobody added counts: verification merges the commit and would never see it.
-                    try:
-                        top = verify.toplevel(here)
-                        if top is None:
-                            raise ValueError("it is not inside a Git checkout")
-                        # Run data is the .swarm folder of this run's project, which need not be the top of the
-                        # repository: the same path is left out of the member's own checkout.
-                        project = verify.repository(verify.Path(os.path.dirname(os.path.dirname(os.path.abspath(d)))))
-                        loose = verify.pending_changes(verify.Path(os.fsdecode(top.rstrip(b"\n"))), project and project[1])
-                    except (ValueError, OSError) as error:
-                        sys.exit("git could not read this checkout, so HEAD cannot be reported: %s" % error)
-                    if loose:
-                        names = ", ".join(os.fsdecode(path) for path in loose[:5]) + (" and more" if len(loose) > 5 else "")
-                        sys.exit("this checkout has uncommitted changes or untracked files, so HEAD is not what you are reporting: %s. "
-                                 "Commit them or add them to .gitignore first, or give the full commit ID" % names)
-                    revision = found.decode().strip()
+                    repo, revision = checkout_head("HEAD is not what you are reporting", ", or give the full commit ID")
                 if revision is not None and not COMMIT.fullmatch(revision):
                     sys.exit("expected a full commit ID")
+                conflicts = {}
+                if revision is not None:
+                    # A dependency's commit missing from this one would be merged beside it, untested with it.
+                    behind = unmerged(repo, {dep: through[dep] for dep in dependencies(member)}, revision)
+                    if behind:
+                        sys.exit("your commit does not contain the READY commit of %s. Run `board.py DIR sync %s` from your "
+                                 "checkout, check the result, then report again" % (", ".join("@" + n for n in behind), sender))
+                    import verify  # late: verify.py imports this module
+                    for peer, files in verify.trial_merge(repo, None, revision, {n: p["revision"] for n, p in through.items()
+                                                                                if n != sender and p.get("revision")}).items():
+                        conflicts[peer] = {"seq": through[peer]["seq"], "files": files}
                 report = sys.stdin.read().strip()
                 if not report:
                     sys.exit("READY needs a report on stdin")
@@ -1386,7 +1499,7 @@ def main(argv):
                     return
                 text = "READY" + (" " + revision if revision else "") + "\n" + report
             else:
-                revision = None
+                revision, conflicts = None, {}
                 text = ("REVISE " + " ".join(args[1:])).strip()
             # An investigator withdrawing a finding nobody confirmed changes nothing for anyone but the coordinator.
             notify = kind_of(member) != "investigator" or sender in readiness(members, posts)
@@ -1402,8 +1515,58 @@ def main(argv):
                 recipients = [name for name in recipients if sender in dependencies(members[name])
                               or (name == COORDINATOR and kind_of(member) == "investigator")]
             if cmd == "ready" and kind_of(member) != "investigator" and not is_consultant:
-                recipients.extend(name for name in targets(report, members) if name != sender and name not in recipients)
-            post_message(sender, text, recipients, kind=cmd, revision=revision)
+                recipients.extend(name for name in targets(report, members, sender=sender) if name != sender and name not in recipients)
+            post_message(sender, text, recipients, kind=cmd, revision=revision, **({"conflicts": conflicts} if conflicts else {}))
+            for peer, clash in conflicts.items():
+                print("conflict: @%s's READY #%d and this commit both change %s. Agree with @%s who changes what before "
+                      "the candidate is prepared" % (peer, clash["seq"], ", ".join(clash["files"]), peer))
+
+        elif cmd == "sync":
+            name = known(args[0])
+            member = members[name]
+            if args[1:] not in ([], ["--check-only"]):
+                sys.exit("sync accepts only --check-only")
+            if state.get("closed") or member.get("role") != "worker" or member.get("killed"):
+                sys.exit("only an active worker of an open run can sync")
+            through = readiness(members, posts)
+            blocked = [dep for dep in dependencies(member) if dep not in through]
+            if blocked:
+                sys.exit("waiting for " + ", ".join(blocked))
+            deps = {dep: through[dep] for dep in dependencies(member) if through[dep].get("revision")}
+            import verify  # late: verify.py imports this module
+            here = os.getcwd()
+            head = verify.git(here, "rev-parse", "--verify", "HEAD^{commit}", optional=True)
+            if head is None:
+                sys.exit("HEAD is no commit here: run `sync` from your checkout")
+            # A merge belongs in the member's own worktree: run from the project, it would land on the user's branch.
+            if verify.toplevel(here) == verify.toplevel(os.path.dirname(os.path.dirname(os.path.abspath(d)))) and not args[1:]:
+                sys.exit("this is the project's own checkout, not your worktree: run `sync` from the worktree you work in")
+            behind = unmerged(here, deps, head.decode().strip())
+            if args[1:]:
+                for dep in behind:
+                    print("unmerged: @%s %s (READY #%d)" % (dep, deps[dep]["revision"], deps[dep]["seq"]))
+                if behind:
+                    sys.exit(1)
+                print("in sync: HEAD contains every dependency's READY commit")
+                return
+            if behind:
+                checkout_head("a merge would mix them into its commit", "")
+            synced = {dep: post["revision"] for dep, post in deps.items() if dep not in behind}
+            try:
+                for dep in behind:
+                    try:
+                        verify.git(here, "merge", "--no-autostash", "--no-edit", "--no-ff", deps[dep]["revision"])
+                    except ValueError as error:
+                        verify.git(here, "merge", "--abort", optional=True)
+                        sys.exit("merging @%s's commit %s failed, so it was aborted: %s. Resolve it with @%s on the board, "
+                                 "or merge it yourself, then sync again" % (dep, deps[dep]["revision"][:12], error, dep))
+                    synced[dep] = deps[dep]["revision"]
+                    print("merged @%s's commit %s" % (dep, deps[dep]["revision"][:12]))
+            finally:  # merges made before one failed are in the checkout, so the record holds them too
+                member["synced_deps"] = synced
+                save(d, state)
+            print("in sync: HEAD contains every dependency's READY commit" if not behind else
+                  "synced: check the merged work, then report with ready %s HEAD" % name)
 
         elif cmd == "confirm":
             if len(args) != 2:
@@ -1466,6 +1629,7 @@ def main(argv):
             reader = members[me]
             if emitted:
                 reader["last_read_seq"] = new[emitted - 1]["seq"]
+                progress(state, reader)
             # A member that has read what it was woken for is reachable and attentive: both counts start again.
             done = [key for key in ("wake_claim", "told") if key in reader and (
                 reader[key].get("seq", 0) <= reader["last_read_seq"] or not unread(me))]
@@ -1555,7 +1719,7 @@ def main(argv):
             started = time.time() - duration / 1000
             changed = False
             for name, member in members.items():
-                if (member.get("killed") or member.get("id") not in args[1:] or not unread(name) or unwoken(name)
+                if (member.get("killed") or member.get("paused") or member.get("id") not in args[1:] or not unread(name) or unwoken(name)
                         or ignored(name, members, posts)):
                     continue
                 told = member.get("told", {})
@@ -1592,6 +1756,20 @@ def main(argv):
             atomic_write(path, os.path.basename(os.path.abspath(d)) + "\n")
             print(os.path.abspath(d))
 
+        elif cmd == "resume" and args:  # one member stopped by its own budget
+            name = known(args[0])
+            member = members[name]
+            if not member.get("paused"):
+                sys.exit("@%s is not paused" % name)
+            used, own = state.get("usage", {}).get("tokens", {}).get(usage_key(member), 0), member_budget(state, member)
+            if own and used >= own:
+                sys.exit("@%s has used %s of its %s tokens. Raise it first: member %s budget=<tokens>"
+                         % (name, f"{used:,}", f"{own:,}", name))
+            del member["paused"]
+            # Its tool calls were refused, so it stopped mid-work with nothing unread to wake it for.
+            return post_message(COORDINATOR, "@%s Your token budget pause is lifted. Go on from where it stopped you." % name,
+                                [name], save_roster=True)
+
         elif cmd in {"pause", "resume"}:
             if cmd == "pause":
                 state["paused"] = " ".join(args).strip() or "awaiting coordinator"
@@ -1604,12 +1782,14 @@ def main(argv):
                 ready, reports = readiness(members, posts), latest_reports(posts)
                 asking = {asker for _, asker, _ in unanswered(members, posts)}
                 verified_seq = max((p["seq"] for p in posts if members.get(p["agent"], {}).get("role") == "verifier"
-                                    and (w := REPORT_WORD.match(p["text"])) and w[1] in {"VERIFIED", "NOT PASSED", "NOT VERIFIED"}), default=0)
+                                    and (w := REPORT_WORD.match(p["text"])) and w[1] in {"VERIFIED", "NOT PASSED", "NOT VERIFIED"}
+                                    and not (w[1] == "VERIFIED" and p.get("partial"))), default=0)  # a partial pass is not the run's
                 # A verifier is told of the work once every worker is ready (see `ready`): before that it was not
                 # reviewing anything a pause could have stopped.
                 unverified = any(p["seq"] > verified_seq for n, p in ready.items() if members.get(n, {}).get("consult") != "1") and all(
                     name in ready for name, entry in team_of(members).items() if entry.get("role") == "worker" and entry.get("consult") != "1")
-                halted = [name for name, member in team_of(members).items() if member.get("id") and name not in asking and (
+                halted = [name for name, member in team_of(members).items() if member.get("id") and not member.get("paused")
+                          and name not in asking and (
                     (member.get("role") == "worker" and name not in ready and all(dep in ready for dep in dependencies(member))
                      and reports.get(name, {}).get("kind") != "finding" and (not unread(name) or bool(member.get("told", {}).get("ended"))))
                     or (member.get("role") == "verifier" and (bool(member.get("told", {}).get("ended")) or (not unread(name) and unverified)))
@@ -1632,10 +1812,58 @@ def main(argv):
                     candidate = json.load(f)
             except (OSError, ValueError):
                 candidate = None
-            if isinstance(candidate, dict) and candidate.get("verified_by") and not candidate.get("accepted"):
+            if isinstance(candidate, dict) and candidate.get("verified_by") and candidate.get("partial"):
+                print("note: the last candidate, %s, passed but was partial: it held only %s, so it is not the run's pass "
+                      "and was never accepted" %(candidate.get("candidate"), ", ".join("@" + n for n in candidate.get("members", []))))
+            elif isinstance(candidate, dict) and candidate.get("verified_by") and not candidate.get("accepted"):
                 print("note: candidate %s passed verification and was never accepted, so the project does not hold it. "
                       "If the work went out another way (pull requests from the members' branches), `prune` removes its checkout"
                       % candidate.get("candidate"))
+
+        elif cmd == "export":
+            outs = [a.partition("=")[2] for a in args if a.startswith("--out=")]
+            if len(outs) != len(args) or (outs and not outs[0]):
+                sys.exit("export accepts only --out=PATH")
+            path = os.path.abspath(outs[0] if outs else os.path.join(d, "summary.md"))
+            ready, tokens = readiness(members, posts), state.get("usage", {}).get("tokens", {})
+
+            def cell(value):
+                return str(value).replace("|", "\\|").replace("\n", " ") or "-"
+
+            lines = ["# " + state["title"], "",
+                     "Status: %s. %d posts." % ("closed" if state.get("closed") else "paused: " + state["paused"]
+                                                if state.get("paused") else "open", len(posts)), "", "## Team", "",
+                     "| Member | Type | Model | Effort | Owns | Ready | Tokens |", "| --- | --- | --- | --- | --- | --- | --- |"]
+            for name, member in members.items():
+                if name != COORDINATOR:
+                    lines.append("| %s |" % " | ".join(cell(v) for v in (
+                        "@" + name + (" (retired)" if member.get("killed") else " (paused)" if member.get("paused") else ""),
+                        kind_of(member), model_of(member), effort_of(member), member.get("owns") or member.get("paths", ""),
+                        "yes" if name in ready else "no", f"{tokens.get(usage_key(member), 0):,}")))
+            lines += ["", "Tokens: %s in all%s, %s of them the coordinator's." % (
+                f"{total:,}", " of a %s budget" % f"{budget:,}" if budget else "", f"{tokens.get(COORDINATOR, 0):,}"),
+                "", "## Verification", ""]
+            try:
+                with open(os.path.join(d, "verification.json"), encoding="utf-8") as f:
+                    candidate = json.load(f)
+            except (OSError, ValueError):
+                candidate = None
+            if isinstance(candidate, dict):
+                lines.append("Candidate %s (%s%s), %s: %s." % (
+                    candidate.get("candidate"), candidate.get("mode"),
+                    ", partial: " + ", ".join("@" + n for n in candidate.get("members", [])) if candidate.get("partial") else "",
+                    candidate.get("commit") or candidate.get("digest"),
+                    "accepted" if candidate.get("accepted") else "passed, verified by @%s" % candidate["verified_by"]
+                    if candidate.get("verified_by") else "not passed"))
+            else:
+                lines.append("No candidate was prepared.")
+            lines += ["", "## Transcript", ""]
+            for p in posts:
+                lines += ["### #%d %s @%s -> %s" % (p["seq"], p["time"].replace("T", " ")[:19], p["agent"],
+                                                    " ".join("@" + t for t in p["to"]) or "-"), ""]
+                lines += ["> " + line if line else ">" for line in p["text"].split("\n")] + [""]
+            atomic_write(path, "\n".join(lines))
+            print(path)
 
         elif cmd == "status":
             status = " (closed)" if state.get("closed") else " (paused)" if state.get("paused") else ""
@@ -1645,7 +1873,7 @@ def main(argv):
                 print(f"Usage: {amount} tokens")
             for name, m in members.items():
                 mine = [p["seq"] for p in posts if p["agent"] == name]
-                extra = " ".join("%s=%s" % kv for kv in m.items() if not kv[0].startswith("last_") and kv[0] not in {"wake_claim", "told"})
+                extra = " ".join("%s=%s" % kv for kv in m.items() if not kv[0].startswith("last_") and kv[0] not in {"wake_claim", "told", "synced_deps"})
                 print("  @%-14s last post %-5s unread mentions %d  %s" % (name, "#%d" % mine[-1] if mine else "-", len(unread(name)), extra))
             edges = Counter((p["agent"], n) for p in posts for n in p["to"])
             for (a, b), count in edges.most_common():

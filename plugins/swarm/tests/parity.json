@@ -1,0 +1,895 @@
+{
+ "targets": [
+  {
+   "text": "@parser please look",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": null,
+   "expect": [
+    "parser"
+   ]
+  },
+  {
+   "text": "@all heads up",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "coordinator",
+   "expect": [
+    "coordinator",
+    "parser",
+    "api",
+    "docs",
+    "v",
+    "v2",
+    "old_"
+   ]
+  },
+  {
+   "text": "@fix rebase on main",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "coordinator",
+   "expect": [
+    "parser",
+    "api"
+   ]
+  },
+  {
+   "text": "@verifiers candidate ready",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "coordinator",
+   "expect": [
+    "v",
+    "v2"
+   ]
+  },
+  {
+   "text": "@dependents the API moved",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "parser",
+   "expect": [
+    "api",
+    "docs",
+    "old_"
+   ]
+  },
+  {
+   "text": "@dependents anyone?",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": null,
+   "expect": []
+  },
+  {
+   "text": "@dependents done",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "api",
+   "expect": [
+    "docs"
+   ]
+  },
+  {
+   "text": "@dependents done",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "docs",
+   "expect": []
+  },
+  {
+   "text": "thanks @parser- and @api_",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "v",
+   "expect": [
+    "parser",
+    "api"
+   ]
+  },
+  {
+   "text": "mail me at me@parser.com or see pkg/@api",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "v",
+   "expect": []
+  },
+  {
+   "text": "`@parser` in code, @api outside",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "v",
+   "expect": [
+    "api"
+   ]
+  },
+  {
+   "text": "```\n@parser\n```\n@docs after the fence",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "v",
+   "expect": [
+    "docs"
+   ]
+  },
+  {
+   "text": "~~~\n@parser\n~~~",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "v",
+   "expect": []
+  },
+  {
+   "text": "@gone are you there",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "coordinator",
+   "expect": []
+  },
+  {
+   "text": "@PARSER loud",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "coordinator",
+   "expect": [
+    "parser"
+   ]
+  },
+  {
+   "text": "@old_ legacy name",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "coordinator",
+   "expect": [
+    "old_"
+   ]
+  },
+  {
+   "text": "@verifiers and @dependents",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "parser",
+   "expect": [
+    "api",
+    "docs",
+    "v",
+    "v2",
+    "old_"
+   ]
+  },
+  {
+   "text": "@nobody here",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "coordinator",
+   "expect": []
+  }
+ ],
+ "quoted": [
+  {
+   "text": "plain text",
+   "expect": "plain text"
+  },
+  {
+   "text": "see `a?.b` here",
+   "expect": "see   here"
+  },
+  {
+   "text": "``code with ` inside`` after",
+   "expect": "  after"
+  },
+  {
+   "text": "```\nfenced ?\n```\nafter",
+   "expect": " \nafter"
+  },
+  {
+   "text": "````\n```\ninner\n```\n````\nout",
+   "expect": " \nout"
+  },
+  {
+   "text": "~~~\ntilde ?\n~~~\nout",
+   "expect": " \nout"
+  },
+  {
+   "text": "   ~~~\nindented tilde\n   ~~~",
+   "expect": " "
+  },
+  {
+   "text": "    ~~~\nfour spaces is code, not a fence\n    ~~~",
+   "expect": "    ~~~\nfour spaces is code, not a fence\n    ~~~"
+  },
+  {
+   "text": "visit https://example.com/a?b=1 now",
+   "expect": "visit   now"
+  },
+  {
+   "text": "is it https://example.com/x?",
+   "expect": "is it  ?"
+  },
+  {
+   "text": "url https://example.com/path.",
+   "expect": "url  ."
+  },
+  {
+   "text": "`unclosed span",
+   "expect": "`unclosed span"
+  },
+  {
+   "text": "a`x`b",
+   "expect": "a b"
+  },
+  {
+   "text": "```\nunclosed fence",
+   "expect": " `\nunclosed fence"
+  }
+ ],
+ "question": [
+  {
+   "text": "which one?",
+   "expect": true
+  },
+  {
+   "text": "it is a ?? b",
+   "expect": false
+  },
+  {
+   "text": "it is c ? a : b",
+   "expect": false
+  },
+  {
+   "text": "are you sure??",
+   "expect": true
+  },
+  {
+   "text": "should we use A? (Option A : yes)",
+   "expect": true
+  },
+  {
+   "text": "the type is name?: T",
+   "expect": false
+  },
+  {
+   "text": "read as a?.b",
+   "expect": false
+  },
+  {
+   "text": "`is this?` in code",
+   "expect": false
+  },
+  {
+   "text": "```\nwhy?\n```",
+   "expect": false
+  },
+  {
+   "text": "see https://example.com/q?x=1",
+   "expect": false
+  },
+  {
+   "text": "done. https://example.com/page?",
+   "expect": true
+  },
+  {
+   "text": "really ?",
+   "expect": true
+  },
+  {
+   "text": "x?y",
+   "expect": false
+  },
+  {
+   "text": "what now?\n",
+   "expect": true
+  },
+  {
+   "text": "ok ? fine",
+   "expect": true
+  }
+ ],
+ "kind": [
+  {
+   "text": "READY",
+   "expect": "READY"
+  },
+  {
+   "text": "READY abc\nreport",
+   "expect": "READY"
+  },
+  {
+   "text": "@coordinator READY",
+   "expect": "READY"
+  },
+  {
+   "text": "@a, @b: VERIFIED cand digest",
+   "expect": "VERIFIED"
+  },
+  {
+   "text": "NOT PASSED: fails",
+   "expect": "NOT PASSED"
+  },
+  {
+   "text": "NOT VERIFIED",
+   "expect": "NOT VERIFIED"
+  },
+  {
+   "text": "BRIEF for you",
+   "expect": "BRIEF"
+  },
+  {
+   "text": "@parser BRIEF\nOwns: x",
+   "expect": "BRIEF"
+  },
+  {
+   "text": "SHUTDOWN",
+   "expect": "SHUTDOWN"
+  },
+  {
+   "text": "FINDING awaiting coordinator review",
+   "expect": "FINDING"
+  },
+  {
+   "text": "REVISE fixing",
+   "expect": "REVISE"
+  },
+  {
+   "text": "hello\nREADY",
+   "expect": ""
+  },
+  {
+   "text": "READYING",
+   "expect": ""
+  },
+  {
+   "text": "ready lower",
+   "expect": ""
+  },
+  {
+   "text": "@a\nREADY",
+   "expect": ""
+  },
+  {
+   "text": "NOT PASSEDX",
+   "expect": ""
+  }
+ ]
+}

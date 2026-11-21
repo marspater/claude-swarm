@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare, test and accept one candidate covering every worker in a Swarm run."""
+"""Prepare, test and accept one candidate covering every worker in a Swarm run, or test a partial one early."""
 import argparse
 from contextlib import contextmanager
 import fcntl
@@ -66,6 +66,24 @@ def git(path, *args, optional=False):
     if optional:
         return None
     raise ValueError(result.stderr.decode(errors="replace").strip() or "git failed")
+
+
+def trial_merge(project, base, revision, others):
+    """The files merging REVISION with each of OTHERS ({peer: commit}) would conflict on, by peer, without touching any
+    checkout. BASE, when given, is the merge base to use. Git before 2.38 has no `merge-tree --write-tree`: nothing then."""
+    conflicts = {}
+    for peer, other in others.items():
+        command = ["git", "-C", str(project), "merge-tree", "--write-tree", "--name-only", "--no-messages", "-z"]
+        try:
+            result = subprocess.run(command + (["--merge-base=" + base] if base else []) + [revision, other],
+                                    capture_output=True, env=clean_env())
+        except FileNotFoundError:
+            return {}
+        # Exit 1 is a conflict, or a commit Git does not know, which prints no file; anything else says nothing.
+        files = [os.fsdecode(name) for name in result.stdout.split(b"\0")[1:] if name] if result.returncode == 1 else []
+        if files:
+            conflicts[peer] = files
+    return conflicts
 
 
 def toplevel(project):
@@ -224,16 +242,23 @@ def verification_lock(directory):
         yield
 
 
-def inputs(run, mode):
+def inputs(run, mode, subset=None):
+    """The READY post and commit of every contributing worker, or of the workers SUBSET names for a partial candidate."""
     state, posts = load(run)
     if state.get("closed"):
         raise ValueError("the run is closed")
     members = state["members"]
     ready = readiness(members, posts)
+    # A consultant advises the coordinator: it contributes nothing to the candidate.
+    workers = [name for name, member in members.items()
+               if member.get("role") == "worker" and not member.get("killed") and member.get("consult") != "1"]
+    stray = sorted(set(subset or ()) - set(workers))
+    if stray:
+        raise ValueError("--members takes the active workers a candidate holds, and not " + ", ".join("@" + n for n in stray))
     result = {}
-    for name, member in members.items():
-        # A consultant advises the coordinator: it contributes nothing to the candidate.
-        if member.get("role") != "worker" or member.get("killed") or member.get("consult") == "1":
+    for name in workers:
+        member = members[name]
+        if subset is not None and name not in subset:
             continue
         if name not in ready:
             reported = latest_reports(posts).get(name, {}).get("kind") == "ready"
@@ -283,8 +308,13 @@ def check_checks_field(run, candidate, recorded):
         raise ValueError("the candidate is missing verification commands; prepare a new candidate")
 
 
+def subset_of(candidate):
+    """The workers a partial candidate holds, or None for one that holds every worker."""
+    return candidate["members"] if candidate.get("partial") else None
+
+
 def check_inputs(run, candidate):
-    recorded = inputs(run, candidate["mode"])
+    recorded = inputs(run, candidate["mode"], subset_of(candidate))
     check_checks_field(run, candidate, recorded)
     if candidate["inputs"] != recorded:
         raise ValueError("worker readiness changed; prepare and test a new candidate")
@@ -330,7 +360,7 @@ def check_current(run, candidate):
         return check_inputs(run, candidate)
     # Accepted: its checkout may be gone, and the project itself now holds what was tested.
     project = Path(candidate["project"])
-    recorded = inputs(run, candidate["mode"])
+    recorded = inputs(run, candidate["mode"], subset_of(candidate))
     check_checks_field(run, candidate, recorded)
     if candidate["inputs"] != recorded:
         raise ValueError("worker readiness changed after acceptance")
@@ -349,12 +379,13 @@ def active_verifier(run, verifier):
         raise ValueError("an active verifier must run the checks")
 
 
-def prepare(run, project, mode, checks, onto=None):
+def prepare(run, project, mode, checks, onto=None, subset=None):
     """CHECKS is None for a candidate with nothing a command could test, such as a designer's assets.
-    ONTO names the commit an isolated candidate is built on when that is not the checkout's own HEAD."""
+    ONTO names the commit an isolated candidate is built on when that is not the checkout's own HEAD.
+    SUBSET names the workers of a partial candidate, which is tested and never accepted."""
     identifier = uuid.uuid4().hex[:16]
     with board_lock(run):
-        recorded = inputs(run, mode)
+        recorded = inputs(run, mode, subset)
         if checks is None:
             check_no_checks(run, recorded)
     work = project
@@ -409,9 +440,10 @@ def prepare(run, project, mode, checks, onto=None):
             "branch": os.fsdecode(branch).strip() if branch else None,
             "worktree": str(integration) if integration else None,
             "inputs": recorded, "digest": source_digest(work),
+            "partial": subset is not None, "members": sorted(recorded),
         }
         with board_lock(run):
-            current_inputs = inputs(run, mode)
+            current_inputs = inputs(run, mode, subset)
             check_checks_field(run, candidate, current_inputs)
             if current_inputs != recorded:
                 raise ValueError("worker readiness changed; prepare and test a new candidate")
@@ -431,7 +463,7 @@ def prepare(run, project, mode, checks, onto=None):
     if stale and stale.parent == run and stale.name.startswith("integration-"):
         git(project, "worktree", "remove", "--force", str(stale), optional=True)
     print(json.dumps({"candidate": identifier, "path": str(work), "commit": commit,
-                      "digest": candidate["digest"]}))
+                      "digest": candidate["digest"], "partial": candidate["partial"]}))
 
 
 def run_check(command, cwd, timeout):
@@ -570,6 +602,10 @@ def test_candidate(run, project, identifier, verifier, timeout_arg=None):
 def accept(run, project, identifier):
     with board_lock(run):
         candidate = candidate_for(run, project, identifier)
+        if candidate.get("partial"):
+            raise ValueError("candidate %s holds only %s: a partial candidate tests pieces early and is never accepted. "
+                             "Prepare one without --members once every worker is ready"
+                             % (identifier, ", ".join("@" + name for name in candidate["members"])))
         if not candidate.get("verified_by"):
             raise ValueError("no passing verification for this candidate: a verifier's NOT PASSED or NOT VERIFIED "
                              "withdraws an earlier pass, so have the verifier run the test again")
@@ -661,6 +697,7 @@ def main():
     checks.add_argument("--check", action="append")
     checks.add_argument("--no-checks", action="store_true")
     prep.add_argument("--base", help="build an isolated candidate on this ref instead of the checkout's HEAD")
+    prep.add_argument("--members", help="a partial candidate of these workers, comma-separated: tested, never accepted")
     test = actions.add_parser("test")
     test.add_argument("candidate")
     test.add_argument("verifier")
@@ -681,7 +718,15 @@ def main():
                 raise ValueError("--base is for an isolated candidate; a shared one is the checkout as it stands")
             if args.base is not None and not args.base.strip():
                 raise ValueError("--base takes a ref, such as a branch name or a commit")
-            prepare(run, project, args.mode, None if args.no_checks else args.check, args.base)
+            subset = None
+            if args.members is not None and args.mode != "isolated":
+                # A shared candidate is the whole checkout, edits of the other workers included: no part of it stands alone.
+                raise ValueError("--members is for an isolated candidate; a shared one always holds every worker's edits")
+            if args.members is not None:
+                subset = list(dict.fromkeys(n.strip().lstrip("@").lower() for n in args.members.split(",") if n.strip()))
+                if not subset:
+                    raise ValueError("--members takes worker names, separated by commas")
+            prepare(run, project, args.mode, None if args.no_checks else args.check, args.base, subset)
         elif args.action == "test":
             test_candidate(run, project, args.candidate, args.verifier, args.timeout)
         else:

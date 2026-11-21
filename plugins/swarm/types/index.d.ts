@@ -5,6 +5,8 @@ export type Post = {
   time: string
   /** The live members the post reaches, its sender left out. */
   to: string[]
+  /** The full commit id a READY reported, when it reported one. */
+  revision?: string
 }
 
 export type Member = {
@@ -23,7 +25,7 @@ export type Member = {
   owns: string
   /** `coordinating`, `working`, `waiting`, `not started`, `failed`, `stopped` (its agent was killed while it is still on the roster), `unreachable` or `killed` (retired). */
   status: string
-  /** What a member that is not working waits for, in words; empty when nothing is pending. */
+  /** What a member that is not working waits for, in words; empty when nothing is pending. A member paused on its own token budget says so even while it works. */
   detail: string
   unread: number
   posts: number
@@ -58,15 +60,25 @@ export type Tab = 'board' | 'attention' | 'members' | 'graph'
 declare module 'claude-code' {
   interface McpToolInputs {
     mcp__swarm__board: {
-      action: 'read' | 'show' | 'post' | 'ready' | 'revise'
+      /** A member's actions, then the coordinator's. */
+      action: 'read' | 'show' | 'post' | 'ready' | 'revise' | 'status' |
+        'init' | 'member' | 'limit' | 'plan' | 'attention' | 'confirm' | 'retry' | 'replace' | 'pause' | 'resume' | 'close' | 'export'
       member?: string
       seq?: number
       text?: string
+      /** ready: the full commit id the report covers. */
+      commit?: string
+      title?: string
+      name?: string
+      newName?: string
+      /** member, limit, replace: `key=value` settings. */
+      options?: string[]
+      out?: string
     }
   }
 
   interface PluginState {
     /** `replay` is the seq the graph shows; 0 follows the newest post. */
-    swarm: { swarm: Shaped<Swarm>; tab: Tab; replay: number; loadError: string; isPlaying: boolean; livePulse: number; earlier: number; latestOnly: boolean; hideInactive: boolean; expandAll: boolean; expanded: number; inspected: Post | null; run: string; query: string }
+    swarm: { swarm: Shaped<Swarm>; tab: Tab; replay: number; loadError: string; isPlaying: boolean; livePulse: number; earlier: number; latestOnly: boolean; hideInactive: boolean; expandAll: boolean; expanded: number; inspected: Post | null; run: string; query: string; diff: { seq: number; text: string } }
   }
 }

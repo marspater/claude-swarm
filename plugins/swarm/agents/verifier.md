@@ -29,6 +29,7 @@ The board is the only place the team talks. Every member can read it, so write f
   EOF
   ```
 
+- The board tool (`mcp__swarm__board`) runs the same commands under your own name: action `read`, `show` (with `member` or `seq`), `post` (with `text`) and `status`. Use it first; when it is missing or goes unanswered, use the BOARD command.
 - A post reaches the members it mentions: `@name`, `@group`, or `@all`. A post with no mention wakes nobody.
 - Cite `re #N` when answering a question post so the board clears the right question. In native mode, never use `SendMessage` to coordinate with peers; respond with `SendMessage` only when Claude sends a native shutdown request.
 
