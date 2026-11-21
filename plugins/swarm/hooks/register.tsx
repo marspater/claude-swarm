@@ -495,6 +495,7 @@ async function refreshTalk($: EngineInterface): Promise<void> {
 function resetMonitoring(): void {
   retired = new Set()
   memberPaused = new Set()
+  headNoted = ''
   ownedRoster = undefined
   moods.clear()
   generation++
@@ -1892,7 +1893,8 @@ async function coordinatorBoard($: EngineInterface, e: BoardInput) {
   return pauseAware($, [call], undefined, async () => {
     const answer = await boardAnswer($, dir, args, action === 'post' ? text : undefined, e)
     // A whole-board show cut to its newest page printed none of the older posts: they are not marked as seen.
-    const isCut = 'result' in answer && answer.result.startsWith('Earlier posts are left out')
+    // Nor is a read that stopped at a page with more to come the end of what the coordinator is owed.
+    const isCut = 'result' in answer && (answer.result.startsWith('Earlier posts are left out') || /^\d+ more post\(s\) remain\./m.test(answer.result))
     const told = await coordinatorNotes($, isCut ? [] : [call], false, answer, answer)
     return boardCallsRan($, undefined, [call], 'result' in answer ? answer.result : '', told)
   })
@@ -1927,14 +1929,19 @@ async function boardAnswer($: EngineInterface, dir: string, args: string[], stdi
 
 // ponytail: a diff past this many characters is cut; `git diff HEAD...<commit>` prints it whole.
 const DIFF_CLIP = 12_000
-// The HEAD the coordinator was last told the shared checkout moved to.
+// The move of the shared checkout's HEAD the coordinator was last told of, as `from>to`.
 let headNoted = ''
 /** Opens a READY's commit under its post: all it adds to the project's HEAD. `git show` would print a synced
  * member's merge commit, which is its dependency's work or nothing at all. */
 async function showDiff($: EngineInterface, dir: string, seq: number, revision: string): Promise<void> {
   const project = dir.slice(0, dir.lastIndexOf('/.swarm/'))
-  const shown = await $.process.run(['git', '-C', project, 'diff', '--stat', '--patch', '--no-color', '--no-ext-diff', `HEAD...${revision}`], { timeoutMs: 10_000 })
+  let shown = await $.process.run(['git', '-C', project, 'diff', '--stat', '--patch', '--no-color', '--no-ext-diff', `HEAD...${revision}`], { timeoutMs: 10_000 })
     .catch(error => ({ exitCode: 1, stdout: '', stderr: String(error) }))
+  // Once the commit is in HEAD (an accepted run, an older one) it adds nothing to it: its own change is shown then.
+  if (shown.exitCode === 0 && shown.stdout.trim() === '') {
+    shown = await $.process.run(['git', '-C', project, 'show', '--first-parent', '--stat', '--patch', '--no-color', '--no-ext-diff', revision], { timeoutMs: 10_000 })
+      .catch(error => ({ exitCode: 1, stdout: '', stderr: String(error) }))
+  }
   if (shown.exitCode !== 0) {
     $.ui.toast(`Swarm could not show ${revision.slice(0, 12)}: ${clean(shown.stderr).trim().split('\n')[0] || 'git failed'}`)
     return
@@ -2230,8 +2237,8 @@ export const register: Register = on => {
       // Said as what was seen, not who did it: another member or the person may have moved it. Nothing is undone.
       const moved = `HEAD of the shared checkout moved from ${headBefore.slice(0, 12)} to ${headAfter.slice(0, 12)}`
       // A refused command moved nothing, and one move seen by several members' commands is one piece of news.
-      if (result.deny === undefined && headNoted !== headAfter) {
-        headNoted = headAfter
+      if (result.deny === undefined && headNoted !== `${headBefore}>${headAfter}`) {
+        headNoted = `${headBefore}>${headAfter}`
         result = { ...result, context: [...(result.context ?? []), `Swarm: ${moved} during this command. Shared-checkout writers must not commit; nothing was undone. Tell the coordinator in your report that HEAD moved.`] }
         notesOwed.push(`${moved} while @${headWatch.name} ran a Bash command. Another actor may have moved it, and nothing was undone: check git log before the next candidate.`)
       }
@@ -2422,6 +2429,10 @@ export const register: Register = on => {
     // Registration is where the limits are checked, so an unregistered member would start outside them.
     if (!named || !member || member.killed) {
       return { deny: 'Register the member with the board\'s member command first, then start it with a description that begins "@<its name>: ".' }
+    }
+    // Its every tool call would be refused: the start would buy one turn that ends at once.
+    if (member.paused) {
+      return { deny: `@${named} is paused (${member.paused}). Raise it with the board's member ${named} budget=<tokens>, then resume ${named}, before starting it.` }
     }
     // A replacement is not started beside the member it replaces (transitively) or beside a killed member with overlapping paths.
     const liveAgents = await $.agent.list().catch(() => [])
@@ -3004,9 +3015,13 @@ export const register: Register = on => {
                 return
               }
               const seq = /^posted #(\d+)/m.exec(posted.stdout)?.[1]
-              notesOwed.push(seq
+              const note = seq
                 ? `The user posted #${seq} to the board in your name from the Swarm pane. Read it before going on: the board's show --post=${seq}`
-                : 'The user posted to the board in your name from the Swarm pane. Read the newest posts with the board\'s show before going on.')
+                : 'The user posted to the board in your name from the Swarm pane. Read the newest posts with the board\'s show before going on.'
+              // Mid-turn it rides on the next tool result. An idle coordinator is in no post's `to`, so nothing
+              // would ever wake it to what was said in its name: it is told now.
+              if (isCoordinatorBusy) notesOwed.push(note)
+              else void $.prompt.submit({ text: `Swarm: ${note}` }).then(result => { if (result.drop) notesOwed.push(note) }).catch(() => { notesOwed.push(note) })
               await refresh($)
             }}
           />

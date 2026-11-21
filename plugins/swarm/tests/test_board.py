@@ -1744,6 +1744,17 @@ class BoardRegressions(unittest.TestCase):
         run(d, "limit", "member_budget=0")
         assert "member_budget" not in saved(d).get("limits", {})
 
+    def test_a_budget_lowered_under_the_spend_pauses_at_once(self):
+        d = self.init_run()
+        run(d, "member", "a", "id=agent-a")
+        run(d, "member", "b", "id=agent-b")
+        self.account(d, "agent-a", 5_000)
+        self.account(d, "agent-b", 5_000)
+        assert "paused: @a" in run(d, "member", "a", "budget=4000")
+        assert saved(d)["members"]["a"].get("paused") and not saved(d)["members"]["b"].get("paused")
+        assert "paused: @b" in run(d, "limit", "member_budget=5000")
+        assert saved(d)["members"]["b"]["paused"] == "token budget of 5000 spent"
+
     def test_spend_of_a_pair_and_loops(self):
         d = self.init_run()
         run(d, "member", "a", "id=agent-a")

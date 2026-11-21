@@ -34,7 +34,7 @@ In the pane:
 - **Open an agent.** A sender's name on a post, or **Open conversation** on the Members tab, shows that agent's own conversation: in the main view in the terminal, and inside the pane in Desktop, which has no main view to switch. **Posts** on a member, or a name under the graph, shows that member's feed.
 - **Collapse history** follows only the latest post; **Show history** restores earlier posts.
 - **Read the graph.** A solid arrow is a mention by name, and its width grows with the count. A post to `@all` is counted in a chip on its sender; **Expand @all** draws it as a dashed arrow to each member it reached. A dashed outline marks a member that posted with no mention. The key under the diagram repeats this.
-- **Steer the run.** **Pause run** and **Resume run** in the header, and **+500k & resume** and **Retry** on Attention items, run the board command themselves, so they cost no coordinator turn. The other Attention buttons (**Ask coordinator to …**, **Tell coordinator**) send the coordinator a request, which starts a turn of its own. All of them appear only for the open run this conversation drives. A pause from the pane is not announced to the coordinator: it finds the run paused in `attention` or `status`. Resuming, from the pane or the coordinator, posts to the workers, consultants, and verifiers the pause stopped mid-work, so they are woken at once.
+- **Steer the run.** **Pause run** and **Resume run** in the header, and **+500k & resume**, **+250k & resume** and **Retry** on Attention items, run the board command themselves, so they cost no coordinator turn. The other Attention buttons (**Ask coordinator to …**, **Tell coordinator**) send the coordinator a request, which starts a turn of its own. All of them appear only for the open run this conversation drives. A pause from the pane is not announced to the coordinator: it finds the run paused in `attention` or `status`. Resuming, from the pane or the coordinator, posts to the workers, consultants, and verifiers the pause stopped mid-work, so they are woken at once.
 - **Look at another run.** **‹ Prev run** and **Next run ›** step through the project's other runs, read-only; **Back to live run** returns. The live run keeps running behind it.
 - **Read a commit.** **View diff** on a `READY` that names a commit shows what it adds to the project's `HEAD` (`git diff HEAD...<commit>`) under the post, cut at 12,000 characters; **Hide diff** closes it.
 - **Export.** **Export MD** in the header runs the board's `export`, which writes the shown run as Markdown (`<run>/summary.md`), and says where.
@@ -74,7 +74,7 @@ The pane's **Attention** tab, and `board.py attention` for the coordinator, list
 | Item | Means |
 | --- | --- |
 | Question | A member was asked something and has not answered the asker |
-| Blocked | A member waits for one that is missing from the roster, was removed, is unreachable, is ignoring its mentions, or was never started |
+| Blocked | A member waits for one that is missing from the roster, was removed, is unreachable, is ignoring its mentions, is paused on its own budget, or was never started |
 | Unstarted | A member has a brief and no agent: its spawn never happened or was cut off |
 | Review | The coordinator must review an investigator's exact finding before confirming it and releasing dependents. The tab offers "Ask coordinator to review" |
 | Unread | Posts addressed to the coordinator that it has not read. It is also told in its next tool result, and by a prompt when idle; `close` refuses until it reads them |
@@ -84,9 +84,9 @@ The pane's **Attention** tab, and `board.py attention` for the coordinator, list
 | Silent | (Swarm pane only) A worker's agent ended after it read its mentions, and it has posted nothing since: no report, no question, nothing it waits for. The coordinator is told once, with its next tool call |
 | Stale | A worker or designer reported a change after the verifier's `VERIFIED` |
 | Rework | A worker failed verification twice in a row. A third failure pauses the run. The tab offers "Ask coordinator to intervene" |
-| Spend | One member has used more than half of the run's tokens, when three or more non-coordinator members have recorded usage, past 200,000 tokens |
+| Spend | One member has used more than half of the run's tokens, when three or more non-coordinator members have recorded usage, past 200,000 tokens. With exactly two, one that has used more than three quarters of the pair's tokens |
 | Paused | The run is paused, with the reason. On a spent budget the tab offers "+500k & resume" |
-| Member paused | A member spent its own token budget (`member_budget`, or `budget=` on the member). Its tool calls are refused at once, the coordinator is told once, and the tab offers "Resume", the board's `resume <name>` |
+| Member paused | A member spent its own token budget (`member_budget`, or `budget=` on the member). Its tool calls are refused at once, the coordinator is told once, and the tab offers **+250k & resume**, which raises its budget and runs the board's `resume <name>` |
 | Loop | A worker has taken many turns or tokens since it last posted or read the board |
 | Conflict | Two current `READY` commits change the same files, so merging them will conflict |
 

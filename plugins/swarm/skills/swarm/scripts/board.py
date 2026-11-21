@@ -720,6 +720,19 @@ def member_budget(state, member):
     return int(member.get("budget") or state.get("limits", {}).get("member_budget", "0"))
 
 
+def pause_over_budget(state, names):
+    """Pauses each of NAMES already at its own budget, as `account` does when a turn crosses it: a budget lowered
+    under what a member has spent stops it now, not a turn later."""
+    tokens = state.get("usage", {}).get("tokens", {})
+    for name in names:
+        member = state["members"][name]
+        own = member_budget(state, member)
+        if (name != COORDINATOR and not member.get("killed") and member.get("id") and own
+                and tokens.get(usage_key(member), 0) >= own and not member.get("paused")):
+            member["paused"] = spent(own)
+            print("paused: @%s, %s. Raise it with member %s budget=<tokens>, then resume %s" % (name, member["paused"], name, name))
+
+
 def progress(state, member):
     """Note that MEMBER posted or read: the loop check counts its turns and tokens from here. True when that changed."""
     usage, key = state.get("usage", {}), usage_key(member)
@@ -1224,6 +1237,8 @@ def main(argv):
             if member.get("killed"):  # a retired member runs no more turns: nothing is paused
                 member.pop("paused", None)
             validate_member(name, member, changes, members)
+            if "budget" in changes:
+                pause_over_budget(state, [name])
             if changes.get("group") in {"", "-"}:
                 member.pop("group", None)
             if "role" in changes or "consult" in changes:
@@ -1295,6 +1310,8 @@ def main(argv):
                     print("paused: %s (%d used). Raise it with limit budget=<tokens>, then resume" % (state["paused"], total))
                 elif state["paused"].startswith("token budget of "):
                     state["paused"] = spent(budget)
+            if "member_budget" in changes:
+                pause_over_budget(state, members)
             save(d, state)
             print("limits: " + (" ".join("%s=%s" % kv for kv in state["limits"].items()) or "none"))
             for error in limit_errors(state):
