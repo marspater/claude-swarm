@@ -14,6 +14,7 @@ You are the coordinator. The roster in `<run>/members.json` is the team: who exi
 | `writes` | `0` for a member that changes no files | You, for read-only members |
 | `group` | A numbered pool's name, reached with `@<group>` | `group=fix` |
 | `depends` | Members whose `READY` this one waits for. For workers only: a verifier waits for no member | `depends=a,b`; must stay acyclic |
+| `after` | Members this one only comes after: it waits for each to report or to be retired, and is told when one was retired with no report. For a fan-in that can go on with the reports there are. The names join `depends` | `after=a,b` |
 | `owns` | The paths or the question it owns, for the plan and the pane | `owns='src/utils/date.*'` |
 | `effort` | The effort, when it is not the type's default: `low`, `medium`, `high`, `xhigh` or `max` | You, at registration and before the spawn: a start whose effort differs from the roster is refused |
 | `model` | The model, when it is not the type's default: a family (`haiku`, `sonnet`, `opus`, `fable`, which starts the newest model of it), an exact model id, or `inherit` for this conversation's model (`Agent.model` only accepts family names, so for `inherit` or exact IDs register `model=` here and omit `model` or pass the matching family on `Agent` (for `inherit`, this conversation's own family) so the hook applies the exact target) | You, at registration and before the spawn: a start on another model than the roster's is refused |

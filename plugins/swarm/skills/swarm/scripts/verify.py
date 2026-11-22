@@ -20,7 +20,7 @@ import time
 import uuid
 
 sys.dont_write_bytecode = True
-from board import REPORT_WORD, atomic_write, latest_reports, load, load_state, readiness, save, shown
+from board import REPORT_WORD, atomic_write, latest_reports, load, load_state, readiness, save, shown, unfenced
 
 GIT_ENV_STRIP = {
     "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
@@ -386,6 +386,310 @@ def pending_changes(project, run_data=None, codes=False):
     return pending
 
 
+# Diff hygiene: mechanical checks on what a candidate changes, made at `prepare` so that a candidate with one of these
+# defects never costs a verifier's review. Ported from OpenSwarm (MIT, Copyright (c) 2026 Heewon Oh): rewriteGuard.ts,
+# reformatMix.ts and callerCheckGuard.ts. Where upstream repairs a file or reads the worker's summary, this reads the
+# READY reports and only refuses: nothing here edits a source.
+REWRITE_MIN_LINES = 20  # a shorter file may be rewritten freely: rewriting 15 lines is an edit
+REWRITE_MAX_DELETED_RATIO = 0.3  # above the floor, losing more than this share of a file's lines is a rewrite
+MAX_REFERENCE_HITS = 2000  # more references than this to removed symbols is refused, never guessed at
+# A worker's own word that a case is meant, one line for each path or symbol, so that it cannot be a blanket one.
+DECLARED = re.compile(r"^[ \t>*`-]*(REWRITE|REFORMAT|REMOVED|NEWLINE):[ \t]*(\S.*?)[ \t]*$", re.M)
+# Leading whitespace is meaning in these, so `git diff -w` cannot tell a re-indent from a change of logic there.
+INDENT_SENSITIVE = re.compile(r"(\.(py|pyi|ya?ml|mk|mdx?|coffee|haml|pug|slim)$)|(^|/)(GNUm|m|M)akefile$")
+# Lockfiles and build output are written by tools: never a worker's choice of formatting.
+GENERATED = re.compile(r"(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|Cargo\.lock|uv\.lock)$"
+                       r"|\.min\.js$|(^|/)(dist|build)/")
+SOURCE_GLOBS = ("*.py", "*.pyi", "*.ts", "*.tsx", "*.js", "*.jsx", "*.mjs", "*.cjs")
+# Every setting that changes the shape of diff or grep output is pinned, so that no configuration of the user's or the
+# repository's can make the parser below see nothing and pass a broken change.
+GIT_PINNED = ("-c", "color.ui=never", "-c", "color.diff=never", "-c", "color.grep=never", "-c", "diff.noprefix=false",
+              "-c", "diff.mnemonicPrefix=false", "-c", "diff.relative=false", "-c", "core.quotePath=false",
+              "-c", "grep.fullName=false", "-c", "grep.column=false", "-c", "grep.lineNumber=false")
+# Top-level only: methods share names across classes (`__init__`, `run`) and are no edge of the import graph.
+PY_DEFINITION = re.compile(r"(?:async\s+)?(?:def|class)\s+([A-Za-z]\w*)\b", re.ASCII)
+TS_EXPORT = re.compile(r"\s*export\s+(?:(?:default|declare|async|abstract)\s+)*(?:function\s*\*?\s*|class\s+|"
+                       r"(?:const\s+enum|const|let|var|enum|type|interface)\s+)([A-Za-z_$][\w$]*)\b", re.ASCII)
+NAME = r"[A-Za-z_$][\w$]*"
+
+
+def declared(text):
+    """{REWRITE, REFORMAT, REMOVED, NEWLINE: the paths or symbols TEXT declares}, a leading ./ and the punctuation of a
+    sentence around it dropped."""
+    found = {"REWRITE": set(), "REFORMAT": set(), "REMOVED": set(), "NEWLINE": set()}
+
+    def bare(value):
+        return value.strip("`'\"").removeprefix("./").rstrip(",;.)`'\"")
+    # A declaration stands at the start of a line of the report itself: one inside a pasted log declares nothing.
+    for kind, value in DECLARED.findall(unfenced(text)):
+        found[kind].add(bare(value.split()[0]))  # the first word, for a line that goes on to say why
+        if kind != "REMOVED":
+            found[kind].add(bare(value))  # and the whole of it, for a path with spaces in it
+    return found
+
+
+def is_python(name):
+    return name.endswith((".py", ".pyi"))
+
+
+def defined_symbol(name, line):
+    match = (PY_DEFINITION if is_python(name) else TS_EXPORT).match(line)
+    return match[1] if match else None
+
+
+def comment_only(name, line):
+    return line.strip().startswith("#" if is_python(name) else ("//", "/*", "*"))
+
+
+def mentions(clause, symbol):
+    return re.search(r"(?<![\w$])%s(?![\w$])" % re.escape(symbol), clause, re.ASCII) is not None
+
+
+def ts_imports(source, symbol, stem=None):
+    """Does a TypeScript or JavaScript file pull SYMBOL in from some module? The module path is not resolved; with
+    STEM, only an import whose path ends in that file name counts."""
+    sym = re.escape(symbol)
+    # import { a, sym as b } from / import sym from / import type { sym } from / export { sym } from. The clause is
+    # anchored to real import shapes, so it cannot span from an unrelated `export const` to a later `from`.
+    for clause, path in re.findall(r"\b(?:import|export)\s+(?:type\s+)?((?:%s\s*,\s*)?(?:\{[^}]*\}|\*\s*as\s+%s)|%s)\s*from\s*['\"]([^'\"]*)"
+                                   % (NAME, NAME, NAME), source, re.ASCII):
+        if mentions(clause, symbol) and stem in (None, re.sub(r"\.[cm]?[jt]sx?$", "", path.rsplit("/", 1)[-1])):
+            return True
+    if stem is not None:
+        return False
+    # const { sym } = require('x') / const { sym } = await import('x')
+    for clause in re.findall(r"(?:const|let|var)\s*\{([^}]*)\}\s*=\s*(?:require|await\s+import)\s*\(", source, re.ASCII):
+        if mentions(clause, symbol):
+            return True
+    # require('x').sym / (await import('x')).sym
+    if re.search(r"(?:require|import)\s*\([^)]*\)\)?\s*\??\.\s*%s(?![\w$])" % sym, source, re.ASCII):
+        return True
+    # The names bound to whole modules: `import * as X`, `export * as X`, `const X = require(...)`.
+    spaces = (re.findall(r"\*\s+as\s+(%s)\s+from\s*['\"]" % NAME, source, re.ASCII)
+              + re.findall(r"(?:const|let|var)\s+(%s)\s*=\s*(?:require|await\s+import)\s*\(" % NAME, source, re.ASCII))
+    return any(re.search(r"(?<![\w$.])%s\s*\??\.\s*%s(?![\w$])" % (re.escape(space), sym), source, re.ASCII)
+               for space in spaces)
+
+
+def py_imports(source, symbol, definition, exact=False):
+    """Does a Python file pull SYMBOL in: `from m import sym`, `from m import *` of the defining module, or `alias.sym`?
+    With EXACT, `from m import sym` counts only when m is the defining module."""
+    stem = re.sub(r"\.pyi?$", "", definition.rsplit("/", 1)[-1])
+    bound = []
+    for module, clause in re.findall(r"^[ \t]*from[ \t]+([\w.]+)[ \t]+import[ \t]+(\([^)]*\)|[^\n#]*(?:\\\n[^\n#]*)*)",
+                                     source, re.ASCII | re.M):
+        clause = re.sub(r"[()\\]", " ", clause)
+        if clause.strip() == "*":
+            if module.rsplit(".", 1)[-1] == stem:
+                return True
+            continue
+        if mentions(clause, symbol) and (not exact or module.rsplit(".", 1)[-1] == stem):
+            return True
+        for part in clause.split(","):  # `from pkg import api [as a]`: only the defining module binds `a.sym`
+            imported = re.fullmatch(r"\s*(\w+)(?:\s+as\s+(\w+))?\s*", part, re.ASCII)
+            if imported and imported[1] == stem:
+                bound.append(imported[2] or imported[1])
+    for names in re.findall(r"^[ \t]*import[ \t]+([^\n#]+)", source, re.ASCII | re.M):
+        for part in names.split(","):
+            alias = re.fullmatch(r"\s*([\w.]+)(?:\s+as\s+(\w+))?\s*", part, re.ASCII)
+            # `import requests` does not make `requests.get` a caller of a `get` removed elsewhere.
+            if alias and alias[1].rsplit(".", 1)[-1] == stem:
+                bound.append(alias[2] or alias[1])
+    return any(re.search(r"(?<![\w.])%s(?:\.\w+)*\.%s\b" % (re.escape(name), re.escape(symbol)), source, re.ASCII)
+               for name in bound)
+
+
+def imports_symbol(name, source, symbol, definition, exact=False):
+    """Whether file NAME, holding SOURCE, plausibly refers to SYMBOL removed from the file DEFINITION. With EXACT,
+    only an import that names the defining module counts: for a symbol another file defines too."""
+    code = "\n".join("" if comment_only(name, line) else line for line in source.split("\n"))
+    if is_python(name):
+        return py_imports(code, symbol, definition, exact)
+    stem = re.sub(r"(\.d)?\.[cm]?[jt]sx?$", "", definition.rsplit("/", 1)[-1])
+    return ts_imports(code, symbol, stem if exact else None)
+
+
+def removed_public_symbols(diff, moved=None):
+    """{symbol: the file it was removed from} for the public symbols a unified diff removes. One the same diff defines
+    again (a changed signature, a move to another file) is not removed; one defined again only in another file is
+    put in MOVED, when given, with the file it left."""
+    removed, added, old, new = {}, {}, "", ""
+    for line in diff.split("\n"):
+        if header := re.fullmatch(r"--- (?:a/(.+)|/dev/null)", line):
+            old = header[1] or ""
+        elif header := re.fullmatch(r"\+\+\+ (?:b/(.+)|/dev/null)", line):
+            new = header[1] or ""
+        elif line.startswith("-") and old:
+            if symbol := defined_symbol(old, line[1:]):
+                removed[symbol] = old
+        elif line.startswith("+") and new:
+            if symbol := defined_symbol(new, line[1:]):
+                added.setdefault(symbol, set()).add(new)
+    if moved is not None:
+        moved.update({symbol: name for symbol, name in removed.items() if symbol in added and name not in added[symbol]})
+    return {symbol: name for symbol, name in removed.items() if symbol not in added}
+
+
+def caller_issues(root, revisions, excluded, allowed):
+    """A line for each file that still imports a public symbol the candidate removes. ALLOWED symbols are declared."""
+    spec = ["--", *(":(top)" + glob for glob in SOURCE_GLOBS), *excluded]
+    moved = {}
+    removed = removed_public_symbols(git(
+        root, *GIT_PINNED, "diff", "--no-ext-diff", "--no-color", "--no-textconv", "--no-renames", "--src-prefix=a/",
+        "--dst-prefix=b/", "--unified=0", *revisions, *spec).decode(errors="replace"), moved)
+    removed = {symbol: name for symbol, name in {**moved, **removed}.items() if symbol not in allowed}
+    if not removed:
+        return []
+    # One grep for every removed symbol. Exit status 1 is "no match"; anything else is an error, never a pass.
+    env = clean_env()
+    env["LC_ALL"] = "C"
+    grep = subprocess.run(["git", "-C", str(root), *GIT_PINNED, "grep", "--no-color", "-z", "-n", "-I", "-F", "-w", "--untracked",
+                           *(arg for symbol in removed for arg in ("-e", symbol)), *spec], capture_output=True, env=env)
+    if grep.returncode not in (0, 1):
+        raise ValueError("cannot look for callers of removed symbols: "
+                         + (grep.stderr.decode(errors="replace").strip() or "git grep failed"))
+    hits = []
+    for hit in grep.stdout.decode(errors="replace").split("\n"):
+        name, _, rest = hit.partition("\0")
+        number, _, text = rest.partition("\0")
+        if name and number.isdigit():
+            hits.append((name, number, text))
+    def provides(name, symbol):
+        """Whether the file a symbol left still gives it to its importers: it imports the symbol itself, or binds the
+        name at the top level. A mention in a string or a call is none of that."""
+        path = root / name
+        if not path.is_file():
+            return False
+        code = "\n".join("" if comment_only(name, line) else line
+                         for line in path.read_text(encoding="utf-8", errors="replace").split("\n"))
+        sym = re.escape(symbol)
+        if is_python(name):
+            return py_imports(code, symbol, "") or re.search(r"^%s[ \t]*(?::[^=\n]*)?=" % sym, code, re.M | re.ASCII) is not None
+        return ts_imports(code, symbol) or re.search(r"\bexport\s*(?:type\s*)?\{[^}]*(?<![\w$])%s(?![\w$])" % sym, code, re.ASCII) is not None
+
+    by_symbol, elsewhere = {}, set()
+    for symbol in removed:
+        found = [hit for hit in hits if mentions(hit[2], symbol)]
+        # Still defined somewhere (`def main` in another script, a second `export const config`, the file it moved
+        # to): a caller may bind to that one, and a grep cannot tell a broken reference from a working one. What it
+        # can tell is an import that names the module the symbol left, and that one is broken unless a re-export
+        # stayed behind.
+        if symbol in moved or any(defined_symbol(name, text) == symbol for name, _, text in found):
+            if provides(removed[symbol], symbol):
+                continue
+            elsewhere.add(symbol)
+        if found:
+            by_symbol[symbol] = found
+    total = sum(map(len, by_symbol.values()))
+    if total > MAX_REFERENCE_HITS:
+        return ["%d references to removed public symbols (%s) are more than the %d this check reads; check the callers "
+                "by hand, then declare each symbol with a `REMOVED: <symbol>` line in the READY report"
+                % (total, ", ".join(by_symbol), MAX_REFERENCE_HITS)]
+    issues, sources, named = [], {}, set()
+    for symbol, found in by_symbol.items():
+        for name, number, text in found:
+            if comment_only(name, text) or (name, symbol) in named:
+                continue
+            if name not in sources:
+                sources[name] = (root / name).read_text(encoding="utf-8", errors="replace")
+            if imports_symbol(name, sources[name], symbol, removed[symbol], symbol in elsewhere):
+                named.add((name, symbol))
+                issues.append('%s:%s still refers to "%s", which the candidate removes from %s: update or remove this caller, '
+                              "or declare `REMOVED: %s` in the READY report if the reference is to another %s"
+                              % (name, number, symbol, removed[symbol], symbol, symbol))
+    return issues
+
+
+def hygiene_issues(root, base, commit, report, skip):
+    """What is wrong with the shape of the candidate's change against BASE, one line for each defect: a file rewritten
+    whole, a trailing newline lost, formatting mixed with real changes, a removed public symbol something still
+    imports. COMMIT is the candidate's, or None when the candidate is the checkout's own files. REPORT is the text of
+    the READY reports, whose REWRITE:, REFORMAT: and REMOVED: lines declare a case as meant. SKIP is what `not_source`
+    returns."""
+    revisions = [base, commit] if commit else [base]
+    excluded = [":(top,literal,exclude)" + os.fsdecode(b"/".join(path)) for path in skip]
+
+    def stat(*flags):
+        fields = git(root, "diff", "--no-renames", "--no-ext-diff", "--no-textconv", "--numstat", "-z", *flags, *revisions,
+                     "--", ":/", *excluded).split(b"\0")
+        counts = {}
+        for field in fields:
+            added, deleted, name = (field.split(b"\t", 2) + [b"", b""])[:3]
+            if added.isdigit() and deleted.isdigit():  # a binary file has "-" for both
+                counts[os.fsdecode(name)] = (int(added), int(deleted))
+        return counts
+
+    def before(name):
+        return git(root, "cat-file", "-p", f"{base}:{name}", optional=True)
+
+    def after(name):
+        if commit:
+            return git(root, "cat-file", "-p", f"{commit}:{name}", optional=True)
+        path = root / name
+        return path.read_bytes() if path.is_file() and not path.is_symlink() else None
+
+    changed, unspaced = stat(), stat("-w")
+    new = {os.fsdecode(name) for name in git(root, "diff", "--no-renames", "--name-only", "--diff-filter=A", "-z", *revisions,
+                                             "--", ":/", *excluded).split(b"\0") if name}
+    if not commit:  # the checkout's own files: an untracked one is a new file no diff shows
+        new |= {os.fsdecode(name) for name in git(root, "ls-files", "--others", "--exclude-standard", "-z",
+                                                  "--", ":/", *excluded).split(b"\0") if name}
+    # Whitespace only: the file has a change, and it disappears under -w.
+    blank = {name for name, (added, deleted) in changed.items() if added + deleted and not sum(unspaced.get(name, (0, 0)))}
+    allowed, issues = declared(report), []
+    for name, (_, deleted) in sorted(changed.items()):
+        if name in new:
+            continue
+        old, now = before(name), after(name)
+        if old is None or now is None:  # a file deleted, or moved (a rename is a deletion here), is no rewrite
+            continue
+        lines = old.count(b"\n") + (not old.endswith(b"\n")) if old else 0
+        if (name not in blank and deleted and lines >= REWRITE_MIN_LINES and deleted / lines > REWRITE_MAX_DELETED_RATIO
+                and name not in allowed["REWRITE"]):
+            issues.append("%s lost %d of its %d lines (%d%%): that is a rewrite. Restore the file and make only the intended "
+                          "change with targeted edits, or declare `REWRITE: %s` in the READY report if the task is to rewrite it"
+                          % (name, deleted, lines, round(100 * deleted / lines), name))
+        if (old.endswith(b"\n") and now and b"\0" not in now and not now.endswith(b"\n")
+                and name not in allowed["NEWLINE"]):
+            issues.append("%s lost the newline at its end: put it back, or declare `NEWLINE: %s` in the READY report if "
+                          "the file is meant to end without one" % (name, name))
+    reformatted = sorted(name for name in blank if not INDENT_SENSITIVE.search(name) and not GENERATED.search(name)
+                         and name not in allowed["REFORMAT"])
+    real = sorted({name for name in changed if name not in blank or INDENT_SENSITIVE.search(name)} | new)
+    if reformatted and real:
+        issues.append("%s changed in whitespace only, beside real changes (%s): revert the formatting there, or declare "
+                      "each with a `REFORMAT: <path>` line in the READY report if it is meant"
+                      % (", ".join(reformatted), ", ".join(real[:5]) + (" and more" if len(real) > 5 else "")))
+    return issues + caller_issues(root, revisions, excluded, allowed["REMOVED"])
+
+
+def allowances(given):
+    """`--allow` values as declaration lines, KIND: target. The coordinator's own word on a case it has checked: the
+    name matching of the caller check resolves no module path, so it can name a caller that imports another symbol
+    of that name, and nobody should have to wake a worker to say so."""
+    lines = []
+    for value in given or ():
+        kind, _, target = value.partition(":")
+        if (kind.upper() not in {"REWRITE", "REFORMAT", "REMOVED", "NEWLINE"} or not target.strip() or "\n" in target
+                or (kind.upper() == "REMOVED" and any(c.isspace() for c in target.strip()))):
+            raise ValueError("--allow takes rewrite:<path>, reformat:<path>, newline:<path> or removed:<symbol>")
+        lines.append("%s: %s" % (kind.upper(), target.strip()))
+    return list(dict.fromkeys(lines))
+
+
+def check_hygiene(run, root, base, commit, recorded, skip, allowed=()):
+    """Raise when the candidate's change has a hygiene defect that neither its workers declared in their READY reports
+    nor the coordinator allowed (ALLOWED, what `allowances` returns)."""
+    reports = {seq for seq, _ in recorded.values()}
+    report = "\n".join([*(post["text"] for post in load(run)[1] if post["seq"] in reports), *allowed])
+    issues = hygiene_issues(root, base, commit, report, skip)
+    if issues:
+        raise ValueError("the candidate is not ready for a verifier:\n- %s\nSend each to its worker; a new READY and a new "
+                         "`prepare` follow the fix. One you have checked yourself, such as a caller a passing type check "
+                         "clears, you can allow on `prepare` with --allow rewrite:<path>, reformat:<path>, "
+                         "newline:<path> or removed:<symbol>: the candidate records it and the verifier reports it" % "\n- ".join(issues))
+
+
 def check_current(run, candidate):
     """Raise unless a passing candidate still describes the reports and the sources it ran on."""
     if not candidate.get("accepted"):
@@ -411,7 +715,7 @@ def active_verifier(run, verifier):
         raise ValueError("an active verifier must run the checks")
 
 
-def prepare(run, project, mode, checks, onto=None, subset=None):
+def prepare(run, project, mode, checks, onto=None, subset=None, baseline=False, allowed=()):
     """CHECKS is None for a candidate with nothing a command could test, such as a designer's assets.
     ONTO names the commit an isolated candidate is built on when that is not the checkout's own HEAD.
     SUBSET names the workers of a partial candidate, which is tested and never accepted."""
@@ -466,6 +770,7 @@ def prepare(run, project, mode, checks, onto=None, subset=None):
             work = integration / project.relative_to(root)
             if not work.is_dir():
                 raise ValueError("the requested project directory is missing in the candidate")
+            check_hygiene(run, integration, base, commit, recorded, [run_data], allowed)
         candidate = {
             "candidate": identifier, "project": str(project), "path": str(work),
             "mode": mode, "base": base, "onto": onto, "commit": commit, "checks": checks or [], "no_checks": checks is None,
@@ -475,8 +780,17 @@ def prepare(run, project, mode, checks, onto=None, subset=None):
             # Every file as prepared: the digest reads a clean submodule of an isolated checkout as its commit, so one
             # filled in afterwards, with files the landed commit will not bring, would go unseen.
             "exact": source_digest(work) if mode == "isolated" else None,
-            "partial": subset is not None, "members": sorted(recorded),
+            "partial": subset is not None, "members": sorted(recorded), "baseline": baseline,
         }
+        if allowed:  # the record of what the coordinator let through, for the verifier's report and the export
+            candidate["allowed"] = list(allowed)
+        if mode != "isolated":
+            # A shared candidate is the checkout's own files, compared with its HEAD. Outside a repository, or in one
+            # with no commit yet, there is nothing to compare them with. Scanned after the fingerprint above was
+            # taken: an edit made since is one `test` refuses, so no source passes that this scan did not read.
+            found = repository(project)
+            if found is not None and git(project, "rev-parse", "--verify", "-q", "HEAD^{commit}", optional=True):
+                check_hygiene(run, found[0], "HEAD", None, recorded, not_source(found), allowed)
         with board_lock(run):
             current_inputs = inputs(run, mode, subset)
             check_checks_field(run, candidate, current_inputs)
@@ -637,6 +951,125 @@ def reserve(logs, identifier):
             number += 1
 
 
+# The baseline comparison: a check that fails on the candidate is run again on the candidate's base, and waived only
+# when it fails there in the same way. Ported from OpenSwarm's verify/runner.ts (MIT, Copyright (c) 2026 Heewon Oh).
+DEPENDENCY_INPUTS = {"package.json", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "Cargo.toml",
+                     "Cargo.lock", "go.mod", "go.sum", "requirements.txt", "pyproject.toml", "uv.lock", "poetry.lock"}
+DEPENDENCY_NAMES = re.compile(r"(requirements|constraints)[\w.-]*\.(txt|in)|Pipfile|setup\.(py|cfg)|Gemfile|pom\.xml|"
+                              r"build\.gradle(\.kts)?|.*\.lock")
+COMPARED_BYTES = 8 << 20  # a log longer than this is not compared, and so not waived: both are read whole
+# A line that counts and names nothing: "1 failed, <N> passed in <DURATION>", "Ran 3 tests in <DURATION>", "FAILED
+# (failures=1)", a row of progress marks. Two runs that agree only on such lines may have failed in different tests.
+COUNTS_ONLY = re.compile(r"[=\-\s]*(?:(?:(?:\d+|<N>) [a-z]+,? ?)+(?:in <DURATION>)?|Ran \d+ tests? in <DURATION>|"
+                         r"(?:FAILED|OK)(?: \([\w=, ]*\))?|[.sxXFEP]+)?[=\-\s]*")
+# The toolchain could not run: that is no verdict on the change, on either side, so it is never waived.
+ENVIRONMENT_FAILURE = [re.compile(pattern, flags) for pattern, flags in (
+    (r"ModuleNotFoundError:\s*No module named\b", re.I), (r"ImportError:\s*No module named\b", re.I),
+    (r"Cannot find module ['\"]", re.I), (r"Failed to initialize cache at", re.I),
+    (r"(?:^|[^A-Za-z]|\x1b\[[0-9;]*m)(?:error|×)(?:\x1b\[[0-9;]*m)*:?(?:\x1b\[[0-9;]*m)*[ \t]+Failed to (?:download|fetch|prepare|sync)\b", re.M),
+    (r"Network connectivity is disabled, but the\s+requested data wasn't found in the cache", 0),
+    (r"No solution found when resolving dependencies", re.I),
+    (r"(?:Network is unreachable|Temporary failure in name resolution|Could not resolve host|nodename nor servname provided)", re.I),
+    (r"No virtual environment found", re.I), (r"command not found:? (?:uv|python3?|pytest|ruff|npm|cargo|go)\b", re.I),
+    (r"could not find [`']?Cargo\.toml", re.I), (r"failed to (?:load|read) manifest for workspace member", re.I),
+    (r"Cargo\.toml.*(?:No such file or directory|os error 2)", re.I))]
+
+
+def normalized_failure(output, roots):
+    """A check's OUTPUT with what differs between two runs of one failure taken out: the checkouts' own paths (ROOTS),
+    colours, durations, how many tests passed or were skipped, progress lines, and the order in which parallel
+    workers finished. What names the failure stays, so a second failure or a changed assertion still differs."""
+    def totals(counts):  # `failed` and `error` counts stay
+        return re.sub(r"\d+ (passed|skipped|deselected|xfailed|xpassed|warnings?)", r"<N> \1", counts)
+
+    for root in sorted(filter(None, roots), key=len, reverse=True):  # a nested path before the one that holds it
+        output = output.replace(root, "<ROOT>")
+    output = re.sub(r"\x1b\[[0-9;]*m", "", output)
+    output = re.sub(r"(=+ .*? in )\d+(?:\.\d+)?s( =+)", lambda m: totals(m[1]) + "<DURATION>" + m[2], output)
+    output = re.sub(r"^(\d+ [a-z]+(?:, \d+ [a-z]+)* in )\d+(?:\.\d+)?s(?: \(\d+:\d{2}:\d{2}\))?$",
+                    lambda m: totals(m[1]) + "<DURATION>", output, flags=re.M)
+    output = re.sub(r"^[.sxXFEP]+ *\[ *\d+%\]\n?", "", output, flags=re.M)
+    output = re.sub(r"(Ran \d+ tests? in )\d+(?:\.\d+)?s", r"\1<DURATION>", output)
+    output = re.sub(r"(finished in )\d+(?:\.\d+)?s", r"\1<DURATION>", output, flags=re.I)
+    output = re.sub(r"\[gw\d+\]", "[gw<WORKER>]", output)
+
+    def ordered(text, heading, until, split):
+        found = re.search(heading, text, re.M)
+        if not found:
+            return text
+        end = re.search(until, text[found.end():], re.M)
+        end = len(text) if end is None else found.end() + end.start()
+        return text[:found.end()] + split(text[found.end():end]) + text[end:]
+
+    output = ordered(output, r"^={3,} FAILURES ={3,}\n", r"^={3,} (?:warnings summary|short test summary info) ={3,}$",
+                     lambda body: "".join(sorted(filter(None, re.split(r"(?=^_{8,}.*$)", body, flags=re.M)))))
+    return ordered(output, r"^={3,} short test summary info ={3,}\n", r"^={3,} .* ={3,}$",
+                   lambda body: "".join(line + "\n" for line in sorted(filter(None, body.split("\n")))))
+
+
+def environment_failure(output):
+    return any(pattern.search(output) for pattern in ENVIRONMENT_FAILURE)
+
+
+def fails_the_same_on_base(run, project, candidate, command, log, timeout, returncode, earlier=()):
+    """(whether COMMAND, which failed on the candidate with LOG and RETURNCODE, fails on the candidate's base in the
+    same way, why). The same exit code is not enough: the candidate may hold the old failure and a new one, so only
+    identical failure output is waived, and a check with unstable or no output stays failed. EARLIER are the checks
+    that ran before it, each with how it ended here and its log: they run on the base too, so that what one of them
+    sets up is there on both sides, and one that ends or prints otherwise there shows the two runs are not set up
+    alike."""
+    if log.stat().st_size > COMPARED_BYTES:
+        return False, "its output is over %d MB, more than is compared" % (COMPARED_BYTES >> 20)
+    head = log.read_bytes().decode(errors="replace")
+    # 126 and 127 are the shell's own: the command could not be run, or was not found.
+    if returncode in (126, 127) or environment_failure(head):
+        return False, "the check could not run here (a missing module, tool or network), which is no result on either side"
+    changed = git(candidate["worktree"], "diff", "--no-renames", "--name-only", "-z", candidate["base"], candidate["commit"])
+    inputs = sorted({os.fsdecode(name) for name in changed.split(b"\0") if name.rsplit(b"/", 1)[-1].decode(errors="replace")
+                     in DEPENDENCY_INPUTS or DEPENDENCY_NAMES.fullmatch(name.rsplit(b"/", 1)[-1].decode(errors="replace"))})
+    if inputs:
+        return False, "the candidate changes %s, so the base runs with other dependencies" % ", ".join(inputs)
+    baseline = run / ("baseline-" + candidate["candidate"])
+    base_log = log.with_name(log.stem + "-base.log")
+    try:
+        git(project, "worktree", "add", "--detach", str(baseline), candidate["base"])
+        work = baseline / Path(candidate["path"]).relative_to(candidate["worktree"])
+        roots = [str(Path(candidate["worktree"])), str(Path(candidate["worktree"]).resolve()), str(baseline), str(baseline.resolve())]
+
+        def printed(path):
+            return None if path.stat().st_size > COMPARED_BYTES else normalized_failure(path.read_bytes().decode(errors="replace"), roots)
+        try:
+            for setup, ended, setup_log in earlier:
+                on_base = setup_log.with_name(setup_log.stem + "-base.log")
+                with on_base.open("wb") as output:
+                    code = run_check(setup, work, timeout, output)
+                if code != ended or printed(on_base) is None or printed(on_base) != printed(setup_log):
+                    return False, ("an earlier check ends or prints otherwise on the base, so the two runs are not set up "
+                                   "alike: " + setup)
+            with base_log.open("wb") as output:
+                on_base = run_check(command, work, timeout, output)
+        except subprocess.TimeoutExpired:
+            return False, "it timed out on the base"
+        if on_base == 0:
+            return False, "it passes on the base %s" % candidate["base"][:12]
+        if on_base != returncode:
+            return False, "it exits %d on the base %s and %d here" % (on_base, candidate["base"][:12], returncode)
+        if base_log.stat().st_size > COMPARED_BYTES:
+            return False, "its output on the base is over %d MB, more than is compared" % (COMPARED_BYTES >> 20)
+        base = base_log.read_bytes().decode(errors="replace")
+        named = normalized_failure(head, roots)
+        if normalized_failure(base, roots) != named:
+            return False, "it fails on the base %s too, with other output (log: %s)" % (candidate["base"][:12], base_log)
+        if all(COUNTS_ONLY.fullmatch(line) for line in named.split("\n")):  # nothing, progress marks, counts
+            return False, "it prints nothing that names a failure on either side, so nothing shows the two are one"
+        return True, "it fails on the base %s with the same output (log: %s)" % (candidate["base"][:12], base_log)
+    except (OSError, ValueError) as error:  # no such folder on the base, a worktree Git could not make: no comparison
+        return False, "the base could not be checked: %s" % error
+    finally:
+        if baseline.exists():
+            git(project, "worktree", "remove", "--force", str(baseline), optional=True)
+
+
 def test_candidate(run, project, identifier, verifier, timeout_arg=None):
     verifier = verifier.lstrip("@").lower()
     if timeout_arg is not None:
@@ -665,6 +1098,7 @@ def test_candidate(run, project, identifier, verifier, timeout_arg=None):
             raise ValueError("this candidate was accepted; prepare a new candidate to test again")
         check_inputs(run, candidate)  # before anything is cleared: a test that cannot run voids nothing
         candidate.pop("verified_by", None)
+        candidate.pop("waived", None)  # the last attempt's: this one says anew what it waives
         candidate["attempt"] = attempt
         save_candidate(run, candidate)
         # Every file as it is while the checks run: the candidate's own digest reads a clean submodule of an isolated
@@ -684,7 +1118,7 @@ def test_candidate(run, project, identifier, verifier, timeout_arg=None):
     logs = run / "checks"
     logs.mkdir(exist_ok=True)
     number = reserve(logs, identifier) if candidate["checks"] else None
-    failed = []
+    failed, waived, ran = [], [], []
     for index, command in enumerate(candidate["checks"], 1):
         print(f"$ {command}", flush=True)
         log = logs / log_name(identifier, number, index)
@@ -710,7 +1144,13 @@ def test_candidate(run, project, identifier, verifier, timeout_arg=None):
                   flush=True)
         if returncode is None:
             raise ValueError(f"verification command timed out after {timeout}s: {command}")
-        if returncode:
+        ran.append((command, returncode, log))
+        if returncode and candidate.get("baseline"):
+            same, why = fails_the_same_on_base(run, project, candidate, command, log, timeout, returncode,
+                                               ran[:index - 1])
+            print("%s: %s" % ("Waived, as no failure of the candidate's" if same else "Not waived", why), flush=True)
+            (waived if same else failed).append(command)
+        elif returncode:
             failed.append(command)
     if failed:
         # Every check ran: a cycle that stops at the first failure hides the rest until the next candidate.
@@ -726,7 +1166,14 @@ def test_candidate(run, project, identifier, verifier, timeout_arg=None):
             raise ValueError("the checks changed files in the candidate's checkout (a submodule they filled in or emptied?), "
                              "so what they read is not what the commit holds; prepare and test a new candidate")
         candidate["verified_by"] = verifier
+        if waived:
+            candidate["waived"] = waived
         save_candidate(run, candidate)
+    if waived:
+        print("Failing on the base in the same way, and so waived; name each in your report: " + "; ".join(waived))
+    if candidate.get("allowed"):
+        print("Allowed by the coordinator at prepare, past the diff guards; name each in your report: "
+              + "; ".join(candidate["allowed"]))
     print(f"VERIFIED {identifier} {candidate['commit'] or candidate['digest']}")
 
 
@@ -1000,6 +1447,10 @@ def main():
     checks.add_argument("--check", action="append")
     checks.add_argument("--no-checks", action="store_true")
     prep.add_argument("--base", help="build an isolated candidate on this ref instead of the checkout's HEAD")
+    prep.add_argument("--allow", action="append", metavar="KIND:TARGET",
+                      help="let one case past the diff guards: rewrite:<path>, reformat:<path>, newline:<path> or removed:<symbol>")
+    prep.add_argument("--baseline-diff", action="store_true",
+                      help="waive a check that fails on the candidate's base with the same output (isolated only)")
     prep.add_argument("--members", help="a partial candidate of these workers, comma-separated: tested, never accepted")
     test = actions.add_parser("test")
     test.add_argument("candidate")
@@ -1033,7 +1484,11 @@ def main():
                 subset = list(dict.fromkeys(n.strip().lstrip("@").lower() for n in args.members.split(",") if n.strip()))
                 if not subset:
                     raise ValueError("--members takes worker names, separated by commas")
-            prepare(run, project, args.mode, None if args.no_checks else args.check, args.base, subset)
+            if args.baseline_diff and (args.mode != "isolated" or args.no_checks):
+                # A shared candidate runs in the user's checkout, with dependencies no fresh checkout of its base has.
+                raise ValueError("--baseline-diff is for an isolated candidate with checks")
+            prepare(run, project, args.mode, None if args.no_checks else args.check, args.base, subset, args.baseline_diff,
+                    allowances(args.allow))
         elif args.action == "test":
             test_candidate(run, project, args.candidate, args.verifier, args.timeout)
         elif args.action == "commit":

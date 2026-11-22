@@ -14,6 +14,11 @@ import unittest
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "skills" / "swarm" / "scripts"
 
+# A fixture's Git commands reach the temporary repository, whatever repository a hook that runs the tests is in.
+NO_GIT_ENV = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+# A report after a NOT PASSED answers each finding the board numbered.
+ANSWERS = "\n".join("F%d: fixed — the change holds it" % n for n in range(1, 6))
+
 
 def run(*args, cwd=None, text=None, ok=True, env=None):
     result = subprocess.run(args, cwd=cwd, input=text, text=True, capture_output=True, env=env)
@@ -578,7 +583,7 @@ class VerifyRegressions(unittest.TestCase):
             gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
             run(*post, "member", "w")
             run(*post, "member", "v", "role=verifier")
-            run(*post, "ready", "w", text="done")
+            run(*post, "ready", "w", text="done" + "\n" + ANSWERS)
             cand = json.loads(run(*gate, "prepare", "shared", "--check", "false", "--check", "echo second-ran", "--check", "test -e missing"))
             res = subprocess.run([*gate, "test", cand["candidate"], "v"], capture_output=True, text=True)
             # a failing first check does not hide what the others would have said
@@ -592,12 +597,12 @@ class VerifyRegressions(unittest.TestCase):
             assert "paused" not in json.loads(members_path.read_text())
             # new work reviewed before the next candidate exists is a new cycle too, though the old candidate is on the table
             run(*post, "revise", "w", "fixing")
-            run(*post, "ready", "w", text="done again")
+            run(*post, "ready", "w", text="done again\n" + ANSWERS)
             run(*post, "post", "v", "@w NOT PASSED: the fix is wrong, seen in review")
             assert "paused" not in json.loads(members_path.read_text())
             # a new candidate that fails is a new cycle
             run(*post, "revise", "w", "fixing")
-            run(*post, "ready", "w", text="done a third time")
+            run(*post, "ready", "w", text="done a third time" + "\n" + ANSWERS)
             run(*gate, "prepare", "shared", "--check", "false")
             run(*post, "post", "v", "@w NOT PASSED: still failing")
             assert json.loads(members_path.read_text())["paused"] == "@w failed verification 3 times in a row"
@@ -612,7 +617,7 @@ class VerifyRegressions(unittest.TestCase):
             run(*post, "member", "w")
             run(*post, "member", "v", "role=verifier")
             run(*post, "member", "v2", "role=verifier")
-            run(*post, "ready", "w", text="done")
+            run(*post, "ready", "w", text="done" + "\n" + ANSWERS)
             cand = json.loads(run(*gate, "prepare", "shared", "--check", "test -s app.txt"))
             line = run(*gate, "test", cand["candidate"], "v").splitlines()[-1]
             # A rejection delivered during the check invalidates that attempt too.
@@ -625,7 +630,7 @@ class VerifyRegressions(unittest.TestCase):
             assert refused.returncode != 0 and "waiting for READY from @w: its last one no longer counts" in refused.stderr
             run(*post, "post", "w", "@v fixed it, have a look")  # a plain reply is no report
             run(*gate, "prepare", "shared", "--check", "test -s app.txt", ok=False)
-            run(*post, "ready", "w", text="fixed")
+            run(*post, "ready", "w", text="fixed\n" + ANSWERS)
             cand = json.loads(run(*gate, "prepare", "shared", "--check", "test -s app.txt"))
             line = run(*gate, "test", cand["candidate"], "v").splitlines()[-1]
             # A rejection that quotes the pass line is no pass.
@@ -641,7 +646,7 @@ class VerifyRegressions(unittest.TestCase):
             # The candidate rests on the refused report, so it cannot be tested again either: the worker reports, and a
             # new candidate is prepared.
             run(*gate, "test", cand["candidate"], "v", ok=False)
-            run(*post, "ready", "w", text="regression fixed")
+            run(*post, "ready", "w", text="regression fixed" + "\n" + ANSWERS)
             cand = json.loads(run(*gate, "prepare", "shared", "--check", "test -s app.txt"))
             line = run(*gate, "test", cand["candidate"], "v").splitlines()[-1]
             run(*post, "post", "v", "@coordinator " + line)
@@ -1435,12 +1440,12 @@ class VerifyRegressions(unittest.TestCase):
             def last():
                 return json.loads(run(*post, "tail").splitlines()[-1])
 
-            run(*post, "ready", "w", text="done")
+            run(*post, "ready", "w", text="done" + "\n" + ANSWERS)
             a = json.loads(run(*gate, "prepare", "shared", "--check", "true"))["candidate"]
             run(*post, "post", "coordinator", "@v please test candidate %s" % a)
             run(*post, "read", "v")
             run(*post, "post", "v", "@coordinator NOT VERIFIED %s: the check cannot run" % a)
-            run(*post, "ready", "w", text="fixed")
+            run(*post, "ready", "w", text="fixed" + "\n" + ANSWERS)
             run(*post, "read", "v")  # v has read w's new READY
             json.loads(run(*gate, "prepare", "shared", "--check", "true"))
             run(*post, "post", "coordinator", "@v please test the next candidate")  # not read yet
@@ -1449,7 +1454,7 @@ class VerifyRegressions(unittest.TestCase):
             assert last()["candidate"] == a and last()["rejects"] == ["w"], last()
             run(*gate, "prepare", "shared", "--check", "true", ok=False)  # w is no longer ready
             # a READY v has not read is no work its verdict saw
-            run(*post, "ready", "w", text="fixed again")
+            run(*post, "ready", "w", text="fixed again\n" + ANSWERS)
             json.loads(run(*gate, "prepare", "shared", "--check", "true"))
             run(*post, "post", "v", "@w NOT PASSED: the old build also leaked")
             assert last()["candidate"] == a and last()["rejects"] == [], last()
@@ -1750,6 +1755,319 @@ class VerifyRegressions(unittest.TestCase):
             assert (Path(board) / "checks" / f"{cand['candidate']}-attempt01-check01.log").read_text() == "v2"
             run(*post, "post", "v", "@coordinator " + line)
             assert "ACCEPTED " in run(*gate, "accept", cand["candidate"])
+
+
+class DiffHygiene(unittest.TestCase):
+    """`prepare` refuses a candidate whose change has a mechanical defect its worker did not declare."""
+
+    BIG = "".join(f"line {n}\n" for n in range(30))
+
+    def _prepare(self, files, changes, report="done", mode="isolated", flags=(), keep=None):
+        """The result of `prepare MODE FLAGS` for one worker that turned FILES into CHANGES (None deletes) and reported
+        REPORT. The project is made in KEEP, when given, and left there."""
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(keep or t).resolve()
+
+            def g(*args):
+                return subprocess.run(["git", "-C", str(proj), *args], check=True, capture_output=True, text=True,
+                                      env=NO_GIT_ENV).stdout.strip()
+            g("init", "-b", "main")
+            for setting in (("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")):
+                g("config", *setting)
+            for name, content in files.items():
+                (proj / name).write_text(content)
+            g("add", ".")
+            g("commit", "-m", "init")
+            board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "hyg", "init", "Hygiene")
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            if mode == "isolated":
+                g("switch", "-q", "-c", "work")
+            for name, content in changes.items():
+                (proj / name).unlink() if content is None else (proj / name).write_text(content)
+            commit = []
+            if mode == "isolated":
+                g("add", "-A", "--", ":/", ":(exclude).swarm")
+                g("commit", "-q", "-m", "work")
+                commit = [g("rev-parse", "HEAD")]
+                g("switch", "-q", "main")
+            run(*post, "ready", "w", *commit, text=report)
+            return subprocess.run([sys.executable, SCRIPTS / "verify.py", board, proj, "prepare", mode, "--check", "true", *flags],
+                                  capture_output=True, text=True)
+
+    def test_a_whole_file_rewrite_is_refused_unless_declared(self):
+        rewritten = "".join(f"other {n}\n" for n in range(15)) + self.BIG[self.BIG.index("line 15"):]
+        for mode in ("isolated", "shared"):
+            refused = self._prepare({"big.txt": self.BIG}, {"big.txt": rewritten}, mode=mode)
+            assert refused.returncode and "big.txt lost 15 of its 30 lines (50%)" in refused.stderr, (mode, refused.stderr)
+            declared = self._prepare({"big.txt": self.BIG}, {"big.txt": rewritten}, "done\nREWRITE: ./big.txt", mode)
+            assert declared.returncode == 0, (mode, declared.stderr)
+        # Another file's declaration is no blanket one, a small edit is no rewrite, and neither is a short file.
+        other = self._prepare({"big.txt": self.BIG}, {"big.txt": rewritten}, "REWRITE: small.txt")
+        assert other.returncode and "big.txt" in other.stderr, other.stderr
+        edit = self._prepare({"big.txt": self.BIG}, {"big.txt": self.BIG.replace("line 3\n", "three\n")})
+        assert edit.returncode == 0, edit.stderr
+        short = self._prepare({"short.txt": "a\nb\nc\n"}, {"short.txt": "x\ny\nz\n"})
+        assert short.returncode == 0, short.stderr
+        # A file deleted or moved loses every line and is no rewrite.
+        for mode in ("isolated", "shared"):
+            assert self._prepare({"big.txt": self.BIG, "keep.txt": "k\n"}, {"big.txt": None}, mode=mode).returncode == 0, mode
+            moved = self._prepare({"big.txt": self.BIG}, {"big.txt": None, "moved.txt": self.BIG}, mode=mode)
+            assert moved.returncode == 0, (mode, moved.stderr)
+
+    def test_a_lost_trailing_newline_is_refused(self):
+        for mode in ("isolated", "shared"):
+            refused = self._prepare({"a.txt": "one\ntwo\n"}, {"a.txt": "one\ntwo\nthree"}, mode=mode)
+            assert refused.returncode and "a.txt lost the newline at its end" in refused.stderr, (mode, refused.stderr)
+        for report, flags in (("NEWLINE: a.txt", ()), ("done", ("--allow", "newline:a.txt"))):  # meant, and said so
+            assert self._prepare({"a.txt": "one\ntwo\n"}, {"a.txt": "one\ntwo\nthree"}, report, flags=flags).returncode == 0
+        # A path with a space in it is declared and allowed whole; a declaration quoted in a pasted log is none.
+        spaced = ({"with space.txt": "one\n"}, {"with space.txt": "one\ntwo"})
+        assert self._prepare(*spaced, "NEWLINE: with space.txt").returncode == 0
+        assert self._prepare(*spaced, flags=("--allow", "newline:with space.txt")).returncode == 0
+        assert self._prepare(*spaced, "NEWLINE: with").returncode
+        quoted = self._prepare({"a.txt": "one\n"}, {"a.txt": "one\ntwo"}, "the log:\n```\nNEWLINE: a.txt\n```")
+        assert quoted.returncode and "a.txt lost the newline" in quoted.stderr, quoted.stderr
+        kept = self._prepare({"a.txt": "one\ntwo"}, {"a.txt": "one\ntwo\nthree"})  # it never had one
+        assert kept.returncode == 0, kept.stderr
+        # A new file, a deleted one and a binary one have no newline to lose.
+        other = self._prepare({"a.txt": "one\n", "b.bin": "x\0y\n", "gone.txt": "g\n"},
+                              {"new.txt": "no newline", "b.bin": "x\0z", "gone.txt": None})
+        assert other.returncode == 0, other.stderr
+
+    def test_formatting_mixed_with_real_changes_is_refused_unless_declared(self):
+        files = {"a.ts": "if (x) {\n  y()\n}\n", "b.ts": "let n = 1\n", "c.py": "if x:\n    y()\n"}
+        spaced = "if (x) {\n    y()\n}\n"
+        for mode in ("isolated", "shared"):
+            refused = self._prepare(files, {"a.ts": spaced, "b.ts": "let n = 2\n"}, mode=mode)
+            assert refused.returncode and "a.ts changed in whitespace only" in refused.stderr and "b.ts" in refused.stderr, \
+                (mode, refused.stderr)
+        assert self._prepare(files, {"a.ts": spaced, "b.ts": "let n = 2\n"}, "REFORMAT: a.ts").returncode == 0
+        assert self._prepare(files, {"a.ts": spaced}).returncode == 0  # formatting alone is one kind of change
+        # A new file is a real change; indentation is meaning in Python, so a re-indent there is no formatting.
+        new = self._prepare(files, {"a.ts": spaced, "new.ts": "let m = 1\n"}, mode="shared")
+        assert new.returncode and "new.ts" in new.stderr, new.stderr
+        assert self._prepare(files, {"c.py": "if x:\n  y()\n", "b.ts": "let n = 2\n"}).returncode == 0
+
+    def test_a_removed_public_symbol_with_a_caller_left_is_refused_unless_declared(self):
+        py = {"lib.py": "def helper():\n    return 1\n\n\ndef kept():\n    return 2\n", "app.py": "from lib import helper\nhelper()\n"}
+        gone = {"lib.py": "def kept():\n    return 2\n"}
+        for mode in ("isolated", "shared"):
+            refused = self._prepare(py, gone, mode=mode)
+            assert refused.returncode and 'app.py:1 still refers to "helper"' in refused.stderr, (mode, refused.stderr)
+        assert self._prepare(py, gone, "REMOVED: helper").returncode == 0
+        # The coordinator's own override wakes no worker, and stays on the record for the verifier and the export.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        allowed = self._prepare(py, gone, flags=("--allow", "removed:helper"), keep=temp.name)
+        assert allowed.returncode == 0, allowed.stderr
+        board = next((Path(temp.name) / ".swarm").glob("hyg-*"))
+        cand = json.loads((board / "verification.json").read_text())
+        assert cand["allowed"] == ["REMOVED: helper"], cand
+        tested = run(sys.executable, SCRIPTS / "verify.py", board, temp.name, "test", cand["candidate"], "v")
+        assert "Allowed by the coordinator at prepare, past the diff guards; name each in your report: REMOVED: helper" in tested
+        assert "allowed these past the diff guards: REMOVED: helper." in Path(
+            run(sys.executable, SCRIPTS / "board.py", board, "export")).read_text()
+        for flags in (("--allow", "removed:other"), ("--allow", "callers:helper"), ("--allow", "removed:")):
+            assert self._prepare(py, gone, flags=flags).returncode, flags
+        assert self._prepare(py, {**gone, "app.py": "from lib import kept\nkept()\n"}).returncode == 0
+        # Moved to another file, an import that still names the old module is broken, once and not for each line;
+        # one that follows the move is fine, and so is a re-export left behind. A mention that imports nothing is no caller.
+        there = {"other.py": "def helper():\n    return 1\n"}
+        for mode in ("isolated", "shared"):
+            moved = self._prepare(py, {**gone, **there}, mode=mode)
+            assert moved.returncode and moved.stderr.count("app.py:") == 1, (mode, moved.stderr)
+        assert self._prepare(py, {**gone, **there, "app.py": "from other import helper\nhelper()\n"}).returncode == 0
+        assert self._prepare(py, {"lib.py": "from other import helper\n" + gone["lib.py"], **there}).returncode == 0
+        # A mention left in the old module is no re-export: only an import or a binding of the name is.
+        said = self._prepare(py, {"lib.py": "NAME = 'helper'\n" + gone["lib.py"], **there})
+        assert said.returncode and "app.py:1" in said.stderr, said.stderr
+        assert self._prepare(py, {"lib.py": "import other\nhelper = other.helper\n" + gone["lib.py"], **there}).returncode == 0
+        # A namesake another file already defines hides no importer of the removed one, and is itself no caller.
+        twin = {**py, "twin.py": "def helper():\n    return 3\n", "use_twin.py": "from twin import helper\nhelper()\n"}
+        refused = self._prepare(twin, gone)
+        assert refused.returncode and "app.py:1" in refused.stderr and "use_twin.py" not in refused.stderr, refused.stderr
+        assert self._prepare({**py, "app.py": "# helper is gone\nhelper = 3\n"}, gone).returncode == 0
+        ts = {"lib.ts": "export function helper() {}\nexport const kept = 1\n", "app.ts": "import { helper } from './lib'\nhelper()\n"}
+        refused = self._prepare(ts, {"lib.ts": "export const kept = 1\n"})
+        assert refused.returncode and 'app.ts:1 still refers to "helper"' in refused.stderr, refused.stderr
+
+    def test_the_import_rules_read_the_shapes_they_were_written_for(self):
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import verify
+            diff = ("--- a/m.py\n+++ b/m.py\n-def gone(a):\n-    def inner(): pass\n-class Moved:\n+def gone(a, b):\n"
+                    "--- a/x.ts\n+++ /dev/null\n-export default async function load() {}\n-  export const enum Kind { A }\n-const local = 1\n"
+                    "--- /dev/null\n+++ b/y.py\n+class Moved:\n")
+            assert verify.removed_public_symbols(diff) == {"load": "x.ts", "Kind": "x.ts"}
+            for source, expected in (
+                    ("from pkg.m import (\n    a,\n    sym as s,\n)\n", True), ("from pkg.m import *\n", True),
+                    ("import pkg.m as mod\nmod.sym()\n", True), ("from pkg import m\nm.sym()\n", True),
+                    ("import requests\nrequests.sym()\n", False), ("from other import *\nsym()\n", False),
+                    ("# from m import sym\nsym = 1\n", False)):
+                assert verify.imports_symbol("c.py", source, "sym", "pkg/m.py") is expected, source
+            for source, expected in (
+                    ("import { a, sym as b } from './m'\n", True), ("import type { sym } from './m'\n", True),
+                    ("import sym from './m'\n", True), ("export { sym } from './m'\n", True),
+                    ("import * as ns from './m'\nns.sym()\n", True), ("const { sym } = require('./m')\n", True),
+                    ("const m = await import('./m')\nm?.sym()\n", True), ("require('./m').sym()\n", True),
+                    ("// import { sym } from './m'\nconst sym = 1\n", False), ("import { symbol } from './m'\n", False),
+                    ("export const other = 1\nconst sym = 2\nconst s = 'x from '\n", False)):
+                assert verify.imports_symbol("c.ts", source, "sym", "m.ts") is expected, source
+            assert verify.imports_symbol("c.ts", "import { sym } from '../lib/m.js'\n", "sym", "src/m.ts", True)
+            assert not verify.imports_symbol("c.ts", "import { sym } from './other'\n", "sym", "src/m.ts", True)
+            assert not verify.imports_symbol("c.py", "from other import sym\n", "sym", "pkg/m.py", True)
+            moved = {}
+            assert verify.removed_public_symbols("--- a/m.py\n+++ b/m.py\n-def go():\n--- /dev/null\n+++ b/n.py\n+def go():\n", moved) == {}
+            assert moved == {"go": "m.py"}
+            assert verify.declared("- REWRITE: src/a.py (the task asks for it)\nsee REWRITE: no.py")["REWRITE"] == {
+                "src/a.py", "src/a.py (the task asks for it"}
+            assert verify.declared("REWRITE: ./a/b.py\n`REFORMAT: c.ts`\nREMOVED: Thing, REWRITE:\nnext") == {
+                "REWRITE": {"a/b.py"}, "REFORMAT": {"c.ts"}, "REMOVED": {"Thing"}, "NEWLINE": set()}
+        finally:
+            sys.path.remove(str(SCRIPTS))
+
+
+class BaselineDiff(unittest.TestCase):
+    """`prepare --baseline-diff` waives a check that fails on the candidate's base in the same way, and nothing else."""
+
+    def _test(self, before, after, *flags, mode="isolated", checks=("sh check.sh",), files=None, changes=None):
+        """(the result of `test`, the candidate, the run) for a worker that turned check.sh from BEFORE into AFTER, in
+        a project that also holds FILES and where the worker also wrote CHANGES; CHECKS are the candidate's."""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        proj = Path(temp.name).resolve()
+
+        def g(*args):
+            return subprocess.run(["git", "-C", str(proj), *args], check=True, capture_output=True, text=True,
+                                  env=NO_GIT_ENV).stdout.strip()
+        g("init", "-b", "main")
+        for setting in (("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")):
+            g("config", *setting)
+        (proj / "check.sh").write_text(before)
+        for name, content in (files or {}).items():
+            (proj / name).write_text(content)
+        g("add", ".")
+        g("commit", "-m", "init")
+        board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "base", "init", "Baseline")
+        post = [sys.executable, SCRIPTS / "board.py", board]
+        gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+        run(*post, "member", "w")
+        run(*post, "member", "v", "role=verifier")
+        commit = []
+        if mode == "isolated":
+            g("switch", "-q", "-c", "work")
+        (proj / "check.sh").write_text(after)
+        (proj / "new.txt").write_text("new\n")
+        for name, content in (changes or {}).items():
+            (proj / name).write_text(content)
+        if mode == "isolated":
+            g("add", "check.sh", "new.txt", *(changes or {}))
+            g("commit", "-q", "-m", "work")
+            commit = [g("rev-parse", "HEAD")]
+            g("switch", "-q", "main")
+        run(*post, "ready", "w", *commit, text="done")
+        prepared = subprocess.run([*gate, "prepare", mode, *(arg for check in checks for arg in ("--check", check)), *flags],
+                                  capture_output=True, text=True)
+        if prepared.returncode:
+            return prepared, None, Path(board)
+        cand = json.loads(prepared.stdout)["candidate"]
+        return subprocess.run([*gate, "test", cand, "v"], capture_output=True, text=True), cand, Path(board)
+
+    OLD = 'echo "in $(pwd)"\necho "FAILED tests/test_old.py::test_a - assert 1 == 2"\necho "1 failed, 3 passed in 0.52s"\nexit 1\n'
+
+    def test_a_failure_the_base_already_has_is_waived_and_said(self):
+        # The same failure: the checkout's path, the duration and the count of passing tests are no part of it.
+        same = self.OLD.replace("3 passed in 0.52s", "4 passed in 1.07s")
+        result, cand, board = self._test(self.OLD, same, "--baseline-diff")
+        assert result.returncode == 0 and "Waived" in result.stdout and "name each in your report: sh check.sh" in result.stdout, \
+            (result.stdout, result.stderr)
+        assert result.stdout.splitlines()[-1].startswith("VERIFIED " + cand)
+        assert json.loads((board / "verification.json").read_text())["waived"] == ["sh check.sh"]
+        assert not list(board.glob("baseline-*")) and list((board / "checks").glob("*-base.log"))
+        # Asked for nothing, nothing is waived.
+        result, _, _ = self._test(self.OLD, same)
+        assert result.returncode and "verification failed: sh check.sh" in result.stderr and "Waived" not in result.stdout
+
+    def test_a_clean_retry_keeps_no_waiver_of_the_attempt_before(self):
+        flaky = 'test -n "$PASS_NOW" && exit 0\n' + self.OLD
+        from unittest import mock
+        with mock.patch.dict(os.environ):  # whatever the runner's environment holds, the first attempt fails
+            os.environ.pop("PASS_NOW", None)
+            result, cand, board = self._test(flaky, flaky + "# changed\n", "--baseline-diff")
+        assert result.returncode == 0 and json.loads((board / "verification.json").read_text())["waived"] == ["sh check.sh"]
+        again = subprocess.run([sys.executable, SCRIPTS / "verify.py", board, board.parent.parent, "test", cand, "v"],
+                               capture_output=True, text=True, env={**os.environ, "PASS_NOW": "1"})
+        assert again.returncode == 0 and "Waived" not in again.stdout, (again.stdout, again.stderr)
+        assert "waived" not in json.loads((board / "verification.json").read_text())
+
+    def test_a_new_failure_beside_the_old_one_is_not_waived(self):
+        more = self.OLD.replace("exit 1", 'echo "FAILED tests/test_new.py::test_b"\nexit 1')
+        result, _, _ = self._test(self.OLD, more, "--baseline-diff")
+        assert result.returncode and "Not waived: it fails on the base" in result.stdout and "other output" in result.stdout, result.stdout
+        result, _, _ = self._test("exit 0\n", self.OLD, "--baseline-diff")
+        assert result.returncode and "Not waived: it passes on the base" in result.stdout, result.stdout
+
+    def test_only_the_same_failure_with_the_same_setup_is_waived(self):
+        # What an earlier check sets up is there on the base too: without it the base would fail for want of the fixture.
+        reads = 'cat fixture.txt || exit 1\necho "FAILED tests/test_old.py::test_a"\nexit 1\n'
+        result, _, _ = self._test(reads, reads, "--baseline-diff", checks=("echo data > fixture.txt", "sh check.sh"),
+                                  files={".gitignore": "fixture.txt\n"})
+        assert result.returncode == 0 and "Waived" in result.stdout, (result.stdout, result.stderr)
+        # A setup that works here and not on the base leaves the two runs set up differently.
+        result, _, _ = self._test(self.OLD, self.OLD, "--baseline-diff", checks=("test -f new.txt", "sh check.sh"))
+        assert result.returncode and "Not waived: an earlier check ends or prints otherwise on the base" in result.stdout, result.stdout
+        # The same exit and other output is another setup too.
+        result, _, _ = self._test(self.OLD, self.OLD, "--baseline-diff", checks=("cat new.txt 2>/dev/null; echo set up", "sh check.sh"))
+        assert result.returncode and "Not waived: an earlier check ends or prints otherwise on the base" in result.stdout, result.stdout
+        # Counts name no failure: one failed test of two may be another one.
+        counts = 'echo "1 failed, 1 passed in 0.10s"\nexit 1\n'
+        result, _, _ = self._test(counts, counts + "# changed\n", "--baseline-diff")
+        assert result.returncode and "Not waived: it prints nothing that names a failure" in result.stdout, result.stdout
+        # Progress marks alone name no failure.
+        marks = 'echo "..F [100%]"\nexit 1\n'
+        result, _, _ = self._test(marks, marks + "# changed\n", "--baseline-diff")
+        assert result.returncode and "Not waived: it prints nothing that names a failure" in result.stdout, result.stdout
+        # Another exit code, or nothing printed on either side, shows no same failure.
+        result, _, _ = self._test("exit 1\n", "exit 2\n", "--baseline-diff")
+        assert result.returncode and "Not waived: it exits 1 on the base" in result.stdout and "and 2 here" in result.stdout, result.stdout
+        result, _, _ = self._test("exit 1\n", "exit 1\n# changed\n", "--baseline-diff")
+        assert result.returncode and "Not waived: it prints nothing that names a failure" in result.stdout, result.stdout
+        # A dependency list under a name of the project's own changes what the base runs with.
+        result, _, _ = self._test(self.OLD, self.OLD, "--baseline-diff", files={"requirements-dev.txt": "a\n"},
+                                  changes={"requirements-dev.txt": "a\nb\n"})
+        assert result.returncode and "Not waived: the candidate changes requirements-dev.txt" in result.stdout, result.stdout
+
+    def test_a_check_that_could_not_run_is_never_waived(self):
+        broken = 'echo "ModuleNotFoundError: No module named \'requests\'"\nexit 1\n'
+        result, _, board = self._test(broken, broken, "--baseline-diff")
+        assert result.returncode and "Not waived: the check could not run here" in result.stdout, result.stdout
+        assert not list((board / "checks").glob("*-base.log"))  # the base was not even asked
+        missing = 'echo "sh: line 1: mytool: command not found"\nexit 127\n'  # the shell's own code for it
+        result, _, _ = self._test(missing, missing, "--baseline-diff")
+        assert result.returncode and "Not waived: the check could not run here" in result.stdout, result.stdout
+        refused, _, _ = self._test(self.OLD, self.OLD, "--baseline-diff", mode="shared")
+        assert refused.returncode and "--baseline-diff is for an isolated candidate" in refused.stderr, refused.stderr
+
+    def test_the_fingerprint_keeps_what_names_a_failure(self):
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import verify
+            def run_output(root, seconds, passed, order):
+                blocks = ["_________ test_a _________\nassert 1 == 2\n", "_________ test_b _________\nassert x\n"]
+                return ("\x1b[31m....F.F [ 50%]\x1b[0m\n=================== FAILURES ===================\n" + "".join(blocks[::order])
+                        + "=========== short test summary info ===========\n"
+                        + "\n".join(["FAILED %s/t.py::test_a [gw1]" % root, "FAILED %s/t.py::test_b [gw0]" % root][::order])
+                        + "\n========= 2 failed, %d passed in %ss =========\n" % (passed, seconds))
+            one = verify.normalized_failure(run_output("/tmp/head", "1.20", 7, 1), ["/tmp/head", "/tmp/base"])
+            assert one == verify.normalized_failure(run_output("/tmp/base", "0.31", 9, -1), ["/tmp/head", "/tmp/base"])
+            assert "<ROOT>/t.py::test_a" in one and "2 failed, <N> passed in <DURATION>" in one
+            assert one != verify.normalized_failure(run_output("/tmp/base", "0.31", 9, 1).replace("assert x", "assert y"), ["/tmp/base"])
+            assert one != verify.normalized_failure(run_output("/tmp/base", "0.31", 9, 1).replace("2 failed", "3 failed"), ["/tmp/base"])
+            assert verify.environment_failure("bash: command not found: pytest") and not verify.environment_failure("TypeError: Failed to fetch")
+        finally:
+            sys.path.remove(str(SCRIPTS))
 
 
 if __name__ == "__main__":

@@ -3744,7 +3744,7 @@ export const register: Register = on => {
     } else if (current === 'attention') {
       // A kind this version does not know is still shown, uncoloured.
       const tone = (kind: string) =>
-        ['unreachable', 'ignored', 'stale', 'rework', 'retired-running', 'conflict'].includes(kind) ? 'error' : kind === 'paused' || kind === 'member_paused' ? 'suggestion'
+        ['unreachable', 'ignored', 'stale', 'rework', 'dispute', 'retired-running', 'conflict'].includes(kind) ? 'error' : kind === 'paused' || kind === 'member_paused' ? 'suggestion'
           : ['unread', 'review', 'question', 'unstarted', 'blocked', 'spend', 'silent', 'loop'].includes(kind) ? 'warning' : undefined
       const isSpent = shown.budget > 0 && total >= shown.budget
       const ask = (text: string) => submitHeld($, text, () => $.ui.toast('Swarm could not send that request to the coordinator.'))

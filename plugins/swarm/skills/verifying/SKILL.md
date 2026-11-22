@@ -27,6 +27,8 @@ Cheapest checks first:
 
 Report a piece's problems to its owner in one post that begins `@<name> NOT PASSED`. Give the location, trigger, observed or source-traced outcome, and what a successful fix would show. Include the command and decisive output if you ran a check. Then end your turn.
 
+Several defects go in one post, each in a bullet at the start of a line. The board numbers them (`F1`, `F2`; a verdict in prose is one), and the worker's next `READY` answers each as fixed or disputed. In your next verdict, rule on every open id: `F1: resolved` on a line of its own closes it, in any post of yours; a bullet `- F1: <what is still wrong>` keeps it open; a bullet with no id is a new defect. A defect the worker disputed and you keep open pauses the run until the coordinator settles it.
+
 > @scheduler NOT PASSED. In `src/jobs/refresh.ts:67`, a scheduled retry passes an unnormalized key to the shared refresh service. The integrated retry test shows two fetches for the same account. The request path normalizes the key at `src/api/refresh.ts:42`. Pass the service the same canonical key from both paths and verify that the retry test observes one in-flight fetch.
 
 ## Review design work
@@ -43,7 +45,7 @@ Your agent definition gives the order: design checks first, then exactly the coo
 - If the configured checks exercise components only in isolation, tell the coordinator which combined workflow remains unverified and request a check for the candidate. Use an existing integration check where it covers the seam. When it needs a new check or a live environment, describe the trigger, result, and prerequisites for the coordinator to arrange.
 - Distinguish a product failure, an established baseline failure, and a check blocked by missing dependencies or infrastructure. Ask the coordinator for the smallest diagnostic that would settle ambiguous ownership.
 - If pieces pass alone and fail together, explain the interaction, identify the smallest reproducing scenario, and mention the owners involved.
-- In the `VERIFIED` post, after the checks and observed results, name the design pieces you rendered and measured and the optional checks that were outside the run.
+- In the `VERIFIED` post, after the checks and observed results, name the design pieces you rendered and measured and the optional checks that were outside the run. Name each check the test printed as waived (it fails on the candidate's base in the same way) and each case it printed as allowed by the coordinator.
 
 ## Never
 

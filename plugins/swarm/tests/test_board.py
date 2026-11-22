@@ -1754,7 +1754,7 @@ class BoardRegressions(unittest.TestCase):
         run(d, "member", "v", "killed=1")  # said twice changes nothing
         for change in ("role=worker", "owns=x", "id=late", "model=opus", "depends=base"):
             run(d, "member", "v", change, ok=False)
-        assert saved(d)["members"]["v"] == {"role": "verifier", "last_read_seq": 0, "killed": "1"}
+        assert saved(d)["members"]["v"] == {"role": "verifier", "last_read_seq": 0, "killed": "1", "retired_at": 1}
         run(d, "member", "w", "killed=1")
         assert json.loads(run(d, "attention", "--json"))["members"]["w"]["blocked_on"] == []
 
@@ -2812,7 +2812,8 @@ class BoardRegressions(unittest.TestCase):
             run(d, "member", who, *extra)
 
         def ready(who, revision, cwd=None):
-            r = subprocess.run([sys.executable, BOARD, d, "ready", who, revision], input="done", capture_output=True,
+            report = "done\n" + "\n".join("F%d: fixed — the commit holds it" % n for n in range(1, 9))
+            r = subprocess.run([sys.executable, BOARD, d, "ready", who, revision], input=report, capture_output=True,
                                text=True, cwd=cwd)
             assert r.returncode == 0 and r.stdout.startswith("posted #"), r.stderr
             return int(r.stdout.split()[1][1:])
@@ -2878,6 +2879,317 @@ class BoardRegressions(unittest.TestCase):
         git("merge", "-q", "--no-ff", "--no-edit", refix)
         assert own(again) == {"w1.txt", "w2.txt", "w3.txt"}
         assert own(ready("w", refix)) == {"w1.txt", "w2.txt", "w3.txt", "w4.txt"}
+
+
+class FindingLedger(unittest.TestCase):
+    """A verifier's defects get ids from the board, the worker answers each, and only the verifier closes one."""
+
+    def _run(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        d = run(os.path.join(temp.name, ".swarm", "led"), "init", "Ledger").strip()
+        run(d, "member", "w")
+        run(d, "member", "v", "role=verifier")
+        run(d, "ready", "w", stdin="done")
+        return d
+
+    def _post(self, d, seq):
+        return json.loads(run(d, "show", "--post=%d" % seq, "--json"))
+
+    def test_each_defect_gets_an_id_and_the_worker_must_answer_it(self):
+        d = self._run()
+        out = run(d, "post", "v", stdin="@w NOT PASSED\n- the retry sends two fetches\n  - seen in the retry test\n"
+                                        "- F9: the key is not normalised\n")
+        assert "recorded: F1, F2" in out, out
+        post = self._post(d, 2)
+        assert post["findings"] == ["F1", "F2"] and post["text"].split("\n")[1:] == [
+            "- F1: the retry sends two fetches", "  - seen in the retry test", "- F2: the key is not normalised"], post
+        # A report that passes over an open id, or answers one with no evidence, is refused in the same step.
+        for report in ("fixed both", "F1: fixed — src/retry.py:4, the retry test passes", "F1: fixed — a.py:1\nF2: disputed"):
+            refused = subprocess.run([sys.executable, BOARD, d, "ready", "w"], input=report, capture_output=True, text=True)
+            assert refused.returncode and "F2" in refused.stderr and "Nothing was posted" in refused.stderr, refused.stderr
+        run(d, "ready", "w", stdin="F1: fixed — src/retry.py:4, the retry test passes\nF2: disputed — api.py:42 normalises it")
+        # The next verdict rules by id: one closed, one raised again, one new. Only the open ones are owed an answer.
+        out = run(d, "post", "v", stdin="@w NOT PASSED\n- F1: resolved\n- F2: the job path skips api.py:42\n- a third defect\n")
+        assert "recorded: F3" in out, out
+        refused = subprocess.run([sys.executable, BOARD, d, "ready", "w"], input="F3: fixed — c.py:9", capture_output=True, text=True)
+        assert refused.returncode and "unanswered: F2 (the job path skips api.py:42)." in refused.stderr, refused.stderr
+
+    def test_a_verdict_in_prose_is_one_finding_and_a_pass_closes_all(self):
+        d = self._run()
+        assert "recorded: F1" in run(d, "post", "v", "@w NOT PASSED. In src/jobs.py:67 the retry passes a raw key.")
+        assert self._post(d, 2)["text"] == "@w NOT PASSED [F1]. In src/jobs.py:67 the retry passes a raw key."
+        run(d, "ready", "w", stdin="F1: fixed — src/jobs.py:67 now calls canonical()")
+        # A verdict that only rules on a known id raises nothing new, and "fixed" is the worker's word: it closes nothing.
+        out = run(d, "post", "v", "@w NOT PASSED. F1: not fixed — the retry test still sees two fetches")
+        assert "recorded" not in out and "findings" not in self._post(d, 4), out
+        run(d, "post", "v", "@coordinator the worker says F1: fixed")
+        refused = subprocess.run([sys.executable, BOARD, d, "ready", "w"], input="again", capture_output=True, text=True)
+        assert refused.returncode and "F1" in refused.stderr
+        run(d, "post", "v", "@w checked again\nF1: resolved — the retry test passes now")  # any post of the verifier's closes
+        run(d, "ready", "w", stdin="nothing left")
+        # A verdict that closes an old id and says what else is wrong raises that as a new one.
+        out = run(d, "post", "v", stdin="@w NOT PASSED: the save now loses data\nF1: resolved")
+        assert "recorded: F2" in out, out
+        # An answer quoted in a pasted log is no answer.
+        quoted = "see the log\n```\nF2: fixed — old run passed\n```"
+        refused = subprocess.run([sys.executable, BOARD, d, "ready", "w"], input=quoted, capture_output=True, text=True)
+        assert refused.returncode and "F2 (the save now loses data)" in refused.stderr, refused.stderr
+
+    def test_a_dispute_the_verifier_keeps_open_pauses_the_run(self):
+        d = self._run()
+        run(d, "post", "v", "@w NOT PASSED. The handler swallows the error.")
+        run(d, "ready", "w", stdin="F1: disputed — handler.py:30 logs and re-raises it")
+        out = run(d, "post", "v", "@w NOT PASSED [F1]. It is swallowed on the retry path, handler.py:52.")
+        assert "paused: @w disputes F1 and @v keeps it open" in out and saved(d)["paused"] == "@w disputes F1 and @v keeps it open", out
+        item = [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "dispute"]
+        assert len(item) == 1 and item[0]["member"] == "w" and "F1" in item[0]["text"] and "consultant" in item[0]["text"], item
+        # Settled by the verifier's ruling, the dispute is gone; a fix kept open is rework, no dispute.
+        run(d, "resume")
+        # Once the worker gives in and fixes it, nobody disputes anything: the next review says where it stands.
+        run(d, "ready", "w", stdin="F1: fixed — handler.py:52 re-raises on the retry path too")
+        assert not [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "dispute"]
+        run(d, "ready", "w", stdin="F1: disputed — on second thought it re-raises already, handler.py:52")
+        assert not [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "dispute"]
+        # A third NOT PASSED in a row pauses for that reason, as before; the dispute it also keeps open is listed.
+        assert "paused: @w failed verification 3 times in a row" in run(d, "post", "v", "@w NOT PASSED [F1]. Swallowed: see the log.")
+        run(d, "resume")
+        run(d, "post", "v", "@w F1: resolved — a ruling shares its line with nothing")
+        assert [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "dispute"]
+        run(d, "post", "v", "@w settled\nF1: resolved — the coordinator showed the retry path re-raises")
+        assert not [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "dispute"]
+        d = self._run()
+        run(d, "post", "v", "@w NOT PASSED. The handler swallows the error.")
+        run(d, "ready", "w", stdin="F1: fixed — handler.py:30 re-raises")
+        assert "paused" not in run(d, "post", "v", "@w NOT PASSED [F1]. Still swallowed on the retry path.")
+        # Silence is no ruling: a verdict that raises only something else keeps no dispute open.
+        d = self._run()
+        run(d, "post", "v", "@w NOT PASSED. The handler swallows the error.")
+        run(d, "ready", "w", stdin="F1: disputed — handler.py:30 logs and re-raises it")
+        out = run(d, "post", "v", stdin="@w NOT PASSED\n- the retry path leaks a handle")
+        assert "recorded: F2" in out and "paused" not in out, out
+        assert not [i for i in self._items(d) if i["kind"] != "rework"], self._items(d)
+        # Two owners of one finding answer each for itself: one that fixed its part settles no dispute of the other's.
+        d = self._run()
+        run(d, "member", "x")
+        run(d, "ready", "x", stdin="done")
+        run(d, "post", "v", "@w @x NOT PASSED. The seam between them drops the key.")
+        run(d, "ready", "w", stdin="F1: disputed — w.py:9 passes the key on")
+        run(d, "ready", "x", stdin="F1: fixed — x.py:3 reads it now")
+        # A verdict about one owner leaves the other's answer to be judged, and names who disputes.
+        assert "paused" not in run(d, "post", "v", "@x NOT PASSED [F1]. x.py:3 reads the wrong key.")
+        out = run(d, "post", "v", "@w NOT PASSED [F1]. w.py:9 passes None.")
+        assert "paused: @w disputes F1 and @v keeps it open" in out, out
+        item = [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "dispute"]
+        assert [i["member"] for i in item] == ["w"] and "tell @w to fix it" in item[0]["text"], item
+
+    def test_quoted_output_raises_nothing_and_a_successor_inherits_the_findings(self):
+        d = self._run()
+        out = run(d, "post", "v", stdin="@w NOT PASSED\n- the retry sends two fetches\n```\n- FAILED test_retry\nF7: resolved\n"
+                                        "- 2 fetches\n```\n    - an indented trace line\n- the key is raw\n")
+        assert "recorded: F1, F2" in out and "F3" not in out, out
+        assert self._post(d, 2)["text"].count(": ") == 3 and "- FAILED test_retry" in self._post(d, 2)["text"]
+        # A shorter fence inside a longer one closes nothing: the ruling after it is still quoted output.
+        run(d, "post", "v", "@w a log\n````\n```\nF1: resolved\n````")
+        refused = subprocess.run([sys.executable, BOARD, d, "ready", "w"], input="F2: fixed — api.py:42", capture_output=True, text=True)
+        assert refused.returncode and "unanswered: F1 (" in refused.stderr, refused.stderr
+        # The stronger model that takes the work over takes its defects too, and its brief lists them.
+        run(d, "replace", "w", "w2", "model=opus")
+        brief = self._post(d, 4)["text"]
+        assert "open findings on this work are yours" in brief and "- F1 (#2): the retry sends two fetches" in brief \
+            and "- F2 (#2): the key is raw" in brief, brief
+        refused = subprocess.run([sys.executable, BOARD, d, "ready", "w2"], input="all done", capture_output=True, text=True)
+        assert refused.returncode and "F1 (the retry sends two fetches); F2 (the key is raw)" in refused.stderr, refused.stderr
+        run(d, "ready", "w2", stdin="F1: fixed — retry.py:4\nF2: fixed — api.py:42")
+        # Retired with no successor, a member takes its findings with it.
+        run(d, "post", "v", "@w2 NOT PASSED. Still two fetches.")
+        run(d, "member", "w2", "killed=1")
+        assert not [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "dispute"]
+
+    def test_a_role_change_erases_no_finding_and_a_second_verdict_can_rule_first(self):
+        d = self._run()
+        run(d, "post", "v", "@w NOT PASSED. The handler swallows the error.")
+        run(d, "member", "v", "role=worker")  # the verdict was a verifier's when it was written
+        refused = subprocess.run([sys.executable, BOARD, d, "ready", "w"], input="done", capture_output=True, text=True)
+        assert refused.returncode and "unanswered: F1 (" in refused.stderr, refused.stderr
+        # Its ruling stays a verifier's too, and a worker's own closes nothing.
+        d = self._run()
+        run(d, "post", "v", "@w NOT PASSED. The handler swallows the error.")
+        run(d, "post", "w", "@v it is fine\nF1: resolved")
+        run(d, "member", "x")
+        run(d, "post", "x", "@v agreed\nF1: resolved")
+        refused = subprocess.run([sys.executable, BOARD, d, "ready", "w"], input="done", capture_output=True, text=True)
+        assert refused.returncode and "unanswered: F1 (" in refused.stderr, refused.stderr
+        run(d, "post", "v", "@w checked\nF1: resolved")
+        run(d, "member", "v", "role=worker")
+        run(d, "ready", "w", stdin="done")
+        # Two verdicts on one candidate are one review, but the first of them to rule on an answer is the ruling on it.
+        d = self._run()
+        run(d, "post", "v", "@w NOT PASSED. The handler swallows the error.")
+        run(d, "ready", "w", stdin="F1: disputed — handler.py:30 logs and re-raises it")
+        with open(os.path.join(d, "verification.json"), "w") as f:
+            json.dump({"candidate": "c" * 16, "inputs": {"w": [3, None]}}, f)
+        out = run(d, "post", "v", stdin="@w NOT PASSED\n- the retry path leaks a handle")
+        assert "recorded: F2" in out and "paused" not in out, out
+        out = run(d, "post", "v", "@w NOT PASSED [F1]. It is swallowed on the retry path, handler.py:52.")
+        assert "paused: @w disputes F1 and @v keeps it open" in out and self._post(d, 5)["candidate"] == self._post(d, 4)["candidate"], out
+
+    def test_a_late_verdict_on_a_replaced_candidate_rules_on_nothing(self):
+        d = self._run()
+        run(d, "post", "v", "@w NOT PASSED. The handler swallows the error.")
+        run(d, "ready", "w", stdin="F1: fixed — handler.py:30 re-raises")
+        old, new = "a" * 16, "c" * 16
+        with open(os.path.join(d, "verification.json"), "w") as f:
+            json.dump({"candidate": new, "inputs": {"w": [3, None]},
+                       "superseded": [{"candidate": old, "inputs": {"w": [1, None]}}]}, f)
+        # It reviewed the report the new candidate replaced: it raises no finding, closes none and pauses nothing.
+        out = run(d, "post", "v", stdin="@w NOT PASSED %s\n- a defect of the old work\nF1: resolved" % old)
+        post = self._post(d, 4)
+        assert "recorded:" not in out and "paused" not in out and post["rejects"] == [] and "findings" not in post, (out, post)
+        assert "- a defect of the old work" in post["text"] and not self._items(d)
+        refused = subprocess.run([sys.executable, BOARD, d, "ready", "w"], input="more", capture_output=True, text=True)
+        assert refused.returncode and "unanswered: F1 (" in refused.stderr and "F2" not in refused.stderr, refused.stderr
+
+    def _items(self, d):
+        return [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] in ("dispute", "rework", "paused")]
+
+    def test_the_answer_and_ruling_rules_read_the_shapes_they_were_written_for(self):
+        sys.path.insert(0, os.path.dirname(BOARD))
+        try:
+            import board
+            assert board.rulings_in("F9999: resolved\nF10000: open") == {"F9999": "resolved", "F10000": "open"}
+            assert board.answers_in("F10000: fixed — a.py:1", {"F10000"}) == {"F10000": ("fixed", "a.py:1")}
+            assert board.tag_findings("@w NOT PASSED\n- F10000: again\n- new", {"F10000"}, 10001)[1] == ["F10001"]
+            assert board.rulings_in("F1: resolved\n- [F2] closed — test passes\nF3: verified the bug still reproduces\n"
+                                    "F4: resolved\nwe think F4: still open\nF5 score is low\nprev-F6: resolved") == {
+                "F1": "resolved", "F2": "resolved", "F4": "open"}
+            assert board.answers_in("F1: fixed — a.py:3 F2: disputed - t.py:9 asserts it\n[F3] — fixed\nF4: fixed: b.py\n"
+                                    "F4: disputed: no\nF7: fixed — x", {"F1", "F2", "F3", "F4"}) == {
+                "F1": ("fixed", "a.py:3"), "F2": ("disputed", "t.py:9 asserts it")}
+        finally:
+            sys.path.remove(os.path.dirname(BOARD))
+
+
+class SoftDependencies(unittest.TestCase):
+    """after= waits for a member to finish, with a report or without one; depends= needs the report."""
+
+    def test_a_retired_members_rejected_commit_rides_in_on_nobodys(self):
+        with tempfile.TemporaryDirectory() as t:
+            project = os.path.realpath(t)
+            env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+
+            def git(*args):
+                return subprocess.run(["git", "-C", project, *args], check=True, capture_output=True, text=True, env=env).stdout.strip()
+
+            def commit(branch, start, name):
+                git("switch", "-q", "-C", branch, start)
+                with open(os.path.join(project, name), "w") as f:
+                    f.write(name + "\n")
+                git("add", "--", name)
+                git("commit", "-q", "-m", "add " + name)
+                revision = git("rev-parse", "HEAD")
+                git("switch", "-q", "main")
+                return revision
+
+            def ready(who, revision):
+                return subprocess.run([sys.executable, BOARD, d, "ready", who, revision], input="done", capture_output=True, text=True)
+            git("init", "-q", "-b", "main")
+            for setting in (("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")):
+                git("config", *setting)
+            git("commit", "-q", "--allow-empty", "-m", "init")
+            d = run(os.path.join(project, ".swarm", "ride"), "init", "Ride").strip()
+            for who, extra in (("a", []), ("b", ["after=a"]), ("v", ["role=verifier"])):
+                run(d, "member", who, *extra)
+            first = commit("a", "main", "a.txt")
+            assert ready("a", first).returncode == 0
+            built = commit("b", "a", "b.txt")  # on top of a's work
+            assert ready("b", built).returncode == 0
+            run(d, "post", "v", "@a NOT PASSED. a.txt is wrong.")
+            run(d, "member", "a", "killed=1")
+            refused = ready("b", built)
+            assert refused.returncode and "still holds @a's commit %s" % first[:12] in refused.stderr, refused.stderr
+            # `sync` says so first, in either form, from the worktree the member would otherwise go on building in.
+            tree = os.path.join(project, "b-tree")
+            git("worktree", "add", "-q", "--detach", tree, built)
+            for form in ([], ["--check-only"]):
+                synced = subprocess.run([sys.executable, BOARD, d, "sync", "b", *form], capture_output=True, text=True, cwd=tree)
+                assert synced.returncode and "HEAD still holds @a's commit %s" % first[:12] in synced.stderr \
+                    and "in sync" not in synced.stdout, (form, synced.stdout, synced.stderr)
+            git("-C", tree, "switch", "-q", "--detach", "main")
+            clean = subprocess.run([sys.executable, BOARD, d, "sync", "b", "--check-only"], capture_output=True, text=True, cwd=tree)
+            assert clean.returncode == 0 and "in sync" in clean.stdout, (clean.stdout, clean.stderr)
+            git("worktree", "remove", "--force", tree)
+            rebuilt = commit("b2", "main", "b.txt")
+            assert ready("b", rebuilt).returncode == 0, ready("b", rebuilt).stderr
+            # Work that stood when its member was retired stays: the dependent built on a passed report.
+            for who, extra in (("c", []), ("e", ["after=c"])):
+                run(d, "member", who, *extra)
+            assert ready("c", commit("c", "main", "c.txt")).returncode == 0
+            good = commit("c", "c", "c2.txt")  # a follow-up on its own first report: both are the work that stood
+            assert ready("c", good).returncode == 0
+            on_it = commit("e", "c", "e.txt")
+            assert ready("e", on_it).returncode == 0
+            run(d, "member", "c", "killed=1")
+            again = ready("e", on_it)
+            assert again.returncode == 0, again.stderr
+            # A report that stopped counting because what it was built on was rejected did not stand either.
+            for who, extra in (("p", []), ("q", ["depends=p"]), ("r", ["after=q"])):
+                run(d, "member", who, *extra)
+            assert ready("p", commit("p", "main", "p.txt")).returncode == 0
+            middle = commit("q", "p", "q.txt")
+            assert ready("q", middle).returncode == 0
+            top = commit("r", "q", "r.txt")
+            assert ready("r", top).returncode == 0
+            run(d, "post", "v", "@p NOT PASSED. p.txt is wrong.")
+            run(d, "member", "q", "killed=1")
+            refused = ready("r", top)
+            assert refused.returncode and "still holds @q's commit %s" % middle[:12] in refused.stderr, refused.stderr
+            # A replacement adds to what its predecessor came after, and is asked only about the names it is given.
+            run(d, "member", "s", "after=e")
+            run(d, "member", "e", "killed=1")
+            run(d, "replace", "s", "s2", "after=r")
+            assert saved(d)["members"]["s2"]["after"] == "e,r" and saved(d)["members"]["s2"]["depends"] == "e,r"
+            run(d, "replace", "v", "v2", "after=r", ok=False)  # a verifier waits for no member, however it is put
+
+    def test_a_fan_in_goes_on_when_a_member_it_comes_after_is_retired(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = run(os.path.join(t, ".swarm", "soft"), "init", "Fan-in").strip()
+            for name in ("a", "b", "c"):
+                run(d, "member", name)
+            run(d, "member", "synth", "depends=c", "after=a,b")
+            run(d, "member", "hard", "depends=a")
+            assert saved(d)["members"]["synth"]["depends"] == "c,a,b" and saved(d)["members"]["synth"]["after"] == "a,b"
+            run(d, "member", "a", "after=synth", ok=False)  # still an edge: a cycle is one
+            run(d, "ready", "c", stdin="c done")
+            run(d, "ready", "a", stdin="a done")
+            assert "waiting for b" in subprocess.run([sys.executable, BOARD, d, "ready", "synth"], input="x",
+                                                     capture_output=True, text=True).stderr
+            view = json.loads(run(d, "attention", "--json"))
+            assert view["members"]["synth"]["blocked_on"] == ["b"], view["members"]["synth"]
+            # Retiring the last one it came after starts it, and says what is missing; nothing lists it as blocked.
+            out = run(d, "member", "b", "killed=1")
+            post = json.loads(run(d, "show", "--post=%d" % int(out.split()[1][1:]), "--json"))
+            assert post["to"] == ["synth"] and "@b was retired and reports nothing" in post["text"], post
+            view = json.loads(run(d, "attention", "--json"))
+            assert not [i for i in view["items"] if i["kind"] == "blocked" and i["member"] == "synth"]
+            run(d, "ready", "synth", stdin="from a and c; b is missing")
+            # A report it needs is another matter: retiring that member leaves the waiter blocked, as before.
+            out = run(d, "member", "a", "killed=1")
+            view = json.loads(run(d, "attention", "--json"))
+            assert [i["member"] for i in view["items"] if i["kind"] == "blocked"] == ["hard"], view["items"]
+            # A report made before the retirement was built on the retired member's work: it stands no longer, and
+            # the member is told to go on and report anew.
+            assert view["members"]["synth"]["ready"] is False, view["members"]["synth"]
+            assert "@a was retired" in json.loads(run(d, "show", "--post=%d" % int(out.split()[1][1:]), "--json"))["text"]
+            run(d, "ready", "synth", stdin="from c alone; a and b are missing")
+            assert json.loads(run(d, "attention", "--json"))["members"]["synth"]["ready"] is True
+            # A successor takes the place in after= too, and depends= given alone keeps after= within it.
+            run(d, "member", "x")
+            run(d, "member", "late", "after=x")
+            run(d, "replace", "x", "y")
+            assert saved(d)["members"]["late"]["after"] == "y" and saved(d)["members"]["late"]["depends"] == "y"
+            run(d, "member", "late", "depends=")
+            assert "after" not in saved(d)["members"]["late"]
 
 
 if __name__ == "__main__":

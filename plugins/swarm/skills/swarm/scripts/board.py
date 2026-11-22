@@ -2,10 +2,10 @@
 """Shared message board for a swarm: numbered posts, @mentions, unread cursors.
 
 usage: board.py DIR init TITLE                    prints the run folder it created; use that as DIR from then on
-       board.py DIR member NAME [key=value ...]   add or update (role= profile= writes= consult= group= depends= owns= paths= model= effort= id= backend= isolated= budget=<tokens> killed=1)
+       board.py DIR member NAME [key=value ...]   add or update (role= profile= writes= consult= group= depends= after= owns= paths= model= effort= id= backend= isolated= budget=<tokens> killed=1)
        board.py DIR limit [key=value ...]         set run limits: max_workers= max_members= budget=<tokens> member_budget=<tokens> <model>=<types>
        board.py DIR plan                          the team as a table: type, model, effort, dependencies, ownership
-       board.py DIR attention [--json]            what needs someone: a paused run or member, unread posts, unanswered questions, findings to review, rework, heavy spend, loops, unstarted, unreachable, ignoring or blocked members, stale verification, conflicting commits
+       board.py DIR attention [--json]            what needs someone: a paused run or member, unread posts, unanswered questions, findings to review, rework, disputed findings, heavy spend, loops, unstarted, unreachable, ignoring or blocked members, stale verification, conflicting commits
        board.py DIR retry NAME                    let delivery try an unreachable or unresponsive member again
        board.py DIR replace OLD NEW [key=value ...]  retire OLD and register NEW with its brief, dependencies and history
        board.py DIR post FROM [TEXT]              TEXT from stdin when omitted; @all, @group, @verifiers and @dependents (of FROM) reach several
@@ -263,6 +263,66 @@ def dependencies(member):
     return list(dict.fromkeys(member["depends"].split(","))) if member.get("depends") else []
 
 
+def soft(member):
+    """The dependencies MEMBER only comes after (after=): it waits for each to finish, with a report or without one."""
+    return set(member["after"].split(",")) & set(dependencies(member)) if member.get("after") else set()
+
+
+def unmet(member, members, ready, reported=None):
+    """The dependencies MEMBER still waits for. One it needs (depends=) must be READY. One it only comes after (after=)
+    is also done once its member was retired with no successor: a fan-in then goes on with the reports there are.
+    REPORTED is the post number of MEMBER's own READY, when that is what is being judged: a report made before the
+    retirement was built on the retired member's work, a rejected commit perhaps, and does not stand again.
+    Ported from the `after` edges of Deuz-SDK's swarm scheduler (MIT, Copyright (c) 2026 Umutcan Edizaslan)."""
+    after = soft(member)
+
+    def gone(dep):
+        retired = members.get(dep, {})
+        return dep in after and retired.get("killed") and (reported is None or reported > retired.get("retired_at", 0))
+    return [dep for dep in dependencies(member) if dep not in ready and not gone(dep)]
+
+
+def withdrawn_commits(name, members, posts):
+    """(the commits retired @NAME reported other than the one that counted as READY when it was retired, that one or
+    None). The roster records it at retirement, from readiness as it then was: a report withdrawn by a NOT PASSED, a
+    revise or a dependency that stopped counting did not stand."""
+    stood = members.get(name, {}).get("stood")
+    commits = [post["revision"] for post in posts
+               if post.get("kind") == "ready" and post.get("subject", post["agent"]) == name and post.get("revision")]
+    return [commit for commit in dict.fromkeys(commits) if commit != stood], stood
+
+
+def carried(git, repo, member, members, posts, revision):
+    """(the retired member, its commit) for the first commit REVISION still holds that had not passed when a member
+    MEMBER came after was retired, or None. What a retired member left unpassed must not ride into the candidate on the
+    commit of a member that came after it: the report is waived by the retirement, the work is not. GIT is verify.git,
+    asked only when such a member has in fact been retired."""
+    def within(commit, tip):
+        return git(repo, "merge-base", "--is-ancestor", commit, tip, optional=True) is not None
+    for dep in sorted(soft(member)):
+        if members.get(dep, {}).get("killed"):
+            left_behind, stood = withdrawn_commits(dep, members, posts)
+            for left in left_behind:
+                # An earlier step of the work that stood is part of it.
+                if within(left, revision) and not (stood and within(left, stood)):
+                    return dep, left
+    return None
+
+
+def merge_after(member, changes, before=""):
+    """Fold an after= given in CHANGES into MEMBER's dependencies, and keep after= within them. A nonempty after= adds
+    to BEFORE, what the member came after until now; an empty one clears it."""
+    if changes.get("after"):
+        member["after"] = ",".join(dict.fromkeys(filter(None, [*before.split(","), *changes["after"].split(",")])))
+    if "after" in changes:
+        member["depends"] = ",".join(dict.fromkeys([*dependencies(member), *filter(None, changes["after"].split(","))]))
+        changes["depends"] = member["depends"]
+    if member.get("after") is not None:
+        member["after"] = ",".join(dep for dep in dict.fromkeys(member["after"].split(",")) if dep in dependencies(member))
+        if not member["after"]:
+            del member["after"]
+
+
 def cyclic(members):
     """An active member that waits, through its dependencies, for itself; None when nobody does."""
     for start, member in members.items():
@@ -312,7 +372,7 @@ def readiness(members, posts):
         # A NOT PASSED withdraws the report it answers: the fix is on the record only once the worker reports again.
         if (post["kind"] == "ready" and member.get("role") == "worker" and not member.get("killed")
                 and refused.get(name, 0) < post["seq"]
-                and all(dep in ready for dep in dependencies(member))):
+                and not unmet(member, members, ready, post["seq"])):
             ready[name] = post
     return ready
 
@@ -325,7 +385,7 @@ READ_ONLY = {"explorer", "investigator", "architect"}
 PROFILES = {*READ_ONLY, "designer"}
 FAMILIES = ("haiku", "sonnet", "opus", "fable")
 LIMITS = {"max_workers", "max_members", "budget", "member_budget", *FAMILIES}
-INHERITED = ("role", "group", "profile", "writes", "depends", "owns", "paths", "model", "effort", "consult")
+INHERITED = ("role", "group", "profile", "writes", "depends", "after", "owns", "paths", "model", "effort", "consult")
 MEMBER_FIELDS = {*INHERITED, "backend", "id", "killed", "isolated", "budget"}
 RESERVED = {"all", "verifiers", "dependents"}  # mentions that reach several members, so no member or group takes them
 
@@ -782,7 +842,7 @@ def runnable(name, members, posts, ready):
     a verifier once every non-consultant worker is, or once a post after its brief asks it for an early review."""
     member = members[name]
     if member.get("role") != "verifier":
-        return all(dep in ready for dep in dependencies(member))
+        return not unmet(member, members, ready)
     if all(n in ready for n, e in team_of(members).items() if e.get("role") == "worker" and e.get("consult") != "1"):
         return True
 
@@ -825,6 +885,219 @@ def rework(state, posts):
     return failed
 
 
+# The finding ledger. Every defect a verifier's NOT PASSED raises gets an id from the board, the worker answers each id
+# in its next READY, and only the verifier closes one. Ported from OpenSwarm's findingLedger.ts (MIT, Copyright (c) 2026
+# Heewon Oh) onto the board's record: the ledger is worked out from the posts and never stored, so a replay changes
+# nothing. Ids come from the board, never from a model: a verifier rewords a defect from round to round, so neither a
+# label of its own nor a hash of the text would stay stable.
+FINDING_ID = r"(?<![\w-])(F\d+)\b"
+BULLET = re.compile(r"(?:[-*]|\d+[.)])[ \t]+")  # at the start of a line only: an indented item is detail of the one above
+# `F<n>:` or `[F<n>]` only: "F1 score is low" is prose, no tag.
+ID_TAG = re.compile(r"\s*(?:\[%s\]\s*(?:[:\-—–]\s*)?|%s\s*:\s*)" % (FINDING_ID, FINDING_ID), re.I | re.A)
+CLOSE_WORDS, OPEN_WORDS = "resolved|closed|verified", "still open|open|unresolved|not fixed"
+# A line that is essentially `F<n>: <ruling>`, bulleted or not. After the ruling word comes nothing, or ` — reason`,
+# ` - reason` or `: reason`: "verified the bug still reproduces" and "closed-form estimate" are prose, no rulings.
+RULING_LINE = re.compile(
+    r"^[ \t]*(?:[-*][ \t]*)?(?:\[%s\][ \t]*[:\-—–]?|%s[ \t]*[:\-—–])[ \t]*(%s|%s)[.!]?(?:[ \t]*(?:—|–|:)[ \t]*\S.*|[ \t]+-[ \t]+\S.*)?[ \t]*$"
+    % (FINDING_ID, FINDING_ID, CLOSE_WORDS, OPEN_WORDS), re.I | re.M | re.A)
+# An `open` ruling anywhere in the text. Loose on purpose: it can only keep an id open, never close one.
+LOOSE_OPEN = re.compile(r"%s\]?[ \t]*[:\-—–][ \t]*(?:%s)\b" % (FINDING_ID, OPEN_WORDS), re.I | re.A)
+# One answer: `F<n>: fixed|disputed — evidence`. The evidence runs to the end of the line or to the next answer.
+RESPONSE_LINE = re.compile(
+    r"\[?%s\]?[ \t]*[:\-—–][ \t]*(fixed|disputed)\b[ \t]*(?:[:\-—–][ \t]*)?([^\n]*?)"
+    r"(?=[ \t]+(?:[-*][ \t]*)?\[?F\d+\]?[ \t]*[:\-—–][ \t]*(?:fixed|disputed)\b|[ \t]*$)" % FINDING_ID, re.I | re.M | re.A)
+DISPUTE_PAUSE = 1  # reviews in a row that keep open what the worker disputed, before the run is paused
+
+
+def fenced(lines):
+    """The indexes of LINES inside a fenced code block, the fence lines included: a pasted log or traceback there is
+    quoted output, and no line of it raises, answers or rules on a finding."""
+    opened, found = None, set()
+    for index, line in enumerate(lines):
+        mark = re.match(r"[ \t]*(`{3,}|~{3,})(.*)", line)
+        if opened is None:
+            if mark:
+                opened = mark[1]
+                found.add(index)
+            continue
+        found.add(index)
+        # Only a fence of the opener's own mark, at least as long and with nothing after it, closes the block: a
+        # shorter one inside a longer is part of what is quoted.
+        if mark and mark[1][0] == opened[0] and len(mark[1]) >= len(opened) and not mark[2].strip():
+            opened = None
+    return found
+
+
+def unfenced(text):
+    lines = text.split("\n")
+    quoted = fenced(lines)
+    return "\n".join("" if index in quoted else line for index, line in enumerate(lines))
+
+
+def rulings_in(text):
+    """{id: "resolved" or "open"} as a verifier's text rules. `F2: resolved` (or closed, verified) closes, only as a whole
+    line; `F2: open`, `still open` or `not fixed` keeps open, read anywhere. "fixed" closes nothing: it is the worker's
+    word, and a verifier quoting the worker must not close an id. Where an id carries both, open wins."""
+    rulings, text = {}, unfenced(text)
+    for match in RULING_LINE.finditer(text):
+        name = (match[1] or match[2]).upper()
+        if rulings.get(name) != "open":
+            rulings[name] = "resolved" if match[3].lower() in CLOSE_WORDS.split("|") else "open"
+    for match in LOOSE_OPEN.finditer(text):
+        rulings[match[1].upper()] = "open"
+    return rulings
+
+
+def answers_in(text, known):
+    """{id: (fixed or disputed, the evidence)} for the ids in KNOWN that a worker's report answers. An answer with no
+    evidence is none, and neither are two different answers to one id, since neither can be trusted."""
+    seen, conflicted = {}, set()
+    for match in RESPONSE_LINE.finditer(unfenced(text)):
+        name, evidence = match[1].upper(), match[3].strip()
+        if name not in known:
+            continue
+        answer = (match[2].lower(), evidence) if evidence else None
+        if name in seen and seen[name] != answer:
+            conflicted.add(name)
+        seen[name] = answer
+    return {name: answer for name, answer in seen.items() if answer and name not in conflicted}
+
+
+def tagged(text):
+    """[(the id a NOT PASSED puts on a defect, the defect's text)]: an id on a bullet, or one in brackets right after
+    the verdict word for a verdict that is one defect in prose."""
+    lines, found = unfenced(text).split("\n"), []
+    for line in lines:
+        mark = BULLET.match(line)
+        tag = mark and not RULING_LINE.fullmatch(line) and ID_TAG.match(line, mark.end())
+        if tag:
+            found.append(((tag[1] or tag[2]).upper(), line[tag.end():].strip()))
+    word = REPORT_WORD.match(lines[0])
+    whole = word and re.match(r"[ \t]*\[(F\d+)\]", lines[0][word.end():], re.I | re.A)
+    if whole:
+        found.append((whole[1].upper(), re.sub(r"^[ \t.:,-]+", "", lines[0][word.end() + whole.end():]).strip()))
+    return found
+
+
+def tag_findings(text, known, number):
+    """(TEXT with an id on each defect a NOT PASSED raises, the ids given), counting on from NUMBER. A defect is a
+    bullet at the start of a line; a verdict with none is one defect in prose, unless it only rules on ids in KNOWN.
+    A bullet that carries a known id raises that defect again, and an id the board never gave is replaced."""
+    lines, given = text.split("\n"), []
+
+    def fresh():
+        given.append("F%d" % (number + len(given)))
+        return given[-1]
+    bullets, quoted = False, fenced(lines)
+    for index, line in enumerate(lines):
+        mark = BULLET.match(line)
+        if not mark or index in quoted:
+            continue
+        bullets = True
+        if RULING_LINE.fullmatch(line):
+            continue
+        tag = ID_TAG.match(line, mark.end())
+        if tag and (tag[1] or tag[2]).upper() in known:
+            continue
+        lines[index] = "%s%s: %s" % (line[:mark.end()], fresh(), line[tag.end() if tag else mark.end():])
+    word = REPORT_WORD.match(lines[0])
+    if not bullets and word:
+        rest = lines[0][word.end():]
+        whole = re.match(r"[ \t]*\[(F\d+)\]", rest, re.I | re.A)
+        about = {name.upper() for name in re.findall(FINDING_ID + r"\]?[ \t]*[:\-—–\]]", unfenced(text), re.I | re.A)} & known
+        if whole and whole[1].upper() not in known:
+            rest = rest[whole.end():]  # an id the board never gave
+        # A verdict that only closes known ids says what is wrong in its prose: that is a new defect.
+        rulings = rulings_in(text)
+        if not any(rulings.get(name) != "resolved" for name in about):
+            lines[0] = "%s [%s]%s" % (lines[0][:word.end()], fresh(), rest)
+    return "\n".join(lines), given
+
+
+def ledger(state, posts):
+    """{id: finding} for every defect raised since the last accepted candidate, in the order raised. A finding holds
+    its owners, text, the post that raised it, whether it is open, the reviews in a row that kept it
+    open right after its worker disputed it (streak), each owner's last answer and the verdict that last judged it."""
+    members, found, latest = state["members"], {}, {}
+    for post in posts:
+        if post["seq"] <= state.get("accepted_seq", 0):
+            continue
+        if post.get("kind") == "ready":
+            worker = post.get("subject", post["agent"])
+            latest.pop(worker, None)
+            owed = {name: f for name, f in found.items() if f["open"] and worker in f["owners"]}
+            answers = answers_in(post["text"], owed.keys())
+            for name, finding in owed.items():  # an open id the report leaves out, or answers with no evidence, is unanswered
+                finding["answers"][worker] = (*answers.get(name, ("missing", "")), post["seq"])
+            continue
+        # A post that records whom it rejects was a verifier's verdict when written: a later change of its
+        # author's role erases no defect.
+        if members.get(post["agent"], {}).get("role") != "verifier" and "rejects" not in post and not post.get("rules"):
+            continue
+        word = REPORT_WORD.match(post["text"])
+        if word and word[1] == "VERIFIED":  # a pass closes what it covers: the verifier saw every open id and passed
+            for finding in found.values():
+                if not post.get("partial") or set(finding["owners"]) <= set(post.get("members", [])):
+                    finding["open"] = False
+            continue
+        rulings = rulings_in(post["text"])
+        # A replaced worker's findings are its successor's: the defects are still in the work it took over.
+        names = ([successor(name, members) for name in rejected(post, members)]
+                 if word and word[1] == "NOT PASSED" else [])
+        if not names and word and word[1] == "NOT PASSED":
+            continue  # a verdict on a candidate since replaced reviewed none of the standing work: it rules on nothing
+        if not names:  # any other post of a verifier's can close an id, and nothing more
+            for name, ruling in rulings.items():
+                if name in found and ruling == "resolved":
+                    found[name]["open"] = False
+            continue
+        raised = dict(tagged(post["text"]))
+        # A second verdict on one candidate, such as test results added to a source review, is the same review.
+        again = post.get("candidate") is not None and all(latest.get(name) == post["candidate"] for name in names)
+        for name, finding in found.items():
+            if not set(finding["owners"]) & set(names):
+                continue
+            if not finding["open"] and name not in raised:  # raising a closed id again reopens it; a bare ruling does not
+                continue
+            finding["open"] = name in raised or rulings.get(name) != "resolved"
+            if raised.get(name):  # the verifier's latest wording is what the worker answers
+                finding["text"] = raised[name]
+            if not finding["open"]:
+                finding["streak"] = 0
+                continue
+            # Silence is no ruling: a verdict that raises only something else leaves the id open and judges nothing
+            # about it. A second verdict on one candidate is the same review, but the first of them to rule on an
+            # answer is the ruling on it. Each owner answers for itself: one that fixed its part does not settle
+            # another's dispute.
+            unruled = [kind for owner, (kind, _, seq) in finding["answers"].items()
+                       if owner in names and seq > finding["judged"].get(owner, 0)]
+            if (name in raised or rulings.get(name) == "open") and (unruled or not again):
+                finding["streak"] = finding["streak"] + 1 if "disputed" in unruled else 0
+                for owner in names:  # a verdict about one owner leaves another's answer still to be judged
+                    if owner in finding["owners"]:
+                        finding["judged"][owner] = post["seq"]
+        for name in post.get("findings", []):
+            found[name] = {"id": name, "owners": names, "text": raised.get(name, ""), "seq": post["seq"], "open": True,
+                           "streak": 0, "judged": dict.fromkeys(names, post["seq"]), "answers": {},
+                           "by": post["agent"]}
+        for name in names:
+            latest[name] = post.get("candidate")
+    # A member retired with no successor takes its findings with it: nobody is left to answer them.
+    return {name: f for name, f in found.items() if any(not members.get(owner, {}).get("killed") for owner in f["owners"])}
+
+
+def disputes(found):
+    """The open findings a worker disputed and a verifier kept open, DISPUTE_PAUSE reviews in a row. A worker that has
+    answered since, by fixing it or disputing it anew, has moved on: the next review says where that stands."""
+    return [finding for finding in found.values() if finding["open"] and finding["streak"] >= DISPUTE_PAUSE and disputers(finding)]
+
+
+def disputers(finding):
+    """The owners whose dispute of FINDING a verdict has judged and kept open."""
+    return [owner for owner, (kind, _, seq) in finding["answers"].items()
+            if kind == "disputed" and seq < finding["judged"].get(owner, 0)]
+
+
 def attention(state, posts):
     """What needs someone, each item naming the post that shows it, and a view of every member."""
     members = state["members"]
@@ -852,6 +1125,14 @@ def attention(state, posts):
             items.append({"kind": "rework", "member": name, "seq": failed[-1],
                           "text": "@%s failed verification %d times in a row. Stop the rework and ask the user how to go on"
                                   % (name, len(failed))})
+    for finding in disputes(ledger(state, posts)):
+        owners = [name for name in disputers(finding) if name in team]
+        if owners:
+            items.append({"kind": "dispute", "member": owners[0], "seq": max(finding["judged"].values()),
+                          "text": "@%s disputes %s and @%s keeps it open: %s. Settle it: decide, or give a consultant the "
+                                  "finding and both positions. Then resume, and have @%s post `%s: resolved` or tell @%s to fix it"
+                                  % (owners[0], finding["id"], finding["by"], finding["text"][:160] or "see the post",
+                                     finding["by"], finding["id"], owners[0])})
     usage = state.get("usage", {})
     tokens = usage.get("tokens", {})
     actors = tokens.keys() - {COORDINATOR}
@@ -898,9 +1179,7 @@ def attention(state, posts):
     for name, member in team.items():
         if name in ready:
             continue
-        for dep in dependencies(member):
-            if dep in ready:
-                continue
+        for dep in unmet(member, members, ready):
             upstream = members.get(dep, {})
             why = ("is missing" if not upstream else "was removed" if upstream.get("killed")
                    else "is paused: %s" % upstream["paused"] if upstream.get("paused")
@@ -937,7 +1216,7 @@ def attention(state, posts):
     view = {name: {"type": kind_of(member), "model": model_of(member), "effort": effort_of(member),
                    "depends": dependencies(member), "owns": member.get("owns", ""), "paths": claims(member),
                    "ready": name in ready,
-                   "blocked_on": [] if closed or name in ready or member.get("killed") else [d for d in dependencies(member) if d not in ready],
+                   "blocked_on": [] if closed or name in ready or member.get("killed") else unmet(member, members, ready),
                    "asked": asked.get(name, 0), "unreachable": not closed and name in awake and unreachable(name, members, posts),
                    "paused": bool(member.get("paused"))}
             for name, member in members.items() if name != COORDINATOR}
@@ -1382,7 +1661,7 @@ def main(argv):
                 subject, named = post.get("subject", sender), targets(text, members, sender=sender)
                 # A dependent is woken by the READY that lets it start, not by each one before it; a mention always reaches.
                 recipients = [name for name in recipients if name in named or subject not in dependencies(members[name])
-                              or all(dep in current for dep in dependencies(members[name]))]
+                              or not unmet(members[name], members, current)]
                 post["to"] = recipients
                 if any(entry.get("role") == "worker" and entry.get("consult") != "1" and name not in current
                        for name, entry in team_of(members).items()):
@@ -1526,8 +1805,13 @@ def main(argv):
             if member.get("profile") in READ_ONLY and "profile" in changes and changes["profile"] not in READ_ONLY and "writes" not in changes:
                 member.pop("writes", None)  # a specialist turned worker or designer writes again unless told otherwise
             member.update(changes)
+            merge_after(member, changes, previous.get("after", ""))
             if member.get("killed"):  # a retired member runs no more turns: nothing is paused
                 member.pop("paused", None)
+                member.setdefault("retired_at", len(posts))
+                standing = readiness({**members, name: previous}, posts).get(name, {}).get("revision")
+                if standing and "killed" not in previous:
+                    member["stood"] = standing  # the commit that counted when it left: work built on it stays good
             validate_member(name, member, changes, members)
             if changes.get("group") in {"", "-"}:
                 member.pop("group", None)
@@ -1569,6 +1853,15 @@ def main(argv):
                         "You are a %s now: your earlier report is withdrawn, and a %s posts no READY." % (member["role"], member["role"]))
                 return post_message(COORDINATOR, f"@{name} Your assignment changed. {what}",
                                     recipients, kind="revise", subject=name, save_roster=True)
+            if "killed" in changes:
+                # Whoever only came after the retired member, and waits for nobody else, starts now: no READY will say so.
+                through = readiness(members, posts)
+                freed = [n for n, entry in team_of(members).items()
+                         if name in soft(entry) and n not in through and not unmet(entry, members, through)]
+                if freed:
+                    return post_message(COORDINATOR, "%s @%s was retired and reports nothing. Go on without it (if you merged its commit, rebuild without it), and name in "
+                                        "your report what is missing for that." % (" ".join("@" + n for n in freed), name),
+                                        freed, save_roster=True)
             save(d, state)
 
         elif cmd == "limit":
@@ -1673,6 +1966,13 @@ def main(argv):
             members[old]["killed"] = "1"
             members[old]["replaced_by"] = new
             members[old].pop("paused", None)
+            # Folded before it is validated, as `member` does: a verifier is refused a wait given as after= too. Only
+            # the names this command asks for are checked as new: an inherited wait for a retired member stays.
+            asked = ",".join(filter(None, [given.get("depends", ""), given.get("after", "")]))
+            named = {"depends", "after"} & given.keys()
+            merge_after(entry, given, members[old].get("after", ""))
+            if named:
+                given["depends"] = asked
             validate_member(new, entry, given, members)
             if given.get("group") in {"", "-"}:
                 entry.pop("group", None)
@@ -1684,6 +1984,8 @@ def main(argv):
             for member in members.values():  # whoever waited for the old member now waits for the new one
                 if member.get("depends"):
                     member["depends"] = ",".join(dict.fromkeys(new if dep == old else dep for dep in dependencies(member)))
+                if member.get("after"):
+                    member["after"] = ",".join(dict.fromkeys(new if dep == old else dep for dep in member["after"].split(",")))
             stranded(new, members)
             # Only what this command asks for: an inherited wait for a removed member is the blocked
             # state Attention already lists, and replacing the waiter must stay possible.
@@ -1726,10 +2028,14 @@ def main(argv):
             owed_seqs = sorted({p["seq"] for p in posts if old in p["to"] and p["seq"] > members[old]["last_read_seq"]}
                                | set(open_questions))
             owed = " ".join("#%d" % seq for seq in owed_seqs)
+            inherited = ["%s (#%d): %s" % (name, finding["seq"], finding["text"][:160] or "see the post")
+                         for name, finding in ledger(state, posts).items() if finding["open"] and new in finding["owners"]]
             post_message(COORDINATOR, "@%s BRIEF (replaces %s)\n%s\nPredecessor: %s was removed. Its posts: %s. "
-                         "Read them before you start, with the show command for %s, and do not redo what they report as done.%s"
+                         "Read them before you start, with the show command for %s, and do not redo what they report as done.%s%s"
                          % (new, old, body, old, history, old,
-                            " It left these posts addressed to it unread or unanswered, which are now yours to answer: %s." % owed if owed else ""),
+                            " It left these posts addressed to it unread or unanswered, which are now yours to answer: %s." % owed if owed else "",
+                            "\nThe verifier's open findings on this work are yours. Answer each in your READY, as `F1: fixed — "
+                            "<evidence>` or `F1: disputed — <evidence>`:\n- " + "\n- ".join(inherited) if inherited else ""),
                          [new], save_roster=True)
             print("spawn @%s as swarm:%s, then record its id" % (new, kind_of(entry)))
 
@@ -1791,13 +2097,31 @@ def main(argv):
             done = bool(done) and done in (answer, passed and passed.get("candidate"))
             if done:
                 del members[sender]["tested"]
+            if members[sender].get("role") == "verifier" and (word == "VERIFIED" or rulings_in(text)):
+                verdict["rules"] = True  # a verifier's when written: a later change of its role undoes no ruling
+            given = []
+            if word == "NOT PASSED" and verdict.get("rejects"):
+                # Each defect gets its id here, in the text every reader sees: the worker answers by id, and the next
+                # verdict rules by id.
+                number = 1 + max((int(name[1:]) for entry in posts for name in entry.get("findings", [])), default=0)
+                text, given = tag_findings(text, ledger(state, posts).keys(), number)
+                if given:
+                    verdict["findings"] = given
             if word == "NOT PASSED" and members[sender].get("role") == "verifier" and not state.get("paused"):
                 # Paused by the verdict itself, so a resumed run is stopped again only by a further one. Counted as the
                 # board will count it once posted: a second verdict on one candidate is no new failure.
                 seq = len(posts) + 1
-                failed = rework(state, posts + [{"seq": seq, "agent": sender, "text": text, "to": recipients, **verdict}])
+                after = posts + [{"seq": seq, "agent": sender, "text": text, "to": recipients, **verdict}]
+                failed = rework(state, after)
                 stuck = next(("@%s failed verification %d times in a row" % (name, len(seqs)) for name, seqs in failed.items()
                               if seqs[-1] == seq and len(seqs) >= REWORK_PAUSE), "")
+                # A worker that disputed a finding and a verifier that keeps it open will not settle it between them:
+                # another round of rework only repeats the two positions.
+                kept = [finding for finding in disputes(ledger(state, after)) if seq in finding["judged"].values()]
+                if kept and not stuck:
+                    stuck = "@%s disputes %s and @%s keeps it open" % (
+                        ", @".join(sorted({owner for finding in kept for owner in disputers(finding)})),
+                        ", ".join(finding["id"] for finding in kept), sender)
                 if stuck:
                     state["paused"] = stuck
             post = post_message(sender, text, recipients, save_roster=bool(stuck) or done, **verdict)
@@ -1814,6 +2138,9 @@ def main(argv):
             if verdict.get("partial"):
                 print("note: this pass is of a partial candidate holding %s. It is not the run's pass, and verify.py never "
                       "accepts it" % ", ".join("@" + name for name in verdict["members"]))
+            if given:
+                print("recorded: %s. The worker answers each id in its next READY; `%s: resolved` on a line of a post "
+                      "of yours closes one" % (", ".join(given), given[0]))
             if stuck:
                 print("paused: %s. The coordinator asks the user how to go on" % stuck)
 
@@ -1824,7 +2151,7 @@ def main(argv):
                 sys.exit("only an active worker of an open run can " + cmd)
             if cmd == "ready":
                 through = readiness(members, posts)
-                blocked = [name for name in dependencies(member) if name not in through]
+                blocked = unmet(member, members, through)
                 if blocked:
                     sys.exit("waiting for " + ", ".join(blocked))
                 revision = args[1] if len(args) > 1 else None
@@ -1838,7 +2165,7 @@ def main(argv):
                 if revision is not None:
                     import verify  # late: verify.py imports this module
                     repo = home = os.path.dirname(os.path.dirname(os.path.abspath(d)))  # the project, which holds every member's commits
-                    deps = {dep: through[dep] for dep in dependencies(member)}
+                    deps = {dep: through[dep] for dep in dependencies(member) if dep in through}
                     reported = latest_reports(posts).get(sender, {}).get("seq")
                     # Compared with the reports that stay current once this one is posted: a member that depends on the
                     # sender loses its READY to it and will sync this commit anyway.
@@ -1867,6 +2194,11 @@ def main(argv):
                         sys.exit("%s is no commit in the project's repository. Commit your work in a worktree of the project "
                                  "(or fetch it into the project's repository) and give its full ID, or HEAD from your checkout"
                                  % revision)
+                    held = carried(verify.git, home, member, members, posts, revision)
+                    if held:
+                        sys.exit("your commit still holds @%s's commit %s, which had not passed when @%s was retired. "
+                                 "Rebuild your work without it, then report again. Nothing was posted"
+                                 % (held[0], held[1][:12], held[0]))
                     # A dependency's commit missing from this one would be merged beside it, untested with it.
                     behind = unmerged(home, deps, revision)
                     if behind:
@@ -1892,7 +2224,7 @@ def main(argv):
                     if member.get("writes") == "0" or kind_of(member) in READ_ONLY:
                         sys.exit("a read-only report cannot include a commit, and @%s was made read-only while git checked "
                                  "it. Nothing was posted" % sender)
-                    if (dependencies(member) != list(deps) or latest_reports(posts).get(sender, {}).get("seq") != reported
+                    if (unmet(member, members, through) or [dep for dep in dependencies(member) if dep in through] != list(deps) or latest_reports(posts).get(sender, {}).get("seq") != reported
                             or any(through.get(dep, {}).get("seq") != post["seq"] for dep, post in deps.items())):
                         sys.exit("a dependency's report, @%s's own or its dependencies changed while git checked the commit, "
                                  "so nothing was posted. Read the board, then report again" % sender)
@@ -1920,6 +2252,17 @@ def main(argv):
                     report = sys.stdin.read().strip()
                 if not report:
                     sys.exit("READY needs a report on stdin")
+                # A report that passes over an open finding sends the verifier into a review of work nobody claims
+                # to have done: refused here, it is corrected in the same step.
+                # An investigator answers a rejected finding with a new one, which the coordinator reviews whole.
+                owed = {name: finding for name, finding in ledger(state, posts).items()
+                        if finding["open"] and sender in finding["owners"] and kind_of(member) != "investigator"}
+                silent = sorted(owed.keys() - answers_in(report, owed.keys()).keys(), key=lambda name: int(name[1:]))
+                if silent:
+                    sys.exit("the report leaves open findings unanswered: %s. Give each a line: `%s: fixed — <where, and "
+                             "the check that shows it>`, or `%s: disputed — <the evidence that it is no defect>`. Nothing "
+                             "was posted" % ("; ".join("%s (%s)" % (name, owed[name]["text"][:120] or "post #%d" % owed[name]["seq"])
+                                                       for name in silent), silent[0], silent[0]))
                 if kind_of(member) == "investigator":
                     # A new finding withdraws the one the coordinator confirmed: whoever built on that one hears,
                     # as it would of a `revise`.
@@ -1967,10 +2310,10 @@ def main(argv):
             if member.get("writes") == "0" or kind_of(member) in READ_ONLY:  # as `ready` refuses it a commit
                 sys.exit("a read-only member reports no commit, so it has nothing to sync")
             through = readiness(members, posts)
-            blocked = [dep for dep in dependencies(member) if dep not in through]
+            blocked = unmet(member, members, through)
             if blocked:
                 sys.exit("waiting for " + ", ".join(blocked))
-            deps = {dep: through[dep] for dep in dependencies(member) if through[dep].get("revision")}
+            deps = {dep: through[dep] for dep in dependencies(member) if dep in through and through[dep].get("revision")}
             earlier = earlier_commits(name, posts)
             scope = assignment_scope(member)
             import verify  # late: verify.py imports this module
@@ -1991,6 +2334,11 @@ def main(argv):
             # A merge belongs in the member's own worktree: run from the project, it would land on the user's branch.
             if verify.toplevel(here) == verify.toplevel(os.path.dirname(os.path.dirname(os.path.abspath(d)))) and not args[1:]:
                 sys.exit("this is the project's own checkout, not your worktree: run `sync` from the worktree you work in")
+            # Said here, before the member builds on it: `ready` would refuse the commit only once the work was done.
+            held = carried(verify.git, here, member, members, posts, head.decode().strip())
+            if held:
+                sys.exit("HEAD still holds @%s's commit %s, which had not passed when @%s was retired: `ready` will refuse a "
+                         "commit built on it. Rebuild your branch without it before you go on" % (held[0], held[1][:12], held[0]))
             behind = unmerged(here, deps, head.decode().strip())
             if args[1:]:
                 for dep in behind:
@@ -2053,7 +2401,7 @@ def main(argv):
             if latest.get("kind") != "finding" or str(latest["seq"]) != args[1]:
                 sys.exit("only the investigator's latest unconfirmed finding can be confirmed")
             through = readiness(members, posts)
-            if any(dep not in through or through[dep]["seq"] > latest["seq"] for dep in dependencies(member)):
+            if unmet(member, members, through, latest["seq"]) or any(through[dep]["seq"] > latest["seq"] for dep in dependencies(member) if dep in through):
                 sys.exit("the finding's prerequisites changed; ask for an updated finding")
             recipients = [dep for dep, entry in team_of(members).items() if name in dependencies(entry) or entry.get("role") == "verifier"]
             post_message(COORDINATOR, "READY %s\nConfirmed %s's finding #%d. Read it with show --post=%d (or the board tool's show action with seq: %d)."
@@ -2370,7 +2718,7 @@ def main(argv):
 
                 halted = [name for name, member in team_of(members).items() if member.get("id") and not member.get("paused")
                           and name not in asking and (
-                    (member.get("role") == "worker" and name not in ready and all(dep in ready for dep in dependencies(member))
+                    (member.get("role") == "worker" and name not in ready and not unmet(member, members, ready)
                      and reports.get(name, {}).get("kind") != "finding" and (not unread(name) or bool(member.get("told", {}).get("ended"))))
                     or (member.get("role") == "verifier" and (bool(member.get("told", {}).get("ended"))
                                                               or (not unread(name) and (unverified or reviewing(name)))))
@@ -2473,6 +2821,10 @@ def main(argv):
                     "accepted" if candidate.get("accepted") else
                     "passed earlier, now stale: %s; verified by @%s" % (stale, candidate["verified_by"]) if stale else
                     "passed, verified by @%s" % candidate["verified_by"] if passed else "not passed"))
+                if candidate.get("allowed"):
+                    lines.append("The coordinator allowed these past the diff guards: %s." % "; ".join(map(str, candidate["allowed"])))
+                if candidate.get("waived"):
+                    lines.append("Waived as failing on the base in the same way: %s." % "; ".join(map(str, candidate["waived"])))
             else:
                 lines.append("No candidate was prepared.")
             lines += ["", "## Transcript", ""]
