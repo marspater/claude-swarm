@@ -122,7 +122,9 @@ def scenario():
         question = [i for i in report["items"] if i["kind"] == "question"]
         assert question and question[0]["member"] == "parser" and report["members"]["late"]["asked"] == question[0]["seq"]
         assert report["members"]["late"]["type"] == "worker" and report["members"]["late"]["model"] == "sonnet"
-        run(d, "post", "parser", "@late JSON lines")
+        run(d, "post", "parser", "@late JSON lines")  # cites nothing, so it settles nothing
+        assert [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]
+        run(d, "post", "parser", "@late re #%d: JSON lines" % question[0]["seq"])
         assert not [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]
 
         # limits: the roster cannot exceed them, and a model can be reserved for one type
@@ -373,8 +375,10 @@ def scenario():
         assert asked() == [1]
         run(third, "post", "w", "@coordinator and may I touch b.py?")
         assert asked() == [1, 5]
-        # a plain reply answers what is still open, whatever post numbers or protocol words it mentions
+        # a plain reply cites nothing, so it answers nothing; one reply can cite several
         run(third, "post", "coordinator", "@w change a.py as in #2, yes to b.py, and post READY when done")
+        assert asked() == [1, 5]
+        run(third, "post", "coordinator", "@w re #1 and #5: a.py, and yes")
         assert asked() == []
 
         # Replacement keeps what registration checked: a consultant stays one, and nobody ends up waiting for itself.
@@ -1114,7 +1118,7 @@ class BoardRegressions(unittest.TestCase):
         assert "#1" in run(d, "show", "--post=2")
         qs = [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]
         assert qs and qs[0]["member"] == "c"
-        run(d, "post", "c", "@a 8080")
+        run(d, "post", "c", "@a re #1: 8080")
         assert not [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]
 
     def test_wake_lease_woke_rearm_closed_and_overflow(self):
@@ -1181,7 +1185,7 @@ class BoardRegressions(unittest.TestCase):
         run(d, "post", "asker", "@other did you check http://localhost:8080?")
         qs = [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]
         assert len(qs) == 1
-        run(d, "post", "other", "@asker yes")
+        run(d, "post", "other", "@asker re #2: yes")
         run(d, "post", "asker", stdin="@other should we use A?\nOption A : yes")
         qs = [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]
         assert len(qs) == 1
@@ -1317,6 +1321,286 @@ class BoardRegressions(unittest.TestCase):
         run(d, "member", "x", "killed=1")
         run(d, "replace", "x", "y")
         assert "yours to answer: #%s." % seq in run(d, "show", "y")
+
+    def test_replace_carries_shared_briefs_above_the_own_one(self):
+        d = self.init_run()
+        for name in ("parser", "lexer", "currency"):
+            run(d, "member", name)
+        run(d, "post", "coordinator", stdin="@parser @currency BRIEF\nShared: the money type")
+        run(d, "post", "coordinator", stdin="@parser BRIEF\nOwns: the parser")
+        run(d, "post", "coordinator", stdin="@lexer BRIEF\nOwns: the lexer")
+        run(d, "post", "coordinator", stdin="@lexer @currency BRIEF\nShared: the token stream")
+        run(d, "replace", "parser", "parser-2")
+        brief = run(d, "show", "parser-2")
+        assert brief.index("Shared brief #1: Shared: the money type") < brief.index("Owns: the parser"), brief
+        # a shared brief posted after the own one does not take its place
+        run(d, "replace", "lexer", "lexer-2")
+        brief = run(d, "show", "lexer-2")
+        assert "Shared brief #4: Shared: the token stream" in brief and "Owns: the lexer" in brief, brief
+        run(d, "replace", "currency", "currency-2")
+        brief = run(d, "show", "currency-2")
+        assert brief.index("Shared brief #1:") < brief.index("Shared brief #4:") and "had no brief" not in brief, brief
+        assert brief.count("the token stream") == 1, brief  # a shared brief does not also stand in as the own one
+        # the successor inherits the group, yet a brief to a group of one stays that member's own
+        run(d, "member", "solo", "group=crew")
+        run(d, "post", "coordinator", stdin="@crew BRIEF\nOwns: the crew work")
+        run(d, "replace", "solo", "solo-2")
+        assert "Shared brief" not in run(d, "show", "solo-2")
+
+    def test_ready_wakes_a_dependent_once_it_can_start(self):
+        d = self.init_run()
+        for name, extra in (("alpha", []), ("beta", []), ("joiner", ["depends=alpha,beta"]),
+                            ("named", ["depends=alpha,beta"]), ("bystander", [])):
+            run(d, "member", name, "id=agent-" + name, *extra)
+        first = run(d, "ready", "alpha", stdin="done\nchecked\nalpha detail @named @bystander")
+        # a mention always reaches its member, a dependent or not
+        assert "@joiner" not in first and "@named" in first and "@bystander" in first, first
+        assert "@joiner" not in woken(d)
+        assert "@joiner" in run(d, "ready", "beta", stdin="done\nchecked\nbeta detail")
+        assert woken(d).count("@joiner") == 1
+        out = run(d, "read", "joiner")
+        assert "alpha detail" in out and "beta detail" in out, out
+        # the same gate holds for a confirmed finding
+        run(d, "member", "probe", "profile=investigator", "writes=0")
+        run(d, "member", "late")
+        run(d, "member", "fixer", "depends=probe,late")
+        run(d, "member", "solo", "depends=probe")
+        finding = run(d, "ready", "probe", stdin="observed").split()[1][1:]
+        confirmed = run(d, "confirm", "probe", finding)
+        assert "@fixer" not in confirmed and "@solo" in confirmed, confirmed
+        assert "@fixer" in run(d, "ready", "late", stdin="done")
+
+    def test_verifier_reads_each_current_ready_in_full(self):
+        d = self.init_run()
+        for name, extra in (("w1", []), ("w2", []), ("v", ["role=verifier"])):
+            run(d, "member", name, *extra)
+        run(d, "ready", "w1", stdin="done\nchecked\nw1 first")
+        run(d, "ready", "w1", stdin="done\nchecked\nw1 second")
+        run(d, "ready", "w2", stdin="done\nchecked\nw2 detail")
+        out = run(d, "read", "v")
+        assert "w1 second" in out and "w2 detail" in out and "w1 first" not in out, out
+
+    def test_read_replays_needed_reports_the_reader_passed(self):
+        d = self.init_run()
+        for name, extra in (("w1", []), ("w2", []), ("late", []), ("dep", ["depends=w1,w2"])):
+            run(d, "member", name, *extra)
+        run(d, "ready", "w1", stdin="done\nchecked\nw1 first")
+        run(d, "ready", "w1", stdin="done\nchecked\nw1 second")
+        run(d, "ready", "w2", stdin="done\nchecked\nw2 detail")
+        # registered after the reports: each current one in full on the first read, a replaced one never, then no more
+        run(d, "member", "v", "role=verifier")
+        out = run(d, "read", "v")
+        assert "w1 second" in out and "w2 detail" in out and "w1 first" not in out, out
+        assert run(d, "read", "v") == "no new posts\n"
+        # a dependency added after its READY was read as a summary
+        assert "w1 second" not in run(d, "read", "late")
+        run(d, "member", "late", "depends=w1")
+        out = run(d, "read", "late")
+        assert "w1 second" in out and "w2 detail" not in out, out
+        assert "w1 second" not in run(d, "read", "late")
+        # a successor gets its dependencies' current reports
+        run(d, "replace", "dep", "dep-2")
+        out = run(d, "read", "dep-2")
+        assert "w1 second" in out and "w2 detail" in out and "w1 first" not in out, out
+
+    def test_read_replay_is_paged_and_keeps_the_cursor(self):
+        d = self.init_run()
+        for name in ("w1", "w2"):
+            run(d, "member", name)
+            run(d, "ready", name, stdin="done\nchecked\n%s detail %s" % (name, "x" * 250))
+        run(d, "member", "v", "role=verifier")
+        cursor = saved(d)["members"]["v"]["last_read_seq"]
+        run(d, "post", "coordinator", "@v hello")
+        out = run(d, "read", "v", "--max-bytes=400")
+        assert "w1 detail" in out and "w2 detail" not in out and "hello" not in out and "remain" in out, out
+        assert saved(d)["members"]["v"]["last_read_seq"] == cursor
+        out = run(d, "read", "v", "--max-bytes=400")
+        assert "w2 detail" in out and "w1 detail" not in out and "hello" in out, out
+        assert saved(d)["members"]["v"]["last_read_seq"] == cursor + 1
+        assert run(d, "read", "v", "--max-bytes=400") == "no new posts\n"
+
+    def test_read_attention_fits_the_page(self):
+        d = self.init_run()
+        for i in range(6):
+            run(d, "member", "q%d" % i)
+            run(d, "post", "q%d" % i, "@coordinator which file?")
+        run(d, "member", "z")
+        run(d, "read", "coordinator")
+        run(d, "post", "z", "@coordinator ok")
+        out = run(d, "read", "coordinator", "--attention", "--max-bytes=256")
+        assert "6 item(s) need attention" in out and "[question]" not in out and "attention" in out.splitlines()[-1], out
+        assert saved(d)["members"]["coordinator"]["last_read_seq"] == 7
+
+    def test_kill_ends_any_run_at_once(self):
+        d = self.init_run()
+        run(d, "member", "w", "id=agent-w", "isolated=1")
+        run(d, "member", "spare")
+        run(d, "member", "v", "role=verifier", "id=agent-v")
+        run(d, "post", "w", "@coordinator which file?")
+        run(d, "post", "coordinator", "@w @v go")
+        run(d, "claim", "w", "agent-w", "2")
+        run(d, "pause", "waiting on the user")
+        run(d, "close", ok=False)  # unread posts hold `close`, never `kill`
+        out = run(d, "kill", "wrong", "repo")
+        assert out == "killed: 3 member(s) retired, run closed\n@w agent-w\n@v agent-v\n", out
+        roster = saved(d)
+        assert roster["closed"] is True and roster["killed"] == "wrong repo" and "paused" not in roster
+        w = roster["members"]["w"]
+        assert w["killed"] == "1" and w["id"] == "agent-w" and w["isolated"] == "1" and "wake_claim" not in w, w
+        last = run(d, "show", "--post=3", "--json")
+        post = json.loads(last)
+        assert post["text"] == "SHUTDOWN\nThe user killed the run: wrong repo" and post["to"] == [], post
+        assert roster["members"]["coordinator"]["last_read_seq"] == 3
+        assert run(d, "read", "coordinator") == "no new posts\n"
+        assert run(d, "wake") == "" and run(d, "claim", "v", "agent-v", "3") == ""
+        assert json.loads(run(d, "attention", "--json"))["items"] == []
+        run(d, "status")
+        run(d, "export")
+        for command in (["post", "w", "late"], ["ready", "w"], ["member", "x"], ["resume"]):
+            run(d, *command, ok=False)
+        assert run(d, "kill") == "already closed\n"
+        assert saved(d) == roster
+
+    def test_kill_retires_members_a_close_left_running(self):
+        from pathlib import Path
+        d = self.init_run()
+        run(d, "member", "w", "id=agent-w")
+        run(d, "close")
+        board = Path(d, "board.jsonl").read_text()
+        assert run(d, "kill") == "killed: 1 member(s) retired, run closed\n@w agent-w\n"
+        roster = saved(d)
+        assert roster["members"]["w"]["killed"] == "1" and roster["killed"] == "killed by the user"
+        assert Path(d, "board.jsonl").read_text() == board  # a closed board gets no post
+        assert run(d, "kill") == "already closed\n" and saved(d) == roster
+
+    def test_headers_read_leaves_an_addressed_ready_to_replay(self):
+        d = self.init_run()
+        for name, extra in (("w1", []), ("w2", []), ("v", ["role=verifier"])):
+            run(d, "member", name, *extra)
+        run(d, "ready", "w1", stdin="done\nchecked\nw1 detail")
+        run(d, "ready", "w2", stdin="done\nchecked\nw2 detail")  # completes the team, so it is addressed to @v
+        assert "detail" not in run(d, "read", "v", "--headers")
+        out = run(d, "read", "v")
+        assert "w1 detail" in out and "w2 detail" in out, out
+        assert run(d, "read", "v") == "no new posts\n"
+
+    def test_a_bare_number_or_a_lone_citation_settles_a_question(self):
+        d = self.init_run()
+        for name in ("api", "parser", "other"):
+            run(d, "member", name)
+
+        def asked():
+            return [i["seq"] for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]
+
+        def seq(out):
+            return int(re.search(r"#(\d+)", out).group(1))
+
+        q = seq(run(d, "post", "parser", "@api which port?"))
+        run(d, "post", "api", "@parser Thanks #%d, 8080" % q)
+        assert asked() == []
+        q = seq(run(d, "post", "parser", "@api which host?"))
+        assert "-> nobody" in run(d, "post", "api", "re #%d: localhost" % q)  # settles, and wakes nobody
+        assert asked() == []
+        # a bare number from anyone who was not asked cites nothing, the asker's included
+        q = seq(run(d, "post", "parser", "@api which user?"))
+        run(d, "post", "parser", "@other we wait on #%d" % q)
+        run(d, "post", "other", "@parser see #%d" % q)
+        run(d, "post", "api", "@parser started")
+        assert asked() == [q]
+
+    def test_only_a_cited_reply_settles_a_question(self):
+        d = self.init_run()
+        for name in ("api", "parser", "currency"):
+            run(d, "member", name)
+
+        def asked():
+            return [i["seq"] for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]
+
+        def seq(out):
+            return int(re.search(r"#(\d+)", out).group(1))
+
+        q = seq(run(d, "post", "parser", "@api Which field carries the revision?"))
+        out = run(d, "post", "api", "@parser I have started the integration test.")
+        assert asked() == [q] and "OPEN: #%d from @parser still open to you" % q in out and "just `re #%d`" % q in out, out
+        assert "OPEN" not in run(d, "post", "api", "@currency a note")  # not to the asker
+        assert "OPEN" not in run(d, "post", "coordinator", "@api a note")  # nothing was put to the coordinator
+        out = run(d, "post", "api", "@parser re #%d: the rev field" % q)
+        assert asked() == [] and "OPEN" not in out, out
+        # a question put to the coordinator is the coordinator's to cite
+        q = seq(run(d, "post", "parser", "@coordinator may I edit lib/?"))
+        assert "OPEN: #%d from @parser" % q in run(d, "post", "coordinator", "@parser later")
+        run(d, "post", "coordinator", "@parser re #%d: yes" % q)
+        # the asker withdraws its own question by citing it
+        q = seq(run(d, "post", "parser", "@api and the base?"))
+        run(d, "post", "parser", "re #%d: moot now" % q)
+        assert asked() == []
+        # the coordinator's ruling settles it for everyone it was put to
+        q = seq(run(d, "post", "parser", "@api @currency which format?"))
+        assert asked() == [q, q]
+        run(d, "post", "coordinator", "@parser re #%d: ISO" % q)
+        assert asked() == []
+        # an uncited post leaves the question to the successor
+        q = seq(run(d, "post", "parser", "@api which port?"))
+        run(d, "read", "api")  # read, so only the open question carries it over
+        run(d, "post", "api", "@parser starting")
+        run(d, "replace", "api", "api-2")
+        assert ("#%d" % q) in run(d, "show", "api-2").split("yours to answer: ")[1].split(".")[0].split()
+
+    def test_coordinator_reads_a_reviewed_ready_as_its_summary(self):
+        d = self.init_run()
+        for name, extra in (("w1", []), ("w2", []), ("adv", ["profile=architect", "writes=0", "consult=1"]),
+                            ("v", ["role=verifier"])):
+            run(d, "member", name, *extra)
+        run(d, "ready", "w1", stdin="done\nchecked\nw1 detail")
+        run(d, "ready", "w2", stdin="done\nchecked\nw2 detail, @coordinator the port is yours to pick")
+        run(d, "ready", "w1", stdin="done\nchecked\nshould the cache stay?")
+        run(d, "ready", "adv", stdin="done\nchecked\nadv detail")
+        out = run(d, "read", "coordinator")
+        assert "w1 detail" not in out and "[full: show --post=1]" in out, out
+        # a decision it is asked for, a question, and a consultant's report stay whole
+        assert "w2 detail" in out and "cache stay" in out and "adv detail" in out, out
+        # a report nobody else reads stays whole
+        solo = self.init_run("solo")
+        run(solo, "member", "w")
+        run(solo, "ready", "w", stdin="done\nchecked\nsolo detail")
+        assert "solo detail" in run(solo, "read", "coordinator")
+
+    def test_unstarted_only_once_it_can_act(self):
+        d = self.init_run()
+        for name, extra in (("a", []), ("b", ["depends=a"]), ("v", ["role=verifier"])):
+            run(d, "member", name, *extra)
+            run(d, "post", "coordinator", stdin="@%s BRIEF\nOwns: %s" % (name, name))
+        run(d, "member", "c", "depends=b", "id=agent-c")
+
+        def unstarted():
+            return [i["member"] for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "unstarted"]
+
+        def blocked():
+            return [i["text"] for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "blocked"]
+
+        assert unstarted() == ["a"] and woken(d) == ["@a"]
+        assert blocked() == []  # @c waits for @b, which waits its turn: no fault
+        run(d, "member", "a", "id=agent-a")
+        run(d, "read", "a")
+        run(d, "ready", "a", stdin="done")
+        assert unstarted() == ["b"] and "@v" not in woken(d)
+        assert blocked() == ["@c waits for @b, which was never started"]
+        run(d, "post", "coordinator", "@v please review @a's piece early")
+        assert unstarted() == ["b", "v"]
+
+    def test_read_coordinator_attention(self):
+        d = self.init_run()
+        run(d, "member", "w", "id=agent-w")
+        assert run(d, "read", "coordinator") == "no new posts\n"
+        run(d, "read", "w", "--attention", ok=False)
+        run(d, "post", "w", "@coordinator " + "x" * 200)
+        asked = run(d, "post", "w", "@coordinator which file?").split()[1]
+        assert "attention" not in run(d, "read", "coordinator", "--attention", "--max-bytes=256")
+        out = run(d, "read", "coordinator", "--attention")
+        assert "[question] %s @coordinator has not answered @w" % asked in out and "[unread]" not in out, out
+        assert out.index("which file?") < out.index("[question]")
+        run(d, "post", "w", "@coordinator note")
+        assert "attention" not in run(d, "read", "coordinator")
 
     def test_claims_compare_case_insensitively(self):
         d = self.init_run()
@@ -1536,12 +1820,14 @@ class BoardRegressions(unittest.TestCase):
         run(d, "member", "a")
         run(d, "member", "b")
         run(d, "post", "a", "@b which parser do we keep?")
-        run(d, "post", "b", "@a the regex one, as `re #99` in the notes says")  # an answer: the code cites nothing
+        run(d, "post", "b", "@a the regex one, as `re #1` in the notes says")  # the code cites nothing
+        assert self.items(d, "question")
+        run(d, "post", "b", "@a re #1: the regex one")
         assert not self.items(d, "question")
         for text in ("@b are you sure??", "@b should we use A? (Option A : yes)"):
-            run(d, "post", "a", text)
+            seq = int(re.search(r"#(\d+)", run(d, "post", "a", text)).group(1))
             assert [item["member"] for item in self.items(d, "question")] == ["b"], text
-            run(d, "post", "b", "@a yes")
+            run(d, "post", "b", "@a re #%d yes" % seq)
         for text in ("@b it is a ?? b", "@b the type is name?: T, read as a?.b", "@b it is c ? a : b"):
             run(d, "post", "a", text)
             assert not self.items(d, "question"), text
@@ -1826,7 +2112,152 @@ class BoardRegressions(unittest.TestCase):
         import board  # noqa: E402
         start = time.monotonic()
         assert board.QUESTION.search("a ?" + " " * 3000 + "b")  # seconds under a pattern that backtracks
+        assert board.asks("takes Int?" + " " * 3000 + "b")  # so is the optional type's lookahead
+        # and the clause each optional type is read in: one long clause, many types, a long lead of blanks and mentions
+        assert not board.asks(" " * 3000 + "@a " * 3000 + "it takes Int? and " * 30000 + "@" + "b" * 3000 + "x")
         assert time.monotonic() - start < 1
+
+    # The review of the uncommitted change on 0.3.50.
+
+    def test_an_optional_type_in_a_question_still_asks(self):
+        d = self.init_run()
+        run(d, "member", "w", "id=agent-w")
+        run(d, "post", "w", "@coordinator May I edit ListView? and its tests too.")
+        run(d, "post", "w", "@coordinator May I edit ListView? is it outside my paths")
+        run(d, "post", "w", "@coordinator Fixed. It returns Date? in both cases")
+        # a dot inside a path ends no clause
+        run(d, "post", "w", "@coordinator Can I make src/config.ts return Config? or nil on lookup failure")
+        run(d, "post", "w", "@coordinator The return value is Config? or nil")
+        qs = [i["seq"] for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]
+        assert qs == [1, 2, 4], qs
+
+    def test_only_a_request_wakes_a_verifier_early(self):
+        def unstarted(d):
+            return [i["member"] for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "unstarted"]
+
+        for request in ("@verifiers please test this partial candidate", "@v please test this partial candidate"):
+            d = self.init_run()
+            for name, extra in (("a", ["group=pool"]), ("b", ["group=pool"]), ("v", ["role=verifier", "group=pool"])):
+                run(d, "member", name, *extra)
+            run(d, "post", "coordinator", stdin="@a @b @v BRIEF\nShared: the parser")
+            run(d, "post", "coordinator", stdin="@v BRIEF\nTest the parser")
+            assert "v" not in unstarted(d)  # a second brief is no request
+            run(d, "member", "a", "id=agent-a")
+            run(d, "read", "a")
+            run(d, "ready", "a", stdin="done, @v can look now")
+            assert "v" not in unstarted(d)  # neither is a READY, whatever it names
+            run(d, "ready", "b", stdin="done")  # the last READY reaches @v on its own
+            run(d, "revise", "a", "one more case")
+            assert "v" not in unstarted(d)  # and stops counting once a worker is unready again
+            run(d, "post", "coordinator", "@all the API moved to v2")
+            run(d, "post", "coordinator", "@pool the API moved to v2")
+            assert "v" not in unstarted(d)  # a broadcast is news, not a request
+            run(d, "post", "coordinator", request)
+            assert "v" in unstarted(d), request
+
+    def test_a_late_reader_is_shown_only_reports_that_count(self):
+        d = self.init_run()
+        for name, extra in (("a", []), ("b", []), ("c", []), ("v", ["role=verifier"])):
+            run(d, "member", name, *extra)
+        run(d, "ready", "a", stdin="a is done")
+        run(d, "ready", "b", stdin="b is done")
+        run(d, "ready", "c", stdin="c is done")
+        run(d, "post", "v", "@a NOT PASSED: the test fails")
+        run(d, "member", "b", "killed=1")
+        run(d, "member", "v2", "role=verifier")  # registered after them: each is replayed if it counts
+        out = run(d, "read", "v2")
+        assert "c is done" in out and "a is done" not in out and "b is done" not in out, out
+
+    def test_a_new_agent_has_read_nothing(self):
+        d = self.init_run()
+        run(d, "member", "a")
+        run(d, "member", "w", "depends=a", "id=agent-1")
+        run(d, "ready", "a", stdin="a is done")
+        run(d, "read", "w")
+        assert saved(d)["members"]["w"]["delivered"] == [1]
+        run(d, "started", "w", "agent-1", "agent-1")  # the same agent again
+        assert saved(d)["members"]["w"]["delivered"] == [1]
+        run(d, "started", "w", "agent-2", "agent-1")
+        assert "delivered" not in saved(d)["members"]["w"]
+        assert "a is done" in run(d, "read", "w")
+        run(d, "member", "w", "id=agent-3")
+        assert "delivered" not in saved(d)["members"]["w"]
+
+    def test_a_cut_report_is_not_delivered_and_not_cut_again(self):
+        d = self.init_run()
+        run(d, "member", "a")
+        run(d, "member", "w", "depends=a")
+        run(d, "ready", "a", stdin="a is done\n" + "detail " * 100)
+        out = run(d, "read", "w", "--max-bytes=256")
+        assert "[cut to fit the page. The whole post: show --post=1]" in out, out
+        w = saved(d)["members"]["w"]
+        assert "delivered" not in w and w["clipped"] == [1], w
+        assert "a is done" not in run(d, "read", "w", "--max-bytes=256")
+
+    def test_replace_classifies_briefs_by_who_they_reached(self):
+        d = self.init_run()
+        run(d, "member", "parser", "group=money")
+        run(d, "member", "currency", "group=money")
+        run(d, "member", "solo", "group=crew")
+        run(d, "post", "coordinator", stdin="@money BRIEF\nShared: the money type")
+        run(d, "post", "coordinator", stdin="@parser BRIEF\nOwns: the parser")
+        run(d, "post", "coordinator", stdin="@crew BRIEF\nOwns: the crew work")
+        run(d, "member", "parser", "group=-")  # no longer in the group the shared brief reached
+        run(d, "member", "currency", "group=crew")  # in a group whose brief reached only @solo
+        run(d, "replace", "parser", "parser-2")
+        brief = run(d, "show", "parser-2")
+        assert "Shared brief #1: Shared: the money type" in brief and "Owns: the parser" in brief, brief
+        run(d, "replace", "solo", "solo-2")
+        brief = run(d, "show", "solo-2")
+        assert "Shared brief" not in brief and "Owns: the crew work" in brief, brief
+
+    def test_replace_reads_whom_a_brief_assigned_when_it_was_posted(self):
+        d = self.init_run()
+        run(d, "member", "parser", "group=money")
+        run(d, "member", "currency", "group=money")
+        run(d, "member", "lexer")
+        run(d, "post", "coordinator", stdin="@money BRIEF\nShared: the money type, which @parser leads")
+        run(d, "post", "coordinator", stdin="@lexer BRIEF\nOwns: the lexer; ask @parser about tokens")
+        assert [p.get("addressed") for p in map(json.loads, open(os.path.join(d, "board.jsonl")))] == [
+            ["parser", "currency"], ["lexer"]]
+        run(d, "member", "parser", "group=-")
+        run(d, "replace", "parser", "parser-2")
+        brief = run(d, "show", "parser-2")
+        # the shared brief reached it as an addressee; the lexer's only names it, which assigns nothing
+        assert "Shared brief #1: Shared: the money type" in brief and "Owns: the lexer" not in brief, brief
+        run(d, "replace", "lexer", "lexer-2")
+        assert "Owns: the lexer" in run(d, "show", "lexer-2")
+
+    def test_replace_never_takes_a_body_mention_for_a_brief(self):
+        d = self.init_run()
+        run(d, "member", "parser")
+        run(d, "member", "lexer")
+        run(d, "post", "coordinator", stdin="@lexer BRIEF\nOwns: the lexer; ask @parser about tokens")
+        run(d, "replace", "parser", "parser-2")
+        brief = run(d, "show", "parser-2")
+        assert "(@parser had no brief on the board)" in brief and "Owns: the lexer" not in brief, brief
+
+    def test_agent_run_finds_a_killed_run_for_a_retired_member(self):
+        key = "d" * 64
+        # a native teammate's address comes back in each run of the conversation
+        old = self.init_run("job")
+        run(old, "bind", key)
+        run(old, "member", "t", "id=teammate-1")
+        run(old, "close")
+        d = self.init_run("job")
+        run(d, "bind", key)
+        run(d, "member", "w", "id=agent-w")
+        run(d, "member", "t", "id=teammate-1")
+        run(d, "kill")
+        assert saved(d)["closed"] and saved(d)["members"]["w"]["killed"] == "1"
+        for agent in ("agent-w", "teammate-1"):  # the latest run that had it, though none is open
+            assert run(self.swarm, "agent-run", key, agent).strip() == os.path.abspath(d)
+        assert not run(self.swarm, "restore", key).strip()  # nothing is resumed on a killed run
+        third = self.init_run("job")
+        run(third, "bind", key)
+        run(third, "member", "t", "id=teammate-1")
+        run(third, "member", "u", "id=teammate-2")
+        assert run(self.swarm, "agent-run", key, "teammate-1").strip() == os.path.abspath(third)  # an open run wins
 
     def test_a_revise_tells_the_verifier_of_a_partial_candidate_built_on_it(self):
         d = self.init_run()
@@ -1945,7 +2376,7 @@ class BoardRegressions(unittest.TestCase):
         for case in vectors["quoted"]:
             assert board.QUOTED.sub(" ", case["text"]) == case["expect"], case
         for case in vectors["question"]:
-            assert bool(board.QUESTION.search(board.OPTIONAL.sub(" ", board.QUOTED.sub(" ", case["text"])))) == case["expect"], case
+            assert board.asks(case["text"]) == case["expect"], case
         for case in vectors["kind"]:
             word = board.REPORT_WORD.match(case["text"])
             assert (word[1] if word else "") == case["expect"], case

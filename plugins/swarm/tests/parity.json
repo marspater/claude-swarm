@@ -1184,6 +1184,70 @@
   {
    "text": "may I edit ArticleListView? it is outside my paths",
    "expect": true
+  },
+  {
+   "text": "takes Int? = nil",
+   "expect": false
+  },
+  {
+   "text": "String? -> Bool",
+   "expect": false
+  },
+  {
+   "text": "returns String? or nil",
+   "expect": false
+  },
+  {
+   "text": "passes Data? nil",
+   "expect": false
+  },
+  {
+   "text": "should I use Swift? or Kotlin",
+   "expect": true
+  },
+  {
+   "text": "may I edit ListView? if yes I start now",
+   "expect": true
+  },
+  {
+   "text": "(is it ListView?)",
+   "expect": true
+  },
+  {
+   "text": "May I edit ListView? and its tests too.",
+   "expect": true
+  },
+  {
+   "text": "@coordinator May I edit ListView? is it outside my paths",
+   "expect": true
+  },
+  {
+   "text": "inferred String? because guid takes String?; now typed",
+   "expect": false
+  },
+  {
+   "text": "it takes Date? and returns nil",
+   "expect": false
+  },
+  {
+   "text": "should this return Date? in both",
+   "expect": true
+  },
+  {
+   "text": "Fixed. It returns Date? in both cases",
+   "expect": false
+  },
+  {
+   "text": "@xmay ListView? and more",
+   "expect": false
+  },
+  {
+   "text": "Can I make src/config.ts return Config? or nil on lookup failure",
+   "expect": true
+  },
+  {
+   "text": "The return value is Config? or nil",
+   "expect": false
   }
  ],
  "kind": [
@@ -1288,6 +1352,6 @@
    "expect": "VERIFIED"
   }
  ],
- "actions": ["account", "adopt", "agent-run", "attention", "bind", "claim", "close", "confirm", "export", "init", "limit", "locate", "member", "pause", "plan", "post", "prune", "read", "ready", "rearm", "replace", "restore", "resume", "retry", "revise", "show", "started", "status", "sync", "tail", "wake", "woke"],
+ "actions": ["account", "adopt", "agent-run", "attention", "bind", "claim", "close", "confirm", "export", "init", "kill", "limit", "locate", "member", "pause", "plan", "post", "prune", "read", "ready", "rearm", "replace", "restore", "resume", "retry", "revise", "show", "started", "status", "sync", "tail", "wake", "woke"],
  "defaults": {"worker": ["sonnet", "medium"], "verifier": ["sonnet", "medium"], "explorer": ["haiku", "medium"], "investigator": ["opus", "high"], "architect": ["fable", "high"], "designer": ["opus", "high"]}
 }

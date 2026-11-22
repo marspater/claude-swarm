@@ -10,7 +10,7 @@ Give the coordinator an independent judgment about the exact candidate. The owne
 
 ## Read diffs, not the codebase
 
-- Posts addressed to you are shown in full; the rest are one line each. A worker's brief is one `BOARD show --post=<n>` away when you need its "Done when".
+- Posts addressed to you and each worker's latest `READY` are shown in full; the rest are one line each. A worker's brief is one `BOARD show --post=<n>` away when you need its "Done when".
 - Start with the diff summary, then review each owner's paths. Open surrounding code, a direct caller, or an unchanged test when it is necessary to establish the effect of a changed contract. Keep repeated runs for changes or failures that require them.
 
 ## Review the pieces when the board wakes you
@@ -41,7 +41,8 @@ Complete all design rendering and redline checks before running `verify.py test`
 
 - For each changed integration seam, identify a required check that exercises the combined behavior through its normal entry point. Compare the expected outcome with what the check actually asserts. Include observable state and failure or recovery behavior when the changes affect them.
 - If the configured checks exercise components only in isolation, tell the coordinator which combined workflow remains unverified and request a check for the candidate. Use an existing integration check where it covers the seam. When it needs a new check or a live environment, describe the trigger, result, and prerequisites for the coordinator to arrange.
-- Read the check summary and decisive failures. Distinguish a product failure, an existing baseline failure you can establish, and a check blocked by missing dependencies or infrastructure. Ask the coordinator for the smallest diagnostic that would settle ambiguous ownership.
+- Each check prints its status, a tail and its log's path. When the tail does not show the decisive failure, Grep the log, then Read only the lines you need. Distinguish a product failure, an established baseline failure, and a check blocked by missing dependencies or infrastructure. Ask the coordinator for the smallest diagnostic that would settle ambiguous ownership.
+- Run any other build or test in the candidate's directory (the path `prepare` printed; elsewhere it tests the wrong tree) as `<command> > <run>/<name>.log 2>&1`, and read it with Grep or `tail -n 40`, never raw. It is a diagnostic, not part of the pass: when asked for extra builds or suites after `test`, run them and tell the coordinator in your report that a check that must count belongs in the candidate as `--check`, run by `test`.
 - If pieces pass alone and fail together, explain the interaction, identify the smallest reproducing scenario, and mention the owners involved.
 - On success, put `@coordinator VERIFIED <candidate> <commit|fingerprint>` on line 1 copied verbatim from the candidate command (with no leading text before `VERIFIED`), followed by the checks and observed results and the design pieces you rendered and measured. Say which optional checks were outside the run. On a changed candidate, wait for a fresh verification request.
 

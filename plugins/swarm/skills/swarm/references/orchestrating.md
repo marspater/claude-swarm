@@ -20,9 +20,10 @@ Every member is its own agent with its own context. Three members cost roughly t
 
 1. **Split by ownership, not by activity.** A piece is a set of paths or one question. "Write the code" and "write its tests" for the same module are one piece: the same worker owns both files.
 2. **No path has two writers.** If two pieces need the same file (a shared type, a route table, a lockfile), either give that file to one worker and make the other depend on it, or have the first worker land the shared change before the others start. In shared work, register each writer's `paths=` on the roster: hooks enforce `paths=` on edits (blocking writes to another writer's paths, outside the member's own `paths=`, or inside `.swarm/`).
-3. **Agree the seams in the briefs.** Where pieces meet (a function signature, a JSON shape, a CLI flag), write the contract into both briefs. Workers that guess a seam produce pieces that pass alone and fail together.
+3. **Agree the seams before the briefs.** Where pieces meet (a function signature, a JSON shape, a CLI flag, a shared convention), state the contract once, in one shared seam post that addresses every member it binds and the verifier (see A good brief). Workers that guess a seam produce pieces that pass alone and fail together.
 4. **Prefer no order.** A dependency makes a member wait. Use one only when the later piece cannot be written without the earlier result.
-5. **As few as the task divides into.** At most eight unless the user asked for more.
+5. **One worker for sequential work of one type.** When the later piece needs the same agent type and model as the earlier one, give both to one worker rather than chaining two (`B depends=A` with B as A's only dependent). A second worker pays a cold start of about 65,000 tokens (measured on a live run) and reads the same files again, while the first already holds them. Chain two workers of one type only when the first piece is long enough that carrying its conversation through the second would cost more than that cold start. Keep `depends=` for a change of agent type or model (an explorer's map for a worker, a designer's spec for its builders) and for fan-out and fan-in.
+6. **As few as the task divides into.** At most eight unless the user asked for more.
 
 ## Patterns
 
@@ -38,7 +39,7 @@ Many similar small jobs: failing tests grouped by package, lint fixes by directo
 
 ### Pipeline
 
-Stages that need the previous result: locate, then implement, then verify. Register the order with `BOARD member <later> depends=<earlier>` and name it in both briefs. `BOARD ready` wakes dependents for ordinary assignments. For an investigator, you review the finding and use `BOARD confirm NAME SEQ` to release dependents. In an isolated-worktree pipeline between writers, the downstream writer's commit must contain the upstream `READY <commit>`, or its `BOARD ready` is refused: brief it to run `BOARD sync <its name>` from its worktree before building and testing on the upstream work, and again after any new upstream `READY`. Keep the chain short so workers spend their turns on independent work where possible.
+Stages that need the previous result: locate, then implement, then verify. Each stage changes agent type or model; consecutive stages for the same type and model are one worker's (Splitting, rule 5). Register the order with `BOARD member <later> depends=<earlier>` and name it in both briefs. `BOARD ready` wakes a dependent once every member it depends on is ready, so a member with two dependencies is woken once, at the second `READY`, and its read shows each dependency's latest `READY` in full. For an investigator, you review the finding and use `BOARD confirm NAME SEQ` to release dependents. In an isolated-worktree pipeline between writers, the downstream writer's commit must contain the upstream `READY <commit>`, or its `BOARD ready` is refused: brief it to run `BOARD sync <its name>` from its worktree before building and testing on the upstream work, and again after any new upstream `READY`. Keep the chain short so workers spend their turns on independent work where possible.
 
 ### Investigate, then fix
 
@@ -71,7 +72,7 @@ A member starts with nothing but its brief and the first two lines (`@name BRIEF
 - **Owns:** exact paths, or the exact question.
 - **Must not touch:** everything else, and who owns the neighbouring pieces.
 - **Depends on:** the members whose `READY` it must wait for, or `nothing`.
-- **Seams:** any contract it shares with another piece, stated identically in both briefs.
+- **Seams:** any contract it shares with another piece. When two or more members share one, post it once, before anyone is started and before the individual briefs: a post whose first line addresses those members and the verifier and ends in BRIEF (`@parser @currency @verifier BRIEF`), then a `Seams:` block. The individual briefs then do not repeat it, and each still writes only its own member's name with `@`. The shared post goes first because a mention wakes a started member; `BOARD replace` copies it into a successor's brief.
 - **Done when:** a check the member can run and see pass. "Works correctly" is not a check.
 - **Repository rules:** the user's standing instructions that apply, such as commit-message rules.
 - **How to report:** `BOARD ready <name>`, or the board tool's `ready` action for a specialist.
@@ -80,7 +81,7 @@ A member starts with nothing but its brief and the first two lines (`@name BRIEF
 
 - Honour the user's limits: record them with `BOARD limit` before registering anyone, and show `BOARD plan` before the team starts.
 - Choose the cheapest agent type that can do the piece (`agent-types.md`).
-- A member reads in full only the posts that mention it. Put what a member needs in its brief, or in a post that mentions it; do not expect it to have read the rest.
+- A member reads in full only the posts that mention it, and the latest `READY` of each member it depends on (a verifier: of every worker). Put what a member needs in its brief, or in a post that mentions it; do not expect it to have read the rest.
 - A waiting member costs nothing. A member that polls or chats does. Briefs should make chatter unnecessary.
 - A build or test suite that only one checkout can run at a time (a shared build folder, a machine-wide lock) makes parallel workers queue while each one's cache goes cold. Give each worktree its own build output where the tool allows it (`-derivedDataPath`, `CARGO_TARGET_DIR`); in a shared checkout, brief workers not to commit (one commit follows `VERIFY accept`; bare `git commit` is refused), to run only narrow fast checks for their piece (if even a filtered test triggers the whole build, skip it and name it in `READY` for the verifier), and never to invent a build lock or queue (an isolated agent is also refused a command built around `trap`).
 - `@all` wakes everyone. Use it for a change every member must act on, such as a shared contract that moved.

@@ -32,6 +32,8 @@ Use `wc -l`, and read the first 50 lines. Unpack an archive first, into `<run>/e
 
 Then write the **canonical taxonomy**: three to eight category tags, taken from the user's question and those first 50 lines (log levels, record kinds, error families, the things the user asked to count). Every analyst buckets into the same tags, so the synthesizer adds counts instead of guessing which labels mean the same thing. Keep the tags short and mutually exclusive, and always end the list with `OTHER`.
 
+When the content is structured or semi-structured (a table, JSON, JSON lines, a log), run one deterministic pass over the whole file before you partition: `awk`, `jq` or `python3`, writing to `<run>/facts.txt` a global section of exact totals and frequency tables (per level, per record kind, per error family, per tag) and the line boundaries you may cut at. Read only that file, not its input. Decide from it whether analysts are needed at all: a question the counts already answer needs none, and you report from the facts. When they are needed, run the same pass again once step 2 fixes the slices, as one command over every slice's own non-overlapping line range, adding one section of the same counts per slice. Name the facts file in every analyst's and the synthesizer's brief, so they spend their turns on meaning (clusters, causes, what changed), not on counting.
+
 ### 2. Partition
 
 Slices are line ranges of the original file, passed by reference. You write no chunk files, with two exceptions noted below.
@@ -47,7 +49,7 @@ Slices are line ranges of the original file, passed by reference. You write no c
 | Prose | by `#` and `##` headings, else 800 lines | 40 lines without headings | Headings | "Slice M of N" |
 | Config, markup, unknown | 800 lines | 40 lines | Line counts | "Slice M of N" |
 
-The number of slices follows from the size. Do not pick a number of analysts and stretch the slices to fit.
+The number of slices follows from the size. Do not pick a number of analysts and stretch the slices to fit. With a facts file, run its per-slice pass (step 1) once the cuts are fixed.
 
 Find the cut points with an indexer, not by reading. Reading the rest of the file to look for boundaries rebuilds it in your context, which is what the pattern avoids. A search that prints only line numbers and the matching lines gives you exact boundaries:
 
@@ -84,20 +86,21 @@ Owns: /abs/path/app.log lines 9951-14950 (slice 3 of 12). Read nothing else in t
 Count boundary: include only items that start at or after line 10001 in your totals. Lines 9951-10000
 are overlap with the previous slice, read for context and stack-trace continuity only.
 Question: <the user's question, word for word the same in every brief>
+Facts: section "slice 3" of <run>/facts.txt holds your exact counts. Copy them; do not recount.
 Taxonomy: bucket every finding into [<TAG_1>, <TAG_2>, <TAG_3>, OTHER]. If a major pattern fits none,
 propose at most 2 new tags under OTHER.
 Report: with the board tool's ready action (or `BOARD ready <name>` for a `swarm:worker` analyst). First line: one sentence with your slice's main finding.
 Then, compactly:
-- COUNTS: exact counts per taxonomy tag, respecting the count boundary
+- COUNTS: exact counts per taxonomy tag, respecting the count boundary. With a facts line, count only what the facts cannot (a judgement call), marked "own count"
 - CLUSTERS: recurring patterns, with one example line number each
 - CROSS_REFS: IDs, symbols or trace keys that are cut off or point outside your slice
 - OUTLIERS & GAPS: anomalies, spikes or changes over time, and what you could not determine
 Give line numbers, not quotations. Keep it under 2,000 characters.
 ```
 
-The taxonomy line is word for word the same in every brief. Leave the count boundary line out for the first slice and for types partitioned without overlap.
+The taxonomy line is word for word the same in every brief. Leave the facts line out when step 1 wrote no facts file. Leave the count boundary line out for the first slice and for types partitioned without overlap.
 
-The synthesizer's brief: wait for every slice; read each report already posted with `BOARD show --post=<n>` (list those numbers in the brief; later reports arrive in full in its `BOARD read`); produce overall rankings by frequency and impact, trends that cross slices, the risks likely to grow, and summary figures (items, range covered, slices); cite the post number behind every claim; mark any claim that rests on a single slice; list the slices that reported nothing or failed. Tell it to sum `COUNTS` per taxonomy tag, merge the tags analysts proposed under `OTHER` where they describe one pattern, and match each slice's `CROSS_REFS` against the neighbouring slices' reports.
+The synthesizer's brief: wait for every slice; its `BOARD read` shows each slice's latest `READY` in full, so it opens none with `show`; with a facts file, take run totals from its global section and never sum slice counts it already totals; produce overall rankings by frequency and impact, trends that cross slices, the risks likely to grow, and summary figures (items, range covered, slices); cite the post number behind every claim; mark any claim that rests on a single slice; list the slices that reported nothing or failed. Tell it to sum `COUNTS` per taxonomy tag (with a facts file, only the analysts' own counts), merge the tags analysts proposed under `OTHER` where they describe one pattern, and match each slice's `CROSS_REFS` against the neighbouring slices' reports.
 
 The synthesizer reads reports only, with one exception that you write into its brief together with the file path: it may inspect up to 3 narrow line ranges of the source, at most 40 lines each, solely to resolve conflicting counts across an overlap or to verify a critical claim that rests on a single slice. It reports each range it read and what the range settled. This is cheaper than a new member for 30 lines; anything larger is still a closer look by a new member (see Recursion).
 
@@ -105,7 +108,7 @@ The synthesizer reads reports only, with one exception that you write into its b
 
 Spawn at most eight analysts at a time. Register and brief a slice in the same step as its spawn, never earlier: a registered member with no agent is reported as unstarted, and a briefed one as owed a wake. As `READY` posts arrive, register, brief and spawn the next slices.
 
-Between batches, let the earlier slices inform the later ones. When the one-line headers of two or more finished analysts name the same new tag or the same critical ID (a correlation ID, an error code, a symbol), add one line to the briefs of the slices not yet spawned: `Watchlist from earlier slices: also track occurrences of [<tag or id>].` Take it from the headers only, keep it to that one line, and do not open the full reports for it. Briefs already posted stay as they are. Register, brief and spawn the synthesizer once the final batch finishes, so it does not wake on each final-batch `READY` or sit idle through the run.
+Between batches, let the earlier slices inform the later ones. When the one-line headers of two or more finished analysts name the same new tag or the same critical ID (a correlation ID, an error code, a symbol), add one line to the briefs of the slices not yet spawned: `Watchlist from earlier slices: also track occurrences of [<tag or id>].` Take it from the headers only, keep it to that one line, and do not open the full reports for it. Briefs already posted stay as they are. Register, brief and spawn the synthesizer once the final batch finishes, so it does not sit idle through the run, reported as unstarted.
 
 ### 7. Keep your own context small
 

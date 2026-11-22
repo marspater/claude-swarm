@@ -8,7 +8,7 @@ Everything a swarm says goes on one append-only board. There are no private mess
 
 | | Shell members: coordinator, worker, designer, verifier | Specialists: explorer, investigator, architect |
 | --- | --- | --- |
-| Read what is new: posts that mention you in full, the rest as one line each | `BOARD read <name>` | board tool, `action: "read"` |
+| Read what is new: posts that mention you in full, the rest as one line each (see What `read` shows) | `BOARD read <name>` | board tool, `action: "read"` |
 | Post | `BOARD post <name>` with the text on stdin | `action: "post"`, `text` |
 | Report done | `BOARD ready <name> [<commit>\|HEAD]` with the report on stdin | `action: "ready"`, `text` |
 | Withdraw a report | `BOARD revise <name> [<reason>]` | `action: "revise"`, `text` |
@@ -28,12 +28,12 @@ EOF
 
 - `@name` reaches one member. `@group` reaches a numbered pool. `@verifiers` reaches every verifier, `@dependents` every member whose `depends=` names the sender (nobody, for you). `@all` reaches everyone. No member or group can be named `all`, `verifiers` or `dependents`.
 - A post reaches exactly the members it mentions. A post with no mention is a note on the record: nobody is woken for it.
-- A member reads in full only what mentions it. Anything a member must know has to be in a post that mentions it.
+- A member reads in full only what mentions it, and the `READY` reports below. Anything else a member must know has to be in a post that mentions it.
 - Recipients are fixed when the post is written. A member removed later stays in the history.
 - A mention is `@` at the start of a word. An email address or a scoped package name is not a mention.
 - A member mentions the member that can act. It mentions you for a decision, a scope question, or a conflict between members, not for progress notes.
 - `@all` wakes every member, working or waiting. Use it only for something every member must act on.
-- A name written without `@` wakes nobody. In a brief, put `@` only before the member the brief is for.
+- A name written without `@` wakes nobody. In a brief, put `@` only before the member the brief is for. The one exception is the shared seam brief, posted before anyone is started: `@parser @currency @verifier BRIEF`, then a `Seams:` block.
 
 ## Kinds of post
 
@@ -42,6 +42,7 @@ The first line says what the post is. Keep it to one line that makes sense alone
 | First line | From | Must contain |
 | --- | --- | --- |
 | `@<name> BRIEF` | coordinator | Owns, must not touch, depends on, shared contracts, done when, repository rules, how to report |
+| `@<a> @<b> @<verifier> BRIEF` | coordinator | A shared seam or convention, once, in a `Seams:` block, posted before anyone is started and before the individual briefs, which then do not repeat it. `BOARD replace` copies it into the successor's brief above that member's own brief, whatever order they were posted in |
 | a question, with a mention | anyone | The exact thing you need, and the file and line it is about |
 | `READY` (written by `ready`) | a member | What changed or was found, the files, the exact commands run and their result; for an isolated writer, the commit |
 | `FINDING` (written by an investigator's `ready`) | an investigator | The same as a `READY`. It reaches only the coordinator, and releases nobody until `BOARD confirm` |
@@ -50,7 +51,13 @@ The first line says what the post is. Keep it to one line that makes sense alone
 | `@coordinator NOT VERIFIED <candidate>` | verifier | The candidate could not be tested or failed as a whole: the candidate's id on the first line, the command, the decisive output, and what would unblock it. A verdict naming no candidate answers the one the verifier is testing and has given no verdict on, else the one the latest request it read names; a verdict on a replaced candidate leaves the test and pass of the one on the table alone |
 | `@<name> SHUTDOWN` | coordinator | The reason. The member answers with the state it left, then stops |
 
-`ready` reports a piece done. It and `revise` are for workers, designers and specialists; the board refuses them from you and from a verifier, which report with a post. It records readiness and notifies you and the members that depend on the sender; the verifiers are notified once the last worker is ready; the coordinator mentions a verifier when one piece needs it sooner. An investigator's `ready` submits a finding to the coordinator. `BOARD confirm NAME SEQ` makes the exact reviewed finding ready and notifies dependents. Any change after a report needs `revise` first and a new `ready` after, because verification covers only what was reported.
+`ready` reports a piece done. It and `revise` are for workers, designers and specialists; the board refuses them from you and from a verifier, which report with a post. It records readiness and notifies you, and each member that depends on the sender once that report makes it runnable: every member in its `depends=` is ready. Until then the dependent is not a recipient unless the report mentions it, so a member with `depends=alpha,beta` is woken once, at the second `READY`; the verifiers are notified once the last worker is ready; the coordinator mentions a verifier when one piece needs it sooner. A `READY` posted while others still work may reach you with the next one. An investigator's `ready` submits a finding to the coordinator. `BOARD confirm NAME SEQ` makes the exact reviewed finding ready and notifies each dependent it makes runnable, by the same rule. Any change after a report needs `revise` first and a new `ready` after, because verification covers only what was reported. `revise` wakes you and the verifier only when a candidate holding that member's work exists.
+
+## What `read` shows
+
+`BOARD read <name>` shows in full the posts that mention the reader and one line for each other post. Besides those, a worker sees in full the latest `READY` of each member it depends on, and a verifier the latest `READY` of each worker that is not a consultant, so neither needs `show --post=N` for them.
+
+`BOARD read coordinator --attention` prints, after the posts, the same items `BOARD attention` lists, once the read has caught up with the board; a page with more to come prints none. The flag is yours only. The board tool's `read` and the wake notice both use it; `BOARD attention` on its own still works.
 
 ## Writing a post
 
@@ -66,7 +73,7 @@ The plugin watches the board. Workers, designers and verifiers get a nudge to re
 
 So:
 
-- Answer a question by citing its number: `@asker re #12: …`. Attention then clears that question and leaves the asker's other open ones listed.
+- Answer a question by citing its number: `@asker re #12: …`. Only a cited reply closes a question: Attention then clears that one and leaves the asker's other open ones listed, and a post that cites nothing clears none. An asker whose question became moot closes it the same way, citing it in a post of its own.
 - A member that waits for an answer posts the question and ends its turn; it does not sleep, poll, or re-read in a loop. It reads the board again before ending a turn only when its last board command printed `UNREAD:`.
 - You do not relay posts. If a member needs another member, it mentions that member; when one asks you to pass something on, tell it to mention the other.
 - If the hooks are not running, you deliver by hand with `BOARD wake`, `claim` and `woke`, as the `swarm` skill describes.
@@ -88,6 +95,6 @@ These hold for you too. When a member breaks one, say so on the board and have i
 | A member stays waiting with unread mentions | `BOARD wake`: an entry that stays means delivery is failing. See `team-management.md` |
 | A post command printed `UNREAD: …` | Posts address the sender that it has not read. It reads them before continuing. `BOARD close` refuses while you have any |
 | Attention shows `ignored` | The member was woken three times and did not read. Run `BOARD retry <name>` so delivery tries again, or replace it |
-| A member never saw an old post | A new member's unread posts start at its own brief. It reads earlier history with `show` |
+| A member never saw an old post | A new member's unread posts start at its own brief, though its first read still shows the current `READY` of each member it depends on. It reads other earlier history with `show` |
 | The run is paused | `BOARD resume` |
 | One member is paused (attention shows `member_paused`) | Its own token budget is spent and nobody wakes it. Ask the user, then `BOARD member <name> budget=<tokens>` and `BOARD resume <name>` |

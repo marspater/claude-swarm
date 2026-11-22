@@ -50,6 +50,14 @@ More examples:
 
 Experimental: to use Claude's native shared task list, launch `/swarm:swarm --native-teams <task>` from a session where Agent Teams is already enabled. Native teams use the shared workspace. The default continues to use background subagents and supports isolated Git worktrees.
 
+### Preview a team: `/swarm:plan`
+
+`/swarm:plan <task>` shows the smallest team for a task before any run exists: who owns which paths, who waits for whom, each member's model and effort, the checks the verifier would run, and a rough token cost. For a small or tightly coupled task the answer can be that one agent is enough. It reads the code but starts no run and edits no project file: no run folder, no member, no edit. A long task is saved under `.swarm/tasks/` as for `/swarm:swarm`. It takes a model turn, because splitting work needs judgement, so it is a skill command (`/swarm:plan`), not the `/swarm-plan` form the instant commands use. Start the run with `/swarm:swarm` and the same task in the same conversation, and the coordinator starts from the accepted plan.
+
+### Ending a run: `/swarm-kill` or `/swarm:kill`
+
+`/swarm-kill [reason]` ends the run this conversation drives at once, with no model turn, even while the coordinator is working. `/swarm:kill [reason]` does the same, but as a skill command it waits for a running turn to end. When the kill lands mid-turn, the coordinator's tool calls in that turn are refused with an instruction to end it, and the compaction waits for the turn to finish. Either way: the board retires every member and closes the run, a member agent still working stops at its next tool call (refused), and what a retired member hands back afterwards is dropped so it does not wake the conversation. The answer names any member still running and any process a retired member left in its worktree, with the `kill` line to stop it. Nothing is committed or reverted: the files stay as the members left them. The conversation is then compacted without the Swarm rules and goes on as an ordinary assistant; if the compaction cannot run you are told to run `/compact`. A new `/swarm:swarm` starts a run as usual.
+
 ## Seeing and limiting the cost
 
 **The plan comes first.** Before any member starts, the coordinator shows the team as a table: each member's type, model, effort, what it owns and what it waits for. It starts straight away for a small team on the default models, and asks first when the plan has more than five members, when a member would run on a stronger model than its type's default, when a member would run on Fable that you did not ask for, or when you asked to approve the plan.
@@ -65,7 +73,7 @@ Experimental: to use Claude's native shared task list, launch `/swarm:swarm --na
 
 **Every run has a budget.** A run starts with 3,000,000 tokens unless you name another figure, and pauses there for your decision. A budget at or below what the run has already used is refused, since it could only stop the members mid-work.
 
-**Tokens are counted.** The pane shows tokens per member and for the run, against the budget when there is one. The count is input, cache writes and output, plus cache reads at a tenth, and it is taken at every model step, so a budget is noticed mid-turn. The count is saved with the run, so resuming the coordinator keeps the total and enforces the same budget. Usage from before this change cannot be recovered. A task of 50,000 characters or more, such as a pasted log, is saved to `.swarm/task-<time>.md`: the coordinator gets its first 6,000 characters, its last 2,000 and the path, and reads what it needs from the file, because text held in the conversation is re-read at every step of the run.
+**Tokens are counted.** The pane shows tokens per member and for the run, against the budget when there is one. The count is input, cache writes and output, plus cache reads at a tenth, and it is taken at every model step, so a budget is noticed mid-turn. The count is saved with the run, so resuming the coordinator keeps the total and enforces the same budget. Usage from before this change cannot be recovered. A task of 16,000 characters or more, such as a pasted log, given to `/swarm:swarm` or `/swarm:plan`, is saved to `.swarm/tasks/<time>.md`, a folder that keeps itself out of git: the coordinator gets its first 4,000 characters, its last 2,000 and the path, and reads what it needs from the file, because text held in the conversation is re-read at every step of the run. A task over 2,000 characters is also held once, not twice: the skill's copy of it points at the command's own message.
 
 **Members read only what is theirs.** A member sees in full only the posts that mention it; the rest of the board costs it one line per post. Each member type also carries a role skill that tells it to search before it reads and to stay inside its piece.
 
@@ -123,6 +131,7 @@ The coordinator can select these profiles when splitting a task. You can also as
 | `swarm/references/agent-types.md` | Coordinator, read when needed | Which agent for which piece: the swarm's six member types, the built-in agents, and other plugins' agents |
 | `swarm/references/team-management.md` | Coordinator, read when needed | The roster, workspaces, permissions, adding, replacing and removing members, shutdown, recovery, closing a run |
 | `swarm/references/messaging.md` | Coordinator, read when needed | The board protocol: mentions, kinds of post, delivery, troubleshooting |
+| `swarm/references/native-teams.md` | Coordinator, read only for a `--native-teams` run | What experimental native Agent Teams mode changes in each step: Agent Teams check, named teammates, native tasks, in-process display, shutdown |
 | `swarm/references/rlm.md` | Coordinator, read only for content over about 5,000 lines or 50K tokens | The RLM pattern for content too large for one context: partition the data, one Haiku analyst at low effort per slice, one synthesizer |
 | `implementing` | `swarm:worker`, preloaded | Smallest change that meets the brief, building from a designer's spec, narrow tests first, a short `READY` |
 | `verifying` | `swarm:verifier`, preloaded | Diffs against briefs, the full checks once on the integrated candidate |

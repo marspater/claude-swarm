@@ -14,8 +14,32 @@ export const unquoted = (text: string) => text.replace(QUOTED, ' ')
 const QUESTION_MARK = /(?<![ \t]\?)(?:(?<![ \t])\?|\?(?![ \t][^\n?]*[ \t]:))(?!\?|\.?\w|:)/
 // The board's OPTIONAL: an optional type named in prose ("inferred String? because") asks nothing. Only before a
 // word that carries a statement on: "may I edit ListView? it is outside my paths" still asks.
-const OPTIONAL = /(?<![@A-Za-z0-9_])[A-Z][A-Z0-9_]*[a-z][A-Za-z0-9_]*\?(?=[ \t]+(?:because|since|so|and|but|as|is|was|are|were|in|at|on|by|for|from|to|with|not)(?![A-Za-z0-9_])|[,;\]>])/g
-export const hasQuestion = (text: string) => QUESTION_MARK.test(unquoted(text).replace(OPTIONAL, ' '))
+const OPTIONAL = /(?<![@A-Za-z0-9_])[A-Z][A-Z0-9_]*[a-z][A-Za-z0-9_]*\?(?=[ \t]+(?:because|since|so|and|but|as|is|was|are|were|in|at|on|by|for|from|to|with|not|nil|null|none)(?![A-Za-z0-9_])|[ \t]+or[ \t]+(?:nil|null|none)(?![A-Za-z0-9_])|[ \t]*(?:[,;\]>=]|->))/g
+// The board's INTERROGATIVE: a clause, past its leading blanks and mentions, opened by a word that asks. In one,
+// "May I edit ListView? and its tests too." is a question, so its optional type is not masked. Each name and
+// separator run ends where its class does, so a failed word backtracks into nothing: `@xmay` is one mention.
+const INTERROGATIVE = /[ \t]*(?![ \t])(?:@[A-Za-z0-9_-]+(?![A-Za-z0-9_-])[ \t,:]*(?![ \t,:]))*(?:may|can|could|should|shall|will|would|do|does|did|is|are|was|were|has|have|had|which|what|who|whom|whose|where|when|why|how)(?![A-Za-z0-9_])/iy
+export const hasQuestion = (text: string) => {
+  const plain = unquoted(text)
+  // The clause starts after the last stop before the type. Each stretch is searched once, and a
+  // type's own mark is a stop, so no clause is read twice: many types in a long text stay linear.
+  let scanned = 0
+  let start = 0
+  const masked = plain.replace(OPTIONAL, (found: string, at: number) => {
+    for (let i = at - 1; i >= scanned; i--) {
+      // The board's clause stop: a `?` or a newline always; `.`, `!`, `;` and `:` only before a space, a tab or a
+      // newline, so not inside `src/a.ts`.
+      if (plain[i] === '?' || plain[i] === '\n' || ('.!;:'.includes(plain[i]!) && ' \t\n'.includes(plain[i + 1]!))) {
+        start = i + 1
+        break
+      }
+    }
+    scanned = at
+    INTERROGATIVE.lastIndex = start
+    return INTERROGATIVE.test(plain) ? found : ' '
+  })
+  return QUESTION_MARK.test(masked)
+}
 
 // A long post is cut here until it is expanded.
 export const CLIP = 480

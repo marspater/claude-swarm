@@ -1615,6 +1615,142 @@ class VerifyRegressions(unittest.TestCase):
             again = subprocess.run(landing, shell=True, cwd=proj, capture_output=True, text=True)
             assert again.returncode, again.stdout
 
+    # A check's output goes to a log under the run folder; the verifier sees a summary and a bounded tail.
+
+    def _checked(self, proj, *checks, env=None):
+        """A new run in PROJ whose one worker is ready, and a shared candidate of CHECKS tested once:
+        (gate, prepared candidate, run, the test's result)."""
+        board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "logs", "init", "Logs")
+        post = [sys.executable, SCRIPTS / "board.py", board]
+        gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+        run(*post, "member", "w")
+        run(*post, "member", "v", "role=verifier")
+        run(*post, "ready", "w", text="done")
+        cand = json.loads(run(*gate, "prepare", "shared", *[arg for check in checks for arg in ("--check", check)]))
+        result = subprocess.run([*gate, "test", cand["candidate"], "v"], capture_output=True, text=True, env=env)
+        return gate, cand, Path(board), result
+
+    def test_a_passing_check_shows_its_summary_and_tail_and_logs_everything(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            (proj / "app.txt").write_text("ok")
+            _, cand, board, result = self._checked(proj, 'seq 1 5000; echo "Ran 5000 tests OK"', "seq 1 20")
+            assert result.returncode == 0, result.stderr
+            log = board / "checks" / f"{cand['candidate']}-attempt01-check01.log"
+            assert log.read_text() == "".join(f"{n}\n" for n in range(1, 5001)) + "Ran 5000 tests OK\n"
+            lines = result.stdout.splitlines()
+            assert lines[1].startswith("Exit 0 in ") and lines[1].endswith(f", 5001 lines (23911 bytes) of output, log: {log}"), lines[1]
+            # the summary line and a few before it, and nothing more of the output
+            assert lines[2:8] == ["4997", "4998", "4999", "5000", "Ran 5000 tests OK", "$ seq 1 20"], lines
+            # a short pass is shown whole
+            assert lines[8].startswith("Exit 0 in ") and ", 20 lines (51 bytes) of output, log: " in lines[8], lines[8]
+            assert lines[9:-1] == [str(n) for n in range(1, 21)], lines
+            assert lines[-1].startswith("VERIFIED "), lines
+
+    def test_a_failing_check_shows_a_bounded_tail_and_the_log_holds_the_error(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            (proj / "app.txt").write_text("ok")
+            noisy = "printf 'FAIL: %s error\\n' decisive >&2; seq 1 20000; exit 1"
+            wide = "for i in $(seq 1 100); do printf '%0200d\\n' $i; done; exit 4"
+            _, cand, board, result = self._checked(proj, noisy, wide)
+            assert result.returncode and "verification failed: " in result.stderr, result.stderr
+            logs = board / "checks"
+            first, second = (logs / f"{cand['candidate']}-attempt01-check0{n}.log" for n in (1, 2))
+            assert first.read_text().startswith("FAIL: decisive error\n1\n")
+            assert "FAIL: decisive error" not in result.stdout, result.stdout[:500]
+            out = result.stdout.split("$ ")
+            noisy_out, wide_out = out[1], out[2]
+            assert f"Exit 1 in " in noisy_out and f", 20001 lines (108915 bytes) of output, log: {first}" in noisy_out
+            assert "\n19941\n" in noisy_out and "\n19940\n" not in noisy_out and noisy_out.count("\n") < 70, noisy_out
+            assert f"(the last 60 of 20001 lines; Grep the log for the rest, then Read the lines you need: {first})" in noisy_out
+            # long lines are held to the byte limit, whole lines only
+            assert f"Exit 4 in " in wide_out and str(second) in wide_out
+            shown = [line for line in wide_out.splitlines() if len(line) == 200]
+            assert 0 < len(shown) < 60 and shown[-1] == "%0200d" % 100 and len(wide_out) < 4000 + 1000, len(wide_out)
+            assert f"(the last {len(shown)} of 100 lines; " in wide_out, wide_out[-300:]
+
+    def test_a_checks_stderr_and_stdout_reach_its_log_in_order(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            (proj / "app.txt").write_text("ok")
+            _, cand, board, result = self._checked(proj, "echo one; echo two >&2; echo three; echo four >&2; exit 1")
+            assert result.returncode
+            log = board / "checks" / f"{cand['candidate']}-attempt01-check01.log"
+            assert log.read_text() == "one\ntwo\nthree\nfour\n"
+            assert "one\ntwo\nthree\nfour\n(the last 4 of 4 lines; " in result.stdout, result.stdout
+
+    def test_a_timed_out_check_leaves_what_it_printed_in_its_log(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            (proj / "app.txt").write_text("ok")
+            env = dict(os.environ, SWARM_VERIFY_TIMEOUT="0.5")
+            _, cand, board, result = self._checked(proj, "echo before; echo also >&2; sleep 30", env=env)
+            assert result.returncode and "verification command timed out after 0.5s" in result.stderr, result.stderr
+            log = board / "checks" / f"{cand['candidate']}-attempt01-check01.log"
+            assert log.read_text() == "before\nalso\n"
+            assert "Timed out after 0.5s in " in result.stdout and f"2 lines (12 bytes) of output, log: {log}" in result.stdout
+            assert "before\nalso\n(the last 2 of 2 lines; " in result.stdout, result.stdout
+
+    def test_logs_change_nothing_verification_records_or_accepts(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g = self._init_git(proj)
+            (proj / "file.txt").write_text("v2")
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "logs", "init", "Logs"))
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            run(*post, "ready", "w", text="done")
+            cand = json.loads(run(*gate, "prepare", "shared", "--check", "cat file.txt; echo checked"))
+            prepared = json.loads((board / "verification.json").read_text())
+            first = run(*gate, "test", cand["candidate"], "v")
+            again = run(*gate, "test", cand["candidate"], "v")
+            # the line and the record are what they were: the attempt and the pass are all a test adds
+            assert first.splitlines()[-1] == again.splitlines()[-1] == f"VERIFIED {cand['candidate']} {cand['digest']}", again
+            tested = json.loads((board / "verification.json").read_text())
+            assert {k: v for k, v in tested.items() if k not in ("attempt", "verified_by")} == prepared
+            assert tested["verified_by"] == "v" and len(tested["attempt"]) == 32
+            # one log per attempt, the earlier one kept
+            assert sorted(log.name for log in (board / "checks").iterdir()) == [
+                f"{cand['candidate']}-attempt01-check01.log", f"{cand['candidate']}-attempt02-check01.log"]
+            # outside the fingerprint and out of the commit, even with nothing ignoring run data
+            (proj / ".swarm" / ".gitignore").unlink()
+            run(*post, "post", "v", "@coordinator " + again.splitlines()[-1])
+            line = next(line for line in run(*gate, "accept", cand["candidate"]).splitlines() if line.startswith("Commit with: "))
+            out = subprocess.run(line[len("Commit with: "):].replace("<message>", "land"), shell=True, cwd=proj,
+                                 check=True, capture_output=True, text=True).stdout
+            assert "COMMITTED " + cand["candidate"] in out, out
+            assert g("show", "--name-only", "--format=", "HEAD").splitlines() == ["file.txt"]
+
+    def test_two_attempts_that_count_alike_still_get_a_log_each(self):
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import verify
+            from unittest import mock
+            with tempfile.TemporaryDirectory() as t:
+                logs = Path(t)
+                # both count the logs before either has made its own
+                with mock.patch.object(Path, "glob", lambda *a, **k: iter(())):
+                    first, second = verify.reserve(logs, "cand"), verify.reserve(logs, "cand")
+                assert (first, second) == (1, 2), (first, second)
+                assert sorted(p.name for p in logs.iterdir()) == ["cand-attempt01-check01.log", "cand-attempt02-check01.log"]
+                assert verify.reserve(logs, "cand") == 3
+        finally:
+            sys.path.remove(str(SCRIPTS))
+
+    def test_logs_stay_out_of_an_isolated_candidate(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            _, _, board, post, gate = self._isolated_candidate(proj, lambda g: ((proj / "file.txt").write_text("v2"), g("add", "file.txt")))
+            cand = json.loads(run(*gate, "prepare", "isolated", "--check", "cat file.txt"))
+            line = run(*gate, "test", cand["candidate"], "v").splitlines()[-1]
+            assert line == f"VERIFIED {cand['candidate']} {cand['commit']}"
+            assert (Path(board) / "checks" / f"{cand['candidate']}-attempt01-check01.log").read_text() == "v2"
+            run(*post, "post", "v", "@coordinator " + line)
+            assert "ACCEPTED " in run(*gate, "accept", cand["candidate"])
+
 
 if __name__ == "__main__":
     unittest.main()

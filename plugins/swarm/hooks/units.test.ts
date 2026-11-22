@@ -23,6 +23,9 @@ test('a board command is recognised in the forms a coordinator types it', async 
   }
   expect(COORDINATOR_READ.test('board.py DIR read --headers --max-bytes=4000 coordinator')).toBe(true)
   expect(COORDINATOR_READ.test('board.py DIR read parser')).toBe(false)
+  // the wake's read asks for the attention items after the name
+  expect(COORDINATOR_READ.test('board.py DIR read coordinator --attention')).toBe(true)
+  expect(COORDINATOR_READ.test('board.py DIR read coordinator --max-bytes=48000 --attention')).toBe(true)
   // the board takes a name with its @
   expect(COORDINATOR_READ.test('board.py DIR read --all @coordinator')).toBe(true)
   expect(runsNamed(`a ${run} b demo-20261116-101010 .swarm/other-20261117-090000x logs/crash-20261116-143022.log`)).toEqual(['demo-20261116-101010', 'other-20261117-090000x'])
@@ -493,6 +496,21 @@ test('a READY keeps its commit only when it is a full id, and a member paused on
   expect(parse('/r', '', roster, []).members.find(member => member.name === 'parser')?.detail).toBe('its token budget is spent')
   expect(hasQuestion('which file? `a ?? b`')).toBe(true)
   expect(hasQuestion('`which file?` and c ? a : b')).toBe(false)
+  // an optional type before a default, an arrow, or `or nil` states a type and asks nothing
+  expect(hasQuestion('the field is now String? = nil')).toBe(false)
+  expect(hasQuestion('it maps Int? -> Bool')).toBe(false)
+  expect(hasQuestion('it returns Date? or nil when unset')).toBe(false)
+  expect(hasQuestion('it returns Date? null when unset')).toBe(false)
+  expect(hasQuestion('may I change Date? or keep it')).toBe(true)
+  // an optional type is masked only in a clause that asks nothing: one opened by may, which, is and their like still asks
+  expect(hasQuestion('May I edit ListView? and its tests too.')).toBe(true)
+  expect(hasQuestion('@coordinator May I edit ListView? is it outside my paths')).toBe(true)
+  expect(hasQuestion('inferred String? because guid takes String?; now typed')).toBe(false)
+  expect(hasQuestion('it takes Date? and returns nil')).toBe(false)
+  expect(hasQuestion('@xmay ListView? and more')).toBe(false)
+  // a dot inside a path ends no clause; one before a blank does
+  expect(hasQuestion('Can I make src/config.ts return Config? or nil on lookup failure')).toBe(true)
+  expect(hasQuestion('Can I go. The return value is Config? or nil')).toBe(false)
 })
 
 // The cases board.py and these hooks must read alike, kept by the Python side in tests/parity.json. The claude kit
@@ -532,6 +550,11 @@ test('F23: a question mark before a long run of blanks is read in linear time', 
   expect(hasQuestion('a ?' + ' '.repeat(5000) + 'b')).toBe(true)
   expect(hasQuestion('c ?' + ' '.repeat(5000) + ': b')).toBe(false)
   expect(Date.now() - started).toBeLessThan(200)
+  // many optional types: each clause is searched once
+  const typed = Date.now()
+  expect(hasQuestion('it takes Date? and '.repeat(30_000))).toBe(false)
+  expect(hasQuestion('may I keep ' + 'Date? and '.repeat(30_000))).toBe(true)
+  expect(Date.now() - typed).toBeLessThan(500)
 })
 
 test('F24: a heredoc or a case inside a substitution keeps it whole, and its commands are listed', () => {

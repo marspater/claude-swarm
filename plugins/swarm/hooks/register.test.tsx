@@ -1278,7 +1278,7 @@ test('the coordinator is told of unread mentions mid-turn and when idle, and a m
   await clock.advance(2000)
   const told = await toolCall($, { tool: 'Read', file_path: '/project/a.ts' })
   expect(told.context?.join(' ')).toContain('1 board post addresses you from #2')
-  expect(told.context?.join(' ')).toContain(`'${RUN}' read coordinator`)
+  expect(told.context?.join(' ')).toContain(`'${RUN}' read coordinator --attention`)
   // once per newest unread post, not on every call
   expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts' })).context).toBeUndefined()
   // mid-turn nothing is submitted; once the turn ends with the post still unread, one prompt is
@@ -1348,7 +1348,7 @@ test('the hive follows roster actions, coordinator turns and sleep', async ($, o
 // The engine beneath a conversation that owns RUN, as the tests below share it.
 const OWNED = '/project/.swarm/demo-20261116-101010'
 type On = Parameters<Extract<Parameters<typeof test>[1], (...args: never[]) => unknown>>[1]
-function owning(on: On, files: { board: () => string; roster: () => string; session?: () => string; read?: (path: string) => string | undefined; end?: () => Promise<void>; exists?: boolean }) {
+function owning(on: On, files: { board: () => string; roster: () => string; session?: () => string; read?: (path: string) => string | undefined; hold?: (path: string) => Promise<void> | undefined; end?: () => Promise<void>; exists?: boolean }) {
   const seen = { commands: [] as string[], prompts: [] as string[], toasts: [] as string[], isDeaf: false, restore: '' }
   on('command.register', () => ({ value: { command: 'swarm-board' } }))
   on('tool.register', (_, spec) => ({ value: { tool: `mcp__swarm__${spec.name}` } }))
@@ -1357,7 +1357,11 @@ function owning(on: On, files: { board: () => string; roster: () => string; sess
   on('session.id', () => ({ value: files.session?.() ?? 'fixture-conversation' }))
   on('session.cwd', () => ({ value: '/project' }))
   on('fs.exists', () => ({ value: files.exists ?? false }))
-  on('fs.read', (_, e) => ({ value: files.read?.(e.path) ?? (e.path.endsWith('/board.jsonl') ? files.board() : e.path.endsWith('/members.json') ? files.roster() : '') }))
+  on('fs.read', async (_, e) => {
+    // A read the test holds answers once it lets go, with the file as it is then.
+    await files.hold?.(e.path)
+    return { value: files.read?.(e.path) ?? (e.path.endsWith('/board.jsonl') ? files.board() : e.path.endsWith('/members.json') ? files.roster() : '') }
+  })
   on('session.end', async (_, e) => {
     await files.end?.()
     return { sessionId: e.sessionId }
@@ -1404,16 +1408,47 @@ test('a task too long to hold is saved to a file, and the coordinator gets its t
   expect([ran, written]).toEqual([['fix the parser'], {}])
   const long = `fix what this log shows\n${'x'.repeat(60_000)}\nand keep the parser's tests green`
   await swarm(long)
-  const [path = ''] = Object.keys(written)
-  expect(path).toMatch(/^\/project\/\.swarm\/task-\d{14}-\d+-[0-9a-f]{8}\.md$/)
+  // the tasks folder keeps itself out of git, whatever .swarm/.gitignore holds; that file is init's, not written here
+  expect(written['/project/.swarm/tasks/.gitignore']).toBe('*\n')
+  expect(written['/project/.swarm/.gitignore']).toBeUndefined()
+  const tasks = () => Object.keys(written).filter(key => key.endsWith('.md'))
+  const [path = ''] = tasks()
+  expect(path).toMatch(/^\/project\/\.swarm\/tasks\/\d{14}-\d+-[0-9a-f]{8}\.md$/)
   // a second one in the same second is a second file
   await swarm(`${long} too`)
-  expect(Object.keys(written).length).toBe(2)
+  expect(tasks().length).toBe(2)
   expect(written[path]).toBe(long)
   expect(ran[1]!.length).toBeLessThan(9_000)
   expect(ran[1]).toMatch(/^fix what this log shows\n[^]*and keep the parser's tests green$/)
   expect(ran[1]).toContain(`All of it is in ${path}`)
   expect(seen.toasts.join(' ')).toContain('60,058 characters')
+})
+
+test('a plan\'s long task is saved the same way, and a tasks/.gitignore already there is left alone', async ($, on) => {
+  let ignore = '*\n'
+  owning(on, { board: () => '', roster: () => '{}', exists: true, read: path => path.endsWith('/.swarm/tasks/.gitignore') ? ignore : undefined })
+  const written: Record<string, string> = {}
+  const ran: string[] = []
+  on('fs.write', (_, e) => {
+    written[e.path] = e.text
+    return { value: undefined }
+  })
+  on('command.run', (_, e) => {
+    ran.push(e.args)
+    return { text: '' }
+  })
+  mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  const long = `plan this log\n${'x'.repeat(60_000)}\nend`
+  await $.command.run({ command: 'swarm:plan', args: long, origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 80 } })
+  const [path = '', ...more] = Object.keys(written)
+  expect([more, path]).toEqual([[], expect.stringMatching(/^\/project\/\.swarm\/tasks\/.*\.md$/)])
+  expect(written[path]).toBe(long)
+  expect(ran[0]).toContain(`All of it is in ${path}`)
+  // one that does not ignore everything is not rewritten, and nothing is saved where git would see it: the task goes on whole
+  ignore = 'node_modules\n'
+  await $.command.run({ command: 'swarm:plan', args: `${long} again`, origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 80 } })
+  expect([Object.keys(written).length, ran[1]]).toEqual([1, `${long} again`])
 })
 
 test('where no main view can be moved the pane shows the member\'s conversation, and its posts only when that cannot be read', async ($, on) => {
@@ -2422,13 +2457,18 @@ test('a READY is held while others still work, and a run made inside a command s
   on('fs.exists', () => ({ value: false }))
   on('fs.read', (_, e) => ({
     value: e.path === `${RUN}/board.jsonl` ? (advice ? consulted : board) : e.path === `${RUN}/members.json` ? (advice ? withSage : roster)
-      : e.path === '/project/.swarm/current' ? 'demo-20261116-101010\n' : '',
+      : e.path === '/project/.swarm/current' ? pointer : '',
   }))
   on('agent.list', () => ({ value: [
     { id: 'a1', description: '@parser', type: 'swarm:worker', status: 'completed' },
     { id: 'a2', description: '@lexer', type: 'swarm:worker', status: lexer },
   ] as never }))
-  on('tool.call', () => ({ result: { stdout: '', stderr: '' } }))
+  // the pointer names the run once a command's init has made it
+  let pointer = ''
+  on('tool.call', () => {
+    pointer = 'demo-20261116-101010\n'
+    return { result: { stdout: '', stderr: '' } }
+  })
   on('turn.complete', () => ({ text: '' }))
   on('process.run', (_, e) => {
     const [, , directory, action] = e.argv
@@ -3353,15 +3393,29 @@ test('F24: the Board filter finds @all and group posts, and a kind is a whole wo
 
 test('a run made inside a command substitution takes the place of the closed run this conversation drove', async ($, on) => {
   let isClosed = false
+  // The pointer names the run this conversation drove until a command's init moves it to the new one.
+  const OLD = 'demo-20261116-101010'
+  let pointer = OLD
+  let isMaking = false
+  let isPointerUnread = false
   const { seen, answer, board } = owning(on, {
+    exists: true,
     board: () => posts({ agent: 'coordinator', to: [], text: 'done' }),
-    read: path => (path === '/project/.swarm/current' ? 'next-20261117-101010\n' : undefined),
+    read: path => {
+      if (path !== '/project/.swarm/current') return undefined
+      if (isPointerUnread) throw new Error('EIO')
+      return `${pointer}\n`
+    },
     roster: () => JSON.stringify({ title: 'Demo swarm', closed: isClosed, members: { coordinator: { role: 'coordinator', last_read_seq: 1 } } }),
   })
   on('process.run', (_, e) => answer(board(e)))
   on('agent.list', () => ({ value: [] }))
   let printed = ''
-  on('tool.call', () => ({ result: { stdout: printed, stderr: '' } }))
+  on('tool.call', () => {
+    isPointerUnread = false
+    if (isMaking) pointer = 'next-20261117-101010'
+    return { result: { stdout: printed, stderr: '' } }
+  })
   mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
   await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
@@ -3371,6 +3425,7 @@ test('a run made inside a command substitution takes the place of the closed run
   expect(noted.context ?? []).toEqual([])
   // a script held in a variable is an init once the command printed the run folder the pointer names
   printed = '/p/board.py\n/Project/.swarm/next-20261117-101010\n'
+  isMaking = true
   const held = await toolCall($, { tool: 'Bash', command: 'S=/p/board.py; ls $S && python3 $S /project/.swarm/next init "Next"' })
   expect(held.context?.join(' ')).toContain('A run was made')
   expect(seen.restore).toBe(OWNED)
@@ -3381,6 +3436,7 @@ test('a run made inside a command substitution takes the place of the closed run
   const named = await toolCall($, { tool: 'Bash', command: 'S=/p/board.py; echo $S init; echo /project/.swarm/next-20261117-101010' })
   expect(named.context ?? []).toEqual([])
   printed = ''
+  pointer = OLD
   // the variable run inside a substitution prints no folder and is an init all the same
   const both = await toolCall($, { tool: 'Bash', command: 'S=/p/board.py; R=$(python3 $S /project/.swarm/next init "Next")' })
   expect(both.context?.join(' ')).toContain('A run was made')
@@ -3390,6 +3446,20 @@ test('a run made inside a command substitution takes the place of the closed run
   expect(seen.restore).toBe(OWNED)
   isClosed = true
   await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" close` })
+  // an init that failed while the command went on left the pointer on the closed run: nothing was made, in either form
+  pointer = OLD
+  isMaking = false
+  for (const command of ['R=$(python3 /p/board.py /project/.swarm/next init "Next"); echo ok', 'S=/p/board.py; R=$(python3 $S /project/.swarm/next init "Next") || true']) {
+    expect((await toolCall($, { tool: 'Bash', command })).context ?? [], command).toEqual([])
+  }
+  printed = `${OWNED}\n`
+  expect((await toolCall($, { tool: 'Bash', command: `S=/p/board.py; python3 $S /project/.swarm/next init "Next"; ls -d ${OWNED}` })).context ?? []).toEqual([])
+  printed = ''
+  isMaking = true
+  // a pointer that could not be read before the command leaves nothing to compare with: no run is inferred
+  isPointerUnread = true
+  expect((await toolCall($, { tool: 'Bash', command: 'R=$(python3 /p/board.py /project/.swarm/next init "Next")' })).context ?? []).toEqual([])
+  pointer = OLD
   // however the script is run inside the substitution
   const made = await toolCall($, { tool: 'Bash', command: 'R=$(uv run /p/board.py /project/.swarm/next init "Next")' })
   expect(seen.restore).toBe('/project/.swarm/next-20261117-101010')
@@ -3448,7 +3518,7 @@ test('the coordinator drives its run through the board tool, and what a typed bo
   // the mention owed is told with the next call, and a read through the tool answers it as a typed read does
   await clock.advance(2000)
   const reading = await tool({ action: 'read' })
-  expect(last('read')?.args).toBe('read coordinator --max-bytes=48000')
+  expect(last('read')?.args).toBe('read coordinator --max-bytes=48000 --attention')
   expect(reading.context).toBeUndefined()
   expect((await tool({ action: 'status' })).context).toBeUndefined()
 
@@ -3510,6 +3580,7 @@ test('workers, designers and verifiers use the board tool as themselves, within 
   expect((await as('des-1', { action: 'revise', text: 'fixing the spacing' })).deny).toBeUndefined()
   expect((await as('ver-1', { action: 'post', text: '@coordinator NOT VERIFIED: no candidate yet' })).deny).toBeUndefined()
   expect(ran).toEqual([
+    // a member's read pages but never asks for the coordinator's attention items
     { args: `${OWNED} read alice --max-bytes=48000`, stdin: undefined },
     { args: `${OWNED} status`, stdin: undefined },
     { args: `${OWNED} ready alice ${sha}`, stdin: 'Parser done.' },
@@ -4861,6 +4932,10 @@ test('guard: a member\'s board and verify commands are read through cd, env, pyt
   expect(await deny(`bash -c 'python3 /p/verify.py ${OWNED} /project accept abc'`, 'vera-1')).toContain("the coordinator's")
   // the commit after an acceptance is the coordinator's too, for a worker and for a verifier
   expect(await deny(`python3 /p/verify.py ${OWNED} /project commit abc -m land`, 'vera-1')).toContain("verify.py commit is the coordinator's")
+  // the user's kill is the coordinator's alone: a member's is refused before the board runs, the coordinator's runs
+  expect(await deny(`${B} kill`)).toContain("the board's kill is the coordinator's")
+  expect(await deny(`${B} kill`, 'vera-1')).toContain("the board's kill is the coordinator's")
+  expect((await toolCall($, { tool: 'Bash', command: `${B} kill` })).deny).toBeUndefined()
 })
 
 test('guard: a # inside a word is no comment, a substitution that never closes is refused, and git options are read in order with their values', async ($, on) => {
@@ -5445,4 +5520,597 @@ test('review: with its pane down, a conversation follows the run it drove until 
   await clock.advance(10_000)
   expect(reads.filter(path => path.startsWith(other))).toEqual([])
   expect(reads.some(path => path.startsWith(OWNED))).toBe(true)
+})
+
+test('/swarm:kill with no run driven from this conversation answers so and runs nothing', async ($, on) => {
+  const { seen, answer, board } = owning(on, { board: () => '', roster: () => '{}' })
+  on('process.run', (_, e) => answer(board(e)))
+  let ran = 0
+  on('command.run', () => { ran++; return { text: '' } })
+  mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  const killed = await $.command.run({ command: 'swarm:kill', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 80 } })
+  expect(killed.text).toContain('No Swarm run is driven from this conversation')
+  expect([ran, seen.commands.filter(c => c.startsWith('kill'))]).toEqual([0, []])
+})
+
+for (const compaction of ['done', 'skipped'] as const) test(`/swarm:kill retires the run with no model turn, drops what its members send back, and keeps the skill away until a new run (compaction ${compaction})`, async ($, on) => {
+  const state: Record<string, unknown> = { title: 'Kill swarm', members: {
+    coordinator: { role: 'coordinator', last_read_seq: 1 },
+    alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '0', last_read_seq: 1 },
+    zed: { role: 'worker', id: 'zed-1', paths: 'src/zed', isolated: '0', last_read_seq: 1 },
+  } }
+  const { seen, answer, board } = owning(on, { board: () => posts({ agent: 'coordinator', to: ['alice'], text: '@alice BRIEF' }), roster: () => JSON.stringify(state) })
+  on('process.run', (_, e) => {
+    if (e.argv[3] !== 'kill') return answer(board(e))
+    board(e)
+    state.closed = true
+    for (const member of Object.values(state.members as Record<string, Record<string, string>>)) if (member.role !== 'coordinator') member.killed = '1'
+    return answer('killed: 2 member(s) retired, run closed\n@alice alice-1\n@zed zed-1\n')
+  })
+  on('agent.list', () => ({ value: [{ id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  let ran = 0
+  on('command.run', () => { ran++; return { text: '' } })
+  const compacted: (string | undefined)[] = []
+  on('session.compact', (_, e) => {
+    compacted.push(e.instructions)
+    return compaction === 'done' ? { messages: [{ role: 'user', text: 'The summary.', toolUses: [] }] as never } : { skip: 'a hook said no' }
+  })
+  on('skill.prompt', (_, e) => ({ text: e.text }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  // the coordinator's turn that made the read has ended: the kill lands while it is idle
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'c0', reason: 'answer' })
+  await clock.advance(2000)
+  const run = (command: string, args: string) => $.command.run({ command, args, origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 80 } })
+
+  const killed = await run('swarm:kill', 'the user changed course')
+  // the hook answered in the command's place: no skill prompt, no turn
+  expect(ran).toBe(0)
+  expect(seen.commands).toContain('kill the user changed course')
+  expect(killed.text).toContain('2 member(s) retired')
+  expect(killed.text).toContain('Still running: @alice')
+  expect(killed.text).toContain('Nothing was committed or reverted')
+  // a retired member's next tool call is refused at once, before any poll: a read, an edit and a command alike
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/src/alice/a.ts', agentId: 'alice-1' })).deny).toBeDefined()
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/src/alice/a.ts', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toContain('retired')
+  expect((await toolCall($, { tool: 'Bash', command: 'npm test', agentId: 'zed-1' })).deny).toContain('retired')
+  await clock.advance(10)
+  expect(compacted.length).toBe(1)
+  expect(compacted[0]).toContain('no longer a Swarm coordinator')
+  expect(seen.toasts.some(text => text.includes('Run /compact'))).toBe(compaction === 'skipped')
+
+
+  // what its members send back is dropped; another agent's and the user's own go through
+  const submit = (text: string, kind: 'task-notification' | 'peer-send-message' | 'peer' | 'composer') => $.prompt.submit({ text, origin: { kind }, wait: false })
+  // a background member's hand-back is a peer message framed with its agent id; another session naming the id is not one
+  expect((await submit('Another Claude session sent a message:\n<agent-message from="alice-1">\n[Subagent hand-back] done</agent-message>', 'peer')).drop).toBeDefined()
+  expect((await submit('Another Claude session sent a message:\n<agent-message from="other">\nalice-1 looks stuck</agent-message>', 'peer')).drop).toBeUndefined()
+  expect((await submit('<task-notification><task-id>alice-1</task-id><status>completed</status></task-notification>', 'task-notification')).drop).toBeDefined()
+  expect((await submit('Message from zed-1: done', 'peer-send-message')).drop).toBeDefined()
+  expect((await submit('<task-notification><task-id>bob-1</task-id></task-notification>', 'task-notification')).drop).toBeUndefined()
+  expect((await submit('<task-notification><task-id>alice-12</task-id></task-notification>', 'task-notification')).drop).toBeUndefined()
+  expect((await submit('what did alice-1 change?', 'composer')).drop).toBeUndefined()
+  // the sender is read from the envelope alone: another agent's notification that mentions a retired one is its own
+  expect((await submit('<task-notification><task-id>other-1</task-id><status>completed</status><summary>alice-1 is done</summary></task-notification>', 'task-notification')).drop).toBeUndefined()
+  expect((await submit('Message from other-1: alice-1 is stuck', 'peer-send-message')).drop).toBeUndefined()
+  expect((await submit('Another Claude session sent a message:\n<agent-message from="other-1">\n<agent-message from="alice-1"></agent-message>', 'peer')).drop).toBeUndefined()
+
+  // the swarm skill's text stays away until a new /swarm:swarm
+  const skill = () => $.skill.prompt({ skill: 'swarm', text: 'FULL SKILL', pluginName: 'swarm' })
+  expect((await skill()).text).toContain('ended with /swarm:kill')
+  await run('swarm:swarm', 'a new task')
+  expect((await skill()).text).toBe('FULL SKILL')
+  // once another run is bound, a late hand-back from the killed run's member is still dropped
+  await toolCall($, { tool: 'Bash', command: 'python3 /p/board.py "/project/.swarm/next-20261122-100000" read coordinator' })
+  await clock.advance(10)
+  expect(seen.commands.filter(c => c.startsWith('bind ')).length).toBe(2)
+  expect((await submit('<task-notification><task-id>alice-1</task-id><status>completed</status></task-notification>', 'task-notification')).drop).toBeDefined()
+})
+
+test('/swarm-kill during the coordinator\'s turn retires the run at once, ends that turn, and compacts only after it', async ($, on) => {
+  const state: Record<string, unknown> = { title: 'Kill swarm', members: {
+    coordinator: { role: 'coordinator', last_read_seq: 1 },
+    alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '0', last_read_seq: 1 },
+  } }
+  const { seen, answer, board } = owning(on, { board: () => posts({ agent: 'coordinator', to: ['alice'], text: '@alice BRIEF' }), roster: () => JSON.stringify(state) })
+  on('process.run', (_, e) => {
+    if (e.argv[3] !== 'kill') return answer(board(e))
+    board(e)
+    state.closed = true
+    ;(state.members as Record<string, Record<string, string>>).alice!.killed = '1'
+    return answer('killed: 1 member(s) retired, run closed\n@alice alice-1\n')
+  })
+  on('agent.list', () => ({ value: [] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const compacted: (string | undefined)[] = []
+  on('session.compact', (_, e) => {
+    compacted.push(e.instructions)
+    return { messages: [{ role: 'user', text: 'The summary.', toolUses: [] }] as never }
+  })
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  await $.turn.start({ text: 'Continue coordinating', turnId: 'c1' })
+  const killed = await $.command.run({ command: 'swarm-kill', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 80 } })
+  // the board kill ran at once, mid-turn
+  expect(seen.commands).toContain('kill')
+  expect(killed.text).toContain('told to end now')
+  // that turn's next tool call is refused with the sentence, and nothing is compacted while it runs
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts' })).deny).toBe('The user ended the Swarm run with /swarm:kill. End your turn now, in one line.')
+  await clock.advance(10)
+  expect(compacted).toEqual([])
+  await $.turn.complete({ answer: 'Stopped.', durationMs: 1, isAborted: false, turnId: 'c1', reason: 'answer' })
+  await clock.advance(10)
+  expect(compacted.length).toBe(1)
+  // a later turn is the ordinary assistant's: its tool calls go through
+  await $.turn.start({ text: 'Thanks, now fix the typo', turnId: 'c2' })
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts' })).deny).toBeUndefined()
+})
+
+test('a member\'s hand-back that only repeats the board is dropped while others work, and every wake the board owes still comes', async ($, on) => {
+  const state: Record<string, unknown> = { title: 'Quiet swarm', members: {
+    coordinator: { role: 'coordinator', last_read_seq: 1 },
+    parser: { role: 'worker', id: 'a1', last_read_seq: 1 },
+    lexer: { role: 'worker', id: 'a2', last_read_seq: 1 },
+    quiet: { role: 'worker', id: 'a3', last_read_seq: 1 },
+    woke: { role: 'worker', id: 'a4', last_read_seq: 1, last_nudged_seq: 1 },
+  } }
+  let list = [
+    { agent: 'coordinator', to: ['parser', 'lexer', 'quiet'], text: '@parser @lexer @quiet BRIEF' },
+    { agent: 'parser', to: ['coordinator'], text: 'READY\nparser done' },
+  ]
+  const { seen, answer, board } = owning(on, { board: () => posts(...list), roster: () => JSON.stringify(state) })
+  on('process.run', (_, e) => e.argv[3] === 'attention' ? answer(JSON.stringify({ items: [], members: {}, limits: {} })) : answer(board(e)))
+  let lexer = 'running'
+  on('agent.list', () => ({ value: [
+    { id: 'a1', description: '@parser', type: 'swarm:worker', status: 'completed' },
+    { id: 'a2', description: '@lexer', type: 'swarm:worker', status: lexer },
+    { id: 'a3', description: '@quiet', type: 'swarm:worker', status: 'completed' },
+    { id: 'a4', description: '@woke', type: 'swarm:worker', status: 'completed' },
+  ] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'c0', reason: 'answer' })
+  await clock.advance(2000)
+  const handBack = (id: string, turnId?: string) => $.prompt.submit({ text: `Another Claude session sent a message:\n<agent-message from="${id}">\n[Subagent hand-back] done</agent-message>`, origin: { kind: 'peer' }, wait: false, ...(turnId && { turnId }) })
+  const notified = (id: string, status = 'completed', summary = '') => $.prompt.submit({ text: `<task-notification><task-id>${id}</task-id><status>${status}</status>${summary}</task-notification>`, origin: { kind: 'task-notification' }, wait: false })
+
+  // a message parser sends about something new is no turn's end: it goes through
+  expect((await $.prompt.submit({ text: 'Another Claude session sent a message:\n<agent-message from="a1">\nthe build broke in src/shared</agent-message>', origin: { kind: 'peer' }, wait: false })).drop).toBeUndefined()
+  // a routine READY while lexer works: both of parser's host wakes are dropped, but not a failure since
+  expect((await handBack('a1')).drop).toBeDefined()
+  expect((await notified('a1', 'failed')).drop).toBeUndefined()
+  expect((await notified('a1')).drop).toBeDefined()
+  // one post answers for one turn's end: parser ran again and left nothing newer, so this end goes through
+  expect((await handBack('a1')).drop).toBeUndefined()
+  expect((await notified('a1')).drop).toBeUndefined()
+  // the sender is the envelope's: a stranger's notification that mentions a member is the stranger's
+  expect((await notified('stranger', 'completed', '<summary>a1 finished</summary>')).drop).toBeUndefined()
+  // one delivered into a running turn starts nothing, and is left alone; an agent that is no member, too
+  expect((await handBack('a1', 'c1')).drop).toBeUndefined()
+  expect((await handBack('stranger')).drop).toBeUndefined()
+  // a member that ended without leaving anything on the board is a silent exit: its wake goes through
+  expect((await handBack('a3')).drop).toBeUndefined()
+  // and so is one that was woken, read what it was woken for, and posted nothing
+  expect((await handBack('a4')).drop).toBeUndefined()
+
+  // a question to the coordinator is worth the turn
+  list = [...list, { agent: 'lexer', to: ['coordinator'], text: '@coordinator may I edit src/shared.ts?' }]
+  await clock.advance(2000)
+  expect((await handBack('a1')).drop).toBeUndefined()
+  // so is a READY that asks the coordinator to rule on something
+  list = [list[0]!, list[1]!, { agent: 'parser', to: ['coordinator'], text: 'READY\nparser done\n@coordinator the slow test was not run' }]
+  await clock.advance(2000)
+  expect((await handBack('a1')).drop).toBeUndefined()
+  // a newer routine READY answers for another turn's end
+  list = [list[0]!, list[1]!, { agent: 'parser', to: ['coordinator'], text: 'READY\nparser done again' }]
+  await clock.advance(2000)
+  // the board woke parser through that post since the poll, and its turn ended with nothing new: a silent exit
+  const parser = (state.members as Record<string, Record<string, unknown>>).parser!
+  parser.last_nudged_seq = 3
+  expect((await notified('a1')).drop).toBeUndefined()
+  delete parser.last_nudged_seq
+  expect((await notified('a1')).drop).toBeDefined()
+
+  // a paused run delivers nothing itself, so the host's wake goes through
+  state.paused = 'waiting for the user'
+  await clock.advance(2000)
+  expect((await handBack('a1')).drop).toBeUndefined()
+  delete state.paused
+  await clock.advance(2000)
+
+  // the last member stops: the wake goes through, and the board's own notice still comes for the READY
+  lexer = 'completed'
+  await clock.advance(2000)
+  expect((await handBack('a1')).drop).toBeUndefined()
+  await clock.advance(16000)
+  expect(seen.prompts.filter(text => /address(?:es)? you/.test(text)).length).toBe(1)
+
+  // a run this conversation no longer drives
+  lexer = 'running'
+  state.closed = true
+  await clock.advance(2000)
+  expect((await handBack('a1')).drop).toBeUndefined()
+})
+
+for (const hasAgent of [true, false]) test(`the last worker's READY is held while a verifier ${hasAgent ? 'with an agent reviews it' : 'with no agent yet would not'}`, async ($, on) => {
+  const state = { title: 'Review swarm', members: {
+    coordinator: { role: 'coordinator', last_read_seq: 1 },
+    parser: { role: 'worker', id: 'a1', last_read_seq: 1 },
+    checker: { role: 'verifier', ...(hasAgent && { id: 'v1' }), last_read_seq: 1 },
+  } }
+  const list = [
+    { agent: 'coordinator', to: ['parser', 'checker'], text: '@parser @checker BRIEF' },
+    { agent: 'parser', to: ['coordinator', 'checker'], text: 'READY\nparser done' },
+  ]
+  const { seen, answer, board } = owning(on, { board: () => posts(...list), roster: () => JSON.stringify(state) })
+  on('process.run', (_, e) => e.argv[3] === 'attention' ? answer(JSON.stringify({ items: [], members: {}, limits: {} })) : answer(board(e)))
+  on('agent.list', () => ({ value: [
+    { id: 'a1', description: '@parser', type: 'swarm:worker', status: 'completed' },
+    ...(hasAgent ? [{ id: 'v1', description: '@checker', type: 'swarm:verifier', status: 'completed' }] : []),
+  ] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'c0', reason: 'answer' })
+  await clock.advance(30000)
+  expect(seen.prompts.filter(text => text.includes('addresses you')).length).toBe(hasAgent ? 0 : 1)
+})
+
+test('a long task is not held twice: the skill\'s copy of it points at the command\'s own message', async ($, on) => {
+  owning(on, { board: () => '', roster: () => '{}' })
+  on('command.run', (_, e) => ({ text: e.args }))
+  on('skill.prompt', (_, e) => ({ text: e.text }))
+  mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  const run = (command: string, args: string) => $.command.run({ command, args, origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 80 } })
+  const long = `migrate the parser\n${'detail '.repeat(500)}\nand keep the tests green`
+  for (const skill of ['swarm', 'plan']) {
+    await run(`swarm:${skill}`, long)
+    const text = (await $.skill.prompt({ skill, text: `# Swarm\n\n${long}\n\nIf no task is given above, ask.`, pluginName: 'swarm' })).text
+    expect(text).not.toContain('detail detail')
+    expect(text).toContain('The task is the text of the user\'s command above.')
+  }
+  // a short task stays where it is
+  await run('swarm:swarm', 'fix the parser')
+  expect((await $.skill.prompt({ skill: 'swarm', text: '# Swarm\n\nfix the parser', pluginName: 'swarm' })).text).toBe('# Swarm\n\nfix the parser')
+})
+
+test('a coordinator turn that ends while /swarm-kill gathers its diagnostics is not refused afterwards, and the compaction runs once', async ($, on) => {
+  const state: Record<string, unknown> = { title: 'Kill swarm', members: {
+    coordinator: { role: 'coordinator', last_read_seq: 1 },
+    alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '0', last_read_seq: 1 },
+  } }
+  const { answer, board } = owning(on, { board: () => posts({ agent: 'coordinator', to: ['alice'], text: '@alice BRIEF' }), roster: () => JSON.stringify(state) })
+  let listing = () => {}
+  const listed = new Promise<void>(resolve => { listing = resolve })
+  let release = () => {}
+  const gate = new Promise<void>(resolve => { release = resolve })
+  on('process.run', async (_, e) => {
+    if (e.argv[0] === 'lsof') {
+      listing()
+      await gate
+      return answer('')
+    }
+    if (e.argv[3] !== 'kill') return answer(board(e))
+    board(e)
+    state.closed = true
+    ;(state.members as Record<string, Record<string, string>>).alice!.killed = '1'
+    return answer('killed: 1 member(s) retired, run closed\n@alice alice-1\n')
+  })
+  on('agent.list', () => ({ value: [] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const compacted: (string | undefined)[] = []
+  on('session.compact', (_, e) => {
+    compacted.push(e.instructions)
+    return { messages: [{ role: 'user', text: 'The summary.', toolUses: [] }] as never }
+  })
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  await $.turn.start({ text: 'Continue coordinating', turnId: 'c1' })
+  const killing = $.command.run({ command: 'swarm-kill', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 80 } })
+  // the turn ends while the kill waits on its process listing; until then its tool calls are refused already
+  await listed
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts' })).deny).toContain('/swarm:kill')
+  await $.turn.complete({ answer: 'Stopped.', durationMs: 1, isAborted: false, turnId: 'c1', reason: 'answer' })
+  release()
+  await killing
+  await clock.advance(10)
+  expect(compacted.length).toBe(1)
+  await $.turn.start({ text: 'Now fix the typo', turnId: 'c2' })
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts' })).deny).toBeUndefined()
+})
+
+/** A run this conversation drives, whose board's kill retires every member and prints each one's agent. */
+function killable(on: On, members: Record<string, Record<string, unknown>>, rosterFails = (_state: Record<string, unknown>) => false,
+  more: { hold?: (path: string, state: Record<string, unknown>) => Promise<void> | undefined; read?: (path: string) => string | undefined; failsAfterClosing?: boolean; compact?: () => unknown; lsofFails?: boolean } = {}) {
+  const state: Record<string, unknown> = { title: 'Kill swarm', members: { coordinator: { role: 'coordinator', last_read_seq: 1 }, ...members } }
+  const fixture = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: Object.keys(members), text: 'BRIEF' }),
+    roster: () => { if (rosterFails(state)) throw new Error('EIO'); return JSON.stringify(state) },
+    hold: path => more.hold?.(path, state),
+    read: more.read,
+  })
+  on('process.run', (_, e) => {
+    if (e.argv[0] === 'lsof' && more.lsofFails) return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (e.argv[3] !== 'kill') return fixture.answer(fixture.board(e))
+    fixture.board(e)
+    state.closed = true
+    state.killed = 'killed by the user'
+    const retired = Object.entries(state.members as Record<string, Record<string, unknown>>).filter(([name]) => name !== 'coordinator')
+    for (const [, member] of retired) member.killed = '1'
+    // the roster is saved, then appending the SHUTDOWN post fails: no ids are printed
+    if (more.failsAfterClosing) return { value: { exitCode: 1, stdout: '', stderr: 'OSError: disk full', isStdoutTruncated: false, isStderrTruncated: false } }
+    return fixture.answer(`killed: ${retired.length} member(s) retired, run closed\n${retired.map(([name, member]) => `@${name} ${String(member.id)}\n`).join('')}`)
+  })
+  on('tool.call', () => ({ result: {} }))
+  const compacted: (string | undefined)[] = []
+  on('session.compact', (_, e) => {
+    compacted.push(e.instructions)
+    return (more.compact?.() ?? { messages: [{ role: 'user', text: 'The summary.', toolUses: [] }] }) as never
+  })
+  return { ...fixture, compacted }
+}
+const killCommand = ($: Engine) => $.command.run({ command: 'swarm:kill', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 80 } })
+const handedBack = ($: Engine, id: string) => $.prompt.submit({ text: `Another Claude session sent a message:\n<agent-message from="${id}">\n[Subagent hand-back] done</agent-message>`, origin: { kind: 'peer' }, wait: false })
+
+test('the compaction after /swarm:kill waits for a coordinator turn that started before it ran, and comes once', async ($, on) => {
+  const { compacted } = killable(on, { alice: { role: 'worker', id: 'alice-1', last_read_seq: 1 } })
+  on('agent.list', () => ({ value: [] as never }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'c0', reason: 'answer' })
+  await clock.advance(2000)
+  await killCommand($)
+  await $.turn.start({ text: 'Go on', turnId: 'c1' })
+  await clock.advance(10)
+  expect(compacted).toEqual([])
+  await $.turn.complete({ answer: 'Done.', durationMs: 1, isAborted: false, turnId: 'c1', reason: 'answer' })
+  await clock.advance(10)
+  expect(compacted.length).toBe(1)
+  await $.turn.start({ text: 'More', turnId: 'c2' })
+  await $.turn.complete({ answer: 'Done.', durationMs: 1, isAborted: false, turnId: 'c2', reason: 'answer' })
+  await clock.advance(10)
+  expect(compacted.length).toBe(1)
+})
+
+test('the compaction after /swarm:kill is skipped once another session has begun', async ($, on) => {
+  const { compacted } = killable(on, { alice: { role: 'worker', id: 'alice-1', last_read_seq: 1 } })
+  on('agent.list', () => ({ value: [] as never }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'c0', reason: 'answer' })
+  await clock.advance(2000)
+  await killCommand($)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await clock.advance(10)
+  await $.turn.start({ text: 'Hello', turnId: 'n1' })
+  await $.turn.complete({ answer: 'Hi.', durationMs: 1, isAborted: false, turnId: 'n1', reason: 'answer' })
+  await clock.advance(10)
+  expect(compacted).toEqual([])
+})
+
+test('/swarm:kill drops what a native teammate sends under either identity, a teammate gone from the agent list included', async ($, on) => {
+  killable(on, {
+    alice: { role: 'worker', id: 'alice@team', last_read_seq: 1 },
+    bob: { role: 'worker', id: 'bob@team', last_read_seq: 1 },
+  })
+  // bob has left the agent list: only the mapping saved from an earlier session knows its agent
+  const stored: Record<string, unknown> = { teammates: { 'agent-b': 'bob@team' } }
+  on('store.get', (_, e) => ({ value: stored[e.key] }))
+  on('store.set', (_, e) => { stored[e.key] = e.value; return { value: undefined } })
+  on('agent.list', () => ({ value: [{ id: 'agent-a', teammateId: 'alice@team', description: '@alice', type: 'swarm:worker', status: 'running' }] as never }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'c0', reason: 'answer' })
+  await clock.advance(2000)
+  await killCommand($)
+  expect((await handedBack($, 'agent-a')).drop).toBeDefined()
+  expect((await handedBack($, 'alice@team')).drop).toBeDefined()
+  expect((await $.prompt.submit({ text: '<task-notification><task-id>agent-b</task-id><status>completed</status></task-notification>', origin: { kind: 'task-notification' }, wait: false })).drop).toBeDefined()
+  expect((await handedBack($, 'agent-c')).drop).toBeUndefined()
+})
+
+test('/swarm:kill takes the retired agents from its own answer when the roster cannot be read after it, and says what it could not check', async ($, on) => {
+  // the roster cannot be read from the kill on
+  const { seen } = killable(on, { alice: { role: 'worker', id: 'alice-1', last_read_seq: 1 } }, state => state.closed === true)
+  on('agent.list', () => ({ value: [] as never }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'c0', reason: 'answer' })
+  await clock.advance(2000)
+  const ran = seen.commands.length
+  const killed = await killCommand($)
+  expect(seen.commands.slice(ran)).toContain('kill')
+  expect(killed.text).toContain('1 member(s) retired')
+  expect(killed.text).toContain('could not be read')
+  expect((await handedBack($, 'alice-1')).drop).toBeDefined()
+})
+
+test('after a restart, a retired member of the run a kill closed is still refused its edits and commands', async ($, on) => {
+  const state = { title: 'Kill swarm', closed: true, killed: 'killed by the user', members: {
+    coordinator: { role: 'coordinator', last_read_seq: 2 },
+    alice: { role: 'worker', id: 'alice-1', killed: '1', paths: 'src/alice', isolated: '0', last_read_seq: 1 },
+  } }
+  const { answer, board } = owning(on, { board: () => '', roster: () => JSON.stringify(state) })
+  // the conversation drives no run now; the board still finds the closed run its agent belonged to
+  on('process.run', (_, e) => answer(e.argv[3] === 'agent-run' ? OWNED : board(e)))
+  on('agent.list', () => ({ value: [{ id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/src/alice/a.ts', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toContain('retired')
+  expect((await toolCall($, { tool: 'Bash', command: 'npm test', agentId: 'alice-1' })).deny).toContain('retired')
+})
+
+/** A gate a test opens: `held` resolves once something waits on it, and `open` lets it go on. */
+function gate() {
+  let open = () => {}
+  let reached = () => {}
+  const isOpen = new Promise<void>(resolve => { open = resolve })
+  const held = new Promise<void>(resolve => { reached = resolve })
+  return { wait: () => { reached(); return isOpen }, held, open }
+}
+const settle = async (clock: Awaited<ReturnType<typeof mock.clock>>, $: Engine) => {
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'c0', reason: 'answer' })
+  await clock.advance(2000)
+}
+
+test('/swarm:kill refuses the agents its board named before it reads the roster', async ($, on) => {
+  const roster = gate()
+  let isHeld = false
+  killable(on, { alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '0', last_read_seq: 1 } }, undefined, {
+    hold: (path, state) => isHeld && state.closed === true && path.endsWith('/members.json') ? roster.wait() : undefined,
+  })
+  on('agent.list', () => ({ value: [{ id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' }] as never }))
+  const clock = mock.clock(on)
+  await settle(clock, $)
+  isHeld = true
+  const killing = killCommand($)
+  await roster.held
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/src/alice/a.ts', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toContain('retired')
+  // and its hand-back is dropped from the same moment
+  expect((await handedBack($, 'alice-1')).drop).toBeDefined()
+  roster.open()
+  await killing
+})
+
+test('a kill whose session ended while it read the roster leaves the next session alone', async ($, on) => {
+  const roster = gate()
+  let isHeld = false
+  const { compacted } = killable(on, { alice: { role: 'worker', id: 'alice-1', last_read_seq: 1 } }, undefined, {
+    hold: (path, state) => isHeld && state.closed === true && path.endsWith('/members.json') ? roster.wait() : undefined,
+  })
+  on('agent.list', () => ({ value: [] as never }))
+  const clock = mock.clock(on)
+  await settle(clock, $)
+  isHeld = true
+  const killing = killCommand($)
+  await roster.held
+  isHeld = false
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  roster.open()
+  await killing
+  await clock.advance(10)
+  expect(compacted).toEqual([])
+  expect((await handedBack($, 'alice-1')).drop).toBeUndefined()
+})
+
+test('a teammate address a kill retired is heard again from a live member of the run driven now', async ($, on) => {
+  const NEXT = '/project/.swarm/next-20261122-100000'
+  const next = { title: 'Next', members: { coordinator: { role: 'coordinator', last_read_seq: 0 }, alice: { role: 'worker', id: 'alice@team', last_read_seq: 0 } } }
+  killable(on, { alice: { role: 'worker', id: 'alice@team', last_read_seq: 1 } }, undefined, {
+    read: path => path === `${NEXT}/members.json` ? JSON.stringify(next) : path === `${NEXT}/board.jsonl` ? '' : undefined,
+  })
+  on('agent.list', () => ({ value: [{ id: 'agent-a', teammateId: 'alice@team', description: '@alice', type: 'swarm:worker', status: 'completed' }] as never }))
+  const clock = mock.clock(on)
+  await settle(clock, $)
+  await killCommand($)
+  expect((await handedBack($, 'alice@team')).drop).toBeDefined()
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${NEXT}" read coordinator` })
+  await clock.advance(2000)
+  expect((await handedBack($, 'alice@team')).drop).toBeUndefined()
+  // the retired agent's own id stays dropped
+  expect((await handedBack($, 'agent-a')).drop).toBeDefined()
+})
+
+for (const refusals of [1, 3]) test(`a compaction the host refuses is asked again twice at most (refused ${refusals} time(s))`, async ($, on) => {
+  let refused = 0
+  const { compacted, seen } = killable(on, { alice: { role: 'worker', id: 'alice-1', last_read_seq: 1 } }, undefined, {
+    compact: () => { if (refused++ < refusals) throw new Error('a turn is running'); return undefined },
+  })
+  on('agent.list', () => ({ value: [] as never }))
+  const clock = mock.clock(on)
+  await settle(clock, $)
+  await killCommand($)
+  for (let i = 0; i < 5; i++) await clock.advance(1000)
+  expect(compacted.length).toBe(Math.min(refusals + 1, 3))
+  expect(seen.toasts.some(text => text.includes('could not be compacted'))).toBe(refusals >= 3)
+})
+
+test('a kill the board committed before it failed is finished from the roster', async ($, on) => {
+  const { compacted } = killable(on, { alice: { role: 'worker', id: 'alice-1', last_read_seq: 1 } }, undefined, { failsAfterClosing: true })
+  on('agent.list', () => ({ value: [] as never }))
+  const clock = mock.clock(on)
+  await settle(clock, $)
+  const killed = await killCommand($)
+  expect(killed.text).toContain('1 member(s) retired')
+  expect((await handedBack($, 'alice-1')).drop).toBeDefined()
+  expect((await toolCall($, { tool: 'Bash', command: 'npm test', agentId: 'alice-1' })).deny).toContain('retired')
+  await clock.advance(10)
+  expect(compacted.length).toBe(1)
+})
+
+test('a poll that read the roster before the kill does not let a retired member go on', async ($, on) => {
+  let stale = ''
+  killable(on, { alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '0', last_read_seq: 1 } }, undefined, {
+    read: path => stale && path === `${OWNED}/members.json` ? stale : undefined,
+  })
+  on('agent.list', () => ({ value: [{ id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' }] as never }))
+  const clock = mock.clock(on)
+  await settle(clock, $)
+  const open = JSON.stringify({ title: 'Kill swarm', members: { coordinator: { role: 'coordinator', last_read_seq: 1 }, alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '0', last_read_seq: 1 } } })
+  await killCommand($)
+  // a read of the roster as it was before the kill lands afterwards
+  stale = open
+  await clock.advance(2000)
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" status` })
+  await clock.advance(2000)
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/src/alice/a.ts', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toContain('retired')
+})
+
+test('a compaction an old kill still owes is cancelled by a new run', async ($, on) => {
+  let refused = 0
+  const { compacted } = killable(on, { alice: { role: 'worker', id: 'alice-1', last_read_seq: 1 } }, undefined, {
+    compact: () => { if (refused++ < 1) throw new Error('a turn is running'); return undefined },
+  })
+  on('agent.list', () => ({ value: [] as never }))
+  on('command.run', () => ({ text: '' }))
+  const clock = mock.clock(on)
+  await settle(clock, $)
+  await killCommand($)
+  await clock.advance(10)
+  expect(compacted.length).toBe(1)
+  await $.command.run({ command: 'swarm:swarm', args: 'a new task', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 80 } })
+  for (let i = 0; i < 4; i++) await clock.advance(1000)
+  expect(compacted.length).toBe(1)
+})
+
+test('/clear leaves nothing of a kill to the next conversation', async ($, on) => {
+  const { compacted } = killable(on, { alice: { role: 'worker', id: 'alice-1', last_read_seq: 1 } })
+  on('agent.list', () => ({ value: [] as never }))
+  const clock = mock.clock(on)
+  await settle(clock, $)
+  await $.turn.start({ text: 'Continue coordinating', turnId: 'c1' })
+  await killCommand($)
+  await $.session.end({ reason: 'clear', sessionId: 'fixture-conversation', resume: { id: 'fixture-conversation' } })
+  await clock.advance(10)
+  expect((await handedBack($, 'alice-1')).drop).toBeUndefined()
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts' })).deny).toBeUndefined()
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'n1', reason: 'answer' })
+  await clock.advance(10)
+  expect(compacted).toEqual([])
+})
+
+test('a process scan that failed with nothing listed is reported as not made', async ($, on) => {
+  killable(on, { alice: { role: 'worker', id: 'alice-1', last_read_seq: 1 } }, undefined, { lsofFails: true })
+  on('agent.list', () => ({ value: [] as never }))
+  const clock = mock.clock(on)
+  await settle(clock, $)
+  expect((await killCommand($)).text).toContain('the process list could not be read')
 })

@@ -8,12 +8,12 @@ You are the coordinator. The roster in `<run>/members.json` is the team: who exi
 | --- | --- | --- |
 | `role` | `worker` (default), `verifier`, `coordinator` | `role=verifier` when registering a verifier |
 | `profile` | The agent type behind a specialist (`explorer`, `investigator`, `architect`) or a `designer` | `profile=<type>` with `writes=0` for a specialist; `profile=designer` for a designer, which writes files |
-| `backend` | `native` on the coordinator's own entry when the run uses native Agent Teams; the plugin then expects named teammates | `BOARD member coordinator backend=native`, before any member starts |
+| `backend` | `native` on the coordinator's own entry when the run uses native Agent Teams (`native-teams.md`); the plugin then expects named teammates. Nothing else is set on the coordinator | `BOARD member coordinator backend=native`, before any member starts |
 | `paths` | The files and folders a writer may edit, relative to the project folder, separated by commas. The board refuses a path that another active writer claims, or a folder that holds one. In a shared checkout, hooks enforce `paths=` on edits (blocking writes to another writer's paths, outside the member's own `paths=`, or inside `.swarm/`). A successor made with `replace` inherits them | `paths=Sources/Feed,Tests/FeedTests.swift` at registration, before the brief |
 | `consult` | Marks an architect that advises you on one question. Verification ignores it, so it never blocks or voids a candidate | `consult=1 effort=medium` at registration (with `effort: "medium"` on `Agent`); `killed=1` once it has answered (in native mode, request teammate shutdown too) |
 | `writes` | `0` for a member that changes no files | You, for read-only members |
 | `group` | A numbered pool's name, reached with `@<group>` | `group=fix` |
-| `depends` | Members whose `READY` this one waits for | `depends=a,b`; must stay acyclic |
+| `depends` | Members whose `READY` this one waits for. For workers only: a verifier waits for no member | `depends=a,b`; must stay acyclic |
 | `owns` | The paths or the question it owns, for the plan and the pane | `owns='src/utils/date.*'` |
 | `effort` | The effort, when it is not the type's default: `low`, `medium`, `high`, `xhigh` or `max` | You, at registration and before the spawn: a start whose effort differs from the roster is refused |
 | `model` | The model, when it is not the type's default: a family (`haiku`, `sonnet`, `opus`, `fable`, which starts the newest model of it), an exact model id, or `inherit` for this conversation's model (`Agent.model` only accepts family names, so for `inherit` or exact IDs register `model=` here and omit `model` or pass the matching family on `Agent` (for `inherit`, this conversation's own family) so the hook applies the exact target) | You, at registration and before the spawn: a start on another model than the roster's is refused |
@@ -24,18 +24,20 @@ A member's life: register, brief, spawn, record its id, work, `READY` (and `revi
 
 Register every name before you post any brief, so a brief can name its neighbours and dependencies.
 
+Changing a member's assignment scope withdraws its previous report and asks it to report again. A retired member's recorded agent address stays reserved and its assignment no longer changes: `replace` it instead.
+
 ## Spawning
 
 Spawn all members of a stage in one message so they start together, in the background, exactly as step 6 of the `swarm` skill gives it: that step is the one place the Agent call's fields and the launch prompt are written down.
 
 - **Default mode:** omit `name`. Record the returned agent id.
-- **Native teams mode** (`--native-teams`, and only when the session has agent teams): pass the roster name as `name`, do not pass worktree isolation, and record the teammate address Claude returns. Native mode shares one workspace.
+- **Native teams mode** (`--native-teams`, and only when the session has agent teams): as `native-teams.md` gives it: pass the roster name as `name`, do not pass worktree isolation, and record the teammate address Claude returns. Native mode shares one workspace.
 
 The hooks record each address when its agent starts. Check `BOARD status` after the spawn: for a member with no id (the hooks are not loaded, or missed it), record it at once with `BOARD member <name> id=<id>`. A member without an id cannot be woken, and `BOARD wake` keeps listing it.
 
 ## Limits
 
-The `swarm` skill's step 1 says how limits are recorded and what the board refuses. Here, only what follows from them for the roster: `BOARD member` and `BOARD replace` refuse a change that breaks a limit, and say which. Passing an empty value (`budget=`, `member_budget=`, `max_workers=`, `max_members=`, `fable=`) clears that limit. When the budget is spent the plugin pauses the run and calls you: report what is done and what is left, and ask the user before you raise the budget and resume. Never raise a limit on your own.
+The `swarm` skill's step 1 says how limits are recorded and what the board refuses. Here, only what follows from them for the roster: `BOARD member` and `BOARD replace` refuse a change that breaks a limit, and say which. Passing an empty value (`budget=`, `member_budget=`, `max_workers=`, `max_members=`, `fable=`) clears that limit, as does `budget=0` or `member_budget=0`; a member's own `budget=0` or `budget=-` clears its cap. `BOARD limit budget=` at or below what the run has already used is refused, since it would only stop every member mid-work: use `BOARD pause` to stop a run. When the budget is spent the plugin pauses the run and calls you: report what is done and what is left, and ask the user before you raise the budget and resume. Never raise a limit on your own.
 
 A member's own budget (`BOARD member <name> budget=<tokens>`, else the run's `member_budget=`) pauses only that member when its tokens reach it: nobody wakes it, it is never listed as unreachable or ignored, and attention shows `member_paused`. The others keep running; members that depend on it are listed as blocked. With the user's agreement, raise it and run `BOARD resume <name>`, which tells it to go on; `resume <name>` is refused while the member is still at or over its budget. A replacement does not inherit the budget, and retiring a member drops its pause.
 
@@ -49,6 +51,8 @@ A member's own budget (`BOARD member <name> budget=<tokens>`, else the run's `me
 | Read-only members | No difference | Mark them `writes=0` so readiness does not expect a commit |
 | Verification | `VERIFY prepare shared` | `VERIFY prepare isolated` merges the exact commits into an integration worktree |
 | Testing some pieces early | Not available: the folder holds every worker's edits | `--members <a,b>` merges only those members' commits |
+
+`BOARD sync` is refused while the checkout has uncommitted changes; a merge that fails is aborted and names the dependency; `--check-only` lists what is missing and exits non-zero if anything is.
 
 Do not mix: if one writer is isolated, all writers are. Never push, and never land anything except through `VERIFY accept`.
 
@@ -78,16 +82,16 @@ If it does not answer after it has been woken, stop its agent, then mark it. In 
 
 1. If it is only unreachable, try `BOARD retry <name>` once and wait for the next delivery.
 2. Check it has no live session, so two agents never hold one piece. If a retired member's agent is still alive (`running`, `pending`, or `waiting`), the Swarm pane's Attention tab (and a hook context notice after `replace` / `killed=1`) flags `retired-running`, and the spawn hook refuses spawning the replacement while any predecessor (or a killed member with overlapping `paths=`) is still active.
-3. `BOARD replace parser parser-2`, with `model=<m>` and `effort=<e>` when they should change. Escalating an investigator to Fable needs both: `model=fable effort=medium`. `BOARD replace` refuses an already-replaced member. Otherwise it marks parser `killed=1`, registers parser-2 with the same type, ownership, group and dependencies, moves every member that waited for parser onto parser-2, and posts parser-2 a brief: parser's brief, plus the numbers of parser's posts and the instruction to read them first.
+3. `BOARD replace parser parser-2`, with `model=<m>` and `effort=<e>` when they should change. Escalating an investigator to Fable needs both: `model=fable effort=medium`. `BOARD replace` refuses an already-replaced member. Otherwise it marks parser `killed=1`, registers parser-2 with the same type, ownership, group and dependencies, moves every member that waited for parser onto parser-2, and posts parser-2 a brief: any shared brief that addressed parser and others (above the rest, whatever order they were posted in), parser's brief, plus the numbers of parser's posts and the instruction to read them first.
 4. Spawn parser-2 as the type the command prints, and record its id (in native mode, also reassign `TaskUpdate.owner` to `parser-2`).
 
 A living member's model cannot be changed. Replacement is the only way.
 
 ## Pausing and stalls
 
-- Waiting for the user: `BOARD pause <reason>`, say what you need, `BOARD resume` when they answer. While paused nothing is delivered and the monitor stays quiet.
+- Waiting for the user: `BOARD pause <reason>`, say what you need, `BOARD resume` when they answer. While paused nothing is delivered and the monitor stays quiet. Resume tells the members the pause stopped mid-work to go on, a verifier asked to test a candidate it has not answered included.
 - The monitor calls you once when an open run is quiet and no member can advance. Run the coordinator loop; do not just acknowledge it.
-- `BOARD attention` is the list of what is stuck: a paused run, a member paused by its own budget (`member_paused`), posts you have not read, findings to review, unanswered questions, unstarted, unreachable or ignored members, a worker that failed verification twice in a row (rework), one member holding most of the spend, a worker going round in circles (`loop`: 150 model steps or 150,000 tokens since it last posted or read; ask it where it stands), two current `READY` commits that would conflict when merged (`conflict`), members waiting on a member that is missing, removed, paused, unreachable, ignoring its mentions or never started, and stale verification. A partial candidate's `VERIFIED` is not the run's verification. The pane's Attention tab shows the same list to the user, plus `retired-running` when a retired member's agent is still alive and `silent` when a worker's agent ended without a report.
+- `BOARD attention` is the list of what is stuck: a paused run, a member paused by its own budget (`member_paused`), posts you have not read, findings to review, unanswered questions, unstarted, unreachable or ignored members, a worker that failed verification twice in a row (rework), one member holding most of the spend (over half of the run's with three or more members using tokens, over three quarters of the pair's with two), a worker going round in circles (`loop`: 150 model steps or 150,000 tokens since it last posted or read; ask it where it stands), two current `READY` commits that would conflict when merged (`conflict`), members waiting on a member that is missing, removed, paused, unreachable, ignoring its mentions or never started, and stale verification. A partial candidate's `VERIFIED` is not the run's verification. The pane's Attention tab shows the same list to the user, plus `retired-running` when a retired member's agent is still alive and `silent` when a worker's agent ended without a report.
 - A member that is "waiting" with unread mentions should have been woken. If attention lists it as unreachable, retry once, then replace it.
 
 ## Recovery
@@ -104,7 +108,7 @@ After this conversation is compacted or Claude Code restarts, the board is the m
 1. Code changes: `VERIFY accept` has succeeded. Read-only work: the reports are in and cross-checked.
 2. Isolated runs: the integration worktree is removed by acceptance or by you; worker worktrees with unlanded work are either landed or reported to the user, never silently dropped.
 3. Native mode: request shutdown of each teammate and confirm it.
-4. `BOARD read coordinator`, then `BOARD close`. The board refuses to close while posts addressed to you are unread. Delivery and monitoring stop.
+4. `BOARD read coordinator`, then `BOARD close`. The board refuses to close while posts addressed to you are unread. Delivery and monitoring stop. Close notes a pass that was never accepted, or that a later change voided; `BOARD export` shows such a pass as stale.
 5. Leave the run folder in place. It is the record, and `.swarm` ignores itself in git.
 
 Waiting members cost nothing, so there is no need to remove them before closing unless the user asks.

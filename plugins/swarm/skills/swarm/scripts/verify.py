@@ -506,8 +506,10 @@ def prepare(run, project, mode, checks, onto=None, subset=None):
                       "digest": candidate["digest"], "partial": candidate["partial"]}))
 
 
-def run_check(command, cwd, timeout):
-    """One check in its own process group: whatever it started ends with it, on a timeout or an interruption too."""
+def run_check(command, cwd, timeout, output=None):
+    """One check in its own process group: whatever it started ends with it, on a timeout or an interruption too.
+    OUTPUT, an open file, takes its stdout and stderr together; the check writes to it directly, so nothing is held
+    in memory and what it printed before it was killed is there too."""
     def interrupted(number, _frame):
         raise SystemExit(128 + number)
 
@@ -517,7 +519,8 @@ def run_check(command, cwd, timeout):
     previous[signal.SIGINT] = signal.getsignal(signal.SIGINT)  # cleanup ignores it; the finally restores it
     process = None
     try:
-        process = subprocess.Popen(["/bin/sh", "-c", command], cwd=cwd, stdin=subprocess.DEVNULL,
+        process = subprocess.Popen(["/bin/sh", "-c", command], cwd=cwd, stdin=subprocess.DEVNULL, stdout=output,
+                                   stderr=None if output is None else subprocess.STDOUT,
                                    env=clean_env(), start_new_session=True)
         returncode = process.wait(timeout=timeout)
         cleanup(process)  # what it left in the background ends with it too
@@ -583,6 +586,57 @@ def cleanup(process):
     process.wait()
 
 
+# What the verifier sees of a check's output; the log holds all of it. Everything printed stays in its conversation
+# and is read again on every later step. A short pass is shown whole; a longer one only its summary line ("Ran 115
+# tests ... OK") and a few before it; a failure enough of a traceback or a compiler error to act on, however long
+# its lines are.
+WHOLE_LINES, WHOLE_BYTES = 20, 1000
+PASS_LINES, PASS_BYTES = 5, 600
+FAIL_LINES, FAIL_BYTES = 60, 4000
+
+
+def lines_in(log):
+    count, last = 0, b"\n"
+    with log.open("rb") as file:
+        while chunk := file.read(1 << 20):  # a long log is counted a piece at a time, never held whole
+            count += chunk.count(b"\n")
+            last = chunk[-1:]
+    return count + (last != b"\n")
+
+
+def excerpt(log, count, lines, limit):
+    """(lines kept, text): the last LINES lines of LOG, which holds COUNT, at most LIMIT bytes. Whole lines are
+    kept where any fit; a single longer line is cut on a character boundary."""
+    with log.open("rb") as file:
+        start = max(0, file.seek(0, os.SEEK_END) - limit)
+        file.seek(start)
+        window = file.read().removesuffix(b"\n").split(b"\n") if count else []
+    kept = window[-lines:]
+    if start and len(kept) == len(window):  # its first line began before the window
+        if len(kept) > 1:
+            kept = kept[1:]
+        else:
+            kept[0] = kept[0].lstrip(bytes(range(0x80, 0xC0)))  # no half of a UTF-8 character
+    return len(kept), b"\n".join(kept).decode(errors="replace")
+
+
+def log_name(identifier, number, index):
+    return f"{identifier}-attempt{number:02d}-check{index:02d}.log"
+
+
+def reserve(logs, identifier):
+    """The next attempt's number, taken by creating its first log exclusively: two tests that counted the same
+    logs at once still never write into one file."""
+    number = 1 + max((int(log.name.split("-")[1][len("attempt"):])
+                      for log in logs.glob(f"{identifier}-attempt*-check*.log")), default=0)
+    while True:
+        try:
+            (logs / log_name(identifier, number, 1)).open("xb").close()
+            return number
+        except FileExistsError:
+            number += 1
+
+
 def test_candidate(run, project, identifier, verifier, timeout_arg=None):
     verifier = verifier.lstrip("@").lower()
     if timeout_arg is not None:
@@ -625,14 +679,37 @@ def test_candidate(run, project, identifier, verifier, timeout_arg=None):
         state["members"][verifier]["tested"] = identifier
         save(run, state)
 
+    # Under the run folder, so inside the project's .swarm folder: never in the candidate's checkout, where the
+    # fingerprint would read them, and never staged by `commit`. An earlier attempt's logs stay.
+    logs = run / "checks"
+    logs.mkdir(exist_ok=True)
+    number = reserve(logs, identifier) if candidate["checks"] else None
     failed = []
-    for command in candidate["checks"]:
+    for index, command in enumerate(candidate["checks"], 1):
         print(f"$ {command}", flush=True)
+        log = logs / log_name(identifier, number, index)
+        started = time.monotonic()
         try:
-            returncode = run_check(command, candidate["path"], timeout)
+            with log.open("wb") as output:
+                returncode = run_check(command, candidate["path"], timeout, output)
         except subprocess.TimeoutExpired:
-            raise ValueError(f"verification command timed out after {timeout}s: {command}") from None
-        print(f"Exit {returncode}", flush=True)
+            returncode = None
+        elapsed, size, count = time.monotonic() - started, log.stat().st_size, lines_in(log)
+        shown, tail = excerpt(log, count, *(
+            (FAIL_LINES, FAIL_BYTES) if returncode != 0 else
+            (WHOLE_LINES, WHOLE_BYTES) if count <= WHOLE_LINES and size <= WHOLE_BYTES else (PASS_LINES, PASS_BYTES)))
+        print("%s in %.1fs, %d lines (%d bytes) of output, log: %s" % (
+            f"Timed out after {timeout}s" if returncode is None else f"Exit {returncode}", elapsed, count, size, log),
+            flush=True)
+        if tail:
+            # As bytes: the output may hold what the terminal's encoding cannot.
+            sys.stdout.buffer.write(tail.encode() + b"\n")
+            sys.stdout.buffer.flush()
+        if returncode != 0:
+            print(f"(the last {shown} of {count} lines; Grep the log for the rest, then Read the lines you need: {log})",
+                  flush=True)
+        if returncode is None:
+            raise ValueError(f"verification command timed out after {timeout}s: {command}")
         if returncode:
             failed.append(command)
     if failed:

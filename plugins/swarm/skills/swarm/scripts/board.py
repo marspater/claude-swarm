@@ -9,12 +9,13 @@ usage: board.py DIR init TITLE                    prints the run folder it creat
        board.py DIR retry NAME                    let delivery try an unreachable or unresponsive member again
        board.py DIR replace OLD NEW [key=value ...]  retire OLD and register NEW with its brief, dependencies and history
        board.py DIR post FROM [TEXT]              TEXT from stdin when omitted; @all, @group, @verifiers and @dependents (of FROM) reach several
-       board.py DIR read ME                       print posts ME has not read, mark them read: posts that mention ME in full, others as one line
+       board.py DIR read ME                       print posts ME has not read, mark them read: posts that mention ME, and the current READYs ME works from, in full; others as one line
        board.py DIR read ME --all                 the same, every post in full
        board.py DIR read ME --headers             the same, every post as one line
        board.py DIR read ME --max-bytes=N          page the unread output without consuming the next unread post; a post longer than a page is cut and names the show command that prints it whole
+       board.py DIR read coordinator --attention  the same, then what attention prints once nothing unread is left
        board.py DIR show [NAME | --post=N [--json]]  print history, optionally for one member or post; marks nothing
-       board.py DIR ready NAME [COMMIT|HEAD]      record readiness and tell the coordinator and dependents, and the verifiers once every worker is ready; HEAD is the checkout's own commit
+       board.py DIR ready NAME [COMMIT|HEAD]      record readiness and tell the coordinator, the dependents it lets start, and the verifiers once every worker is ready; HEAD is the checkout's own commit
        board.py DIR sync NAME [--check-only]      from NAME's checkout, merge the READY commits of its dependencies that HEAD lacks; --check-only lists them
        board.py DIR confirm NAME SEQ              accept an investigator finding and release its dependents
        board.py DIR revise NAME [REASON]           withdraw readiness before starting a fix
@@ -31,6 +32,7 @@ usage: board.py DIR init TITLE                    prints the run folder it creat
        board.py .swarm agent-run KEY ID...         find the run owning agent ID
        board.py DIR started NAME ID EXPECTED [isolated=0|1]  record a started agent's ID if it matches EXPECTED
        board.py DIR close                         mark the run finished
+       board.py DIR kill [REASON]                 end the run now, whatever its state: retire every member, close it, post SHUTDOWN
        board.py DIR account TURN_HASH ACTOR_KEY TOKENS  record a completed turn once
        board.py DIR status                        members, unread counts, who mentioned whom
        board.py DIR export [--out=PATH]           write a Markdown report of the run (default DIR/summary.md) and print its path
@@ -39,9 +41,10 @@ usage: board.py DIR init TITLE                    prints the run folder it creat
 
 `init` takes <project>/.swarm/<name> and creates <project>/.swarm/<name>-<timestamp>, so every
 run has its own folder. A run folder holds board.jsonl, one {"seq","agent","text","time","to"}
-per line, and members.json: {"title","closed","members":{name:{role,group,model,id,
-last_read_seq,last_nudged_seq,killed,budget,paused,synced_deps,start,tested}}}; a verifier's "tested" is the
-candidate it is testing and has posted no verdict on. A READY with a commit records "revision",
+per line (a coordinator's BRIEF adds "addressed", whom its first line assigned when it was posted), and members.json: {"title","closed","killed","members":{name:{role,group,model,id,
+last_read_seq,last_nudged_seq,killed,budget,paused,synced_deps,start,tested,delivered,clipped}}}; a verifier's "tested" is the
+candidate it is testing and has posted no verdict on, and "delivered" the current READY posts it works from that
+`read` has shown it in full ("clipped" those it could show only in part). A run's "killed" is the reason `kill` closed it. A READY with a commit records "revision",
 and "base" and "except" when it can: the reporter's own work is `git log --first-parent --no-merges REVISION --not
 BASE EXCEPT...`.
 """
@@ -100,8 +103,41 @@ QUESTION = re.compile(r"(?<![ \t]\?)(?:(?<![ \t])\?|\?(?![ \t][^\n?]*[ \t]:))(?!
 # An optional type named in prose asks nothing either: "inferred String? because", "takes Int?, so". A capitalised
 # word with a lowercase letter, its mark followed by a word that carries the statement on. At a line's end, or
 # before any other word, it still reads as a question: "may I edit ListView? it is outside my paths" asks.
+# A default or a return type follows one too (`Int? = nil`, `String? -> Bool`), and so does "or nil". "or" alone,
+# "if" and a closing parenthesis do not: "Swift? or Kotlin", "ListView? if yes I start" and "(is it ListView?)" ask.
 OPTIONAL = re.compile(r"(?<![@A-Za-z0-9_])[A-Z][A-Z0-9_]*[a-z][A-Za-z0-9_]*\?"
-                      r"(?=[ \t]+(?:because|since|so|and|but|as|is|was|are|were|in|at|on|by|for|from|to|with|not)(?![A-Za-z0-9_])|[,;\]>])")
+                      r"(?=[ \t]+(?:because|since|so|and|but|as|is|was|are|were|in|at|on|by|for|from|to|with|not|nil|null|none)(?![A-Za-z0-9_])"
+                      r"|[ \t]+or[ \t]+(?:nil|null|none)(?![A-Za-z0-9_])|[ \t]*(?:[,;\]>=]|->))")
+
+
+# A clause that opens like a question keeps its optional type's mark: "May I edit ListView? and its tests too" asks.
+# Each name and separator run ends where its class does, so a failed word backtracks into nothing.
+# Blanks are spaces and tabs, as in OPTIONAL and the pane's mirror.
+INTERROGATIVE = re.compile(r"[ \t]*(?![ \t])(?:@[A-Za-z0-9_-]+(?![A-Za-z0-9_-])[ \t,:]*(?![ \t,:]))*"
+                           r"(?:may|can|could|should|shall|will|would|do|does|did|is|are|was|were|has|have|had"
+                           r"|which|what|who|whom|whose|where|when|why|how)(?![A-Za-z0-9_])", re.IGNORECASE | re.ASCII)
+# A clause ends at a question mark or a line's end, and at `.`, `:`, `;` or `!` only before a blank or a line's end:
+# the dot in src/config.ts ends nothing.
+STOP = re.compile(r"[.:;!](?=[ \t\n])|[?\n]")
+
+
+def asks(text):
+    """Whether TEXT asks something. Quotes go first: an optional type inside a code span is already gone."""
+    text = QUOTED.sub(" ", text)
+    scanned, start = 0, 0
+
+    def optional(m):
+        # The clause starts after the last stop before the type. Each stretch is searched once, and a type's own mark
+        # is a stop, so no clause is read twice: many types in a long text stay linear. The search ends at the type,
+        # which opens with a letter, so a mark just before it is rightly no stop.
+        nonlocal scanned, start
+        for stop in STOP.finditer(text, scanned, m.start()):
+            start = stop.end()
+        scanned = m.start()
+        return m[0] if INTERROGATIVE.match(text, start) else " "
+    return QUESTION.search(OPTIONAL.sub(optional, text)) is not None
+
+
 SUMMARY_CHARS = 200
 ARG_COUNTS = {
     "init": (1, None), "restore": (1, 1), "adopt": (2, None), "locate": (2, None),
@@ -110,7 +146,7 @@ ARG_COUNTS = {
     "replace": (2, None), "post": (1, None), "ready": (1, 2), "revise": (1, None),
     "confirm": (2, 2), "read": (1, 4), "show": (0, 2), "wake": (0, 0),
     "claim": (3, 3), "woke": (3, 3), "rearm": (2, None), "bind": (1, 1),
-    "pause": (0, None), "resume": (0, 1), "close": (0, 0), "status": (0, 0), "account": (3, 3), "tail": (0, 1),
+    "pause": (0, None), "resume": (0, 1), "close": (0, 0), "kill": (0, None), "status": (0, 0), "account": (3, 3), "tail": (0, 1),
     "prune": (0, 2), "sync": (1, 2), "export": (0, 1),
 }
 READ_COMMANDS = {"show", "status", "plan", "attention", "wake", "export"}
@@ -716,29 +752,49 @@ def unanswered(members, posts):
         text = post["text"]
         if post.get("kind") or REPORT_WORD.match(text):
             continue
-        text = QUOTED.sub(" ", text)  # `re #99` in a code span cites nothing, and a `?` there asks nothing
+        asking = asks(text)
+        text = QUOTED.sub(" ", text)  # `re #99` in a code span cites nothing
         sender = post["agent"]
         responder = successor(sender, members)
         # "re #4" or "re: #4", and every number of "re #4, #7 and #9" or "re #4 #7 #9"
         cited = [seq for run in re.findall(r"\bre(?:\s+|\s*:\s*)((?:#[0-9]+(?:\s*(?:,|and|&)?\s*))+)", text, re.IGNORECASE)
                  for seq in re.findall(r"#([0-9]+)", run)]
+        # A bare "#7" cites too, but only a question put to the poster: "@regions Thanks #7" answers it.
+        named = re.findall(r"(?<![A-Za-z0-9_&])#([0-9]+)", text)
+        # Only a citation settles: a post that cites nothing may be about anything, and the asker still waits. It
+        # settles by the question's number, whoever the post reaches, so a bare `re #7` closes it and wakes nobody.
+        # The asker withdraws its own question the same way, and the coordinator's ruling settles it for everyone it
+        # was put to: a member asked in the same post owes no second answer.
+        for key, seqs in pending.items():
+            for seq in (cited + named if key[1] == responder else cited if sender in (key[0], COORDINATOR) else []):
+                seqs.pop(seq.lstrip("0"), None)
         for recipient in post["to"]:
-            pair = (recipient, responder)
-            if cited:
-                # The coordinator's ruling on a question settles it for everyone it was put to: a member asked in the
-                # same post owes no second answer.
-                settled = [key for key in pending if key[0] == recipient] if sender == COORDINATOR else [pair]
-                for key in settled:
-                    for seq in cited:
-                        pending.get(key, {}).pop(seq.lstrip("0"), None)
-            else:
-                pending.pop(pair, None)
             target = successor(recipient, members)
-            if QUESTION.search(OPTIONAL.sub(" ", text)) and target in members and not members[target].get("killed"):
+            if asking and target in members and not members[target].get("killed"):
                 pending.setdefault((sender, target), {})[str(post["seq"])] = post["seq"]
     # A removed member is waiting for nothing: its questions close with it.
     return sorted((seq, asker, recipient) for (asker, recipient), seqs in pending.items() for seq in seqs.values()
                   if not members.get(asker, {}).get("killed"))
+
+
+def runnable(name, members, posts, ready):
+    """Whether NAME can act now, so starting its agent costs no idle wait: a worker once its dependencies are READY,
+    a verifier once every non-consultant worker is, or once a post after its brief asks it for an early review."""
+    member = members[name]
+    if member.get("role") != "verifier":
+        return all(dep in ready for dep in dependencies(member))
+    if all(n in ready for n, e in team_of(members).items() if e.get("role") == "worker" and e.get("consult") != "1"):
+        return True
+
+    def brief(p):
+        return (w := REPORT_WORD.match(p["text"])) is not None and w[1] == "BRIEF"
+
+    # A second brief asks for no review. A READY or REVISE reaches a verifier on its own, and while a worker is
+    # unready never does, even when it names one. @all and a group are news it reads on its first turn anyway:
+    # only its name or @verifiers asks it to start.
+    briefs = [p["seq"] for p in posts if name in p["to"] and brief(p)]
+    return bool(briefs) and any(p["seq"] > briefs[0] and name in p["to"] and not p.get("kind") and not brief(p)
+                                and mentions(p["text"]) & {name, "verifiers"} for p in posts)
 
 
 def rework(state, posts):
@@ -827,7 +883,7 @@ def attention(state, posts):
         asked.setdefault(asker, seq)
     for name, member in team.items():  # briefed, but no agent: a spawn that never happened or was cut off
         owed = unwoken_of(name, members, posts)
-        if not member.get("id") and owed:
+        if not member.get("id") and owed and runnable(name, members, posts, ready):
             items.append({"kind": "unstarted", "member": name, "seq": owed[0],
                           "text": "@%s has a brief and no agent. Start it once and record its id" % name})
     awake = [name for name, member in team.items() if not member.get("paused")]  # a paused member is woken by nobody
@@ -850,7 +906,8 @@ def attention(state, posts):
                    else "is paused: %s" % upstream["paused"] if upstream.get("paused")
                    else "is unreachable" if unreachable(dep, members, posts)
                    else "is ignoring its mentions" if ignored(dep, members, posts)
-                   else "was never started" if "id" not in upstream and "id" in member else None)
+                   else "was never started" if "id" not in upstream and "id" in member
+                   and runnable(dep, members, posts, ready) else None)
             if why:
                 last = [p["seq"] for p in posts if p["agent"] == dep]
                 items.append({"kind": "blocked", "member": name, "seq": last[-1] if last else 0,
@@ -885,6 +942,11 @@ def attention(state, posts):
                    "paused": bool(member.get("paused"))}
             for name, member in members.items() if name != COORDINATOR}
     return {"items": items, "members": view, "limits": state.get("limits", {})}
+
+
+def attention_text(report):
+    lines = ["[%s] %s%s" % (item["kind"], "#%d " % item["seq"] if item["seq"] else "", item["text"]) for item in report["items"]]
+    return "\n".join(lines + ["%d item(s) need attention; `show --post=N` prints one post" % len(lines) if lines else "nothing needs attention"])
 
 
 def budget_usage(state):
@@ -1104,11 +1166,16 @@ def prune(root, args):
     print("%sremove %d worktree(s) and archive %d run(s)" % (would, removed, archived))
 
 
+def mentions(text):
+    """The names TEXT mentions outside code. The name as written also reaches a roster made before names had to end
+    in a letter or digit."""
+    return {form for m in MENTION.findall(QUOTED.sub(" ", text)) for form in (m.lower(), m.lower().rstrip("-_"))}
+
+
 def targets(text, members, *, include_killed=False, sender=None):
     """The names a post reaches: its @name, @group and @all mentions, @verifiers (every verifier) and @dependents (whoever
     depends on SENDER), expanded to live members (or all when include_killed)."""
-    # the name as written reaches a roster made before names had to end in a letter or digit
-    mentioned = {form for m in MENTION.findall(QUOTED.sub(" ", text)) for form in (m.lower(), m.lower().rstrip("-_"))}
+    mentioned = mentions(text)
     return [n for n, m in members.items() if (include_killed or not m.get("killed")) and (
         mentioned & {"all", n, m.get("group")} or ("verifiers" in mentioned and m.get("role") == "verifier")
         or ("dependents" in mentioned and sender is not None and sender in dependencies(m)))]
@@ -1192,7 +1259,9 @@ def main(argv):
         matches = [(name, state) for name, state in saved_runs(d) if state.get("binding") == args[0] and any(
             member.get("id") in args[1:] for member in state["members"].values())]
         open_matches = [name for name, state in matches if not state.get("closed")]
-        chosen = open_matches if len(open_matches) == 1 else [name for name, _ in matches] if len(matches) == 1 else []
+        # With no open run, the latest that had the agent: a native teammate's address comes back in each run of the
+        # conversation, and a killed run must still own it so its tool calls stay refused. Two open runs stay unknown.
+        chosen = open_matches if len(open_matches) == 1 else [] if open_matches else [name for name, _ in matches[:1]]
         if len(chosen) == 1:
             print(os.path.abspath(os.path.join(d, chosen[0])))
         return
@@ -1305,8 +1374,16 @@ def main(argv):
         def post_message(sender, text, recipients, *, save_roster=False, **extra):
             post = {"seq": len(posts) + 1, "agent": sender, "text": text,
                     "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "to": recipients, **extra}
+            if sender == COORDINATOR and (head := REPORT_WORD.match(text)) and head[1] == "BRIEF":
+                # Who the first line assigned, as the roster stood: groups and retirements later change no brief.
+                post["addressed"] = [n for n in targets(text.split("\n")[0], members, sender=sender) if n != sender]
             if post.get("kind") == "ready":
                 current = readiness(members, [*posts, post])
+                subject, named = post.get("subject", sender), targets(text, members, sender=sender)
+                # A dependent is woken by the READY that lets it start, not by each one before it; a mention always reaches.
+                recipients = [name for name in recipients if name in named or subject not in dependencies(members[name])
+                              or all(dep in current for dep in dependencies(members[name]))]
+                post["to"] = recipients
                 if any(entry.get("role") == "worker" and entry.get("consult") != "1" and name not in current
                        for name, entry in team_of(members).items()):
                     recipients = [name for name in recipients if members[name].get("role") != "verifier"]
@@ -1325,6 +1402,23 @@ def main(argv):
             if owed:  # the one notice that reaches a member whatever started it and whatever hooks are loaded
                 print("UNREAD: %d post(s) address @%s from #%d on. Read them now: read %s"
                       % (len(owed), sender, owed[0], sender))
+            return post
+
+        def judge_last_pass():
+            """The last candidate and why its pass no longer holds, recorded for `export` once the run is closed."""
+            try:
+                with open(os.path.join(d, "verification.json"), encoding="utf-8") as f:
+                    candidate = json.load(f)
+            except (OSError, ValueError):
+                candidate = None
+            stale = None
+            if isinstance(candidate, dict) and candidate.get("verified_by") and not candidate.get("accepted"):
+                # Judged while the run is open, as the board judges a VERIFIED post, and kept for `export` afterwards.
+                stale = stale_pass(d, candidate, bool(state.get("closed")))
+                if stale and not state.get("closed"):
+                    candidate["stale"] = stale
+                    atomic_write(os.path.join(d, "verification.json"), json.dumps(candidate, indent=2))
+            return candidate, stale
 
         def waiting(member):
             return (not state.get("closed") and not state.get("paused") and not over_budget and not member.get("killed")
@@ -1395,7 +1489,8 @@ def main(argv):
                 return
             if member.get("id", "") != expected:
                 sys.exit("the roster address changed while the agent was starting")
-            for key in ("wake_claim", "last_nudged_seq", "told"):
+            # What the old agent read, the new one has not.
+            for key in ("wake_claim", "last_nudged_seq", "told", "delivered", "clipped"):
                 member.pop(key, None)
             member["id"] = address
             if isolated is not None:
@@ -1424,7 +1519,7 @@ def main(argv):
                 sys.exit("@%s has been retired, so its assignment no longer changes. To put a member in its place: replace %s NEW"
                          % (name, name))
             if "id" in changes and changes["id"] != member.get("id"):
-                for key in ("wake_claim", "last_nudged_seq", "told"):
+                for key in ("wake_claim", "last_nudged_seq", "told", "delivered", "clipped"):
                     member.pop(key, None)
                 if "isolated" not in changes:
                     member.pop("isolated", None)
@@ -1546,9 +1641,7 @@ def main(argv):
             if "--json" in args:
                 print(json.dumps(report))
             else:
-                for item in report["items"]:
-                    print("[%s] %s%s" % (item["kind"], "#%d " % item["seq"] if item["seq"] else "", item["text"]))
-                print("%d item(s) need attention; `show --post=N` prints one post" % len(report["items"]) if report["items"] else "nothing needs attention")
+                print(attention_text(report))
 
         elif cmd == "retry":
             name = known(args[0])
@@ -1608,11 +1701,26 @@ def main(argv):
                 print(f"note: @{new} has model=inherit, which cannot be checked against family limits here", file=sys.stderr)
             briefs = [p for p in posts if p["agent"] == COORDINATOR and old in p["to"]
                       and (word := REPORT_WORD.match(p["text"])) and word[1] == "BRIEF"]
-            # A brief addressed to the old member in its first line, not one that only mentions it further down.
-            briefs = [p for p in briefs if old in targets(p["text"].split("\n")[0], members, include_killed=True, sender=COORDINATOR)] or briefs
-            lines = briefs[-1]["text"].split("\n") if briefs else []
-            first = lines[0][REPORT_WORD.match(lines[0]).end():].strip() if lines else ""
-            body = "\n".join(([first] if first else []) + lines[1:]) if briefs else "(@%s had no brief on the board)" % old
+            # A brief assigned to the old member alone is its own; one assigned to others too is shared: it goes along,
+            # but never stands in for the member's own. A brief records whom its first line assigned. An older one
+            # without that record goes by its `to`, with the first line telling a brief addressed to the member from
+            # one that names it further down; when none was addressed to it, those that name it stand in.
+            def addressed(p):
+                head, _, rest = p["text"].partition("\n")
+                return old in targets(head, members, include_killed=True, sender=COORDINATOR) or old not in mentions(rest)
+            heads = [(p, [n for n in p["addressed"] if n != new]) for p in briefs if old in p.get("addressed", [])]
+            heads += [(p, [n for n in p["to"] if n != new]) for p in briefs if "addressed" not in p and addressed(p)]
+            heads.sort(key=lambda head: head[0]["seq"])
+            own = [p for p, reached in heads if reached == [old]] or ([] if heads else [p for p in briefs if "addressed" not in p])
+            shared = [p for p, reached in heads if len(reached) > 1]
+
+            def brief_body(post):
+                lines = post["text"].split("\n")
+                first = lines[0][REPORT_WORD.match(lines[0]).end():].strip()
+                return "\n".join(([first] if first else []) + lines[1:])
+
+            parts = ["Shared brief #%d: %s" % (p["seq"], brief_body(p)) for p in shared] + [brief_body(p) for p in own[-1:]]
+            body = "\n".join(parts) or "(@%s had no brief on the board)" % old
             history = " ".join("#%d" % p["seq"] for p in posts if p["agent"] == old) or "none"
             # what the old member was sent and never read (or left unanswered) would otherwise be lost with it
             owed_seqs = sorted({p["seq"] for p in posts if old in p["to"] and p["seq"] > members[old]["last_read_seq"]}
@@ -1692,7 +1800,13 @@ def main(argv):
                               if seqs[-1] == seq and len(seqs) >= REWORK_PAUSE), "")
                 if stuck:
                     state["paused"] = stuck
-            post_message(sender, text, recipients, save_roster=bool(stuck) or done, **verdict)
+            post = post_message(sender, text, recipients, save_roster=bool(stuck) or done, **verdict)
+            # An answer that cites nothing closes nothing: said now, it is corrected in the same step.
+            still = [(seq, asker) for seq, asker, asked in unanswered(members, [*posts, post])
+                     if not word and asked == sender and asker in post["to"]]
+            if still:
+                print("OPEN: %s still open to you; only citing it closes it, and a post of just `re #%d` wakes nobody"
+                      % (", ".join("#%d from @%s" % pair for pair in still), still[0][0]))
             if answer != current:
                 print("note: this verdict is recorded as answering candidate %s, %s, so candidate %s, the one being verified "
                       "now, keeps its test and its pass. If it is about %s, post it again with that id in its first line"
@@ -1950,43 +2064,118 @@ def main(argv):
             headers, everything = "--headers" in args, "--all" in args
             readers = [a for a in args if not a.startswith("--")]
             limits = [a for a in args if a.startswith("--max-bytes=")]
-            if (headers and everything) or len(readers) != 1 or len(limits) > 1 or len(set(args)) != len(args) or set(args) - {*readers, *limits, "--headers", "--all"}:
-                sys.exit("read requires one member and accepts --all, --headers or --max-bytes=N")
+            attend = "--attention" in args
+            if (headers and everything) or len(readers) != 1 or len(limits) > 1 or len(set(args)) != len(args) or set(args) - {*readers, *limits, "--headers", "--all", "--attention"}:
+                sys.exit("read requires one member and accepts --all, --headers, --max-bytes=N or --attention")
             if limits and not re.fullmatch(r"--max-bytes=[0-9]{1,9}", limits[0]):
                 sys.exit("--max-bytes must be between 256 and 1000000")
             maximum = int(limits[0].partition("=")[2]) if limits else None
             if maximum is not None and not 256 <= maximum <= 1_000_000:
                 sys.exit("--max-bytes must be between 256 and 1000000")
             me = known(readers[0])
+            if attend and me != COORDINATOR:
+                sys.exit("--attention is for the coordinator only")
             new = [p for p in posts if p["seq"] > members[me]["last_read_seq"]]
-            emitted = size = 0
-            for p in new:
-                mine = me in p["to"]
-                if headers or not (mine or everything):
+            latest, role, deps = latest_reports(posts), members[me].get("role"), dependencies(members[me])
+            current = readiness(members, posts)
+
+            def needed(p):
+                """A READY that counts now and the reader works from: a dependency's for a worker, any worker's for a
+                verifier. Withheld from its `to` until it could act, the reader would otherwise pay a show for each.
+                One a NOT PASSED rejected, a retired member's, or one whose own dependencies fell back is no work to
+                build on."""
+                subject = p.get("subject", p["agent"])
+                if p.get("kind") != "ready" or current.get(subject) is not p:
+                    return False
+                if role == "verifier":
+                    return members.get(subject, {}).get("role") == "worker" and members[subject].get("consult") != "1"
+                return role == "worker" and subject in deps
+
+            reader = members[me]
+            delivered = set(reader.get("delivered", []))
+            # A needed READY shown only in part: never delivered in full, but its start is not printed again either,
+            # since the cut already says to show the whole post.
+            clipped = set(reader.get("clipped", []))
+
+            def passed_on(p):
+                """A worker's READY the coordinator need not hold in full, where it is re-read at every step: someone
+                else reviews it, and it asks nothing and names the coordinator nowhere, as a report needing a decision does."""
+                subject = p.get("subject", p["agent"])
+                return (p.get("kind") == "ready" and p["agent"] != COORDINATOR and members.get(p["agent"], {}).get("consult") != "1"
+                        and not asks(p["text"]) and COORDINATOR not in mentions(p["text"])
+                        and any(e.get("role") == "verifier" or subject in dependencies(e) for e in team_of(members).values()))
+            # A needed READY the reader passed without its body: registered or replaced after it, given the
+            # dependency later, or read with --headers or as a summary. Each is shown in full once.
+            replay = [] if headers else [p for p in posts if p["seq"] <= reader["last_read_seq"]
+                                         and p["seq"] not in delivered | clipped and needed(p)]
+            printed = size = 0
+
+            def fit(output, seq):
+                """OUTPUT as it fits the page, or None once the page is full."""
+                nonlocal size
+                if maximum is None:
+                    return output
+                size += len(output.encode("utf-8")) + 1
+                if size > maximum and printed:
+                    return None
+                if size > maximum:
+                    # One post longer than a page would block every later read: its start is shown and the cursor moves on.
+                    note = "\n  [cut to fit the page. The whole post: show --post=%d]\n" % seq
+                    output = output.encode("utf-8")[:maximum - len(note.encode("utf-8")) - 1].decode("utf-8", "ignore") + note
+                return output
+
+            def say(line):  # a status line, counted so the attention block knows what room is left
+                nonlocal size
+                size += len(line.encode("utf-8")) + 1
+                print(line)
+
+            for p in replay:
+                whole = show(p)
+                output = fit(whole, p["seq"])
+                if output is None:
+                    break
+                print(output)
+                printed += 1
+                (delivered if output == whole else clipped).add(p["seq"])
+            replayed, emitted = printed, 0
+            for p in new:  # a page the replay filled takes none of them: `size` is already past it
+                mine, full = me in p["to"], needed(p) and not headers
+                routine = me == COORDINATOR and not (everything or headers) and passed_on(p)
+                if headers or routine or not (mine or everything or full):
                     lines = p["text"].split("\n")
                     word = REPORT_WORD.match(p["text"])
                     summary = " | ".join(lines[:2 if p.get("kind") or (word and word[1] == "BRIEF") else 1])
-                    p = dict(p, text=summary[:SUMMARY_CHARS] + "…" if len(summary) > SUMMARY_CHARS else summary)
-                output = ("* " if mine else "") + show(p)
-                if maximum is not None:
-                    size += len(output.encode("utf-8")) + 1
-                    if size > maximum and emitted:
-                        break
-                    if size > maximum:
-                        # One post longer than a page would block every later read: its start is shown and the cursor moves on.
-                        note = "\n  [cut to fit the page. The whole post: show --post=%d]\n" % p["seq"]
-                        output = output.encode("utf-8")[:maximum - len(note.encode("utf-8")) - 1].decode("utf-8", "ignore") + note
-                print(output)
-                emitted += 1
-                if maximum is not None and size > maximum:
+                    summary = summary[:SUMMARY_CHARS] + "…" if len(summary) > SUMMARY_CHARS else summary
+                    p = dict(p, text=summary + (" [full: show --post=%d]" % p["seq"] if routine else ""))
+                whole = ("* " if mine else "") + show(p)
+                output = fit(whole, p["seq"])
+                if output is None:
                     break
-            layout = ("one line per post" if headers else "all posts are shown in full" if everything else
-                      "posts marked * mention you and are shown in full")
-            print(f"{emitted} new post(s); {layout}" if emitted else "no new posts")
-            if emitted < len(new):
-                print(f"{len(new) - emitted} more post(s) remain. Read again for the next page.")
+                print(output)
+                printed += 1
+                emitted += 1
+                if full:
+                    (delivered if output == whole else clipped).add(p["seq"])
+            remaining = len(replay) - replayed + len(new) - emitted
+            if replayed:
+                say(f"{replayed} earlier report(s) you work from, shown in full")
+            if replayed == len(replay):
+                layout = ("one line per post" if headers else "all posts are shown in full" if everything else
+                          "posts marked * mention you and are shown in full")
+                say(f"{emitted} new post(s); {layout}" if emitted else "no new posts")
+            if remaining:
+                say(f"{remaining} more post(s) remain. Read again for the next page.")
             sys.stdout.flush()
-            reader = members[me]
+            # Kept to the posts that are still some subject's latest report: a replaced one is never needed again.
+            changed = False
+            for key, seqs in (("delivered", delivered), ("clipped", clipped - delivered)):
+                seqs = sorted(seqs & {p["seq"] for p in latest.values()})
+                if seqs != reader.get(key, []):
+                    if seqs:
+                        reader[key] = seqs
+                    else:
+                        reader.pop(key, None)
+                    changed = True
             if emitted:
                 reader["last_read_seq"] = new[emitted - 1]["seq"]
                 progress(state, reader)
@@ -1995,8 +2184,14 @@ def main(argv):
                 reader[key].get("seq", 0) <= reader["last_read_seq"] or not unread(me))]
             for key in done:
                 del reader[key]
-            if emitted or done:
+            if emitted or done or changed:
                 save(d, state)
+            if attend and not remaining:  # after the cursor moved, so what was just read is not listed as unread
+                report = attention(state, posts)
+                block = attention_text(report)
+                if maximum is not None and size + len(block.encode("utf-8")) + 1 > maximum:
+                    block = "%d item(s) need attention, too many for this page. Run: attention" % len(report["items"])
+                print(block)
 
         elif cmd == "show":
             as_json = "--json" in args
@@ -2017,9 +2212,11 @@ def main(argv):
                     print(show(p))
 
         elif cmd == "wake":
+            ready = readiness(members, posts)
             for name, member in members.items():
                 owed = unwoken(name)
-                if name != COORDINATOR and waiting(member) and owed:
+                # A member not yet started is started once it can act: one started early idles past its cache.
+                if name != COORDINATOR and waiting(member) and owed and (member.get("id") or runnable(name, members, posts, ready)):
                     claim = member.get("wake_claim", {})
                     exhausted = claim.get("attempts", 0) >= WAKE_ATTEMPTS and claim.get("until", 0) <= time.time()
                     suffix = " (attempts exhausted)" if exhausted else ""
@@ -2183,23 +2380,47 @@ def main(argv):
                                         % " ".join("@" + name for name in halted), halted, save_roster=True)
             save(d, state)
 
+        elif cmd == "kill":  # the user's stop: no precondition, since whatever is open is what the user wants ended
+            # `close` retires nobody, so a closed run may still have members at work: they are retired, and the closed
+            # board gets no post.
+            closed = state.get("closed")
+            retired = [name for name, member in members.items() if name != COORDINATOR and not member.get("killed")]
+            if closed and not retired:
+                print("already closed")
+                return
+            if not closed:
+                judge_last_pass()  # before the members are retired, while the pass is judged as on an open run
+            reason = " ".join(args).strip() or "killed by the user"
+            for name in retired:
+                # The id and the rest stay, so the hooks still know each agent and refuse its tool calls.
+                members[name]["killed"] = "1"
+                for key in ("wake_claim", "told", "last_nudged_seq", "paused"):
+                    members[name].pop(key, None)
+            state["closed"] = True
+            state.setdefault("killed", reason)
+            state.pop("paused", None)
+            if closed:
+                save(d, state)
+            else:
+                post = {"seq": len(posts) + 1, "agent": COORDINATOR, "text": "SHUTDOWN\nThe user killed the run: " + reason,
+                        "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "to": []}
+                members[COORDINATOR]["last_read_seq"] = post["seq"]  # nothing is owed on a run nobody will read again
+                state["pending_post"] = post  # roster and post land together, as in `replace`
+                save(d, state)
+                append_post(d, post)
+                del state["pending_post"]
+                save(d, state)
+            print("killed: %d member(s) retired, run closed" % len(retired))
+            for name in retired:
+                if members[name].get("id"):
+                    print("@%s %s" % (name, members[name]["id"]))
+
         elif cmd == "close":
             owed = unread(COORDINATOR)
             if owed:
                 sys.exit("@coordinator has not read %d post(s) addressed to it, from #%d on. Run: read coordinator, then close"
                          % (len(owed), owed[0]))
-            try:
-                with open(os.path.join(d, "verification.json"), encoding="utf-8") as f:
-                    candidate = json.load(f)
-            except (OSError, ValueError):
-                candidate = None
-            stale = None
-            if isinstance(candidate, dict) and candidate.get("verified_by") and not candidate.get("accepted"):
-                # Judged while the run is open, as the board judges a VERIFIED post, and kept for `export` afterwards.
-                stale = stale_pass(d, candidate, bool(state.get("closed")))
-                if stale and not state.get("closed"):
-                    candidate["stale"] = stale
-                    atomic_write(os.path.join(d, "verification.json"), json.dumps(candidate, indent=2))
+            candidate, stale = judge_last_pass()
             state["closed"] = True
             state.pop("paused", None)
             save(d, state)

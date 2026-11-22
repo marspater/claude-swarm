@@ -261,6 +261,18 @@ let ownedRoster: { dir: string; closed: boolean; members: Roster } | undefined
 let rosterMiss: { dir: string; stamp: string; ids: Set<string> } | undefined
 // The run this conversation drove until it closed: its members are still refused by name.
 let closedRun = ''
+// What /swarm:kill ended: its run, and the agents of the members it retired, whose hand-backs are dropped. While
+// `killedRun` is set and no new /swarm:swarm came, the swarm skill's text is not given back to the conversation.
+let killedRun = ''
+let killedIds: ReadonlySet<string> = new Set()
+// The agents a kill retired, as the board confirmed it: refused by the tool guard until another run is owned, whatever
+// a poll that read the roster before the kill puts in `retired`.
+const killConfirmed = new Set<string>()
+// A kill that landed while the coordinator's turn ran: that turn's tool calls are refused, and the compaction, which
+// cannot run mid-turn, waits for its end.
+let isKillTurn = false
+// Counts the coordinator's turns that ended, so a kill can tell whether the turn it landed in ended during its awaits.
+let coordinatorTurnsEnded = 0
 // Whether the project held a Swarm run when the session began: only then is the board offered unasked.
 let hadRun = false
 // The owned run while it is paused or over budget, and why: its members are refused their next tool call.
@@ -372,10 +384,15 @@ const ROUTINE_GRACE_MS = 600_000
 // The coordinator's conversation at this size makes every further wake dear: the person is told once per run.
 const HEAVY_CONVERSATION = 180_000
 let owed = NONE
+const KILL_DROP = 'Swarm: a member retired by /swarm:kill reported back; it was not passed on.'
 // A task of this many characters is saved to a file, and this much of its start stays in the conversation.
-const TASK_CHARS = 50_000
-const TASK_HEAD = 6_000
+const TASK_CHARS = 16_000
+const TASK_HEAD = 4_000
 const TASK_TAIL = 2_000
+// The arguments of the last /swarm:swarm or /swarm:plan, as the command passed them on: past this length the copy
+// the skill's text holds of them is replaced with a pointer to the command's own message, which holds them already.
+const ARGS_DEDUP = 2_000
+let commandArgs = ''
 // A conversation this long is worth a word before a run starts in it: about half of what the coordinator's last run averaged.
 const LONG_CONVERSATION = 120_000
 // Posts the coordinator has opened with `show`: the board still counts them unread, but it is not told of them again.
@@ -734,6 +751,13 @@ async function own($: EngineInterface, dir: string): Promise<void> {
   }
   const owner = generation
   closedRun = ''
+  // The ids a kill retired stay: a late hand-back from an earlier run's member is still dropped. Another run's
+  // members are judged by its own roster, and an old kill's owed compaction would take away the new run's rules.
+  if (dir !== killedRun) {
+    killedRun = ''
+    killConfirmed.clear()
+    owedCompaction = undefined
+  }
   hadRun = true
   await update($, run, () => dir)
   if (sEpoch !== sessionEpoch || isEnding) return
@@ -1093,7 +1117,7 @@ async function deliver(
 function unreadNotice($: EngineInterface, dir: string): string {
   const script = `${$.plugin.root}/skills/swarm/scripts/board.py`
   return `${counted(owed.count, 'board post')} ${owed.count === 1 ? 'addresses' : 'address'} you from #${owed.first} on and you have not read ${owed.count === 1 ? 'it' : 'them'}. ` +
-    `Read ${owed.count === 1 ? 'it' : 'them'} before anything else: python3 ${shellQuote(script)} ${shellQuote(dir)} read coordinator`
+    `Read ${owed.count === 1 ? 'it' : 'them'} before anything else: python3 ${shellQuote(script)} ${shellQuote(dir)} read coordinator --attention`
 }
 
 function moodOf(full: Swarm, agents: AgentInfo[]): Mood {
@@ -1287,11 +1311,16 @@ async function refresh($: EngineInterface): Promise<void> {
       ? owed.since : now
     owed = last === 0 ? NONE : { count: unread.length, first: unread[0]?.seq ?? last, last, since }
     owedSeqs = unread.map(post => post.seq)
-    // A consultant's READY is the answer the coordinator asked for, and a READY that asks something is a question.
+    // A consultant's READY is the answer the coordinator asked for, a READY that asks something is a question, and one
+    // that mentions the coordinator asks it to rule on something.
     isOwedRoutine = !full.attentionUnavailable && unread.length > 0 && unread.every(post => kindOf(post.text)?.label === 'READY' &&
-      state.members[post.agent]?.consult !== '1' && !hasQuestion(post.text) &&
+      state.members[post.agent]?.consult !== '1' && !hasQuestion(post.text) && !/(?<![\w@.-])@coordinator(?![\w-])/.test(post.text) &&
       !full.attention.some(item => item.kind === 'question' && item.seq === post.seq)) &&
-      full.members.some(member => member.role !== 'coordinator' && member.status === 'working')
+      (full.members.some(member => member.role !== 'coordinator' && member.status === 'working') ||
+        // A verifier with an agent reviews these READY posts next and mentions the coordinator with what it found: one
+        // wake, not two inspecting the same diff. One with no agent yet is the coordinator's to start, so it is not waited for.
+        full.members.some(member => member.role === 'verifier' && member.id && member.status === 'waiting' &&
+          unread.some(post => post.to.includes(member.name) && post.seq > (state.members[member.name]?.last_read_seq ?? 0))))
     if (owned) {
       const reason = state.closed ? '' : state.paused ?? ''
       if (reason === '') budgetPauseNotifiedFor = ''
@@ -1406,6 +1435,200 @@ async function refresh($: EngineInterface): Promise<void> {
   }
 }
 
+/**
+ * The agent that sent a notification, read off its envelope alone: a peer message's first `<agent-message from>`
+ * frame, a task notification's opening `<task-id>`, a SendMessage delivery's `Message from ID:`. The text inside may
+ * name any agent; a format not known here names none.
+ */
+function senderOf(e: { text: string; origin: { kind: string } }): string | undefined {
+  const envelope = e.origin.kind === 'peer' ? /<agent-message from="([^"]+)">/
+    : e.origin.kind === 'task-notification' ? /^\s*<task-notification>\s*<task-id>([^<]+)<\/task-id>/
+    : e.origin.kind === 'peer-send-message' ? /^Message from ([^\s:]+):/ : undefined
+  return envelope?.exec(e.text)?.[1]?.trim() || undefined
+}
+// Per member of a run, the newest post that let one of its turn ends be dropped, and the kinds of wake dropped for it:
+// a hand-back and a task notification each once.
+const boardDrops = new Map<string, { seq: number; kinds: Set<string> }>()
+
+/**
+ * Whether a member's hand-back or task notification would only repeat the board: it would start a turn of its own
+ * while other members still work, the member posted on the board since it was last woken, and nothing the
+ * coordinator must act on is unread. The board's own paths still wake the coordinator: an urgent mention, a silent
+ * exit, the last member stopping. Anything in doubt goes through.
+ */
+async function repeatsBoard($: EngineInterface, e: { text: string; origin: { kind: string }; turnId?: string }): Promise<boolean> {
+  const roster = ownedRoster
+  const shown = snapshot
+  if (e.turnId !== undefined || !roster || roster.closed || halted || !shown || shown.dir !== roster.dir) return false
+  const kind = e.origin.kind
+  if (kind !== 'peer' && kind !== 'task-notification') return false
+  // A failure, or a stop, is news the board does not hold.
+  if (kind === 'task-notification' && /<status>([^<]*)<\/status>/.exec(e.text)?.[1]?.trim() !== 'completed') return false
+  const from = senderOf(e)
+  if (!from) return false
+  // A peer message is dropped only as a turn's end; one a member sends about something new goes through.
+  if (kind === 'peer' && !/<agent-message from="[^"]+">\s*\[Subagent hand-back\]/.test(e.text)) return false
+  if (roster.dir !== await read($, run)) return false
+  // The roster and the board as they are now: since the last poll the board may have woken the member again, and a
+  // turn that ended on that wake with nothing posted is a silent exit. Either unread, the prompt goes through.
+  const [fresh, board] = await Promise.all([
+    $.fs.read(`${roster.dir}/members.json`).then(text => JSON.parse(text) as { closed?: boolean; members?: Roster }),
+    readBoard($, roster.dir),
+  ]).catch(() => [undefined, ''] as const)
+  if (!fresh?.members || fresh.closed) return false
+  const address = teammates.get(from)
+  const found = Object.entries(fresh.members).find(([name, m]) => name !== 'coordinator' && m.id && m.killed !== '1' &&
+    (m.id === from || m.id === address))
+  if (!found) return false
+  const [name, member] = found
+  const woken = Number(member.last_nudged_seq ?? 0)
+  const newest = parsePosts(board, fresh.members).reduce((seq, post) => post.agent === name && post.seq > seq ? post.seq : seq, 0)
+  const key = `${roster.dir}\n${name}`
+  const used = boardDrops.get(key)
+  // Only a post newer than its last wake, and one turn's end per post: a member that read its wake and posted
+  // nothing exited silently, and one that ran again and posted nothing new left no news on the board.
+  if (newest <= woken || (used?.seq === newest && used.kinds.has(kind))) return false
+  const othersWork = shown.members.some(m => m.role !== 'coordinator' && m.name !== name && m.status === 'working')
+  if (!othersWork || (owed.count !== 0 && !isOwedRoutine)) return false
+  if (used?.seq === newest) used.kinds.add(kind)
+  else boardDrops.set(key, { seq: newest, kinds: new Set([kind]) })
+  return true
+}
+
+/** A closed run stops being the one this conversation drives: nothing is woken or charged, its members stay refused. */
+async function released($: EngineInterface, dir: string): Promise<void> {
+  if (dir !== await read($, run)) return
+  closedRun = dir
+  resetMonitoring()
+  // Read under this generation: a run bound while the roster is read keeps its own guard state.
+  const owner = generation
+  await update($, run, () => '')
+  // Its members are still refused by name: a retired one, a commit, an edit outside its paths.
+  await syncOwnedState($, dir, undefined, undefined, owner).catch(() => undefined)
+}
+
+const KILL_COMPACT = 'The user ended the Swarm run with /swarm:kill. Summarize this conversation for one assistant that ' +
+  'continues the user\'s work alone. Keep the user\'s request and every later instruction in their own words, what was ' +
+  'changed in which files, what was verified and what was not, what is uncommitted, failures, and open decisions. Leave ' +
+  'out the Swarm skill\'s rules, board commands, the roster, wakes and budget mechanics. Say that this conversation is ' +
+  'no longer a Swarm coordinator: it runs no board command and starts no member unless the user starts a new run.'
+
+/**
+ * /swarm:kill, answered in the command's place so no model turn starts: the board retires every member and closes
+ * the run, the hooks let go of it as after a close, and the conversation is compacted between turns.
+ */
+async function killRun($: EngineInterface, reason: string): Promise<{ text: string }> {
+  // The turn the kill lands in, read before any await: one that ends while the kill runs is not refused afterwards.
+  const landedMidTurn = isCoordinatorBusy
+  const turnsEnded = coordinatorTurnsEnded
+  const sEpoch = sessionEpoch
+  const dir = await read($, run) || closedRun
+  if (!dir) return { text: 'No Swarm run is driven from this conversation, so there is nothing to kill.' }
+  const result = await boardCommand($, dir, ['kill', ...(reason.trim() ? [reason.trim()] : [])])
+    .catch(error => ({ exitCode: 1, stdout: '', stderr: String(error) }))
+  const readRoster = () => $.fs.read(`${dir}/members.json`).then(text => JSON.parse(text) as { closed?: boolean; killed?: string; members?: Roster })
+  // The board can close the run and fail after it (the SHUTDOWN post not appended): a roster closed by a kill is one.
+  const committed = result.exitCode === 0 ? undefined : await readRoster().then(state => state.closed && state.killed ? state : undefined, () => undefined)
+  if (result.exitCode !== 0 && !committed) return { text: `Swarm: the board's kill failed: ${clean(result.stderr).trim() || 'it gave no answer'}` }
+  // Every write of kill state is this session's alone: one that began since (/clear) is left as it is. The board's
+  // kill stands either way.
+  const isOurs = () => sEpoch === sessionEpoch
+  if (!isOurs()) return { text: 'The Swarm run is closed.' }
+  // At once, with no await since the board answered: a tool call the coordinator makes while the diagnostics run is
+  // refused, unless the turn the kill landed in has ended meanwhile.
+  const armed = landedMidTurn && coordinatorTurnsEnded === turnsEnded
+  if (armed) isKillTurn = true
+  // The board names each member it retired, with its agent: the guard refuses them from here on, before the roster is read.
+  const retiredNow = new Map([...result.stdout.matchAll(/^@([\w.-]+) (\S+)$/gm)].map(([, name, id]) => [name!, id!]))
+  const said: Roster = Object.fromEntries([...retiredNow].map(([name, id]) => [name, { role: 'worker', id, last_read_seq: 0 }]))
+  const confirm = (ids: Set<string>) => {
+    if (!isOurs()) return
+    killedIds = new Set([...killedIds, ...ids])
+    retired = new Set([...retired, ...ids])
+    for (const id of ids) killConfirmed.add(id)
+  }
+  confirm(agentIdsOf(said, [], () => true))
+  const unread: string[] = []
+  const roster = committed?.members ?? await readRoster().then(state => state.members ?? {})
+    .catch((): Roster => { unread.push('the run\'s roster'); return {} })
+  for (const [name, member] of Object.entries(said)) roster[name] ??= member
+  const members = Object.entries(roster).filter(([, m]) => m.role !== 'coordinator' && m.id)
+  const killed = Object.fromEntries(members)
+  // Both identities of a native teammate, as the tool guard knows them, the saved mapping of one gone from the list included.
+  const retire = (agents: AgentInfo[]) => confirm(agentIdsOf(killed, agents, () => true))
+  if (isOurs()) killedRun = dir
+  retire([])
+  if (isOurs()) await released($, dir)
+  if (isOurs()) $.clock.after(0, () => void refresh($))
+  const lines = [/^already closed/m.test(result.stdout)
+    ? 'The Swarm run was already closed.'
+    : `The Swarm run is closed: ${/^killed: (\d+)/m.exec(result.stdout)?.[1] ?? members.length} member(s) retired.`]
+  const live = await $.agent.list().catch((): AgentInfo[] => { unread.push('the agent list'); return [] })
+  retire(live)
+  const running = members.filter(([, m]) => ['running', 'pending', 'waiting'].includes(findAgent(live, m.id)?.status ?? ''))
+  if (running.length > 0) lines.push(`Still running: ${running.map(([name]) => `@${name}`).join(', ')}. Each stops at its next tool call, which is refused.`)
+  // A failed scan with nothing listed is no scan; what a scan that partly failed listed is kept.
+  const listing = await $.process.run(['lsof', '-b', '-w', '-a', '-d', 'cwd', '-Fpn'], { timeoutMs: 5000 })
+    .then(listed => listed.exitCode !== 0 && !listed.stdout.trim() ? Promise.reject(new Error('lsof failed')) : listed.stdout)
+    .catch(() => { unread.push('the process list'); return '' })
+  for (const [name, m] of members) {
+    const left = await leftRunning($, m.id!, listing)
+    if (left.length > 0) lines.push(`@${name} left ${left.map(one => `${one.pid} (${one.command})`).join(', ')} running in its worktree. Unless it should finish: kill ${left.map(one => one.pid).join(' ')}`)
+  }
+  if (unread.length > 0) lines.push(`Not checked, as ${unread.join(' and ')} could not be read: which members still run and what they left running.`)
+  // No await from here on: the check and the owed compaction are one step, so a turn's end cannot fall between them.
+  // A turn that ended during the diagnostics found the kill armed and owes the compaction already.
+  const isMidTurn = armed && coordinatorTurnsEnded === turnsEnded
+  lines.push('Nothing was committed or reverted: the files are as the members left them.', isMidTurn
+    ? 'The coordinator\'s turn is told to end now; then this conversation is compacted, to go on as an ordinary assistant.'
+    : 'This conversation is being compacted, to go on as an ordinary assistant.')
+  if (!armed && isOurs()) compactAfterKill($)
+  return { text: lines.join('\n') }
+}
+
+// The compaction a kill owes, to the session that asked, between its turns only. The host refuses one while a turn
+// runs, so a refused one is asked again twice at most. A new run, bound or started, cancels it.
+let owedCompaction: { epoch: number; tries: number; isAsked: boolean } | undefined
+const COMPACTION_RETRY_MS = 1000
+/** Owes the compaction to this session; it runs once no coordinator turn is running, or at the end of the one that is. */
+function compactAfterKill($: EngineInterface): void {
+  owedCompaction = { epoch: sessionEpoch, tries: 0, isAsked: false }
+  $.clock.after(0, () => compactOwed($))
+}
+function compactOwed($: EngineInterface): void {
+  const owed = owedCompaction
+  if (!owed || owed.isAsked || owed.epoch !== sessionEpoch || isCoordinatorBusy) return
+  owed.isAsked = true
+  void $.session.compact({ instructions: KILL_COMPACT }).then(
+    done => {
+      if (owedCompaction === owed) owedCompaction = undefined
+      // A hook's veto is final.
+      if (done.skip !== undefined) $.ui.toast(`Swarm: the compaction was skipped (${done.skip}). Run /compact to drop the run from the context.`)
+    },
+    () => {
+      // Cancelled meanwhile, by a new run or another session: nothing is owed.
+      if (owedCompaction !== owed) return
+      if (++owed.tries > 2) {
+        owedCompaction = undefined
+        return $.ui.toast('Swarm: the conversation could not be compacted. Run /compact to drop the run from the context.')
+      }
+      // Asked again at the next idle point: a turn's end, or shortly when none runs.
+      owed.isAsked = false
+      $.clock.after(COMPACTION_RETRY_MS, () => compactOwed($))
+    },
+  )
+}
+
+/** What a kill leaves behind belongs to its conversation: a new one, after /clear or a resume, starts without it. */
+function forgetKills(): void {
+  killedRun = ''
+  killedIds = new Set()
+  killConfirmed.clear()
+  boardDrops.clear()
+  isKillTurn = false
+  owedCompaction = undefined
+}
+
 // Charges `amount` tokens to the actor's run under `report`, a name the board records once: a model step
 // (`<turn>:<index>`) as it answers, and a turn's end (`<turn>`) for what no step reported. False when the
 // charge is still owed: no run to charge yet, or the board did not take it.
@@ -1421,15 +1644,7 @@ async function account($: EngineInterface, report: string, agentId: string | und
   const isClosed = await $.fs.read(`${dir}/members.json`)
     .then(text => (JSON.parse(text) as { closed?: boolean }).closed === true).catch(() => false)
   if (isClosed) {
-    if (dir === await read($, run)) {
-      closedRun = dir
-      resetMonitoring()
-      // Read under this generation: a run bound while the roster is read keeps its own guard state.
-      const owner = generation
-      await update($, run, () => '')
-      // Its members are still refused by name: a retired one, a commit, an edit outside its paths.
-      await syncOwnedState($, dir, undefined, undefined, owner).catch(() => undefined)
-    }
+    await released($, dir)
     return true
   }
   const [turn, actor] = await Promise.all([
@@ -1476,14 +1691,14 @@ function stoppedMember(agentId: string): string | undefined {
   const address = teammates.get(agentId)
   const has = (ids: ReadonlySet<string>) => ids.has(agentId) || (address !== undefined && ids.has(address))
   // A member that was replaced or removed may still be mid-turn: it builds and edits beside the team that took over.
-  if (has(retired)) return 'This Swarm member has been retired, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped.'
+  if (has(retired) || has(killConfirmed)) return 'This Swarm member has been retired, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped.'
   if (has(memberPaused)) return MEMBER_PAUSED
   return undefined
 }
 
 const OVER = 'This Swarm run is over and its conversation drives another run now, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped.'
 async function refusal($: EngineInterface, agentId: string | undefined): Promise<string | undefined> {
-  if (agentId === undefined) return undefined
+  if (agentId === undefined) return isKillTurn ? 'The user ended the Swarm run with /swarm:kill. End your turn now, in one line.' : undefined
   const stopped = stoppedMember(agentId)
   if (stopped) return stopped
   // The run this conversation drives, or drove until its close: closing it makes no earlier run's agents welcome.
@@ -1607,7 +1822,7 @@ async function boardCallsRan<R extends ToolCallResult>($: EngineInterface, agent
       if (agentId === undefined) strangers.clear()
       if (dir === owned || agentId === undefined) $.clock.after(0, () => void refresh($))
     }
-    if (agentId === undefined && calls.some(c => ['member', 'replace', 'pause', 'resume', 'limit', 'close'].includes(c.action))) {
+    if (agentId === undefined && calls.some(c => ['member', 'replace', 'pause', 'resume', 'limit', 'close', 'kill'].includes(c.action))) {
       // Only the run this conversation owns: another run's pause and roster are not this session's to enforce.
       const resolvedSyncDir = await read($, run)
       if (resolvedSyncDir) {
@@ -1999,7 +2214,7 @@ async function coordinatorBoard($: EngineInterface, e: BoardInput) {
   const args = action === 'init' ? [action, e.title!.trim()]
     : action === 'member' || action === 'retry' ? [action, name, ...options]
     : action === 'limit' ? [action, ...options]
-    : action === 'post' || action === 'read' ? [action, 'coordinator', ...(action === 'read' ? [`--max-bytes=${PAGE}`] : [])]
+    : action === 'post' || action === 'read' ? [action, 'coordinator', ...(action === 'read' ? [`--max-bytes=${PAGE}`, '--attention'] : [])]
     : action === 'show' ? shown
     : action === 'confirm' ? [action, name, String(e.seq)]
     : action === 'replace' ? [action, name, newName, ...options]
@@ -2147,6 +2362,7 @@ export const register: Register = on => {
     isCoordinatorBusy = isEnding = isRefreshOwed = isPaneOpen = isWatched = false
     // A start that follows no session.end (a reload) still opens its run's pane and reads its state anew.
     opened = closedRun = ''
+    forgetKills()
     talk = browsed = undefined
     const saved = await $.store.get(TEAMMATES).catch(() => undefined)
     for (const [id, address] of Object.entries(saved && typeof saved === 'object' ? saved : {})) {
@@ -2163,11 +2379,17 @@ export const register: Register = on => {
         description:
           'Open the Swarm pane: the live board, members and @mention graph',
       })
+      await $.command.register({
+        name: 'swarm-kill',
+        immediate: true,
+        argumentHint: '[reason]',
+        description: 'End this conversation\'s Swarm run now, even mid-turn: retire every member, close the run, commit and revert nothing',
+      })
       await $.tool.register({
         name: 'board',
         description: 'Works only inside a Swarm run the user started with /swarm:swarm, and answers nothing useful anywhere else. ' +
           'The Swarm board, as the caller: a member reads its unread posts, shows history, posts, and sees status; a worker also reports ready or withdraws readiness. ' +
-          'The coordinator drives its run: init, member, limit, plan, attention, post, read, show, confirm, retry, replace, pause, resume, status, close, export.',
+          'The coordinator drives its run: init, member, limit, plan, attention, post, read, show, confirm, retry, replace, pause, resume, status, close, export. Its read ends with the attention items once it has caught up.',
         isDeferred: false,
         inputSchema: {
           type: 'object',
@@ -2326,6 +2548,16 @@ export const register: Register = on => {
         return { deny: `Swarm could not check @${guarded}'s call against the run's roster (${error instanceof Error ? error.message : String(error)}), so it was refused. Report this sentence to the coordinator.` }
       }
     }
+    // In a substitution the folder is not printed: the script typed out, or a variable of this command that holds it.
+    const isHiddenInit = substitutions(command).some(body => /\bboard\.py\b[^\n;|&]*\sinit\s/.test(body) ||
+      runsHeldInit(`${command.replace(/\$\([\s\S]*$/, '')}\n${body}`))
+    const mayMake = e.tool === 'Bash' && e.agentId === undefined && !calls.some(c => c.action === 'init') && (isHiddenInit || runsHeldInit(command))
+    // The run the pointer names before the command: an init that failed inside it leaves the pointer on an older run.
+    // Absent counts as a pointer read; one that could not be read leaves nothing to compare, and no run is inferred.
+    const pointed = mayMake ? await $.session.cwd().then(async cwd => {
+      const path = `${cwd}/.swarm/current`
+      return await $.fs.exists(path) ? (await $.fs.read(path)).trim() : ''
+    }).catch(() => undefined) : undefined
     const headBefore = headWatch ? await headOf($, headWatch.checkout) : ''
     const raw = await pauseAware($, calls, e.agentId, () => next(e)).finally(() => {
       if (agentCall) {
@@ -2348,11 +2580,7 @@ export const register: Register = on => {
         notesOwed.push(`${moved} while @${headWatch.name} ran a Bash command. Another actor may have moved it, and nothing was undone: check git log before the next candidate.`)
       }
     }
-    // In a substitution the folder is not printed: the script typed out, or a variable of this command that holds it.
-    const isHiddenInit = substitutions(command).some(body => /\bboard\.py\b[^\n;|&]*\sinit\s/.test(body) ||
-      runsHeldInit(`${command.replace(/\$\([\s\S]*$/, '')}\n${body}`))
-    if (e.tool === 'Bash' && e.agentId === undefined && !result.isError && !result.deny && !calls.some(c => c.action === 'init') &&
-      (isHiddenInit || runsHeldInit(command))) {
+    if (mayMake && !result.isError && !result.deny) {
       // `R=$(board.py … init …)` keeps the folder out of the output and the call out of what is read off the
       // command. Read loosely, however the script is run, but only inside a substitution: the same words in a
       // quoted string or a heredoc make no run. The pointer `init` just wrote names the run; the board refuses
@@ -2361,14 +2589,15 @@ export const register: Register = on => {
       // variable with `init` after it, and the command must have printed the run folder the pointer names, as
       // `init` does. Text that only prints such words runs nothing and makes no run.
       // The new run also takes the place of one this conversation drove and closed, as a plain `init` does.
-      let isMade = isHiddenInit
+      // Either way only a pointer the command moved names a run it made.
+      let isMade = false
       try {
         const root = `${await $.session.cwd()}/.swarm`
         const name = (await $.fs.read(`${root}/current`)).trim()
-        const made = /^[\w.-]+$/.test(name) && RUN.test(`${root}/${name}`) ? `${root}/${name}` : ''
+        const made = pointed !== undefined && name !== pointed && /^[\w.-]+$/.test(name) && RUN.test(`${root}/${name}`) ? `${root}/${name}` : ''
         const printed = String((raw.result as { stdout?: unknown } | undefined)?.stdout ?? '').split('\n').map(line => line.trim())
         // By its name: the folder is printed as the command spelled it, which a symlink or the letter case can vary.
-        isMade ||= made !== '' && printed.some(line => line.endsWith(`/.swarm/${name}`))
+        isMade = made !== '' && (isHiddenInit || printed.some(line => line.endsWith(`/.swarm/${name}`)))
         const ownedNow = await read($, run)
         if (isMade && made && (ownedNow === '' || (ownedRoster?.dir === ownedNow && ownedRoster.closed))) await bind($, made)
       } catch {
@@ -2771,6 +3000,12 @@ export const register: Register = on => {
         // Only once its usage is on the board: a poll in between would act on the roster as it was before a budget pause.
         if (e.agentId === undefined) {
           isCoordinatorBusy = false
+          coordinatorTurnsEnded++
+          // The turn a kill landed in owes its compaction from here on; it is asked for once the host has ended the turn.
+          if (isKillTurn) {
+            isKillTurn = false
+            owedCompaction = { epoch: sessionEpoch, tries: 0, isAsked: false }
+          }
           quietSince = await $.clock.now()
           const dir = await read($, run)
           if (dir && heavyTold !== dir) {
@@ -2793,7 +3028,10 @@ export const register: Register = on => {
     } catch {
       // A usage failure must not change how a turn ends.
     }
-    return next(e)
+    const answered = await next(e)
+    // Only once the host has ended the turn: compacting earlier is refused while it runs.
+    if (e.agentId === undefined && owedCompaction?.epoch === sessionEpoch) $.clock.after(0, () => compactOwed($))
+    return answered
   })
 
   on('session.end', async ($, e, next) => {
@@ -2806,6 +3044,7 @@ export const register: Register = on => {
     isRefreshOwed = false
     isPaneOpen = false
     sessionEpoch++
+    forgetKills()
     browseGen++
     if (!goesOn) {
       poller?.cancel()
@@ -2858,13 +3097,62 @@ export const register: Register = on => {
   // as typed and inside the skill, and the coordinator re-reads its whole conversation on every step. Seen live: a
   // 370,000-character console log made a new run's first step cost 440,000 tokens and each later one 45,000. The
   // whole text goes to a file the coordinator reads from, and the task keeps its two ends, where the request is.
+  // The skill-named form waits for a running turn to end, as a skill command does; `swarm-kill` is registered to run
+  // at once, mid-turn included.
+  on('command.run', { command: 'swarm:kill' }, ($, e) => killRun($, e.args))
+  on('command.run', { command: 'swarm-kill' }, ($, e) => killRun($, e.args))
+  // A run that was killed gives the swarm skill's text back only to a new /swarm:swarm.
+  on('skill.prompt', ($, e, next) => {
+    if (e.pluginName !== $.plugin.name || !/^(?:swarm:)?(?:swarm|plan)$/.test(e.skill)) return next(e)
+    if (killedRun && /^(?:swarm:)?swarm$/.test(e.skill)) {
+      return { text: 'The Swarm run of this conversation was ended with /swarm:kill: you are an ordinary assistant again, and run no board command and start no member unless the user starts a new run with /swarm:swarm.' }
+    }
+    // The command's own message holds a long task already: the skill's copy of it would be read twice at every step.
+    const args = commandArgs
+    commandArgs = ''
+    if (args.length < ARGS_DEDUP || !e.text.includes(args)) return next(e)
+    return next({ ...e, text: e.text.replace(args, () => '(The task is the text of the user\'s command above.)') })
+  })
+  // A member the kill retired may still hand back or message: that would start a paid turn for nothing. Only a
+  // notification whose envelope names one of its agents as the sender is dropped; anything in doubt goes through.
+  on('prompt.submit', async ($, e, next) => {
+    // Seen live: a member's turn ended on a routine READY while three others worked, and its hand-back and its task
+    // notification each started a coordinator turn the board's own notice would start again.
+    // Seen live: a background member's last words arrive as a peer message framed `<agent-message from="ID">`, and
+    // its task notification follows. Settled first, with no file read: a retired agent is dropped while the kill runs.
+    const from = senderOf(e)
+    if (from !== undefined && killedIds.has(from)) {
+      // A teammate's address can come back in a later run: a live member of the run driven now by that id is heard.
+      // Not the killed run itself, whose retirements stand until another run is owned.
+      const now = ownedRoster
+      const isLive = !killConfirmed.has(from) && now !== undefined && !now.closed && now.dir === await read($, run).catch(() => '') &&
+        Object.values(now.members).some(member => member.id === from && member.killed !== '1')
+      if (!isLive) return { drop: KILL_DROP }
+    }
+    if (await repeatsBoard($, e).catch(() => false)) return { drop: 'Swarm: a member handed back while others still work; the board holds what it left.' }
+    return next(e)
+  })
   on('command.run', async ($, e, next) => {
-    if (!/^(?:swarm:)?swarm$/.test(e.command) || e.args.length < TASK_CHARS) return next(e)
+    // A new run takes the place of the killed one: an old kill's compaction would take away its rules.
+    if (/^(?:swarm:)?swarm$/.test(e.command)) {
+      killedRun = ''
+      owedCompaction = undefined
+    }
+    // A plan's task sits in the conversation that may become the coordinator's, so it is saved the same way.
+    if (/^(?:swarm:)?(?:swarm|plan)$/.test(e.command)) commandArgs = e.args
+    if (!/^(?:swarm:)?(?:swarm|plan)$/.test(e.command) || e.args.length < TASK_CHARS) return next(e)
     let args = e.args
     try {
+      // A folder of its own that keeps itself out of git: a plan comes before any `init`, and a .swarm/.gitignore of
+      // the project's own need not ignore everything.
+      const folder = `${await $.session.cwd()}/.swarm/tasks`
+      const ignore = `${folder}/.gitignore`
+      // One already there is never rewritten: unless it ignores everything, the task is not saved where git sees it.
+      if (!(await $.fs.exists(ignore))) await $.fs.write(ignore, '*\n')
+      else if (!(await $.fs.read(ignore)).split('\n').some(line => line.replace(/\r$/, '') === '*')) throw new Error('the tasks folder is not ignored')
       const stamp = `${new Date(await $.clock.now()).toISOString().replace(/\D/g, '').slice(0, 14)}-${++tasksSaved}`
       // The conversation's own key in the name: two tasks sent in one second from two conversations are two files.
-      const path = `${await $.session.cwd()}/.swarm/task-${stamp}-${(await lookupKey($)).slice(0, 8)}.md`
+      const path = `${folder}/${stamp}-${(await lookupKey($)).slice(0, 8)}.md`
       await $.fs.write(path, e.args)
       const size = e.args.length.toLocaleString('en-US')
       args = `${e.args.slice(0, TASK_HEAD)}\n\n[Swarm: the task is ${size} characters long, and its middle is left out here. All of it is in ${path}. What you keep in this conversation is re-read at every step of the run: search that file with Grep and read the parts the task needs, all of it only when it is a specification to follow as a whole, and give a member the path and the lines to look at instead of pasting from it. The task ends:]\n\n${e.args.slice(-TASK_TAIL)}`
@@ -2872,6 +3160,7 @@ export const register: Register = on => {
     } catch {
       // The file could not be written: the task goes on whole.
     }
+    commandArgs = args
     return next(args === e.args ? e : { ...e, args })
   })
 
