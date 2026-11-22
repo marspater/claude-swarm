@@ -4,3 +4,4 @@ __pycache__/
 .swarm/
 *.zip
 node_modules/
+.claude.local.md
