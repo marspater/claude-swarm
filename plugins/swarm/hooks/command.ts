@@ -363,7 +363,7 @@ export function scanShell(command: string): Statement[] {
     if (/[a-z]/.test(ch) && startsWord(command, i, 0, /[\s;&|()]/)) {
       const word = /^[a-z]+(?=$|[\s;&|()<>])/.exec(command.slice(i, i + 8))?.[0]
       // A keyword only where a command starts: `echo done | head` closes nothing.
-      const atCommand = word !== undefined && /^(?:[\s({!]+|(?:then|do|else|elif|if|while|until|time)\b)*$/.test(command.slice(Math.max(start, commandStart), i))
+      const atCommand = word !== undefined && /^(?:[\s({!]+|(?:then|do|else|elif|if|while|until|time)\b)*$/.test(command.slice(Math.max(start, commandStart), i).replace(/\\\n/g, ''))
       if (word === 'in' && kase?.state === 'word') kase.state = 'pattern'
       else if (word === 'esac' && kase && (kase.state === 'pattern' || atCommand)) close('case')
       else if (atCommand && word === 'case') groups.push({ at: segments.length, kind: 'case', state: 'word' })
@@ -477,15 +477,28 @@ export function unwrap(statement: string): { text: string; negated: boolean } {
 }
 
 /** A statement's words with their quotes and escapes taken off: `"git" commit` and `\git commit` read as they run. */
+/** A redirection operator at the start of a word, with the descriptor before it. */
+const REDIRECT = /^(\d*|&)(<<<|<<-?|<>|>>|>\||&>>?|[<>]&?)/
+/**
+ * Leads a word that reads like a redirection and is none: its first character was quoted or escaped, as in the
+ * program of `bash -c '>out cmd'`. `withoutRedirects` keeps such a word and takes the mark off; a redirection whose
+ * target is quoted (`>'out file'`) begins bare and carries none.
+ */
+const QUOTED_START = '\u0001'
 export function shellWords(text: string): string[] {
   text = fold(text)
   const words: string[] = []
   let word: string | undefined
+  let isBare = true
+  const push = () => {
+    if (word !== undefined) words.push(!isBare && REDIRECT.test(word) ? QUOTED_START + word : word)
+    word = undefined
+  }
   for (let i = 0; i < text.length; i++) {
     const ch = text[i]!
+    if (word === undefined && !/\s/.test(ch)) isBare = ch !== '\\' && ch !== "'" && ch !== '"'
     if (/\s/.test(ch)) {
-      if (word !== undefined) words.push(word)
-      word = undefined
+      push()
     } else if (ch === '\\') {
       word = (word ?? '') + (text[++i] ?? '')
     } else if (ch === "'" || ch === '"') {
@@ -499,7 +512,7 @@ export function shellWords(text: string): string[] {
       word = (word ?? '') + ch
     }
   }
-  if (word !== undefined) words.push(word)
+  push()
   return words
 }
 
@@ -572,6 +585,7 @@ export function makesCommit(sub: string, args: readonly string[]): boolean {
   const isPick = sub === 'cherry-pick' || sub === 'revert'
   let stops = false
   let noCommit = false
+  let squash = false
   let ffOnly = false
   let rebase = false
   for (let i = 0; i < args.length; i++) {
@@ -591,6 +605,8 @@ export function makesCommit(sub: string, args: readonly string[]): boolean {
         negated = !negated
       }
       if (base.length > 1 && 'commit'.startsWith(base)) noCommit = arg === '--no-commit'
+      // A squash merge leaves its result staged and commits nothing; the last of the two given holds.
+      if (base.length > 1 && 'squash'.startsWith(base)) squash = !negated
       if (base.length > 1 && 'ff-only'.startsWith(base)) ffOnly = arg === '--ff-only'
       if (base.length > 1 && 'rebase'.startsWith(base)) rebase = !negated && !FALSE.test(value ?? '')
     } else if (arg.startsWith('-')) {
@@ -611,7 +627,7 @@ export function makesCommit(sub: string, args: readonly string[]): boolean {
   if (stops) return false
   // A fast-forward makes no commit; a rebase may.
   if (sub === 'pull') return !ffOnly || rebase
-  return !(noCommit && (isPick || sub === 'merge'))
+  return !((noCommit && (isPick || sub === 'merge')) || (squash && sub === 'merge'))
 }
 /** A command line that names git and a command that commits: refused where the guard cannot read the command. */
 export const NAMES_COMMIT = new RegExp(`\\bgit\\b[\\s\\S]*\\b(?:${COMMITTING.join('|')})\\b|\\bgit-(?:${COMMITTING.join('|')})\\b`)
@@ -665,13 +681,20 @@ export function withoutRedirects(words: readonly string[]): { words: string[]; f
   const kept: string[] = []
   let fed: string | undefined
   for (let i = 0; i < words.length; i++) {
-    const operator = /^(?:\d*|&)(<<<|<<-?|<>|[<>]&?|>>|>\||&>>?)/.exec(words[i]!)
+    // A word marked as quoted from its start is an argument, a `-c` program that begins with a redirection among
+    // them. The longer operators come first: `>>` read as `>` would leave its second character as the target.
+    if (words[i]!.startsWith(QUOTED_START)) {
+      kept.push(words[i]!.slice(1))
+      continue
+    }
+    const operator = REDIRECT.exec(words[i]!)
     if (!operator) {
       kept.push(words[i]!)
       continue
     }
-    const target = words[i]!.length > operator[0].length ? words[i]!.slice(operator[0].length) : words[++i]
-    if (operator[1] === '<<<') fed = target ?? ''
+    const target = words[i]!.length > operator[0].length ? words[i]!.slice(operator[0].length) : words[++i]?.replace(QUOTED_START, '')
+    // Only what feeds its input, descriptor 0, is a program it may read.
+    if (operator[2] === '<<<' && (operator[1] === '' || Number(operator[1]) === 0)) fed = target ?? ''
   }
   return fed === undefined ? { words: kept } : { words: kept, fed }
 }
@@ -746,6 +769,8 @@ export function scriptsRun(command: string, depth = 0): string[] {
 // Commands that run the rest of their words as a command: a script named after one of these is run.
 const RUNNERS = new Set(['env', 'nohup', 'time', 'command', 'builtin', 'exec', 'sudo', 'doas', 'timeout', 'nice', 'xargs', 'watch', 'stdbuf',
   'caffeinate', 'xcrun', 'flock', 'parallel', 'ionice', 'taskset', 'chronic', 'unbuffer'])
+// The runners that take the program as their first word when no option or operand of their own comes before it.
+const DIRECT = new Set(['env', 'nohup', 'time', 'command', 'builtin', 'exec', 'sudo', 'doas', 'nice', 'stdbuf', 'caffeinate', 'xcrun', 'chronic', 'unbuffer', 'ionice'])
 const PYTHON = /^(?:python|pypy)(?:\d+(?:\.\d+)*)?$/
 // Modules that read a script without running it: `python3 -m py_compile board.py` runs none of it. Any other module
 // given the script (runpy, pdb, cProfile, trace) may run it.
@@ -824,6 +849,10 @@ export function launches(statementWords: readonly string[], file: string, input 
   const at = words.findIndex(word => base(word) === file)
   if (at < 0) return undefined
   // Run as the command itself, or behind a command that runs the rest of its words; `find -name board.py` runs nothing.
-  const name = words.find(word => !/^[A-Za-z_]\w*=/.test(word))
-  return name !== undefined && (name === words[at] || RUNNERS.has(base(name))) ? 'script' : undefined
+  let first = words.findIndex(word => !/^[A-Za-z_]\w*=/.test(word))
+  // A runner whose next word is the program it runs: `env grep board.py` runs grep. One followed by an option or an
+  // operand of its own keeps its words unread, so the script among them counts as run.
+  while (first >= 0 && first < at && DIRECT.has(base(words[first]!)) && /^[A-Za-z_./~]/.test(words[first + 1] ?? '-') &&
+      !/^[A-Za-z_]\w*=/.test(words[first + 1]!)) first++
+  return first >= 0 && (first === at || RUNNERS.has(base(words[first]!))) ? 'script' : undefined
 }

@@ -491,6 +491,10 @@ test('/clear keeps the poller alive, an exit stops it, and a start that cannot b
   const clock = mock.clock(on)
 
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  // with no run of its own and no pane up, a session looks for nobody's run
+  await clock.advance(2000)
+  expect(polls).toBe(0)
+  await $.ui.mount({ ...PANE, surface: 'desktop' })
   await clock.advance(2000)
   expect(polls).toBeGreaterThan(0)
 
@@ -548,8 +552,11 @@ test('a board too large to read is tailed, and control characters never reach th
 
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
   await clock.advance(2000)
-  expect(tails).toBeGreaterThan(0)
+  // another conversation's run is read once someone looks at the pane, not before
+  expect(tails).toBe(0)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await clock.advance(0)
+  expect(tails).toBeGreaterThan(0)
   // The post drew: the escape codes, the bell and the carriage return are gone, the words are not.
   expect(await ui.find({ type: 'Markdown', text: /all red tests pass/ })).toBeDefined()
   expect(JSON.stringify(await ui.drawn())).not.toMatch(/\\u001b|\\u0007|\\r/)
@@ -1341,7 +1348,7 @@ test('the hive follows roster actions, coordinator turns and sleep', async ($, o
 // The engine beneath a conversation that owns RUN, as the tests below share it.
 const OWNED = '/project/.swarm/demo-20261116-101010'
 type On = Parameters<Extract<Parameters<typeof test>[1], (...args: never[]) => unknown>>[1]
-function owning(on: On, files: { board: () => string; roster: () => string; session?: () => string; read?: (path: string) => string | undefined; end?: () => Promise<void> }) {
+function owning(on: On, files: { board: () => string; roster: () => string; session?: () => string; read?: (path: string) => string | undefined; end?: () => Promise<void>; exists?: boolean }) {
   const seen = { commands: [] as string[], prompts: [] as string[], toasts: [] as string[], isDeaf: false, restore: '' }
   on('command.register', () => ({ value: { command: 'swarm-board' } }))
   on('tool.register', (_, spec) => ({ value: { tool: `mcp__swarm__${spec.name}` } }))
@@ -1349,7 +1356,7 @@ function owning(on: On, files: { board: () => string; roster: () => string; sess
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: files.session?.() ?? 'fixture-conversation' }))
   on('session.cwd', () => ({ value: '/project' }))
-  on('fs.exists', () => ({ value: false }))
+  on('fs.exists', () => ({ value: files.exists ?? false }))
   on('fs.read', (_, e) => ({ value: files.read?.(e.path) ?? (e.path.endsWith('/board.jsonl') ? files.board() : e.path.endsWith('/members.json') ? files.roster() : '') }))
   on('session.end', async (_, e) => {
     await files.end?.()
@@ -4423,11 +4430,15 @@ test('review: what the coordinator spent under one run is charged to that run, t
     read: path => path === `${NEXT}/members.json` ? state('Next swarm') : undefined,
   })
   const charged: string[] = []
+  const failed: string[] = []
   let isFailing = true
   on('process.run', (_, e) => {
     if (e.argv[3] !== 'account') return answer(board(e))
     // the step's own charge does not reach the board: it is left to the turn's end
-    if (isFailing) return { value: { exitCode: 1, stdout: '', stderr: 'busy', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (isFailing) {
+      failed.push(String(e.argv[2]))
+      return { value: { exitCode: 1, stdout: '', stderr: 'busy', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     charged.push(`${e.argv[2]} ${e.argv.at(-1)}`)
     return answer(JSON.stringify({ title: 'x', total: 0, budget: 0, paused: false }))
   })
@@ -4446,10 +4457,15 @@ test('review: what the coordinator spent under one run is charged to that run, t
   await drive(OWNED)
   for await (const _ of $.turn.step({ turnId: 'long', index: 0, model: 'm', messageCount: 1 })) { /* no chunks */ }
   await clock.advance(0)
+  // the step's charge was tried under the first run and did not land
+  expect(failed).toEqual([OWNED])
   isFailing = false
   await drive(NEXT)
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'long', usage: spent })
   expect(charged).toEqual([`${OWNED} 250`])
+  // and the conversation does drive the next run by then: a turn of its own is charged there
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'after', usage: spent })
+  expect(charged).toEqual([`${OWNED} 250`, `${NEXT} 250`])
 })
 
 // The review of the 0.3.47 audit fixes.
@@ -4706,10 +4722,12 @@ test('guard: every common wrapper is read through, or refused for sure when it c
   // read: the commit refused, anything else let through
   for (const [refused, allowed] of [
     ['xargs git commit -m x', 'printf a | xargs git log --grep commit'],
-    ['echo commit | xargs git', 'find . -name "*.ts" -exec git log --grep commit {} \;'],
+    ['echo commit | xargs git', 'find . -name "*.ts" -exec git log --grep commit {} \\;'],
     ['xargs -I{} git {} -m x', 'watch -n 5 git status'],
-    ['find . -name x -exec git commit -m x \;', "watch -n 1 'git log --grep commit'"],
+    ['find . -name x -exec git commit -m x \\;', "watch -n 1 'git log --grep commit'"],
     ['cd /tmp/wt && find . -execdir git commit -m x {} +', 'sudo -u bob git status'],
+    [`bash >'out file' -c 'git commit -m x'`, `bash -c '>out printf ok'`],
+    [`bash -c '>out git commit -m x'`, `bash >> 'out file' -c 'git log --grep commit'`],
     ['watch -n 5 git commit -m x', 'cd /tmp/wt && sudo git commit -m x'],
     ["watch 'git commit -m x'", 'time -p git status'],
     ['sudo -u bob git commit -m x', 'env -i PATH=/usr/bin git log --grep commit'],
@@ -5032,9 +5050,13 @@ test('review: a run bound while the closed run\'s roster is read again keeps its
   stateB.closed = true
   holdAt = NEXT
   const completing = complete('c2')
-  await atHold
-  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${THIRD}" read coordinator` })
-  release()
+  try {
+    // an end before the held read is a failure here and now, not a wait for the test's time to run out
+    await Promise.race([atHold, completing.then(() => { throw new Error('the turn ended before its roster read was held') })])
+    await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${THIRD}" read coordinator` })
+  } finally {
+    release()
+  }
   await completing
   expect((await reads$('cara-c')).deny).toContain('paused')
 })
@@ -5045,7 +5067,8 @@ test('review: a roster that could not be read is read again on the next call, so
     alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '0', last_read_seq: 1 } as Record<string, unknown>,
   } }
   let isBroken = false
-  const { answer, board } = owning(on, { board: () => '', roster: () => { if (isBroken) throw new Error('EIO'); return JSON.stringify(state) } })
+  let rosterReads = 0
+  const { answer, board } = owning(on, { board: () => '', roster: () => { rosterReads++; if (isBroken) throw new Error('EIO'); return JSON.stringify(state) } })
   on('process.run', (_, e) => answer(e.argv[3] === 'agent-run' ? OWNED : board(e)))
   on('fs.stat', (_, e) => e.path.endsWith('/members.json') ? { value: { size: 10, mtimeMs: 1 } as never } : { deny: 'none' })
   on('agent.list', () => ({ value: [{ id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' }, { id: 'ghost-1', description: 'a helper', type: 'swarm:worker', status: 'running' }] as never }))
@@ -5057,10 +5080,14 @@ test('review: a roster that could not be read is read again on the next call, so
   // the roster's stat answers and its read fails: the agent is no known miss of that stamp
   state.members.alice.id = 'ghost-1'
   isBroken = true
+  let before = rosterReads
   expect((await toolCall($, { tool: 'Bash', command: 'git status', agentId: 'ghost-1' })).deny).toBeUndefined()
-  // readable again under the same stamp: the agent is now @alice, and its commit is refused
+  expect(rosterReads).toBeGreaterThan(before)  // it was tried, and failed
+  // readable again under the same stamp: it is read once more, the agent is now @alice, and its commit is refused
   isBroken = false
+  before = rosterReads
   expect((await toolCall($, { tool: 'Bash', command: 'git commit -m x', agentId: 'ghost-1' })).deny).toContain('Shared-checkout writers')
+  expect(rosterReads).toBeGreaterThan(before)
 })
 
 test('view diff: a READY\'s except leaves those commits out beside its base, and an except that is not all full ids is dropped', async ($, on) => {
@@ -5205,7 +5232,7 @@ test('the graph says in its alt what it draws, and its routes are listed in word
 // A conversation that drives no run, in a project whose open run another conversation owns: Swarm stays out of its way.
 function strangerTo(on: On, agents: unknown[] = [{ id: 'gp1', description: 'Fix the tests', type: 'general-purpose', status: 'running' }]) {
   const other = '/project/.swarm/other-20261117-090000'
-  const seen = { commands: [] as string[], placed: [] as string[], opened: [] as string[], toasts: [] as string[], prompts: [] as string[], sends: [] as string[] }
+  const seen = { commands: [] as string[], calls: [] as { run: string; action: string }[], reads: [] as string[], placed: [] as string[], opened: [] as string[], toasts: [] as string[], prompts: [] as string[], sends: [] as string[] }
   on('command.register', () => ({ value: { command: 'swarm-board' } }))
   on('tool.register', (_, spec) => ({ value: { tool: `mcp__swarm__${spec.name}` } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -5222,7 +5249,7 @@ function strangerTo(on: On, agents: unknown[] = [{ id: 'gp1', description: 'Fix 
   on('turn.complete', () => ({ text: '' }))
   on('fs.exists', () => ({ value: true }))
   on('fs.stat', () => ({ value: { size: 1, mtimeMs: 1 } as never }))
-  on('fs.read', (_, e) => ({
+  on('fs.read', (_, e) => (seen.reads.push(e.path), {
     value: e.path === '/project/.swarm/current' ? 'other-20261117-090000\n'
       : e.path.endsWith('/members.json') ? JSON.stringify({ title: 'Theirs', binding: 'another-conversation', members: { coordinator: { role: 'coordinator' }, alice: { role: 'worker', id: 'alice-1' } } })
       : e.path.endsWith('/board.jsonl') ? posts({ agent: 'coordinator', to: ['alice'], text: '@alice BRIEF' }) : '',
@@ -5230,7 +5257,10 @@ function strangerTo(on: On, agents: unknown[] = [{ id: 'gp1', description: 'Fix 
   // The board answers as board.py does for a run of another conversation's: nothing restores, locates or binds here.
   on('process.run', (_, e) => {
     const isBoard = e.argv[0] === 'python3'
-    if (isBoard) seen.commands.push(e.argv.slice(3).join(' '))
+    if (isBoard) {
+      seen.commands.push(e.argv.slice(3).join(' '))
+      seen.calls.push({ run: e.argv[2] ?? '', action: e.argv[3] ?? '' })
+    }
     const refused = isBoard && e.argv[3] === 'bind'
     return { value: { exitCode: refused ? 1 : 0, stdout: '', stderr: refused ? 'owned by another conversation' : '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
@@ -5303,7 +5333,9 @@ test('no run here: tool calls, turns and the chat are left as they are, though a
   await $.turn.complete({ answer: 'Done.', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
   await clock.advance(60_000)
   expect({ placed: seen.placed, opened: seen.opened, toasts: seen.toasts, prompts: seen.prompts, sends: seen.sends }).toEqual({ placed: [], opened: [], toasts: [], prompts: [], sends: [] })
-  expect(seen.commands.filter(command => command.startsWith(other) || /^(bind|tail|account|read|started) /.test(command))).toEqual([])
+  // by run and by action: nothing was asked of the other run's folder, and nothing bound, read or charged anywhere
+  expect(seen.calls.filter(call => call.run === other || ['bind', 'tail', 'account', 'read', 'started'].includes(call.action))).toEqual([])
+  expect(seen.reads.filter(path => path === `${other}/board.jsonl`)).toEqual([])
   // Only a board command typed for that run claims it; the board refuses, and the claim that failed is said.
   const claimed = await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${other}" read coordinator` })
   expect(claimed.deny).toBeUndefined()
@@ -5336,4 +5368,33 @@ test('no run here: a project Swarm never ran in shows no board shortcut on Deskt
     props: { hasSurvey: false, isCollapsed: false, isWorking: false, maxRows: 3, bodyColumns: 80, scroll: { offset: 0, bodyRows: 3 }, view: {} },
   })
   expect(await band.find({ key: 'swarm-board-shortcut' })).toBeUndefined()
+})
+
+test('review: with its pane down, a conversation follows the run it drove until its close, not whatever run is the project\'s newest by then', async ($, on) => {
+  const other = '/project/.swarm/other-20261123-090000'
+  const state: Record<string, unknown> = { title: 'Mine', members: { coordinator: { role: 'coordinator', last_read_seq: 1 } } }
+  const reads: string[] = []
+  const { answer, board } = owning(on, {
+    board: () => '', roster: () => JSON.stringify(state),
+    read: path => {
+      reads.push(path)
+      // another conversation started a run since: the project's pointer names it now
+      return path.endsWith('/current') ? 'other-20261123-090000\n'
+        : path.startsWith(other) ? JSON.stringify({ title: 'Theirs', members: { coordinator: { role: 'coordinator', last_read_seq: 0 } } }) : undefined
+    },
+    exists: true,
+  })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({ value: [] }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  state.closed = true
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'closing', reason: 'answer', usage: { model: 'm', input_tokens: 10, output_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } })
+  reads.length = 0
+  await clock.advance(10_000)
+  expect(reads.filter(path => path.startsWith(other))).toEqual([])
+  expect(reads.some(path => path.startsWith(OWNED))).toBe(true)
 })

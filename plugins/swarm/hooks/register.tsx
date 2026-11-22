@@ -241,6 +241,8 @@ let isRestoreOwed = false
 // True while a session.end runs, and from an exit on: a poll in between would read the session that is ending.
 let isEnding = false
 let isPaneOpen = false
+// Whether the pane is up at all, minimised included: only then is a run this conversation does not drive read.
+let isWatched = false
 let poller: Timer | undefined
 let generation = 0
 let sessionEpoch = 0
@@ -1110,6 +1112,19 @@ async function refresh($: EngineInterface): Promise<void> {
     const now = await $.clock.now()
     const owned = await read($, run)
     let dir = owned
+    if (dir === '') {
+      // Another conversation's run is shown to someone looking at the pane, and read for nobody else: a session that
+      // never used Swarm polls no run. The run this conversation drove until its close is still its own to follow.
+      if (!isWatched && !closedRun) {
+        if (epoch !== generation) return
+        if ((await read($, swarm)).dir) await update($, swarm, () => EMPTY)
+        seen = seenBoard = ''
+        snapshot = undefined
+        return
+      }
+      // Unwatched, only that closed run is followed: the project's newest may be another conversation's by now.
+      if (!isWatched) dir = closedRun
+    }
     if (dir === '') {
       // No run of this conversation's: show the project's newest, and only show it.
       const root = `${await $.session.cwd()}/.swarm`
@@ -2110,7 +2125,7 @@ export const register: Register = on => {
     spawnIsolations.clear()
     sharedAgents.clear()
     isolatedAgents.clear()
-    isCoordinatorBusy = isEnding = isRefreshOwed = isPaneOpen = false
+    isCoordinatorBusy = isEnding = isRefreshOwed = isPaneOpen = isWatched = false
     // A start that follows no session.end (a reload) still opens its run's pane and reads its state anew.
     opened = closedRun = ''
     talk = browsed = undefined
@@ -2822,7 +2837,7 @@ export const register: Register = on => {
     return result
   })
   on('ui.close', { id: PANE }, async ($, e, next) => {
-    isPaneOpen = false
+    isPaneOpen = isWatched = false
     const result = await next(e)
     talk = undefined  // nothing reads a conversation behind a closed pane
     await stop($)
@@ -2916,6 +2931,11 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button, Markdown, Input } = $.ui.resolve(e)
     const HeaderArt = e.surface !== 'terminal' ? $.ui.resolve(e).Svg : undefined
+    if (!isWatched) {
+      // Looked at for the first time: the run to show is read now, not at the next poll.
+      isWatched = true
+      void refresh($)
+    }
     const shown = await shownSwarm($)
     const error = await read($, loadError)
     if (e.props.placement === 'widget') {

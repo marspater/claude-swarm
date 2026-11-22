@@ -738,3 +738,43 @@ test('a turn\'s end charges its whole usage less what the board took for its ste
   // a step that reports after its turn's end was charged with the end
   expect(bare.charge('v', cached, 0)).toBe(0)
 })
+
+test('review: redirections are read whole and only where they are redirections, a squash merge commits nothing, and a runner runs the program after it', () => {
+  const words = (c: string) => shellWords(c)
+  // the longer operators are read first, attached or apart, and take their target with them
+  for (const line of ['bash -c "git status" >> log', 'bash -c "git status" >>log', 'bash -c "git status" >| log', 'bash -c "git status" &>> log', 'bash 2>&1 -c "git status"']) {
+    expect([line, shellLaunch(words(line).slice(1)).code, shellLaunch(words(line).slice(1)).operands]).toEqual([line, 'git status', []])
+  }
+  // a quoted program that begins with a redirection is the program, not a redirection of the shell
+  expect(shellLaunch(words("bash -c '>out printf ok'").slice(1)).code).toBe('>out printf ok')
+  expect(shellLaunch(words("bash -c '>out;git commit -m x'").slice(1)).code).toBe('>out;git commit -m x')
+  expect(scriptsRun("bash -c '>out git commit -m x'")).toContain('>out git commit -m x')
+  // a redirection whose target is quoted is still a redirection: the program after it is read
+  for (const line of [`bash >'out file' -c "git commit -m x"`, `bash > "out file" -c "git commit -m x"`, `bash 2>'err log' -c "git commit -m x"`]) {
+    expect([line, shellLaunch(words(line).slice(1)).code]).toEqual([line, 'git commit -m x'])
+    expect(scriptsRun(line)).toContain('git commit -m x')
+  }
+  // and a word quoted from its start is an argument whatever it looks like, as its own text
+  expect(shellLaunch(words(`bash -c '>out;git commit -m x' '>arg'`).slice(1)).operands).toEqual(['>arg'])
+  expect(shellLaunch(words(`bash <<< '>out; git commit -m x'`).slice(1)).fed).toBe('>out; git commit -m x')
+  expect(scriptsRun(`eval '>out; git commit -m x'`).some(script => scanShell(script).some(statement => /^git commit/.test(statement.text.trim())))).toBe(true)
+  // only what feeds descriptor 0 is a program the shell may read
+  expect(shellLaunch(words('bash <<< "git commit -m x"').slice(1)).fed).toBe('git commit -m x')
+  expect(shellLaunch(words('bash 0<<< "git commit -m x"').slice(1)).fed).toBe('git commit -m x')
+  expect(shellLaunch(words('bash 3<<< "git commit -m x" script.sh').slice(1)).fed).toBeUndefined()
+  // a squash merge stages its result and commits nothing; the last of --squash and --no-squash holds
+  expect(makesCommit('merge', words('--squash topic'))).toBe(false)
+  expect(makesCommit('merge', words('--squash --no-squash topic'))).toBe(true)
+  expect(makesCommit('merge', words('--no-squash --squash topic'))).toBe(false)
+  expect(makesCommit('merge', words('topic'))).toBe(true)
+  // a runner followed by another program runs that program; one whose own words come first keeps the script as run
+  expect(launches(words('env grep -n close /p/board.py'), 'board.py')).toBeUndefined()
+  expect(launches(words('sudo cat /p/board.py'), 'board.py')).toBeUndefined()
+  expect(launches(words('env nice /p/board.py R close'), 'board.py')).toBe('script')
+  expect(launches(words('env -u X /p/board.py R close'), 'board.py')).toBe('script')
+  expect(launches(words('env A=1 /p/board.py R close'), 'board.py')).toBe('script')
+  expect(launches(words('timeout 5 /p/board.py R close'), 'board.py')).toBe('script')
+  // a compound command after a joined line is still one command, piped onward as a whole
+  expect(boardCalls('if true; then \\\n  python3 /p/board.py /project/.swarm/demo-20261116-101010 read coordinator; fi | head').map(call => call.piped)).toEqual([true])
+  expect(boardCalls('\\\nif true; then python3 /p/board.py /project/.swarm/demo-20261116-101010 read coordinator; fi | head').map(call => call.piped)).toEqual([true])
+})
