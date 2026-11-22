@@ -31,8 +31,8 @@ export function tokensUsed(tokens?: Record<string, unknown> | null): number {
 
 // What a model step reports it spent, and what that is charged against a budget as it is billed: fresh tokens whole,
 // cached reads at a tenth.
-export type Spent = { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number }
-export const weigh = (spent: Spent | undefined) => spent === undefined ? 0
+type Spent = { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number }
+const weigh = (spent: Spent | undefined) => spent === undefined ? 0
   : (spent.input_tokens || 0) + (spent.cache_creation_input_tokens || 0) + (spent.output_tokens || 0) + Math.round((spent.cache_read_input_tokens || 0) * 0.1)
 // `sum` is what the steps reported, `charged` the whole tokens the board took for the turn, `pending` each step charge
 // the board has not acknowledged yet, by step index; `landing` settles once every step charge sent so far has been answered.
@@ -44,6 +44,8 @@ const fresh = (agentId: string | undefined, last: number): Turn => ({ steps: new
  * second time; once the agent it belongs to has ended and `graceMs` passed with no end reported for it, it joins the
  * newest `kept` turns that ended, so a late or repeated end still finds what was charged.
  */
+/** The pending entry of a turn's end the board did not take: retried under the turn's own report. */
+export const END = -1
 export function ledger(kept = 256, graceMs = 600_000) {
   const running = new Map<string, Turn>()
   const ended = new Map<string, Turn>()
@@ -52,7 +54,11 @@ export function ledger(kept = 256, graceMs = 600_000) {
     running.delete(turnId)
     ended.delete(turnId)
     ended.set(turnId, turn)
-    if (ended.size > kept) ended.delete(ended.keys().next().value!)
+    if (ended.size > kept) {
+      // The oldest the board owes nothing for goes first: one with a charge still pending is kept while it can be.
+      const settled = [...ended].find(([, old]) => old.pending.size === 0)
+      ended.delete(settled ? settled[0] : ended.keys().next().value!)
+    }
   }
   return {
     of,
@@ -101,6 +107,14 @@ export function ledger(kept = 256, graceMs = 600_000) {
       if (index !== undefined && !turn.pending.delete(index)) return
       turn.charged += amount
     },
+    /** A turn's end charge the board did not take: pending, as a step's is, until the board takes it. */
+    held(turn: Turn, amount: number): void {
+      if (amount > 0) turn.pending.set(END, amount)
+    },
+    /** The ended turns with a charge the board has not taken yet, oldest first. */
+    owed(): [string, Turn][] {
+      return [...ended].filter(([, turn]) => turn.pending.size > 0)
+    },
     /** Ends the running turns of agents that are no longer live and stepped last `graceMs` or more ago. */
     prune(isLive: (agentId: string) => boolean, now: number): void {
       for (const [turnId, turn] of running) {
@@ -111,7 +125,7 @@ export function ledger(kept = 256, graceMs = 600_000) {
 }
 
 // The same rule as board.py: @name at a word start, never an email or a path.
-export const MENTION = /(?<![\w.@/])@([A-Za-z][\w-]*)/g
+const MENTION = /(?<![\w.@/])@([A-Za-z][\w-]*)/g
 
 export type Roster = Record<
   string,
@@ -153,7 +167,6 @@ export type Report = {
     effort: string
     depends: string[]
     owns: string
-    paths?: string[]
     ready: boolean
     blocked_on: string[]
     asked: number
@@ -161,7 +174,6 @@ export type Report = {
     /** It spent its own token budget. */
     paused?: boolean
   }>
-  limits: Record<string, string>
 }
 
 // What a member that is not working is waiting for, in words.

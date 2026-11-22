@@ -1836,6 +1836,14 @@ class DiffHygiene(unittest.TestCase):
                               {"new.txt": "no newline", "b.bin": "x\0z", "gone.txt": None})
         assert other.returncode == 0, other.stderr
 
+    def test_a_declaration_means_one_file_and_each_report_is_read_alone(self):
+        files = {"cfg": "a\n", "cfg test.txt": "a\n"}
+        refused = self._prepare(files, {"cfg": "b", "cfg test.txt": "b"}, "NEWLINE: cfg test.txt")
+        assert refused.returncode and "cfg lost the newline" in refused.stderr and "cfg test.txt lost" not in refused.stderr, refused.stderr
+        # A code fence the worker left open hides nothing of the coordinator's.
+        allowed = self._prepare(files, {"cfg": "b"}, "done\n```\na log", flags=("--allow", "newline:cfg"))
+        assert allowed.returncode == 0, allowed.stderr
+
     def test_formatting_mixed_with_real_changes_is_refused_unless_declared(self):
         files = {"a.ts": "if (x) {\n  y()\n}\n", "b.ts": "let n = 1\n", "c.py": "if x:\n    y()\n"}
         spaced = "if (x) {\n    y()\n}\n"
@@ -1884,6 +1892,9 @@ class DiffHygiene(unittest.TestCase):
         said = self._prepare(py, {"lib.py": "NAME = 'helper'\n" + gone["lib.py"], **there})
         assert said.returncode and "app.py:1" in said.stderr, said.stderr
         assert self._prepare(py, {"lib.py": "import other\nhelper = other.helper\n" + gone["lib.py"], **there}).returncode == 0
+        # Imported under another name, the old module no longer gives out this one.
+        named = self._prepare(py, {"lib.py": "from other import helper as other_helper\n" + gone["lib.py"], **there})
+        assert named.returncode and "app.py:1" in named.stderr, named.stderr
         # A namesake another file already defines hides no importer of the removed one, and is itself no caller.
         twin = {**py, "twin.py": "def helper():\n    return 3\n", "use_twin.py": "from twin import helper\nhelper()\n"}
         refused = self._prepare(twin, gone)
@@ -1892,6 +1903,21 @@ class DiffHygiene(unittest.TestCase):
         ts = {"lib.ts": "export function helper() {}\nexport const kept = 1\n", "app.ts": "import { helper } from './lib'\nhelper()\n"}
         refused = self._prepare(ts, {"lib.ts": "export const kept = 1\n"})
         assert refused.returncode and 'app.ts:1 still refers to "helper"' in refused.stderr, refused.stderr
+        # The old module importing the moved symbol for its own use exports nothing; a re-export does.
+        there = {"other.ts": "export function helper() {}\n"}
+        inner = self._prepare(ts, {"lib.ts": "import { helper } from './other'\nexport const kept = helper\n", **there})
+        assert inner.returncode and "app.ts:1" in inner.stderr, inner.stderr
+        assert self._prepare(ts, {"lib.ts": "export { helper } from './other'\nexport const kept = 1\n", **there}).returncode == 0
+        named = self._prepare(ts, {"lib.ts": "export { helper as other } from './other'\nexport const kept = 1\n", **there})
+        assert named.returncode and "app.ts:1" in named.stderr, named.stderr
+        # Removed from two modules, a namesake added elsewhere hides no importer of either.
+        two = {**ts, "lib2.ts": "export function helper() {}\n", "app2.ts": "import { helper } from './lib2'\nhelper()\n"}
+        both = self._prepare(two, {"lib.ts": "export const kept = 1\n", "lib2.ts": "export const two = 2\n", **there})
+        assert both.returncode and "app.ts:1" in both.stderr and "app2.ts:1" in both.stderr, both.stderr
+        # One module changes the symbol's signature and the other drops it: the importer of the other is still broken.
+        kept = self._prepare(two, {"lib.ts": "export function helper(a: number) {}\nexport const kept = 1\n",
+                                   "lib2.ts": "export const two = 2\n"})
+        assert kept.returncode and "app2.ts:1" in kept.stderr and "app.ts:1" not in kept.stderr, kept.stderr
 
     def test_the_import_rules_read_the_shapes_they_were_written_for(self):
         sys.path.insert(0, str(SCRIPTS))
@@ -1900,7 +1926,7 @@ class DiffHygiene(unittest.TestCase):
             diff = ("--- a/m.py\n+++ b/m.py\n-def gone(a):\n-    def inner(): pass\n-class Moved:\n+def gone(a, b):\n"
                     "--- a/x.ts\n+++ /dev/null\n-export default async function load() {}\n-  export const enum Kind { A }\n-const local = 1\n"
                     "--- /dev/null\n+++ b/y.py\n+class Moved:\n")
-            assert verify.removed_public_symbols(diff) == {"load": "x.ts", "Kind": "x.ts"}
+            assert verify.removed_public_symbols(diff) == {"load": ["x.ts"], "Kind": ["x.ts"]}
             for source, expected in (
                     ("from pkg.m import (\n    a,\n    sym as s,\n)\n", True), ("from pkg.m import *\n", True),
                     ("import pkg.m as mod\nmod.sym()\n", True), ("from pkg import m\nm.sym()\n", True),
@@ -1918,11 +1944,22 @@ class DiffHygiene(unittest.TestCase):
             assert verify.imports_symbol("c.ts", "import { sym } from '../lib/m.js'\n", "sym", "src/m.ts", True)
             assert not verify.imports_symbol("c.ts", "import { sym } from './other'\n", "sym", "src/m.ts", True)
             assert not verify.imports_symbol("c.py", "from other import sym\n", "sym", "pkg/m.py", True)
+            assert verify.names_failure("FAILED tests/t.py::test_x") and not verify.names_failure("x " * 100000 + "ERROR")
+            # Through a namespace, only the module the symbol left counts.
+            assert verify.imports_symbol("c.ts", "import * as api from './m'\napi.sym()\n", "sym", "src/m.ts", True)
+            assert not verify.imports_symbol("c.ts", "import * as api from './other'\napi.sym()\n", "sym", "src/m.ts", True)
+            # Each module a symbol left is kept; one that defines it again, with another signature, lost nothing.
+            two = "--- a/a.ts\n+++ b/a.ts\n-export const h = 1\n%s--- a/b.ts\n+++ b/b.ts\n-export const h = 1\n"
+            assert verify.removed_public_symbols(two % "") == {"h": ["a.ts", "b.ts"]}
+            moved = {}
+            assert verify.removed_public_symbols(two % "+export const h = 2\n", moved) == {} and moved == {"h": ["b.ts"]}
             moved = {}
             assert verify.removed_public_symbols("--- a/m.py\n+++ b/m.py\n-def go():\n--- /dev/null\n+++ b/n.py\n+def go():\n", moved) == {}
-            assert moved == {"go": "m.py"}
-            assert verify.declared("- REWRITE: src/a.py (the task asks for it)\nsee REWRITE: no.py")["REWRITE"] == {
-                "src/a.py", "src/a.py (the task asks for it"}
+            assert moved == {"go": ["m.py"]}
+            said = verify.declared("- REWRITE: src/a.py (the task asks for it)\nsee REWRITE: no.py", "```\nopen", "NEWLINE: cfg")
+            assert said["REWRITE"] == {"src/a.py (the task asks for it"} and said["NEWLINE"] == {"cfg"}, said
+            assert verify.meant(said["REWRITE"] | {"cfg test.txt", "b.py, see above"}, {"src/a.py", "cfg", "cfg test.txt", "b.py"}) == {
+                "src/a.py", "cfg test.txt", "b.py"}
             assert verify.declared("REWRITE: ./a/b.py\n`REFORMAT: c.ts`\nREMOVED: Thing, REWRITE:\nnext") == {
                 "REWRITE": {"a/b.py"}, "REFORMAT": {"c.ts"}, "REMOVED": {"Thing"}, "NEWLINE": set()}
         finally:
@@ -2025,6 +2062,11 @@ class BaselineDiff(unittest.TestCase):
         counts = 'echo "1 failed, 1 passed in 0.10s"\nexit 1\n'
         result, _, _ = self._test(counts, counts + "# changed\n", "--baseline-diff")
         assert result.returncode and "Not waived: it prints nothing that names a failure" in result.stdout, result.stdout
+        # A banner, an error that names no test, and the path of a log: none says which test failed.
+        for said in ("", 'echo "make: *** [test] Error 1"\n', 'echo "error logs saved in reports/check.log"\n'):
+            banner = 'echo "Running unit tests"\necho "1 failed, 1 passed"\n' + said + 'exit 1\n'
+            result, _, _ = self._test(banner, banner + "# changed\n", "--baseline-diff")
+            assert result.returncode and "Not waived: it prints nothing that names a failure" in result.stdout, result.stdout
         # Progress marks alone name no failure.
         marks = 'echo "..F [100%]"\nexit 1\n'
         result, _, _ = self._test(marks, marks + "# changed\n", "--baseline-diff")
@@ -2038,6 +2080,25 @@ class BaselineDiff(unittest.TestCase):
         result, _, _ = self._test(self.OLD, self.OLD, "--baseline-diff", files={"requirements-dev.txt": "a\n"},
                                   changes={"requirements-dev.txt": "a\nb\n"})
         assert result.returncode and "Not waived: the candidate changes requirements-dev.txt" in result.stdout, result.stdout
+        result, _, _ = self._test(self.OLD, self.OLD, "--baseline-diff", files={".npmrc": "a\n"}, changes={".npmrc": "b\n"})
+        assert result.returncode and "Not waived: the candidate changes .npmrc" in result.stdout, result.stdout
+
+    def test_the_base_is_asked_only_after_every_check_ran_here(self):
+        # The replay of an earlier check on the base writes the marker again: a later check here must not read that.
+        with tempfile.TemporaryDirectory() as outside:
+            marker = os.path.join(os.path.realpath(outside), "marker")
+            result, _, _ = self._test(self.OLD, self.OLD + "# changed\n", "--baseline-diff", checks=(
+                "echo run >> " + marker, "sh check.sh", 'test "$(wc -l < %s)" -eq 1' % marker))
+        assert result.returncode == 0 and "Waived" in result.stdout, (result.stdout, result.stderr)
+
+    def test_the_base_runs_each_check_once_an_attempt(self):
+        with tempfile.TemporaryDirectory() as outside:
+            marker = os.path.join(os.path.realpath(outside), "runs")
+            checks = tuple('echo x >> %s; echo "FAILED tests/t.py::test_%d"; exit 1' % (marker, n) for n in range(3))
+            result, _, _ = self._test(self.OLD, self.OLD + "# changed\n", "--baseline-diff", checks=checks)
+            assert result.returncode == 0 and result.stdout.count("Waived, as") == 3, (result.stdout, result.stderr)
+            with open(marker) as f:
+                assert len(f.readlines()) == 6  # three here, three on the base
 
     def test_a_check_that_could_not_run_is_never_waived(self):
         broken = 'echo "ModuleNotFoundError: No module named \'requests\'"\nexit 1\n'
@@ -2046,6 +2107,9 @@ class BaselineDiff(unittest.TestCase):
         assert not list((board / "checks").glob("*-base.log"))  # the base was not even asked
         missing = 'echo "sh: line 1: mytool: command not found"\nexit 127\n'  # the shell's own code for it
         result, _, _ = self._test(missing, missing, "--baseline-diff")
+        assert result.returncode and "Not waived: the check could not run here" in result.stdout, result.stdout
+        wrapped = './tools/missing-tool || exit 1\n'  # the command around it gives its own exit code
+        result, _, _ = self._test(wrapped, wrapped + "# changed\n", "--baseline-diff")
         assert result.returncode and "Not waived: the check could not run here" in result.stdout, result.stdout
         refused, _, _ = self._test(self.OLD, self.OLD, "--baseline-diff", mode="shared")
         assert refused.returncode and "--baseline-diff is for an isolated candidate" in refused.stderr, refused.stderr

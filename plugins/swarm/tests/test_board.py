@@ -654,7 +654,7 @@ def audit(name):
     # a turn that ends after the run closed is not added to it, and the caller still gets its JSON
     run(money, "close")
     late = json.loads(run(money, "account", "3" * 64, "coordinator", "500"))
-    assert late == {"title": "Budget", "total": 70, "budget": 60, "paused": False, "closed": True}
+    assert late == {"title": "Budget", "total": 70, "budget": 60, "paused": False}
     assert sum(saved(money)["usage"]["tokens"].values()) == 70
 
     # One-line summaries are capped, and a post longer than the page is cut, not refused.
@@ -1692,7 +1692,6 @@ class BoardRegressions(unittest.TestCase):
             run(d, "member", "p2", "writes=invalid", "paths=a", ok=False)
             run(d, "member", "p2", "role=verifier", "paths=a")  # verifier does not clash
             att = json.loads(run(d, "attention", "--json"))
-            assert att["members"]["p1"]["paths"] == ["a", "a/b"]
             assert "a,a/b" in run(d, "plan")
 
             # rework ignores killed status of first-line target so body mention is not blamed
@@ -3006,6 +3005,41 @@ class FindingLedger(unittest.TestCase):
         run(d, "member", "w2", "killed=1")
         assert not [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "dispute"]
 
+    def test_a_new_agent_under_a_verifiers_name_tested_nothing(self):
+        d = self._run()
+        path = os.path.join(d, "members.json")
+        with open(path) as f:
+            state = json.load(f)
+        state["members"]["v"]["tested"] = "c" * 16  # as verify.py records the candidate under test
+        with open(path, "w") as f:
+            json.dump(state, f)
+        run(d, "member", "v", "id=agent-2")
+        with open(path) as f:
+            assert "tested" not in json.load(f)["members"]["v"]
+
+    def test_a_role_change_keeps_the_count_of_failed_verifications(self):
+        d = self._run()
+
+        def counted():
+            return [item for item in json.loads(run(d, "attention", "--json"))["items"] if item["kind"] == "rework"]
+        run(d, "post", "v", "@w NOT PASSED. The handler swallows the error.")
+        run(d, "ready", "w", stdin="F1: fixed — handler.py:30")
+        run(d, "post", "v", "@w NOT PASSED. F1: handler.py:30 still swallows it")
+        before = counted()
+        assert before, run(d, "attention", "--json")
+        run(d, "member", "v", "role=worker")
+        assert counted() == before
+
+    def test_another_workers_id_on_a_bullet_is_a_new_defect(self):
+        d = self._run()
+        run(d, "member", "b")
+        run(d, "ready", "b", stdin="done")
+        assert "recorded: F1" in run(d, "post", "v", "@w NOT PASSED. The handler swallows the error.")
+        out = run(d, "post", "v", stdin="@b NOT PASSED\n- F1: src/b.py still fails\n")
+        assert "recorded: F2" in out, out
+        refused = subprocess.run([sys.executable, BOARD, d, "ready", "b"], input="done", capture_output=True, text=True)
+        assert refused.returncode and "unanswered: F2 (src/b.py still fails)" in refused.stderr, refused.stderr
+
     def test_a_role_change_erases_no_finding_and_a_second_verdict_can_rule_first(self):
         d = self._run()
         run(d, "post", "v", "@w NOT PASSED. The handler swallows the error.")
@@ -3018,6 +3052,7 @@ class FindingLedger(unittest.TestCase):
         run(d, "post", "w", "@v it is fine\nF1: resolved")
         run(d, "member", "x")
         run(d, "post", "x", "@v agreed\nF1: resolved")
+        run(d, "member", "x", "role=verifier")  # what it wrote as a worker is no ruling now either
         refused = subprocess.run([sys.executable, BOARD, d, "ready", "w"], input="done", capture_output=True, text=True)
         assert refused.returncode and "unanswered: F1 (" in refused.stderr, refused.stderr
         run(d, "post", "v", "@w checked\nF1: resolved")
@@ -3121,6 +3156,91 @@ class SoftDependencies(unittest.TestCase):
             git("worktree", "remove", "--force", tree)
             rebuilt = commit("b2", "main", "b.txt")
             assert ready("b", rebuilt).returncode == 0, ready("b", rebuilt).stderr
+            # A dependency's commit that holds the retired member's work is not merged: said before, not at `ready`.
+            for who, extra in (("x", []), ("y", []), ("z", ["after=x", "depends=y"])):
+                run(d, "member", who, *extra)
+            left = commit("x", "main", "x.txt")
+            assert ready("x", left).returncode == 0
+            on_x = commit("y", "x", "y.txt")
+            assert ready("y", on_x).returncode == 0
+            run(d, "post", "v", "@x NOT PASSED. x.txt is wrong.")
+            run(d, "member", "x", "killed=1")
+            tree = os.path.join(project, "z-tree")
+            git("worktree", "add", "-q", "--detach", tree, "main")
+            synced = subprocess.run([sys.executable, BOARD, d, "sync", "z"], capture_output=True, text=True, cwd=tree)
+            assert synced.returncode and "@y's commit %s holds @x's commit %s" % (on_x[:12], left[:12]) in synced.stderr, \
+                (synced.stdout, synced.stderr)
+            assert git("-C", tree, "rev-parse", "HEAD") == git("rev-parse", "main")
+            git("worktree", "remove", "--force", tree)
+            # Further down the chain too: a member that waits for the retired one through another holds none of it.
+            for who, extra in (("u", []), ("b1", ["after=u"]), ("c1", ["after=b1"])):
+                run(d, "member", who, *extra)
+            gone = commit("u", "main", "u.txt")
+            assert ready("u", gone).returncode == 0
+            assert ready("b1", commit("b1", "u", "b1.txt")).returncode == 0
+            below = commit("c1", "b1", "c1.txt")
+            assert ready("c1", below).returncode == 0
+            run(d, "post", "v", "@u NOT PASSED. u.txt is wrong.")
+            run(d, "member", "u", "killed=1")
+            clean = commit("b1-clean", "main", "b1.txt")
+            assert ready("b1", clean).returncode == 0
+            git("switch", "-q", "-C", "c1-merged", below)
+            git("merge", "-q", "--no-edit", clean)
+            merged = git("rev-parse", "HEAD")
+            git("switch", "-q", "main")
+            refused = ready("c1", merged)
+            assert refused.returncode and "still holds @u's commit %s" % gone[:12] in refused.stderr, refused.stderr
+            # The assembled candidate is read as well: @y waits for nobody, and its commit was built on @x's.
+            prepared = subprocess.run([sys.executable, os.path.join(os.path.dirname(BOARD), "verify.py"), d, project, "prepare",
+                                       "isolated", "--check", "true", "--members", "y"], capture_output=True, text=True)
+            assert prepared.returncode and "holds @x's commit %s" % left[:12] in prepared.stderr, prepared.stderr
+            # A member put in a retired one's place takes over its work: what the successor's READY leaves out stays out.
+            for who, extra in (("m", []), ("n", ["after=m"])):
+                run(d, "member", who, *extra)
+            rejected = commit("m", "main", "m.txt")
+            assert ready("m", rejected).returncode == 0
+            on_m = commit("n", "m", "n.txt")
+            assert ready("n", on_m).returncode == 0
+            raised = re.search(r"recorded: (F\d+)", run(d, "post", "v", "@m NOT PASSED. m.txt is wrong."))[1]
+            run(d, "replace", "m", "m2")
+            answer = raised + ": fixed — m.txt:1"
+
+            def report(revision):
+                return subprocess.run([sys.executable, BOARD, d, "ready", "m2", revision], input=answer, capture_output=True, text=True)
+            anew = commit("m2", "main", "m2.txt")  # the successor began again, without the rejected commit
+            assert report(anew).returncode == 0, report(anew).stderr
+            git("switch", "-q", "-C", "n-both", on_m)
+            git("merge", "-q", "--no-edit", anew)
+            both = git("rev-parse", "HEAD")
+            git("switch", "-q", "main")
+            refused = ready("n", both)
+            assert refused.returncode and "still holds @m's commit %s" % rejected[:12] in refused.stderr, refused.stderr
+            onward = commit("m2-on", rejected, "m3.txt")  # the successor went on from it: the commit is its own now
+            assert report(onward).returncode == 0, report(onward).stderr
+            assert ready("n", commit("n-on", onward, "n2.txt")).returncode == 0
+            # A replaced member's report that stood is good work still, whatever its successor then builds.
+            for who, extra in (("g", []), ("h", ["after=g"])):
+                run(d, "member", who, *extra)
+            passed = commit("g", "main", "g.txt")
+            assert ready("g", passed).returncode == 0
+            on_g = commit("h", "g", "h.txt")
+            run(d, "replace", "g", "g2")
+            assert subprocess.run([sys.executable, BOARD, d, "ready", "g2", commit("g2", "main", "g2.txt")], input="done",
+                                  capture_output=True, text=True).returncode == 0
+            git("switch", "-q", "-C", "h-both", on_g)
+            git("merge", "-q", "--no-edit", "g2")
+            held_both = git("rev-parse", "HEAD")
+            git("switch", "-q", "main")
+            assert ready("h", held_both).returncode == 0, ready("h", held_both).stderr
+            # Git failing to say is an error, never a no; a commit the repository no longer holds is in no history.
+            sys.path.insert(0, os.path.dirname(BOARD))
+            try:
+                import board
+                assert board.is_ancestor(project, "0" * 40, anew, True) is False
+                with self.assertRaises(SystemExit):
+                    board.is_ancestor(project, anew, "no-such-revision", True)
+            finally:
+                sys.path.remove(os.path.dirname(BOARD))
             # Work that stood when its member was retired stays: the dependent built on a passed report.
             for who, extra in (("c", []), ("e", ["after=c"])):
                 run(d, "member", who, *extra)

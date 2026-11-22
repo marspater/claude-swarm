@@ -25,7 +25,7 @@ Cheapest checks first:
 4. **Seams.** Trace the contract through a caller and provider. Compare types, data shapes, ownership, and failure behavior. Check older input or a retry only when those paths are affected.
 5. **Leftovers.** Debug output, commented-out code, secrets, unrelated edits.
 
-Report a piece's problems to its owner in one post that begins `@<name> NOT PASSED`. Give the location, trigger, observed or source-traced outcome, and what a successful fix would show. Include the command and decisive output if you ran a check. Then end your turn.
+Report a piece's problems to its owner in one post that begins `@<name> NOT PASSED`. Give the location, trigger, observed or source-traced outcome, and what a successful fix would show. Include the command and decisive output if you ran a check. Then end your turn. A piece with nothing wrong gets no post: when no piece has a problem, end your turn without one. The coordinator is told when the run is quiet and takes your silence on a `READY` you were shown as your answer to it.
 
 Several defects go in one post, each in a bullet at the start of a line. The board numbers them (`F1`, `F2`; a verdict in prose is one), and the worker's next `READY` answers each as fixed or disputed. In your next verdict, rule on every open id: `F1: resolved` on a line of its own closes it, in any post of yours; a bullet `- F1: <what is still wrong>` keeps it open; a bullet with no id is a new defect. A defect the worker disputed and you keep open pauses the run until the coordinator settles it.
 

@@ -29,7 +29,7 @@ usage: board.py DIR init TITLE                    prints the run folder it creat
        board.py .swarm restore KEY                 find the run for a private lookup key
        board.py .swarm adopt KEY NAME [HINT]       bind the one open run that has member NAME; exit 3 when ambiguous, 4 when an open run lacks it, 5 when HINT names an ineligible run
        board.py .swarm locate KEY NAME [HINT]      find the one open run that has member NAME without binding it
-       board.py .swarm agent-run KEY ID...         find the run owning agent ID
+       board.py .swarm agent-run KEY ID [ADDRESS]  find the run owning agent ID, or the address it was started under
        board.py DIR started NAME ID EXPECTED [isolated=0|1]  record a started agent's ID if it matches EXPECTED
        board.py DIR close                         mark the run finished
        board.py DIR kill [REASON]                 end the run now, whatever its state: retire every member, close it, post SHUTDOWN
@@ -41,8 +41,9 @@ usage: board.py DIR init TITLE                    prints the run folder it creat
 
 `init` takes <project>/.swarm/<name> and creates <project>/.swarm/<name>-<timestamp>, so every
 run has its own folder. A run folder holds board.jsonl, one {"seq","agent","text","time","to"}
-per line (a coordinator's BRIEF adds "addressed", whom its first line assigned when it was posted), and members.json: {"title","closed","killed","members":{name:{role,group,model,id,
-last_read_seq,last_nudged_seq,killed,budget,paused,synced_deps,start,tested,delivered,clipped}}}; a verifier's "tested" is the
+per line (a coordinator's BRIEF adds "addressed", whom its first line assigned when it was posted), and members.json: {"title","closed","killed","binding","limits","usage","accepted_seq","pending_post","members":{name:{role,group,model,id,
+last_read_seq,last_nudged_seq,wake_claim,told,killed,replaced_by,retired_at,stood,after,budget,paused,synced_deps,start,tested,
+delivered,clipped}}}; a retired member's "stood" is the commit that counted as READY when it left; a verifier's "tested" is the
 candidate it is testing and has posted no verdict on, and "delivered" the current READY posts it works from that
 `read` has shown it in full ("clipped" those it could show only in part). A run's "killed" is the reason `kill` closed it. A READY with a commit records "revision",
 and "base" and "except" when it can: the reporter's own work is `git log --first-parent --no-merges REVISION --not
@@ -53,6 +54,7 @@ import fcntl  # ponytail: POSIX only; swap in msvcrt.locking if Windows support 
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -75,6 +77,7 @@ SPEND_SHARE, PAIR_SHARE = 1 / 2, 3 / 4  # of the run's tokens with three or more
 # so a long stretch of honest edits stays well under it. Each step re-reads the member's conversation, some 14,000
 # charged tokens at 100,000 held, so the token count is set to about as many steps and catches the heavier ones.
 LOOP_STEPS, LOOP_TOKENS = 150, 2_000_000
+AGENT_STATE = ("wake_claim", "last_nudged_seq", "told", "delivered", "clipped", "tested")  # what one agent read and was told: not its successor's
 # No run is without a bound: one made with no budget named pauses here and the user is asked. Seen live: a run nobody
 # had capped spent 7.8M tokens before the user looked. Five members on a task of a few files use about this much.
 DEFAULT_BUDGET = 3_000_000
@@ -292,21 +295,66 @@ def withdrawn_commits(name, members, posts):
     return [commit for commit in dict.fromkeys(commits) if commit != stood], stood
 
 
-def carried(git, repo, member, members, posts, revision):
-    """(the retired member, its commit) for the first commit REVISION still holds that had not passed when a member
-    MEMBER came after was retired, or None. What a retired member left unpassed must not ride into the candidate on the
-    commit of a member that came after it: the report is waived by the retirement, the work is not. GIT is verify.git,
-    asked only when such a member has in fact been retired."""
-    def within(commit, tip):
-        return git(repo, "merge-base", "--is-ancestor", commit, tip, optional=True) is not None
-    for dep in sorted(soft(member)):
-        if members.get(dep, {}).get("killed"):
-            left_behind, stood = withdrawn_commits(dep, members, posts)
+def is_ancestor(repo, older, newer, strict=False):
+    """Whether commit OLDER is NEWER or in its history. With STRICT, Git failing to say is an error, not a no; a
+    commit this repository no longer holds is in no history here."""
+    import verify  # late: verify.py imports this module
+    if not strict:
+        return verify.git(repo, "merge-base", "--is-ancestor", older, newer, optional=True) is not None
+    env = verify.clean_env()
+    env["LC_ALL"] = "C"
+    asked = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", older, newer], capture_output=True, env=env)
+    if asked.returncode in (0, 1):
+        return asked.returncode == 0
+    # Exit 1 with nothing said is Git's "no such object"; anything else is Git failing to read, which is no answer.
+    there = subprocess.run(["git", "-C", str(repo), "cat-file", "-e", older], capture_output=True, env=env)
+    if there.returncode == 1 and not there.stderr.strip() \
+            and verify.git(repo, "rev-parse", "-q", "--verify", newer + "^{commit}", optional=True) is not None:
+        return False
+    sys.exit("cannot tell whether %s holds the commit %s: %s" % (
+        newer[:12], older[:12], asked.stderr.decode(errors="replace").strip() or "git failed"))
+
+
+def upstream(member, members):
+    """Every member MEMBER waits for, directly or through another."""
+    seen, frontier = set(), dependencies(member)
+    while frontier:
+        dep = frontier.pop()
+        if dep not in seen:
+            seen.add(dep)
+            frontier += dependencies(members.get(dep, {}))
+    return seen
+
+
+def withdrawn_in(repo, names, members, posts, revision, base=None):
+    """(the retired member, its commit) for the first commit REVISION still holds that had not passed when one of
+    NAMES, or a member whose place one of them took, was retired; None when there is none. A member put in a retired
+    one's place takes its work over, so what the successor's latest READY holds is its own; what it left out is the
+    retired member's still. What BASE already holds is the project's, not the candidate's. Git is asked only when such
+    a member has in fact been retired, and a failure of Git's is an error: nothing is taken as clean unseen."""
+    for dep in sorted(names):
+        # The members whose place DEP holds, and DEP itself when it was retired with no successor.
+        line = [name for name, entry in members.items() if entry.get("killed") and successor(name, members) == dep]
+        if not line:
+            continue
+        taken = None if members.get(dep, {}).get("killed") else next((
+            post["revision"] for post in reversed(posts)
+            if post.get("kind") == "ready" and post.get("subject", post["agent"]) == dep and post.get("revision")), None)
+        for name in line:
+            left_behind, stood = withdrawn_commits(name, members, posts)
             for left in left_behind:
-                # An earlier step of the work that stood is part of it.
-                if within(left, revision) and not (stood and within(left, stood)):
-                    return dep, left
+                # An earlier step of the work that stood, or of what the successor reports, is part of it.
+                if is_ancestor(repo, left, revision, True) and not any(
+                        kept and is_ancestor(repo, left, kept, True) for kept in (stood, taken, base)):
+                    return name, left
     return None
+
+
+def carried(repo, member, members, posts, revision):
+    """What `withdrawn_in` finds in MEMBER's commit REVISION among the members it waits for, directly or through
+    another. What a retired member left unpassed must not ride into the candidate on the commit of a member that came
+    after it, however far down the chain: the report is waived by the retirement, the work is not."""
+    return withdrawn_in(repo, upstream(member, members), members, posts, revision)
 
 
 def merge_after(member, changes, before=""):
@@ -749,11 +797,9 @@ def branch_starts(repo, revision):
 def fresh(repo, start, earlier):
     """START, unless it holds one of EARLIER, the member's own commits reported before: a branch made from its own work
     (a fix begun on a new branch after a rejection) began inside that work, not before it."""
-    import verify  # late: verify.py imports this module
     if not start or not COMMIT.fullmatch(start):
         return None
-    return None if any(verify.git(repo, "merge-base", "--is-ancestor", commit, start, optional=True) is not None
-                       for commit in dict.fromkeys(earlier)) else start
+    return None if any(is_ancestor(repo, commit, start) for commit in dict.fromkeys(earlier)) else start
 
 
 def earlier_commits(name, posts):
@@ -771,7 +817,7 @@ def own_range(repo, revision, starts, merged, earlier=()):
     import verify  # late: verify.py imports this module
 
     def ancestor(older, newer):
-        return verify.git(repo, "merge-base", "--is-ancestor", older, newer, optional=True) is not None
+        return is_ancestor(repo, older, newer)
 
     cuts = {}  # each candidate base, with the commit it meets REVISION at
     head = verify.git(repo, "rev-parse", "--verify", "HEAD^{commit}", optional=True)
@@ -868,7 +914,10 @@ def rework(state, posts):
             # posted by the coordinator about its investigator.
             latest.pop(post.get("subject", post["agent"]), None)
         word = REPORT_WORD.match(post["text"])
-        if post["seq"] <= state.get("accepted_seq", 0) or not word or members.get(post["agent"], {}).get("role") != "verifier":
+        # What the post records makes it a verifier's, whatever its author's role is now; an older post records
+        # nothing, and goes by the role.
+        if post["seq"] <= state.get("accepted_seq", 0) or not word or not (
+                "rejects" in post or post.get("rules") or members.get(post["agent"], {}).get("role") == "verifier"):
             continue
         if word[1] == "VERIFIED" and post.get("partial"):  # a partial pass clears only the workers it held
             for name in post.get("members", []):
@@ -1030,9 +1079,9 @@ def ledger(state, posts):
             for name, finding in owed.items():  # an open id the report leaves out, or answers with no evidence, is unanswered
                 finding["answers"][worker] = (*answers.get(name, ("missing", "")), post["seq"])
             continue
-        # A post that records whom it rejects was a verifier's verdict when written: a later change of its
-        # author's role erases no defect.
-        if members.get(post["agent"], {}).get("role") != "verifier" and "rejects" not in post and not post.get("rules"):
+        # Only what the post itself records makes it a verifier's verdict or ruling: its author's role may have changed
+        # since, and a later change neither erases a defect nor turns a worker's word into a ruling.
+        if "rejects" not in post and not post.get("rules"):
             continue
         word = REPORT_WORD.match(post["text"])
         if word and word[1] == "VERIFIED":  # a pass closes what it covers: the verifier saw every open id and passed
@@ -1214,13 +1263,13 @@ def attention(state, posts):
     if closed:  # a finished run asks for nothing: what was left open is history
         items, asked = [], {}
     view = {name: {"type": kind_of(member), "model": model_of(member), "effort": effort_of(member),
-                   "depends": dependencies(member), "owns": member.get("owns", ""), "paths": claims(member),
+                   "depends": dependencies(member), "owns": member.get("owns", ""),
                    "ready": name in ready,
                    "blocked_on": [] if closed or name in ready or member.get("killed") else unmet(member, members, ready),
                    "asked": asked.get(name, 0), "unreachable": not closed and name in awake and unreachable(name, members, posts),
                    "paused": bool(member.get("paused"))}
             for name, member in members.items() if name != COORDINATOR}
-    return {"items": items, "members": view, "limits": state.get("limits", {})}
+    return {"items": items, "members": view}
 
 
 def attention_text(report):
@@ -1273,8 +1322,6 @@ def progress(state, member):
 
 
 def account(d, args):
-    if len(args) != 3:
-        sys.exit("account requires a turn hash, an actor key, and a token count")
     turn, actor, count = args
     if not BIND_KEY.fullmatch(turn) or (actor != COORDINATOR and not BIND_KEY.fullmatch(actor)):
         sys.exit("invalid usage key")
@@ -1283,7 +1330,7 @@ def account(d, args):
     state = load_state(d)
     if state.get("closed"):  # a turn that ends after the run did is not the run's
         budget, total = budget_usage(state)
-        print(json.dumps({"title": state["title"], "total": total, "budget": budget, "paused": False, "closed": True}))
+        print(json.dumps({"title": state["title"], "total": total, "budget": budget, "paused": False}))
         return
     usage = state.setdefault("usage", {})
     tokens = usage.setdefault("tokens", {})
@@ -1738,9 +1785,7 @@ def main(argv):
 
         def unmerged(repo, deps, revision):
             """The dependencies, of {name: READY post}, whose READY commit REVISION does not contain."""
-            import verify  # late: verify.py imports this module
-            return [dep for dep, post in deps.items() if post.get("revision") and verify.git(
-                repo, "merge-base", "--is-ancestor", post["revision"], revision, optional=True) is None]
+            return [dep for dep, post in deps.items() if post.get("revision") and not is_ancestor(repo, post["revision"], revision)]
 
         if cmd == "started":
             name = known(args[0])
@@ -1769,7 +1814,7 @@ def main(argv):
             if member.get("id", "") != expected:
                 sys.exit("the roster address changed while the agent was starting")
             # What the old agent read, the new one has not.
-            for key in ("wake_claim", "last_nudged_seq", "told", "delivered", "clipped"):
+            for key in AGENT_STATE:
                 member.pop(key, None)
             member["id"] = address
             if isolated is not None:
@@ -1798,7 +1843,7 @@ def main(argv):
                 sys.exit("@%s has been retired, so its assignment no longer changes. To put a member in its place: replace %s NEW"
                          % (name, name))
             if "id" in changes and changes["id"] != member.get("id"):
-                for key in ("wake_claim", "last_nudged_seq", "told", "delivered", "clipped"):
+                for key in AGENT_STATE:
                     member.pop(key, None)
                 if "isolated" not in changes:
                     member.pop("isolated", None)
@@ -1884,7 +1929,7 @@ def main(argv):
                         print("note: %s=%s names no agent type and no member yet. Types are: %s" % (model, token, ", ".join(DEFAULTS)))
             # A budget the run has already spent could only stop it at once, members mid-work and a verifier mid-test
             # included. Seen live: a coordinator asked to "limit the tokens" set 1.3M on a run that had used 7.7M.
-            used = sum(state.get("usage", {}).get("tokens", {}).values())
+            _, used = budget_usage(state)
             if changes.get("budget") and not state.get("paused") and 0 < int(changes["budget"]) <= used:
                 sys.exit("The run has already used %s tokens, so budget=%s would pause it at once and stop every member "
                          "mid-work. Set a budget above what is used (used plus what the rest may cost), or stop the run "
@@ -1963,6 +2008,10 @@ def main(argv):
                              and effort_of(entry) == "medium")):
                 sys.exit("Fable escalation requires replacing an Opus investigator with model=fable effort=medium")
             entry["last_read_seq"] = len(posts)
+            # As at a retirement: the commit that counted when it left, so work built on a report that stood stays good.
+            standing = readiness(members, posts).get(old, {}).get("revision")
+            if standing:
+                members[old]["stood"] = standing
             members[old]["killed"] = "1"
             members[old]["replaced_by"] = new
             members[old].pop("paused", None)
@@ -2104,7 +2153,11 @@ def main(argv):
                 # Each defect gets its id here, in the text every reader sees: the worker answers by id, and the next
                 # verdict rules by id.
                 number = 1 + max((int(name[1:]) for entry in posts for name in entry.get("findings", [])), default=0)
-                text, given = tag_findings(text, ledger(state, posts).keys(), number)
+                # Only a defect of the workers this verdict rejects is raised again by its id: another worker's id on a
+                # bullet here is a new defect, which the rejected worker has to answer.
+                owners = {successor(name, members) for name in verdict["rejects"]}
+                text, given = tag_findings(text, {name for name, finding in ledger(state, posts).items()
+                                                  if owners & set(finding["owners"])}, number)
                 if given:
                     verdict["findings"] = given
             if word == "NOT PASSED" and members[sender].get("role") == "verifier" and not state.get("paused"):
@@ -2194,7 +2247,7 @@ def main(argv):
                         sys.exit("%s is no commit in the project's repository. Commit your work in a worktree of the project "
                                  "(or fetch it into the project's repository) and give its full ID, or HEAD from your checkout"
                                  % revision)
-                    held = carried(verify.git, home, member, members, posts, revision)
+                    held = carried(home, member, members, posts, revision)
                     if held:
                         sys.exit("your commit still holds @%s's commit %s, which had not passed when @%s was retired. "
                                  "Rebuild your work without it, then report again. Nothing was posted"
@@ -2335,7 +2388,7 @@ def main(argv):
             if verify.toplevel(here) == verify.toplevel(os.path.dirname(os.path.dirname(os.path.abspath(d)))) and not args[1:]:
                 sys.exit("this is the project's own checkout, not your worktree: run `sync` from the worktree you work in")
             # Said here, before the member builds on it: `ready` would refuse the commit only once the work was done.
-            held = carried(verify.git, here, member, members, posts, head.decode().strip())
+            held = carried(here, member, members, posts, head.decode().strip())
             if held:
                 sys.exit("HEAD still holds @%s's commit %s, which had not passed when @%s was retired: `ready` will refuse a "
                          "commit built on it. Rebuild your branch without it before you go on" % (held[0], held[1][:12], held[0]))
@@ -2347,6 +2400,12 @@ def main(argv):
                     sys.exit(1)
                 print("in sync: HEAD contains every dependency's READY commit")
                 return
+            for dep in behind:  # before the first merge: a dependency's commit may hold what HEAD does not
+                held = carried(here, member, members, posts, deps[dep]["revision"])
+                if held:
+                    sys.exit("@%s's commit %s holds @%s's commit %s, which had not passed when @%s was retired: `ready` would "
+                             "refuse a commit built on it. Nothing was merged; ask @%s to rebuild without it"
+                             % (dep, deps[dep]["revision"][:12], held[0], held[1][:12], held[0], dep))
             if behind:
                 checkout_head("a merge would mix them into its commit", "")
             # Where this checkout's branch began, before anything is merged: a later READY reports the work from there.
@@ -2391,8 +2450,6 @@ def main(argv):
                   "synced: check the merged work, then report with ready %s HEAD" % name)
 
         elif cmd == "confirm":
-            if len(args) != 2:
-                sys.exit("confirm requires an investigator name and finding post number")
             name = known(args[0])
             member = members[name]
             if state.get("closed") or member.get("role") != "worker" or member.get("killed") or kind_of(member) != "investigator":

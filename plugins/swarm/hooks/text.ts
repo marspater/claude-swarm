@@ -115,7 +115,7 @@ export function head(text: string, length: number): string {
 
 // An opened post is drawn whole up to this size: a drawing over 100,000 characters is refused, and every
 // newline costs extra once it is drawn, so runs of blank lines are folded first. One post is open at a time.
-export const OPEN_LIMIT = 20_000
+const OPEN_LIMIT = 20_000
 export function openedText(post: Post): string {
   const body = bodyOf(post).replace(/\n{3,}/g, '\n\n')
   if (body.length <= OPEN_LIMIT) return body

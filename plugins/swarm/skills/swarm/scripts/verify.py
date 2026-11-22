@@ -20,7 +20,7 @@ import time
 import uuid
 
 sys.dont_write_bytecode = True
-from board import REPORT_WORD, atomic_write, latest_reports, load, load_state, readiness, save, shown, unfenced
+from board import REPORT_WORD, atomic_write, latest_reports, load, load_state, readiness, save, shown, unfenced, withdrawn_in
 
 GIT_ENV_STRIP = {
     "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
@@ -413,19 +413,30 @@ TS_EXPORT = re.compile(r"\s*export\s+(?:(?:default|declare|async|abstract)\s+)*(
 NAME = r"[A-Za-z_$][\w$]*"
 
 
-def declared(text):
-    """{REWRITE, REFORMAT, REMOVED, NEWLINE: the paths or symbols TEXT declares}, a leading ./ and the punctuation of a
-    sentence around it dropped."""
+def declared(*texts):
+    """{REWRITE, REFORMAT, REMOVED, NEWLINE: what TEXTS declare}: the symbol for REMOVED; for the others the rest of
+    the line, which may go on to say why, a leading ./ and the punctuation around it dropped. Each text is read by
+    itself, so a code fence one report leaves open hides nothing in the next."""
     found = {"REWRITE": set(), "REFORMAT": set(), "REMOVED": set(), "NEWLINE": set()}
 
     def bare(value):
         return value.strip("`'\"").removeprefix("./").rstrip(",;.)`'\"")
-    # A declaration stands at the start of a line of the report itself: one inside a pasted log declares nothing.
-    for kind, value in DECLARED.findall(unfenced(text)):
-        found[kind].add(bare(value.split()[0]))  # the first word, for a line that goes on to say why
-        if kind != "REMOVED":
-            found[kind].add(bare(value))  # and the whole of it, for a path with spaces in it
+    for text in texts:
+        # A declaration stands at the start of a line of the report itself: one inside a pasted log declares nothing.
+        for kind, value in DECLARED.findall(unfenced(text)):
+            found[kind].add(bare(value.split()[0] if kind == "REMOVED" else value))
     return found
+
+
+def meant(lines, paths):
+    """The files among PATHS that the declarations LINES name: each line means one file, the longest path it begins
+    with, so `cfg test.txt` is that file and not `cfg`."""
+    files = set()
+    for line in lines:
+        fits = [path for path in paths if re.match(re.escape(path) + r"(?:$|[\s,;:)`'\"])", line)]
+        if fits:
+            files.add(max(fits, key=len))
+    return files
 
 
 def is_python(name):
@@ -445,6 +456,15 @@ def mentions(clause, symbol):
     return re.search(r"(?<![\w$])%s(?![\w$])" % re.escape(symbol), clause, re.ASCII) is not None
 
 
+PY_FROM = re.compile(r"^[ \t]*from[ \t]+([\w.]+)[ \t]+import[ \t]+(\([^)]*\)|[^\n#]*(?:\\\n[^\n#]*)*)", re.ASCII | re.M)
+
+
+def gives(clause, symbol):
+    """Whether an import or export CLAUSE gives out the name SYMBOL: `sym`, `type sym` or `other as sym`, never
+    `sym as other`."""
+    return any(part.split()[-1:] == [symbol] for part in re.sub(r"[()\\]", " ", clause).split(","))
+
+
 def ts_imports(source, symbol, stem=None):
     """Does a TypeScript or JavaScript file pull SYMBOL in from some module? The module path is not resolved; with
     STEM, only an import whose path ends in that file name counts."""
@@ -453,7 +473,13 @@ def ts_imports(source, symbol, stem=None):
     # anchored to real import shapes, so it cannot span from an unrelated `export const` to a later `from`.
     for clause, path in re.findall(r"\b(?:import|export)\s+(?:type\s+)?((?:%s\s*,\s*)?(?:\{[^}]*\}|\*\s*as\s+%s)|%s)\s*from\s*['\"]([^'\"]*)"
                                    % (NAME, NAME, NAME), source, re.ASCII):
-        if mentions(clause, symbol) and stem in (None, re.sub(r"\.[cm]?[jt]sx?$", "", path.rsplit("/", 1)[-1])):
+        if stem not in (None, re.sub(r"\.[cm]?[jt]sx?$", "", path.rsplit("/", 1)[-1])):
+            continue
+        if mentions(clause, symbol):
+            return True
+        space = re.search(r"\*\s*as\s+(%s)" % NAME, clause, re.ASCII)  # `import * as api from './lib'`, then `api.sym`
+        if stem is not None and space and re.search(
+                r"(?<![\w$.])%s\s*\??\.\s*%s(?![\w$])" % (re.escape(space[1]), sym), source, re.ASCII):
             return True
     if stem is not None:
         return False
@@ -476,8 +502,7 @@ def py_imports(source, symbol, definition, exact=False):
     With EXACT, `from m import sym` counts only when m is the defining module."""
     stem = re.sub(r"\.pyi?$", "", definition.rsplit("/", 1)[-1])
     bound = []
-    for module, clause in re.findall(r"^[ \t]*from[ \t]+([\w.]+)[ \t]+import[ \t]+(\([^)]*\)|[^\n#]*(?:\\\n[^\n#]*)*)",
-                                     source, re.ASCII | re.M):
+    for module, clause in PY_FROM.findall(source):
         clause = re.sub(r"[()\\]", " ", clause)
         if clause.strip() == "*":
             if module.rsplit(".", 1)[-1] == stem:
@@ -510,9 +535,9 @@ def imports_symbol(name, source, symbol, definition, exact=False):
 
 
 def removed_public_symbols(diff, moved=None):
-    """{symbol: the file it was removed from} for the public symbols a unified diff removes. One the same diff defines
-    again (a changed signature, a move to another file) is not removed; one defined again only in another file is
-    put in MOVED, when given, with the file it left."""
+    """{symbol: the files it was removed from} for the public symbols a unified diff removes. One the same file defines
+    again (a changed signature) is not removed from it; one a file loses and only another file defines is put in
+    MOVED, when given, with the files it left."""
     removed, added, old, new = {}, {}, "", ""
     for line in diff.split("\n"):
         if header := re.fullmatch(r"--- (?:a/(.+)|/dev/null)", line):
@@ -521,13 +546,15 @@ def removed_public_symbols(diff, moved=None):
             new = header[1] or ""
         elif line.startswith("-") and old:
             if symbol := defined_symbol(old, line[1:]):
-                removed[symbol] = old
+                removed.setdefault(symbol, []).append(old)
         elif line.startswith("+") and new:
             if symbol := defined_symbol(new, line[1:]):
                 added.setdefault(symbol, set()).add(new)
+    left = {symbol: [name for name in dict.fromkeys(names) if name not in added.get(symbol, ())]
+            for symbol, names in removed.items()}
     if moved is not None:
-        moved.update({symbol: name for symbol, name in removed.items() if symbol in added and name not in added[symbol]})
-    return {symbol: name for symbol, name in removed.items() if symbol not in added}
+        moved.update({symbol: names for symbol, names in left.items() if names and symbol in added})
+    return {symbol: names for symbol, names in left.items() if names and symbol not in added}
 
 
 def caller_issues(root, revisions, excluded, allowed):
@@ -537,7 +564,7 @@ def caller_issues(root, revisions, excluded, allowed):
     removed = removed_public_symbols(git(
         root, *GIT_PINNED, "diff", "--no-ext-diff", "--no-color", "--no-textconv", "--no-renames", "--src-prefix=a/",
         "--dst-prefix=b/", "--unified=0", *revisions, *spec).decode(errors="replace"), moved)
-    removed = {symbol: name for symbol, name in {**moved, **removed}.items() if symbol not in allowed}
+    removed = {symbol: names for symbol, names in {**moved, **removed}.items() if symbol not in allowed}
     if not removed:
         return []
     # One grep for every removed symbol. Exit status 1 is "no match"; anything else is an error, never a pass.
@@ -555,8 +582,9 @@ def caller_issues(root, revisions, excluded, allowed):
         if name and number.isdigit():
             hits.append((name, number, text))
     def provides(name, symbol):
-        """Whether the file a symbol left still gives it to its importers: it imports the symbol itself, or binds the
-        name at the top level. A mention in a string or a call is none of that."""
+        """Whether the file a symbol left still gives it to its importers under that name: a Python module that
+        imports it or binds the name at the top level, a TypeScript one that exports it. A TypeScript import alone
+        exports nothing, `sym as other` gives out another name, and a mention in a string or a call is none of that."""
         path = root / name
         if not path.is_file():
             return False
@@ -564,47 +592,48 @@ def caller_issues(root, revisions, excluded, allowed):
                          for line in path.read_text(encoding="utf-8", errors="replace").split("\n"))
         sym = re.escape(symbol)
         if is_python(name):
-            return py_imports(code, symbol, "") or re.search(r"^%s[ \t]*(?::[^=\n]*)?=" % sym, code, re.M | re.ASCII) is not None
-        return ts_imports(code, symbol) or re.search(r"\bexport\s*(?:type\s*)?\{[^}]*(?<![\w$])%s(?![\w$])" % sym, code, re.ASCII) is not None
+            return (any(gives(clause, symbol) for _, clause in PY_FROM.findall(code))
+                    or re.search(r"^%s[ \t]*(?::[^=\n]*)?=" % sym, code, re.M | re.ASCII) is not None)
+        return any(gives(clause, symbol) for clause in re.findall(r"\bexport\s*(?:type\s*)?\{([^}]*)\}", code, re.ASCII))
 
     by_symbol, elsewhere = {}, set()
-    for symbol in removed:
+    for symbol, origin in ((symbol, origin) for symbol, names in removed.items() for origin in names):
         found = [hit for hit in hits if mentions(hit[2], symbol)]
         # Still defined somewhere (`def main` in another script, a second `export const config`, the file it moved
         # to): a caller may bind to that one, and a grep cannot tell a broken reference from a working one. What it
         # can tell is an import that names the module the symbol left, and that one is broken unless a re-export
-        # stayed behind.
+        # stayed behind. Each module the symbol left is asked for itself.
         if symbol in moved or any(defined_symbol(name, text) == symbol for name, _, text in found):
-            if provides(removed[symbol], symbol):
+            if provides(origin, symbol):
                 continue
-            elsewhere.add(symbol)
+            elsewhere.add((symbol, origin))
         if found:
-            by_symbol[symbol] = found
+            by_symbol[symbol, origin] = found
     total = sum(map(len, by_symbol.values()))
     if total > MAX_REFERENCE_HITS:
         return ["%d references to removed public symbols (%s) are more than the %d this check reads; check the callers "
                 "by hand, then declare each symbol with a `REMOVED: <symbol>` line in the READY report"
-                % (total, ", ".join(by_symbol), MAX_REFERENCE_HITS)]
+                % (total, ", ".join(dict.fromkeys(symbol for symbol, _ in by_symbol)), MAX_REFERENCE_HITS)]
     issues, sources, named = [], {}, set()
-    for symbol, found in by_symbol.items():
+    for (symbol, origin), found in by_symbol.items():
         for name, number, text in found:
             if comment_only(name, text) or (name, symbol) in named:
                 continue
             if name not in sources:
                 sources[name] = (root / name).read_text(encoding="utf-8", errors="replace")
-            if imports_symbol(name, sources[name], symbol, removed[symbol], symbol in elsewhere):
+            if imports_symbol(name, sources[name], symbol, origin, (symbol, origin) in elsewhere):
                 named.add((name, symbol))
                 issues.append('%s:%s still refers to "%s", which the candidate removes from %s: update or remove this caller, '
                               "or declare `REMOVED: %s` in the READY report if the reference is to another %s"
-                              % (name, number, symbol, removed[symbol], symbol, symbol))
+                              % (name, number, symbol, origin, symbol, symbol))
     return issues
 
 
-def hygiene_issues(root, base, commit, report, skip):
+def hygiene_issues(root, base, commit, reports, skip):
     """What is wrong with the shape of the candidate's change against BASE, one line for each defect: a file rewritten
     whole, a trailing newline lost, formatting mixed with real changes, a removed public symbol something still
-    imports. COMMIT is the candidate's, or None when the candidate is the checkout's own files. REPORT is the text of
-    the READY reports, whose REWRITE:, REFORMAT: and REMOVED: lines declare a case as meant. SKIP is what `not_source`
+    imports. COMMIT is the candidate's, or None when the candidate is the checkout's own files. REPORTS are the texts of
+    the READY reports and the coordinator's allowances, whose REWRITE:, REFORMAT: and REMOVED: lines declare a case as meant. SKIP is what `not_source`
     returns."""
     revisions = [base, commit] if commit else [base]
     excluded = [":(top,literal,exclude)" + os.fsdecode(b"/".join(path)) for path in skip]
@@ -636,7 +665,8 @@ def hygiene_issues(root, base, commit, report, skip):
                                                   "--", ":/", *excluded).split(b"\0") if name}
     # Whitespace only: the file has a change, and it disappears under -w.
     blank = {name for name, (added, deleted) in changed.items() if added + deleted and not sum(unspaced.get(name, (0, 0)))}
-    allowed, issues = declared(report), []
+    allowed, issues = declared(*reports), []
+    rewritten, unended, respaced = (meant(allowed[kind], set(changed) | new) for kind in ("REWRITE", "NEWLINE", "REFORMAT"))
     for name, (_, deleted) in sorted(changed.items()):
         if name in new:
             continue
@@ -645,16 +675,16 @@ def hygiene_issues(root, base, commit, report, skip):
             continue
         lines = old.count(b"\n") + (not old.endswith(b"\n")) if old else 0
         if (name not in blank and deleted and lines >= REWRITE_MIN_LINES and deleted / lines > REWRITE_MAX_DELETED_RATIO
-                and name not in allowed["REWRITE"]):
+                and name not in rewritten):
             issues.append("%s lost %d of its %d lines (%d%%): that is a rewrite. Restore the file and make only the intended "
                           "change with targeted edits, or declare `REWRITE: %s` in the READY report if the task is to rewrite it"
                           % (name, deleted, lines, round(100 * deleted / lines), name))
         if (old.endswith(b"\n") and now and b"\0" not in now and not now.endswith(b"\n")
-                and name not in allowed["NEWLINE"]):
+                and name not in unended):
             issues.append("%s lost the newline at its end: put it back, or declare `NEWLINE: %s` in the READY report if "
                           "the file is meant to end without one" % (name, name))
     reformatted = sorted(name for name in blank if not INDENT_SENSITIVE.search(name) and not GENERATED.search(name)
-                         and name not in allowed["REFORMAT"])
+                         and name not in respaced)
     real = sorted({name for name in changed if name not in blank or INDENT_SENSITIVE.search(name)} | new)
     if reformatted and real:
         issues.append("%s changed in whitespace only, beside real changes (%s): revert the formatting there, or declare "
@@ -681,8 +711,8 @@ def check_hygiene(run, root, base, commit, recorded, skip, allowed=()):
     """Raise when the candidate's change has a hygiene defect that neither its workers declared in their READY reports
     nor the coordinator allowed (ALLOWED, what `allowances` returns)."""
     reports = {seq for seq, _ in recorded.values()}
-    report = "\n".join([*(post["text"] for post in load(run)[1] if post["seq"] in reports), *allowed])
-    issues = hygiene_issues(root, base, commit, report, skip)
+    texts = [*(post["text"] for post in load(run)[1] if post["seq"] in reports), "\n".join(allowed)]
+    issues = hygiene_issues(root, base, commit, texts, skip)
     if issues:
         raise ValueError("the candidate is not ready for a verifier:\n- %s\nSend each to its worker; a new READY and a new "
                          "`prepare` follow the fix. One you have checked yourself, such as a caller a passing type check "
@@ -752,6 +782,19 @@ def prepare(run, project, mode, checks, onto=None, subset=None, baseline=False, 
                         raise ValueError(f"could not merge @{name}'s commit {revision[:12]}: {error}. If Git asks for an identity "
                                          "or a signing key, configure it for this repository, then prepare again") from None
             commit = git(integration, "rev-parse", "HEAD").decode().strip()
+            # Whatever chain it came down: `ready` reads only the members a worker waits for.
+            state, posts = load(run)
+            try:
+                held = withdrawn_in(integration, state["members"], state["members"], posts, commit, base)
+            except SystemExit as error:
+                raise ValueError(str(error)) from None
+            if held:
+                raise ValueError("the candidate holds @%s's commit %s, which had not passed when @%s was retired; it came in with "
+                                 "%s. Have that work rebuilt without it, then prepare again" % (
+                                     held[0], held[1][:12], held[0], ", ".join(
+                                         "@" + name for name, (_, revision) in recorded.items() if revision and git(
+                                             integration, "merge-base", "--is-ancestor", held[1], revision, optional=True) is not None)
+                                     or "a member's commit"))
             diff = git(integration, "diff", "--no-renames", "--ignore-submodules=none", "--raw", "-z", base, commit).split(b"\0")
             _, run_data = repository(project)
             for meta, name in zip(diff[::2], diff[1::2]):
@@ -954,7 +997,8 @@ def reserve(logs, identifier):
 # The baseline comparison: a check that fails on the candidate is run again on the candidate's base, and waived only
 # when it fails there in the same way. Ported from OpenSwarm's verify/runner.ts (MIT, Copyright (c) 2026 Heewon Oh).
 DEPENDENCY_INPUTS = {"package.json", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "Cargo.toml",
-                     "Cargo.lock", "go.mod", "go.sum", "requirements.txt", "pyproject.toml", "uv.lock", "poetry.lock"}
+                     "Cargo.lock", "go.mod", "go.sum", "requirements.txt", "pyproject.toml", "uv.lock", "poetry.lock",
+                     ".npmrc", ".yarnrc.yml", "pip.conf"}  # where packages come from decides which ones arrive
 DEPENDENCY_NAMES = re.compile(r"(requirements|constraints)[\w.-]*\.(txt|in)|Pipfile|setup\.(py|cfg)|Gemfile|pom\.xml|"
                               r"build\.gradle(\.kts)?|.*\.lock")
 COMPARED_BYTES = 8 << 20  # a log longer than this is not compared, and so not waived: both are read whole
@@ -962,6 +1006,19 @@ COMPARED_BYTES = 8 << 20  # a log longer than this is not compared, and so not w
 # (failures=1)", a row of progress marks. Two runs that agree only on such lines may have failed in different tests.
 COUNTS_ONLY = re.compile(r"[=\-\s]*(?:(?:(?:\d+|<N>) [a-z]+,? ?)+(?:in <DURATION>)?|Ran \d+ tests? in <DURATION>|"
                          r"(?:FAILED|OK)(?: \([\w=, ]*\))?|[.sxXFEP]+)?[=\-\s]*")
+# A line that says what failed: a failure word beside a test's id (`a::b`, `(pkg.mod.Case.test)`, `test_x`, `TestX`)
+# or a place in a file (`src/a.rs:4`). A banner, a count, `make: *** [test] Error 1` or the path of a log says none
+# of that.
+# ponytail: a heuristic over free text; read a structured report (JUnit XML) if one tool's failures slip through.
+FAILURE_WORD = re.compile(r"\b(?:FAIL(?:ED|URE|S)?|ERROR|[Ee]rror\w*|\w*Exception|panicked|assert\w*|not ok)\b|[✗✕✘×]")
+FAILURE_ID = re.compile(r"\w::\w|\(\w+(?:\.\w+)+\)|[\w/-][\w./-]{0,200}\.\w{1,16}:\d+|\b[Tt]est(?:_\w+|[A-Z]\w*)")
+
+
+def names_failure(line):
+    line = line[:4000]  # no test's name is longer, and a line of megabytes is read no further
+    return bool(FAILURE_WORD.search(line) and FAILURE_ID.search(line)) and not COUNTS_ONLY.fullmatch(line)
+
+
 # The toolchain could not run: that is no verdict on the change, on either side, so it is never waived.
 ENVIRONMENT_FAILURE = [re.compile(pattern, flags) for pattern, flags in (
     (r"ModuleNotFoundError:\s*No module named\b", re.I), (r"ImportError:\s*No module named\b", re.I),
@@ -972,7 +1029,10 @@ ENVIRONMENT_FAILURE = [re.compile(pattern, flags) for pattern, flags in (
     (r"(?:Network is unreachable|Temporary failure in name resolution|Could not resolve host|nodename nor servname provided)", re.I),
     (r"No virtual environment found", re.I), (r"command not found:? (?:uv|python3?|pytest|ruff|npm|cargo|go)\b", re.I),
     (r"could not find [`']?Cargo\.toml", re.I), (r"failed to (?:load|read) manifest for workspace member", re.I),
-    (r"Cargo\.toml.*(?:No such file or directory|os error 2)", re.I))]
+    (r"Cargo\.toml.*(?:No such file or directory|os error 2)", re.I),
+    # A shell that could not start a program, whatever exit code the command around it then gave.
+    (r"^\S+: (?:(?:line )?\d+: )?\S+: (?:command not found|not found|No such file or directory|Permission denied)\s*$", re.M),
+    (r"^zsh: (?:command not found|no such file or directory|permission denied): ", re.M))]
 
 
 def normalized_failure(output, roots):
@@ -1011,26 +1071,33 @@ def environment_failure(output):
     return any(pattern.search(output) for pattern in ENVIRONMENT_FAILURE)
 
 
-def fails_the_same_on_base(run, project, candidate, command, log, timeout, returncode, earlier=()):
-    """(whether COMMAND, which failed on the candidate with LOG and RETURNCODE, fails on the candidate's base in the
-    same way, why). The same exit code is not enough: the candidate may hold the old failure and a new one, so only
-    identical failure output is waived, and a check with unstable or no output stays failed. EARLIER are the checks
-    that ran before it, each with how it ended here and its log: they run on the base too, so that what one of them
-    sets up is there on both sides, and one that ends or prints otherwise there shows the two runs are not set up
-    alike."""
-    if log.stat().st_size > COMPARED_BYTES:
-        return False, "its output is over %d MB, more than is compared" % (COMPARED_BYTES >> 20)
-    head = log.read_bytes().decode(errors="replace")
-    # 126 and 127 are the shell's own: the command could not be run, or was not found.
-    if returncode in (126, 127) or environment_failure(head):
-        return False, "the check could not run here (a missing module, tool or network), which is no result on either side"
+def same_on_base(run, project, candidate, ran, timeout):
+    """{index in RAN: (whether that failed check fails on the candidate's base in the same way, why)}. RAN is every
+    check as it ended here: (command, exit code, log). The base runs them once, in order, up to the last one in
+    question, so what an earlier check sets up is there on both sides. The same exit code is not enough: the candidate
+    may hold the old failure and a new one, so only identical failure output is waived, and a check with unstable or
+    no output stays failed. Once a check ends or prints otherwise on the base the two runs are no longer set up alike,
+    and nothing after it is waived."""
+    verdicts = {}
+    for index, (_, returncode, log) in enumerate(ran):
+        if not returncode:
+            continue
+        if log.stat().st_size > COMPARED_BYTES:
+            verdicts[index] = (False, "its output is over %d MB, more than is compared" % (COMPARED_BYTES >> 20))
+        # 126 and 127 are the shell's own: the command could not be run, or was not found.
+        elif returncode in (126, 127) or environment_failure(log.read_bytes().decode(errors="replace")):
+            verdicts[index] = (False, "the check could not run here (a missing module, tool or network), which is no result "
+                                      "on either side")
+    asked = [index for index, (_, returncode, _) in enumerate(ran) if returncode and index not in verdicts]
+    if not asked:
+        return verdicts
     changed = git(candidate["worktree"], "diff", "--no-renames", "--name-only", "-z", candidate["base"], candidate["commit"])
     inputs = sorted({os.fsdecode(name) for name in changed.split(b"\0") if name.rsplit(b"/", 1)[-1].decode(errors="replace")
                      in DEPENDENCY_INPUTS or DEPENDENCY_NAMES.fullmatch(name.rsplit(b"/", 1)[-1].decode(errors="replace"))})
     if inputs:
-        return False, "the candidate changes %s, so the base runs with other dependencies" % ", ".join(inputs)
-    baseline = run / ("baseline-" + candidate["candidate"])
-    base_log = log.with_name(log.stem + "-base.log")
+        why = "the candidate changes %s, so the base runs with other dependencies" % ", ".join(inputs)
+        return {**verdicts, **dict.fromkeys(asked, (False, why))}
+    baseline, short, diverged = run / ("baseline-" + candidate["candidate"]), candidate["base"][:12], None
     try:
         git(project, "worktree", "add", "--detach", str(baseline), candidate["base"])
         work = baseline / Path(candidate["path"]).relative_to(candidate["worktree"])
@@ -1038,36 +1105,47 @@ def fails_the_same_on_base(run, project, candidate, command, log, timeout, retur
 
         def printed(path):
             return None if path.stat().st_size > COMPARED_BYTES else normalized_failure(path.read_bytes().decode(errors="replace"), roots)
-        try:
-            for setup, ended, setup_log in earlier:
-                on_base = setup_log.with_name(setup_log.stem + "-base.log")
-                with on_base.open("wb") as output:
-                    code = run_check(setup, work, timeout, output)
-                if code != ended or printed(on_base) is None or printed(on_base) != printed(setup_log):
-                    return False, ("an earlier check ends or prints otherwise on the base, so the two runs are not set up "
-                                   "alike: " + setup)
-            with base_log.open("wb") as output:
-                on_base = run_check(command, work, timeout, output)
-        except subprocess.TimeoutExpired:
-            return False, "it timed out on the base"
-        if on_base == 0:
-            return False, "it passes on the base %s" % candidate["base"][:12]
-        if on_base != returncode:
-            return False, "it exits %d on the base %s and %d here" % (on_base, candidate["base"][:12], returncode)
-        if base_log.stat().st_size > COMPARED_BYTES:
-            return False, "its output on the base is over %d MB, more than is compared" % (COMPARED_BYTES >> 20)
-        base = base_log.read_bytes().decode(errors="replace")
-        named = normalized_failure(head, roots)
-        if normalized_failure(base, roots) != named:
-            return False, "it fails on the base %s too, with other output (log: %s)" % (candidate["base"][:12], base_log)
-        if all(COUNTS_ONLY.fullmatch(line) for line in named.split("\n")):  # nothing, progress marks, counts
-            return False, "it prints nothing that names a failure on either side, so nothing shows the two are one"
-        return True, "it fails on the base %s with the same output (log: %s)" % (candidate["base"][:12], base_log)
+        for index, (command, returncode, log) in enumerate(ran[:asked[-1] + 1]):
+            if diverged is not None:
+                if index in asked:
+                    verdicts[index] = (False, "an earlier check ends or prints otherwise on the base, so the two runs are not "
+                                              "set up alike: " + diverged)
+                continue
+            base_log = log.with_name(log.stem + "-base.log")
+            try:
+                with base_log.open("wb") as output:
+                    on_base = run_check(command, work, timeout, output)
+            except subprocess.TimeoutExpired:
+                on_base = None
+            here, there = printed(log), printed(base_log)
+            if on_base != returncode or here is None or here != there:
+                diverged = command
+            if index not in asked:
+                continue
+            if on_base is None:
+                why = "it timed out on the base"
+            elif on_base == 0:
+                why = "it passes on the base %s" % short
+            elif on_base != returncode:
+                why = "it exits %d on the base %s and %d here" % (on_base, short, returncode)
+            elif there is None:
+                why = "its output on the base is over %d MB, more than is compared" % (COMPARED_BYTES >> 20)
+            elif here != there:
+                why = "it fails on the base %s too, with other output (log: %s)" % (short, base_log)
+            # Nothing, progress marks, counts, a banner: the same count may be another test on each side.
+            elif not any(map(names_failure, here.split("\n"))):
+                why = "it prints nothing that names a failure on either side, so nothing shows the two are one"
+            else:
+                verdicts[index] = (True, "it fails on the base %s with the same output (log: %s)" % (short, base_log))
+                continue
+            verdicts[index] = (False, why)
     except (OSError, ValueError) as error:  # no such folder on the base, a worktree Git could not make: no comparison
-        return False, "the base could not be checked: %s" % error
+        for index in asked:
+            verdicts.setdefault(index, (False, "the base could not be checked: %s" % error))
     finally:
         if baseline.exists():
             git(project, "worktree", "remove", "--force", str(baseline), optional=True)
+    return verdicts
 
 
 def test_candidate(run, project, identifier, verifier, timeout_arg=None):
@@ -1145,10 +1223,14 @@ def test_candidate(run, project, identifier, verifier, timeout_arg=None):
         if returncode is None:
             raise ValueError(f"verification command timed out after {timeout}s: {command}")
         ran.append((command, returncode, log))
-        if returncode and candidate.get("baseline"):
-            same, why = fails_the_same_on_base(run, project, candidate, command, log, timeout, returncode,
-                                               ran[:index - 1])
-            print("%s: %s" % ("Waived, as no failure of the candidate's" if same else "Not waived", why), flush=True)
+    # The base is asked only once every check has run here: its replay of the earlier checks may write what a later
+    # check reads outside the checkout. Once for the attempt, however many checks failed.
+    verdicts = same_on_base(run, project, candidate, ran, timeout) if candidate.get("baseline") else {}
+    for index, (command, returncode, log) in enumerate(ran):
+        if index in verdicts:
+            same, why = verdicts[index]
+            print("$ %s\n%s: %s" % (command, "Waived, as no failure of the candidate's" if same else "Not waived", why),
+                  flush=True)
             (waived if same else failed).append(command)
         elif returncode:
             failed.append(command)
@@ -1190,7 +1272,7 @@ def stray_submodules(root):
     return strays
 
 
-def landing_guards(project, found):
+def landing_guards(found):
     """Raises while the index or the checkout holds something the one commit after a shared `accept` would take unread
     or leave out. What is merely staged apart from the verified files is no matter: `commit` stages them anew. FOUND is
     what `repository` returns."""
@@ -1279,7 +1361,7 @@ def commit(run, project, identifier, message):
         if found is None:
             raise ValueError("the project is not a Git repository, so there is nothing to commit")
         check_current(run, candidate)
-        landing_guards(project, found)
+        landing_guards(found)
         # Built in an index of its own and checked there, then put in the repository's: whatever was staged before,
         # the commit takes this tree and no other.
         skip = not_source(found)
@@ -1354,7 +1436,7 @@ def accept(run, project, identifier):
             # commit this retry prints the command for is guarded as the first one was.
             found = repository(project) if candidate["mode"] != "isolated" else None
             if found is not None:
-                landing_guards(project, found)
+                landing_guards(found)
             print(f"Already accepted {identifier}")
             if found is not None:
                 print(landing(run, project, identifier))
@@ -1421,7 +1503,7 @@ def accept(run, project, identifier):
                 raise
         elif (found := repository(project)) is not None:
             # Built before the candidate is saved as accepted: a retry after that takes the "already accepted" path.
-            landing_guards(project, found)
+            landing_guards(found)
             guidance = landing(run, project, identifier)
         state, posts = load(run)
         state["accepted_seq"] = len(posts)  # the board counts failed verification cycles from here again

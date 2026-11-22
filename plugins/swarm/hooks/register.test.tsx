@@ -1752,6 +1752,28 @@ test('a turn\'s end whose write failed is charged in full when it is reported ag
   expect([run.state.usage.tokens.coordinator, run.landed.length]).toEqual([105, 1])
 })
 
+test('a charge the board took neither at its step nor at its turn\'s end is charged when a later turn ends', async ($, on) => {
+  const run = await nearBudget($, on)
+  for await (const _ of $.turn.step({ turnId: 's', index: 0, model: 'm', messageCount: 1 })) { /* no chunks */ }
+  await run.clock.advance(1)
+  await $.turn.complete({ ...ends, turnId: 's' })
+  expect([run.state.usage.tokens.coordinator, run.failed.length]).toEqual([95, 2])
+  run.isFailing = false
+  await $.turn.complete({ ...ends, turnId: 't', usage: { model: 'm', input_tokens: 1, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } })
+  expect([run.state.usage.tokens.coordinator, run.state.paused]).toEqual([106, 'token budget of 100 spent'])
+  expect(run.landed).toContain(run.failed[0])
+})
+
+test('a turn that reported only its end, and whose charge the board did not take, is charged when a later turn ends', async ($, on) => {
+  const run = await nearBudget($, on)
+  const spent = (input_tokens: number) => ({ model: 'm', input_tokens, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 })
+  await $.turn.complete({ ...ends, turnId: 'r', usage: spent(10) })
+  expect([run.state.usage.tokens.coordinator, run.failed.length]).toEqual([95, 1])
+  run.isFailing = false
+  await $.turn.complete({ ...ends, turnId: 't', usage: spent(1) })
+  expect([run.state.usage.tokens.coordinator, run.landed]).toEqual([106, [expect.any(String), run.failed[0]]])
+})
+
 test('a step whose write failed is charged at its turn\'s end under its own report, though the end carries no usage', async ($, on) => {
   const run = await nearBudget($, on)
   for await (const _ of $.turn.step({ turnId: 's', index: 0, model: 'm', messageCount: 1 })) { /* no chunks */ }
@@ -1865,7 +1887,7 @@ test('the pane pauses, resumes and answers attention items on the board itself, 
       item('spend', '@parser used more than half the tokens'), item('mystery', 'a kind from a newer board'),
       item('unreachable', '@parser could not be woken after 3 attempts'),
     ],
-    members: {}, limits: {},
+    members: {},
   }
   const { seen, answer, board } = owning(on, {
     board: () => posts({ agent: 'coordinator', to: ['parser'], text: '@parser BRIEF' }, { agent: 'parser', to: ['coordinator'], text: '@coordinator FINDING' }),
@@ -2347,7 +2369,7 @@ test('wave 2 UI: off-tab clock, dimmed replay guards, markdown fences, hide-inac
   on('agent.list', () => ({ value: [{ id: 'a1', description: '@parser', type: 'swarm:worker', status: 'idle' }] as never }))
   on('process.run', (_, e) => {
     if (e.argv.includes('attention')) {
-      return { value: { exitCode: 0, stdout: JSON.stringify({ items: attentionItems, members: {}, limits: {} }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      return { value: { exitCode: 0, stdout: JSON.stringify({ items: attentionItems, members: {} }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
     return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
@@ -2536,7 +2558,7 @@ test('a READY is held while others still work, and a run made inside a command s
   on('process.run', (_, e) => {
     const [, , directory, action] = e.argv
     commands.push(`${action} ${directory}`)
-    const stdout = action === 'attention' ? JSON.stringify({ items: [], members: {}, limits: {} }) : ''
+    const stdout = action === 'attention' ? JSON.stringify({ items: [], members: {} }) : ''
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('prompt.submit', (_, e) => {
@@ -3189,7 +3211,7 @@ test('a member whose agent ended without a report is flagged while others work, 
     return answer(e.argv[3] === 'attention'
       ? JSON.stringify({
         items: [{ kind: 'question', member: 'coordinator', seq: 5, text: '@asker asked @coordinator in #5 and has no answer.' }],
-        members: { quiet: hint(), asker: hint(), busy: hint(), done: hint(true) }, limits: {},
+        members: { quiet: hint(), asker: hint(), busy: hint(), done: hint(true) },
       })
       : stdout)
   })
@@ -3674,7 +3696,7 @@ test('a member that spends its own token budget is stopped at once, the coordina
       bob: { role: 'worker', id: 'bob-1', last_read_seq: 0 } as Record<string, unknown>,
     },
   }
-  const report = { items: [] as unknown[], members: {}, limits: {} }
+  const report = { items: [] as unknown[], members: {} }
   const { seen, answer, board } = owning(on, { board: () => '', roster: () => JSON.stringify(state) })
   let spender: 'alice' | 'bob' = 'alice'
   on('process.run', (_, e) => {
@@ -4027,7 +4049,7 @@ test('S6: a request sent from the pane holds the poll\'s own notice until its tu
   on('process.run', (_, e) => {
     const stdout = board(e)
     return answer(e.argv[3] === 'attention'
-      ? JSON.stringify({ items: [{ kind: 'question', member: 'coordinator', seq: 2, text: '@alice asked @coordinator in #2 and has no answer.' }], members: {}, limits: {} })
+      ? JSON.stringify({ items: [{ kind: 'question', member: 'coordinator', seq: 2, text: '@alice asked @coordinator in #2 and has no answer.' }], members: {} })
       : stdout)
   })
   on('agent.list', () => ({ value: [{ id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' }] as never }))
@@ -4194,7 +4216,7 @@ test('audit: a failed load of a browsed run says so, and Retry reads it again in
       if (e.argv[3] === 'tail') boardReads++
     }
     return isAttentionReadable
-      ? { value: { exitCode: 0, stdout: JSON.stringify({ items: [], members: {}, limits: {} }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      ? { value: { exitCode: 0, stdout: JSON.stringify({ items: [], members: {} }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
       : { value: { exitCode: 1, stdout: '', stderr: 'no python', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   const clock = mock.clock(on)
@@ -5727,7 +5749,7 @@ test('a member\'s hand-back that only repeats the board is dropped while others 
     { agent: 'parser', to: ['coordinator'], text: 'READY\nparser done' },
   ]
   const { seen, answer, board } = owning(on, { board: () => posts(...list), roster: () => JSON.stringify(state) })
-  on('process.run', (_, e) => e.argv[3] === 'attention' ? answer(JSON.stringify({ items: [], members: {}, limits: {} })) : answer(board(e)))
+  on('process.run', (_, e) => e.argv[3] === 'attention' ? answer(JSON.stringify({ items: [], members: {} })) : answer(board(e)))
   let lexer = 'running'
   on('agent.list', () => ({ value: [
     { id: 'a1', description: '@parser', type: 'swarm:worker', status: 'completed' },
@@ -5813,7 +5835,7 @@ for (const hasAgent of [true, false]) test(`the last worker's READY is held whil
     { agent: 'parser', to: ['coordinator', 'checker'], text: 'READY\nparser done' },
   ]
   const { seen, answer, board } = owning(on, { board: () => posts(...list), roster: () => JSON.stringify(state) })
-  on('process.run', (_, e) => e.argv[3] === 'attention' ? answer(JSON.stringify({ items: [], members: {}, limits: {} })) : answer(board(e)))
+  on('process.run', (_, e) => e.argv[3] === 'attention' ? answer(JSON.stringify({ items: [], members: {} })) : answer(board(e)))
   on('agent.list', () => ({ value: [
     { id: 'a1', description: '@parser', type: 'swarm:worker', status: 'completed' },
     ...(hasAgent ? [{ id: 'v1', description: '@checker', type: 'swarm:verifier', status: 'completed' }] : []),

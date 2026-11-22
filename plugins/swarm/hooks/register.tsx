@@ -6,7 +6,7 @@ import type { Member, Post, Swarm, Tab } from '../types'
 import { COORDINATOR_READ, NAMES_COMMIT, RUN, boardCalls, type ParsedBoardCall, runsNamed, scanShell, shellWords, substitutions, unwrap, wakeMessage, wakeSequence } from './command'
 import { actsAsAnother, commitsInSharedCheckout, normalizePath, resolveRealPath } from './guard'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, LATEST, SPECIALISTS, SWARM_AGENTS, familyOf, latestOf } from './models'
-import { KEPT, budgetOf, findAgent, ledger, memberNamed, mentions, parse, parsePosts, postFields, targets, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
+import { END, KEPT, budgetOf, findAgent, ledger, memberNamed, mentions, parse, parsePosts, postFields, targets, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
 import { CLIP, bodyOf, chipped, clean, clip, compact, fenceAfter, hasQuestion, head, kindOf, openedText, verdictOf, type Fence } from './text'
 import { statusInk, statusDot } from './palette'
 import { hiveArt, toolMood, toolSummary, type Mood } from './hive'
@@ -282,6 +282,9 @@ const stepped = ledger()
 // The run the coordinator drove when a turn of its own last stepped. Kept past the turn's end, so a replayed end still
 // finds it: the oldest go first.
 const turnRuns = new Map<string, string>()
+// How many earlier turns with a charge the board did not take are tried again at each turn's end.
+const STRANDED_RETRIES = 8
+let strandedFrom = 0
 // Past this many running turns, those of agents that have ended are looked for and dropped.
 const TURNS_KEPT = 256
 // A native teammate's address by agent id. The agent list drops a teammate when it ends, sometimes before its
@@ -2160,7 +2163,7 @@ async function memberBoard($: EngineInterface, e: BoardInput & { agentId: string
 
   const text = typeof e.text === 'string' ? e.text.trim() : ''
   const writesPost = action === 'post' || action === 'ready' || action === 'revise'
-  if (writesPost && (closed || !text || text.length > 12000)) {
+  if (writesPost && (closed || !text || text.length > TEXT_LIMIT)) {
     return { deny: 'Use a nonempty report of at most 12,000 characters on an open run.' }
   }
   const args = action === 'show' ? shown : action === 'status' ? [action] : [action, name]
@@ -2206,7 +2209,7 @@ async function coordinatorBoard($: EngineInterface, e: BoardInput) {
   if (e.seq !== undefined && (!Number.isSafeInteger(e.seq) || e.seq < 1)) return { deny: 'seq is a positive post number.' }
   const text = typeof e.text === 'string' ? e.text.trim() : ''
   const oneLine = [e.title, e.out].find(value => typeof value === 'string' && /\n/.test(value))
-  if (oneLine !== undefined || text.length > 12000) return { deny: 'title and out are one line each, and text at most 12,000 characters.' }
+  if (oneLine !== undefined || text.length > TEXT_LIMIT) return { deny: 'title and out are one line each, and text at most 12,000 characters.' }
   const owned = await read($, run)
   // init is how the skill may make a run with this tool; anything else needs the run this conversation drives.
   if (action !== 'init' && !owned) return { deny: NO_RUN_BOARD }
@@ -2266,6 +2269,8 @@ async function boardAnswer($: EngineInterface, dir: string, args: string[], stdi
 
 // ponytail: a diff past this many characters is cut; `git diff HEAD...<commit>` prints it whole.
 const DIFF_CLIP = 12_000
+// The longest text the board tool takes for a post, a report or a reason.
+const TEXT_LIMIT = 12_000
 // The move of the shared checkout's HEAD the coordinator was last told of, as `from>to`.
 let headNoted = ''
 /** Opens a READY's commit under its post, saying what it covers. With the base the board recorded (the project's
@@ -2400,7 +2405,7 @@ export const register: Register = on => {
             action: { enum: ['read', 'show', 'post', 'ready', 'revise', 'status', 'init', 'member', 'limit', 'plan', 'attention', 'confirm', 'retry', 'replace', 'pause', 'resume', 'close', 'export'] },
             member: { type: 'string', description: 'Optional member filter for show.' },
             seq: { type: 'integer', minimum: 1, description: 'A post number: one post for show, the finding for confirm.' },
-            text: { type: 'string', maxLength: 12000, description: 'Report, message, or reason (post, ready, revise, pause).' },
+            text: { type: 'string', maxLength: TEXT_LIMIT, description: 'Report, message, or reason (post, ready, revise, pause).' },
             commit: { type: 'string', description: 'ready: the full 40- or 64-character commit id the report covers. Never HEAD.' },
             title: { type: 'string', description: 'init: the run\'s title.' },
             name: { type: 'string', description: 'init: the run\'s folder name under .swarm. member, retry, replace (the old one), confirm, resume: the member.' },
@@ -3000,23 +3005,51 @@ export const register: Register = on => {
         // What its steps left uncharged goes to the run they were spent under, where one was driven then: a step charge
         // the board did not take is retried under its own report, so the board still records it once, and the rest
         // under the turn's. Kept for the run, not dropped: a replayed end, or one that fails, still finds it.
-        const at = turnRuns.get(e.turnId)
+        // A coordinator's turn that reported no step has no run on record yet: the one it drives now is its run.
+        const at = turnRuns.get(e.turnId) ?? (e.agentId === undefined ? (await read($, run)) || undefined : undefined)
         const turn = stepped.of(e.turnId)
         // Each one left was sent and not taken, so it stays pending until the board takes it under its own report, even
         // when it cannot be sent now: charged under the turn's, it could be taken twice.
-        for (const [index, amount] of turn ? [...turn.pending] : []) {
-          if (await account($, `${e.turnId}:${index}`, e.agentId, amount, at).catch(() => false)) {
-            stepped.landed(turn!, amount, index)
-            isCharged = true
+        const settle = async (turnId: string, owing: NonNullable<typeof turn>, agentId: string | undefined, under?: string, isOwn = false) => {
+          for (const [index, amount] of [...owing.pending]) {
+            // Its end is reported again: what that end owed is worked out anew below, and sent once under the one report.
+            if (isOwn && index === END) {
+              owing.pending.delete(END)
+              continue
+            }
+            if (await account($, index === END ? turnId : `${turnId}:${index}`, agentId, amount, under).catch(() => false)) {
+              stepped.landed(owing, amount, index)
+              isCharged = true
+            }
           }
         }
-        const owed = stepped.charge(e.turnId, e.usage)
-        if (await account($, e.turnId, e.agentId, owed, at).catch(() => false)) {
-          // The ledger may have been cleared meanwhile (a new session): nothing is left to mark.
-          const ended = stepped.of(e.turnId)
+        if (turn) await settle(e.turnId, turn, e.agentId, at, true)
+        const owed = stepped.charge(e.turnId, e.usage, undefined, e.agentId)
+        const taken = await account($, e.turnId, e.agentId, owed, at).catch(() => false)
+        // The ledger may have been cleared meanwhile (a new session): nothing is left to mark.
+        const ended = stepped.of(e.turnId)
+        if (taken) {
           if (ended) stepped.landed(ended, owed)
           isCharged = true
+        } else if (taken === false && ended) {
+          stepped.held(ended, owed)
+          if (at && owed > 0) {
+            turnRuns.set(e.turnId, at)
+            if (turnRuns.size > TURNS_KEPT) turnRuns.delete(turnRuns.keys().next().value!)
+          }
         }
+        // What earlier turns still owe is tried again now: their own end is not reported twice, so a board that was
+        // out of reach then would never be charged. Under each one's own report and run; a coordinator's turn whose
+        // run is no longer known is left for its own end.
+        // ponytail: the oldest few an end, so a board that stays out of reach costs each end a bounded number of commands.
+        // Taken in turn, so one the board keeps refusing does not hold up those behind it.
+        const late = stepped.owed().filter(([turnId]) => turnId !== e.turnId)
+        for (let tried = 0; tried < Math.min(STRANDED_RETRIES, late.length); tried++) {
+          const [turnId, owing] = late[(strandedFrom + tried) % late.length]!
+          const under = turnRuns.get(turnId)
+          if (owing.agentId !== undefined || under) await settle(turnId, owing, owing.agentId, under)
+        }
+        strandedFrom += STRANDED_RETRIES
       } finally {
         // Only once its usage is on the board: a poll in between would act on the roster as it was before a budget pause.
         if (e.agentId === undefined) {

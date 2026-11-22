@@ -3,7 +3,6 @@
 // Read-only profiles that reach the board through its tool. The designer is a profile too, but writes files and uses the shell board like a worker.
 export const SPECIALISTS = ['explorer', 'investigator', 'architect']
 export const SWARM_AGENTS = new Set(['swarm:worker', 'swarm:verifier', 'swarm:designer', ...SPECIALISTS.map(role => `swarm:${role}`)])
-// The model each agent type starts on when the Agent call names none; board.py holds the same table.
 // The newest model of each family. Every Swarm member starts on one of these: a bare family name on the Agent
 // call resolves here. When a model ships, update this table and the `model:` line of each agents/*.md file.
 export const LATEST: Record<string, string> = {
@@ -14,9 +13,10 @@ export const latestOf = (model: string | undefined) => {
   const family = model?.toLowerCase() ?? ''
   return Object.hasOwn(LATEST, family) ? LATEST[family] : model
 }
+// The model each agent type starts on when the Agent call names none; board.py holds the same table.
 export const DEFAULT_MODEL: Record<string, string> = {
   worker: LATEST.sonnet!, verifier: LATEST.sonnet!, explorer: LATEST.haiku!, investigator: LATEST.opus!, architect: LATEST.fable!, designer: LATEST.opus!,
 }
 export const DEFAULT_EFFORT: Record<string, string> = { worker: 'medium', verifier: 'medium', explorer: 'medium', investigator: 'high', architect: 'high', designer: 'high' }
 export const familyOf = (model: string) =>
-  ['haiku', 'sonnet', 'opus', 'fable'].find(name => model.toLowerCase().includes(name)) ?? model
+  Object.keys(LATEST).find(name => model.toLowerCase().includes(name)) ?? model

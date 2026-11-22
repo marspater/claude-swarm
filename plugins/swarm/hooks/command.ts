@@ -677,7 +677,7 @@ export function closesAfter(text: string): { text: string; closes: number } {
 }
 
 /** A command's words without its redirections and their targets; what a here-string (`<<< text`) feeds it is `fed`. */
-export function withoutRedirects(words: readonly string[]): { words: string[]; fed?: string } {
+function withoutRedirects(words: readonly string[]): { words: string[]; fed?: string } {
   const kept: string[] = []
   let fed: string | undefined
   for (let i = 0; i < words.length; i++) {

@@ -5,7 +5,7 @@ import { edgesOf, graphSvg, isBroadcast } from './graph'
 import { BOARD_ACTIONS, hiveArt, toolMood, toolSummary } from './hive'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, SWARM_AGENTS, familyOf, latestOf } from './models'
 import { statusCss, statusDot, statusKey } from './palette'
-import { budgetOf, detailOf, findAgent, ledger, mentions, parse, parsePosts, postFields, statusOf, targets, tokensUsed } from './roster'
+import { END, budgetOf, detailOf, findAgent, ledger, mentions, parse, parsePosts, postFields, statusOf, targets, tokensUsed } from './roster'
 import { bodyOf, chipped, clean, clip, compact, fenceAfter, hasQuestion, head, kindOf, openedText, stripKind, unquoted, verdictOf } from './text'
 
 const post = (text: string, to: string[] = []): Post => ({ seq: 1, agent: 'parser', to, text, time: '2026-11-16T14:03:22+0100' })
@@ -124,7 +124,7 @@ test('multi-segment board calls, wakeSequence bounds, and roster status/closed-r
   })
   const tailedBoard = `${JSON.stringify({ seq: 500, agent: 'constructor', text: 'done', time: 't' })}\n`
   const closed = parse('/project/.swarm/demo-20261116-101010', tailedBoard, closedRoster, agents, 300, {
-    items: [], limits: {},
+    items: [],
     members: { constructor: { type: 'worker', model: 'sonnet', effort: 'medium', depends: [], owns: '', ready: false, blocked_on: ['x'], asked: 0, unreachable: true } },
   })
   expect(closed.total).toBe(500)
@@ -396,7 +396,7 @@ test('F18: a member whose agent was killed is stopped, not retired, and a newer 
   expect(statusOf('worker', { id: 'k1', killed: '1', last_read_seq: 0 }, killed)).toBe('killed')
   const roster = JSON.stringify({ title: 'T', members: { coordinator: { role: 'coordinator', last_read_seq: 0 }, art: { role: 'worker', id: 'k1', last_read_seq: 0 } } })
   const hint = { type: 'worker', model: 'sonnet', effort: 'medium', depends: [], owns: '', ready: false, blocked_on: [], asked: 0, unreachable: true }
-  const shown = parse('/p/.swarm/x-20261116-101010', '', roster, killed, 300, { items: [], limits: {}, members: { art: hint } })
+  const shown = parse('/p/.swarm/x-20261116-101010', '', roster, killed, 300, { items: [], members: { art: hint } })
   expect(shown.members.find(m => m.name === 'art')?.status).toBe('unreachable')
 })
 
@@ -408,7 +408,7 @@ test('F19: a malformed roster, token count or report draws what it can, and no l
   expect([empty.title, empty.members, empty.posts]).toEqual(['', [], []])
   const roster = JSON.stringify({ title: 'T', usage: { tokens: { a: '7', b: 'x' } }, members: { coordinator: { role: 'coordinator', last_read_seq: 0 }, bad: null, art: { role: 'worker', last_read_seq: 0 } } })
   const board = [1, 2, 3].map(seq => JSON.stringify({ seq, agent: 'art', text: '@coordinator hi', time: 't' })).join('\n') + '\nnull\n'
-  const none = parse('/p/.swarm/x-20261116-101010', board, roster, [], 0, { items: [], limits: {}, members: { art: { type: 'worker' } } } as never)
+  const none = parse('/p/.swarm/x-20261116-101010', board, roster, [], 0, { items: [], members: { art: { type: 'worker' } } } as never)
   expect(none.posts).toEqual([])
   expect(none.earlierEdges).toEqual({ 'art>coordinator': 3 })
   expect(none.members.map(m => m.name)).toEqual(['coordinator', 'art'])
@@ -600,7 +600,7 @@ test('F26: what a group writes goes where its close sends it', () => {
 
 test('F27: a malformed attention report, the board subcommands, and a kind word after a no-break space', () => {
   const roster = JSON.stringify({ members: { a: { role: 'worker', id: 'x', last_read_seq: 0 } } })
-  const shown = parse('/r', '', roster, [], 300, { items: [], limits: {}, members: { a: { owns: 123, blocked_on: 'b' } as never } })
+  const shown = parse('/r', '', roster, [], 300, { items: [], members: { a: { owns: 123, blocked_on: 'b' } as never } })
   expect(shown.members[0]?.owns).toBe('')
   expect(toolMood('Bash', '$PY "$S"/board.py "$RUN" export')).toBe('inspect')
   expect(toolMood('Bash', '$PY "$S"/board.py "$RUN" sync parser')).toBe('relay')
@@ -740,6 +740,24 @@ test('a turn that runs past any count keeps what its steps were charged until it
   // the dead agent's turn left the running ones, and an end it still reports finds what its step was charged
   for (const turnId of ['live', 'dead']) book.landed(book.of(turnId)!, 100, 0)
   expect([book.running, book.charge('live', used), book.charge('dead', used)]).toEqual([1, 0, 0])
+})
+
+test('an ended turn the board still owes an answer for outlasts settled ones', () => {
+  const book = ledger(2)
+  const ten = { input_tokens: 10, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+  book.charge('a', ten, 0)
+  for (const turnId of ['a', 'b', 'c', 'd']) book.charge(turnId, undefined)
+  expect(book.owed().map(([turnId]) => turnId)).toEqual(['a'])
+})
+
+test('a turn\'s end the board did not take stays owed under the turn\'s own report', () => {
+  const book = ledger()
+  const ten = { input_tokens: 10, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+  expect(book.charge('t', ten)).toBe(10)
+  book.held(book.of('t')!, 10)
+  expect([book.owed().map(([turnId]) => turnId), book.charge('t', ten)]).toEqual([['t'], 0])
+  book.landed(book.of('t')!, 10, END)
+  expect([book.owed().length, book.charge('t', ten)]).toEqual([0, 0])
 })
 
 test('a turn\'s end charges its whole usage less what the board took and what its steps still owe, cached reads rounded once over the turn', () => {

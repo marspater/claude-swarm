@@ -1,6 +1,7 @@
+import type { Swarm } from '../types'
 import { boardCalls } from './command'
 
-export type Mood = 'sleep' | 'forage' | 'inspect' | 'build' | 'verify' | 'relay'
+export type Mood = NonNullable<Swarm['mood']>
 // The board's subcommands, as tests/parity.json lists them: a word after `board.py <folder>` that is none of these
 // names a file, not a board call.
 export const BOARD_ACTIONS = new Set(['init', 'member', 'limit', 'plan', 'attention', 'retry', 'replace', 'post', 'read', 'show', 'ready', 'confirm',
