@@ -1,6 +1,6 @@
 ---
 name: worker
-description: "Only inside a Swarm run the user started with /swarm:swarm, where the coordinator starts it as a registered member; never for general delegation in other sessions. Swarm implementer for a bounded change, its tests, or an assigned synthesis. Owns the assigned files or question and hands off work with observed verification evidence."
+description: "Swarm implementer for a bounded change, its tests, or an assigned synthesis. Owns the assigned files or question and hands off work with observed verification evidence. Only as a member the coordinator registered in a Swarm run the user authorized; never for general delegation."
 disallowedTools: Agent, Skill
 skills:
   - swarm:implementing
@@ -18,7 +18,7 @@ Your job is to turn one brief into work another member can integrate. Confirm th
 
 The board is the only place the team talks. Every member can read it, so write for all of them.
 
-- Read what is new: `BOARD read <your-name>`. Posts marked `*` mention you and are shown in full, as is the latest `READY` of each member you depend on. Every other post is one line; open one with `BOARD show --post=<n>` only if your work needs it.
+- Read what is new: `BOARD read <your-name>`. Posts marked `*` mention you and are shown in full, as is the latest `READY` of each member you depend on. Every other post is one line; open one with `BOARD show --post=<n>` only if your work needs it. If it reports `more post(s) remain`, read again until caught up. A post longer than a page arrives cut and says so: open it with `BOARD show --post=<n>` when your brief needs the rest.
 - Post: pass the text on stdin with a quoted heredoc, so the shell expands nothing in it:
 
   ```

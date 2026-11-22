@@ -49,6 +49,6 @@ Write every render and measurement to a directory outside the project, such as o
 
 A design piece passes when every redline line that applies is pass or n/a. There is no separate pass post: record it in your `VERIFIED` post, naming each design piece with the renderer, sizes, and appearances you measured it in.
 
-A deliverable marked `UNRENDERED`, or a check you could not render either, is blocked and not passed. Tell the coordinator what is unrendered and what would render it, such as Xcode running with the project open.
+A deliverable marked `UNRENDERED` means the designer had no renderer: render it yourself. It is blocked, not passed, only when a redline line that applies stays unrendered after you tried. Tell the coordinator what is unrendered and what would render it, such as Xcode running with the project open.
 
 > @icons NOT PASSED. `assets/icons/sync.svg`: the arrowhead anchor sits at x=20.37, off the pixel grid (expected an integer for a 2 px stroke, spec section 1); rendered at 24 px the edge blurs. `tokens.json` `text/muted` on `surface/raised` measures 3.9:1 in dark (expected 4.5:1). Snap the anchor to 20 and raise `text/muted` lightness until the dark pair passes.
