@@ -63,7 +63,9 @@ Experimental: to use Claude's native shared task list, launch `/swarm:swarm --na
 | "no Opus" | `opus=none` |
 | "stay under two million tokens" | `budget=2000000`: when it is spent the run pauses, so no member is woken again, and the coordinator asks you what to do. A member that is mid-turn is refused its next tool call and told to end its turn, as on any pause, and no new member can be started until you raise the budget |
 
-**Tokens are counted.** The pane shows tokens per member and for the run, against the budget when there is one. The count is input, cache writes and output, plus cache reads at a tenth, and it is taken at every model step, so a budget is noticed mid-turn. The count is saved with the run, so resuming the coordinator keeps the total and enforces the same budget. Usage from before this change cannot be recovered.
+**Every run has a budget.** A run starts with 3,000,000 tokens unless you name another figure, and pauses there for your decision. A budget at or below what the run has already used is refused, since it could only stop the members mid-work.
+
+**Tokens are counted.** The pane shows tokens per member and for the run, against the budget when there is one. The count is input, cache writes and output, plus cache reads at a tenth, and it is taken at every model step, so a budget is noticed mid-turn. The count is saved with the run, so resuming the coordinator keeps the total and enforces the same budget. Usage from before this change cannot be recovered. A task of 50,000 characters or more, such as a pasted log, is saved to `.swarm/task-<time>.md`: the coordinator gets its first 6,000 characters, its last 2,000 and the path, and reads what it needs from the file, because text held in the conversation is re-read at every step of the run.
 
 **Members read only what is theirs.** A member sees in full only the posts that mention it; the rest of the board costs it one line per post. Each member type also carries a role skill that tells it to search before it reads and to stay inside its piece.
 

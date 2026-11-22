@@ -69,8 +69,12 @@ REWORK_WARNING, REWORK_PAUSE = 2, 3  # failed verification cycles in a row
 SPEND_FLOOR = 200_000  # a share of less says nothing about the run
 SPEND_SHARE, PAIR_SHARE = 1 / 2, 3 / 4  # of the run's tokens with three or more members using any, of the pair's with two
 # Spent by a worker without posting or reading: it is going round in circles. A step is one model response,
-# so a long stretch of honest edits stays well under it.
-LOOP_STEPS, LOOP_TOKENS = 150, 150_000
+# so a long stretch of honest edits stays well under it. Each step re-reads the member's conversation, some 14,000
+# charged tokens at 100,000 held, so the token count is set to about as many steps and catches the heavier ones.
+LOOP_STEPS, LOOP_TOKENS = 150, 2_000_000
+# No run is without a bound: one made with no budget named pauses here and the user is asked. Seen live: a run nobody
+# had capped spent 7.8M tokens before the user looked. Five members on a task of a few files use about this much.
+DEFAULT_BUDGET = 3_000_000
 TURNS_KEPT = 2000
 COMMIT = re.compile(r"(?:[a-f0-9]{40}|[a-f0-9]{64})")
 RUN_NAME = re.compile(r"[a-zA-Z0-9_.-]+-\d{8}-\d{6}x*")
@@ -93,6 +97,11 @@ QUOTED = re.compile(r"(?P<f>`{3,}).*?(?P=f)`*|%s {0,3}(?P<t>~{3,}).*?%s {0,3}(?P
 # One blank after the mark and one before the colon are enough to look for: the class between them takes any more,
 # and a quantifier on each blank would backtrack cubically on a long run of spaces.
 QUESTION = re.compile(r"(?<![ \t]\?)(?:(?<![ \t])\?|\?(?![ \t][^\n?]*[ \t]:))(?!\?|\.?[A-Za-z0-9_]|:)")
+# An optional type named in prose asks nothing either: "inferred String? because", "takes Int?, so". A capitalised
+# word with a lowercase letter, its mark followed by a word that carries the statement on. At a line's end, or
+# before any other word, it still reads as a question: "may I edit ListView? it is outside my paths" asks.
+OPTIONAL = re.compile(r"(?<![@A-Za-z0-9_])[A-Z][A-Z0-9_]*[a-z][A-Za-z0-9_]*\?"
+                      r"(?=[ \t]+(?:because|since|so|and|but|as|is|was|are|were|in|at|on|by|for|from|to|with|not)(?![A-Za-z0-9_])|[,;\]>])")
 SUMMARY_CHARS = 200
 ARG_COUNTS = {
     "init": (1, None), "restore": (1, 1), "adopt": (2, None), "locate": (2, None),
@@ -725,7 +734,7 @@ def unanswered(members, posts):
             else:
                 pending.pop(pair, None)
             target = successor(recipient, members)
-            if QUESTION.search(text) and target in members and not members[target].get("killed"):
+            if QUESTION.search(OPTIONAL.sub(" ", text)) and target in members and not members[target].get("killed"):
                 pending.setdefault((sender, target), {})[str(post["seq"])] = post["seq"]
     # A removed member is waiting for nothing: its questions close with it.
     return sorted((seq, asker, recipient) for (asker, recipient), seqs in pending.items() for seq in seqs.values()
@@ -1139,9 +1148,12 @@ def init(d, title):
                           "Verification leaves it out of the source fingerprint either way."
                           % os.path.join(parent, ".gitignore"), file=sys.stderr)
         open(os.path.join(d, "board.jsonl"), "a").close()
-        save(d, {"title": title, "members": {COORDINATOR: {"role": COORDINATOR, "last_read_seq": 0}}})
+        save(d, {"title": title, "members": {COORDINATOR: {"role": COORDINATOR, "last_read_seq": 0}},
+                 "limits": {"budget": str(DEFAULT_BUDGET)}})
         atomic_write(os.path.join(parent, "current"), run + "\n")
     print(d)
+    print("note: the run pauses at %s tokens unless the user names another budget: limit budget=<tokens>, or budget= for none"
+          % f"{DEFAULT_BUDGET:,}", file=sys.stderr)
 
 
 def main(argv):
@@ -1482,6 +1494,13 @@ def main(argv):
                         sys.exit("%s=%s: list agent types (%s), member names, or none" % (model, changes[model], ", ".join(DEFAULTS)))
                     if token not in members:  # a name registered later is fine; a typo would lock the model for everyone
                         print("note: %s=%s names no agent type and no member yet. Types are: %s" % (model, token, ", ".join(DEFAULTS)))
+            # A budget the run has already spent could only stop it at once, members mid-work and a verifier mid-test
+            # included. Seen live: a coordinator asked to "limit the tokens" set 1.3M on a run that had used 7.7M.
+            used = sum(state.get("usage", {}).get("tokens", {}).values())
+            if changes.get("budget") and not state.get("paused") and 0 < int(changes["budget"]) <= used:
+                sys.exit("The run has already used %s tokens, so budget=%s would pause it at once and stop every member "
+                         "mid-work. Set a budget above what is used (used plus what the rest may cost), or stop the run "
+                         "with pause" % (f"{used:,}", changes["budget"]))
             limits = state.setdefault("limits", {})
             for k, v in changes.items():
                 if v == "" or (k in ("budget", "member_budget") and not int(v)):  # a budget of zero is no budget

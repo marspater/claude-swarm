@@ -1160,6 +1160,30 @@
   {
    "text": "here\u00a0?",
    "expect": true
+  },
+  {
+   "text": "$0 inferred String? because guid takes String?; now typed",
+   "expect": false
+  },
+  {
+   "text": "returns [Int?], and URLSession? in both",
+   "expect": false
+  },
+  {
+   "text": "should this take a String?",
+   "expect": true
+  },
+  {
+   "text": "is it OK? then I go on",
+   "expect": true
+  },
+  {
+   "text": "@Parser? are you there",
+   "expect": true
+  },
+  {
+   "text": "may I edit ArticleListView? it is outside my paths",
+   "expect": true
   }
  ],
  "kind": [

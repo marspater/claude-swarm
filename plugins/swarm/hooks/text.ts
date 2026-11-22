@@ -12,7 +12,10 @@ export const unquoted = (text: string) => text.replace(QUOTED, ' ')
 // The board's QUESTION: a question mark that asks, in a run of them too ("sure??"), and none of `a ?? b`, `a?.b`,
 // `name?: type` or `c ? a : b`.
 const QUESTION_MARK = /(?<![ \t]\?)(?:(?<![ \t])\?|\?(?![ \t][^\n?]*[ \t]:))(?!\?|\.?\w|:)/
-export const hasQuestion = (text: string) => QUESTION_MARK.test(unquoted(text))
+// The board's OPTIONAL: an optional type named in prose ("inferred String? because") asks nothing. Only before a
+// word that carries a statement on: "may I edit ListView? it is outside my paths" still asks.
+const OPTIONAL = /(?<![@A-Za-z0-9_])[A-Z][A-Z0-9_]*[a-z][A-Za-z0-9_]*\?(?=[ \t]+(?:because|since|so|and|but|as|is|was|are|were|in|at|on|by|for|from|to|with|not)(?![A-Za-z0-9_])|[,;\]>])/g
+export const hasQuestion = (text: string) => QUESTION_MARK.test(unquoted(text).replace(OPTIONAL, ' '))
 
 // A long post is cut here until it is expanded.
 export const CLIP = 480

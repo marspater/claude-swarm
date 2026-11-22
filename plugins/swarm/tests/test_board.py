@@ -635,13 +635,15 @@ def audit(name):
     run(wakes, "post", "coordinator", "@w four")
     assert len(run(wakes, "claim", "w", "agent-w", "4").strip()) == 32
 
-    # A budget set at or below what is already spent pauses the run and says so.
+    # A budget at or below what is already spent is refused: it could only stop the run at once, mid-work.
     money = fresh("Budget")
     run(money, "account", "1" * 64, "coordinator", "50")
-    assert "paused: token budget of 40 spent" in run(money, "limit", "budget=40")
-    assert "(paused)" in run(money, "status") and "token budget of 40 spent" in run(money, "attention")
+    for under in ("40", "50"):
+        refused = subprocess.run([sys.executable, BOARD, money, "limit", "budget=" + under], capture_output=True, text=True)
+        assert refused.returncode and "already used 50 tokens" in refused.stderr, refused
+    # and the budget stays the one every run starts with, so none is without a bound
+    assert "(paused)" not in run(money, "status") and saved(money)["limits"] == {"budget": "3000000"}
     run(money, "limit", "budget=60")
-    run(money, "resume")
     run(money, "pause", "awaiting a decision")
     run(money, "account", "2" * 64, "coordinator", "20")
     assert "token budget is spent (70 of 60)" in run(money, "attention")  # the pause names another reason
@@ -746,6 +748,8 @@ def audit(name):
     assert "@v" in run(quiet, "ready", "third", stdin="fixed too").splitlines()[0]
     os.unlink(record)
     # the plan says what the run has no guard against
+    assert "no token budget" not in run(team, "plan")  # every run starts with one
+    run(team, "limit", "budget=")
     plan = run(team, "plan")
     assert "no token budget" in plan and "@all wakes all" in plan
     run(team, "limit", "budget=1000")
@@ -1771,7 +1775,9 @@ class BoardRegressions(unittest.TestCase):
         assert not self.items(d, "spend")  # 70% of the pair
         self.account(d, "agent-a", 50_000)
         assert [item["member"] for item in self.items(d, "spend")] == ["a"]  # 76%
-        assert [item["member"] for item in self.items(d, "loop")] == ["a"]  # 190,000 tokens without a post or a read
+        assert not self.items(d, "loop")  # 190,000 tokens are a dozen honest steps: each one re-reads the conversation
+        self.account(d, "agent-a", 1_900_000)
+        assert [item["member"] for item in self.items(d, "loop")] == ["a"]  # 2,090,000 tokens without a post or a read
         run(d, "post", "a", "@b still on it")
         assert not self.items(d, "loop")
         for _ in range(148):  # its 149th step since it began
@@ -1939,7 +1945,7 @@ class BoardRegressions(unittest.TestCase):
         for case in vectors["quoted"]:
             assert board.QUOTED.sub(" ", case["text"]) == case["expect"], case
         for case in vectors["question"]:
-            assert bool(board.QUESTION.search(board.QUOTED.sub(" ", case["text"]))) == case["expect"], case
+            assert bool(board.QUESTION.search(board.OPTIONAL.sub(" ", board.QUOTED.sub(" ", case["text"])))) == case["expect"], case
         for case in vectors["kind"]:
             word = board.REPORT_WORD.match(case["text"])
             assert (word[1] if word else "") == case["expect"], case

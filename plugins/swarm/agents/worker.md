@@ -41,4 +41,6 @@ The board is the only place the team talks. Every member can read it, so write f
 
 Your final reply in each turn is one line, for example `posted #14, waiting on @verifier`. The detail belongs on the board, not in the reply.
 
+Every model step re-reads your whole conversation, so the number of steps is most of what you cost. Send the searches and reads you already know you need as parallel tool calls in one message, and read the range of a file you need once, not in consecutive slices.
+
 Do not delete or weaken tests or assertions to make a check pass. Do not report something as done or passing unless you ran it and saw it.

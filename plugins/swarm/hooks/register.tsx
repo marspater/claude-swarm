@@ -3,7 +3,7 @@ import { atom, read, update } from 'claude-code'
 import type { AgentInfo, EngineInterface, Register, SessionMessage, Timer, ToolCallResult } from 'claude-code'
 
 import type { Member, Post, Swarm, Tab } from '../types'
-import { COORDINATOR_READ, NAMES_COMMIT, RUN, boardCalls, type ParsedBoardCall, runsNamed, substitutions, wakeMessage, wakeSequence } from './command'
+import { COORDINATOR_READ, NAMES_COMMIT, RUN, boardCalls, type ParsedBoardCall, runsNamed, scanShell, shellWords, substitutions, unwrap, wakeMessage, wakeSequence } from './command'
 import { actsAsAnother, commitsInSharedCheckout, normalizePath, resolveRealPath } from './guard'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, LATEST, SPECIALISTS, SWARM_AGENTS, familyOf, latestOf } from './models'
 import { KEPT, budgetOf, findAgent, ledger, memberNamed, mentions, parse, parsePosts, postFields, targets, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
@@ -372,6 +372,10 @@ const ROUTINE_GRACE_MS = 600_000
 // The coordinator's conversation at this size makes every further wake dear: the person is told once per run.
 const HEAVY_CONVERSATION = 180_000
 let owed = NONE
+// A task of this many characters is saved to a file, and this much of its start stays in the conversation.
+const TASK_CHARS = 50_000
+const TASK_HEAD = 6_000
+const TASK_TAIL = 2_000
 // A conversation this long is worth a word before a run starts in it: about half of what the coordinator's last run averaged.
 const LONG_CONVERSATION = 120_000
 // Posts the coordinator has opened with `show`: the board still counts them unread, but it is not told of them again.
@@ -380,6 +384,8 @@ const shownPosts = { through: 0, posts: new Set<number>() }
 let owedSeqs: number[] = []
 let isOwedRoutine = false
 let heavyTold = ''
+// Counts the long tasks saved to files, so two saved in one second are two files.
+let tasksSaved = 0
 let hinted = 0
 let prompted = 0
 // A pause of the owned run that nobody was told about (the board pauses by itself when a member keeps failing
@@ -776,6 +782,19 @@ const headOf = ($: EngineInterface, checkout: string) =>
   $.process.run(['git', '-C', checkout, 'rev-parse', 'HEAD'], { timeoutMs: 5000 })
     .then(answer => answer.exitCode === 0 && COMMIT_ID.test(answer.stdout.trim()) ? answer.stdout.trim() : '', () => '')
 
+/** Whether a statement runs a variable that holds the board script, with `init` after it: `S=…/board.py; python3 $S <run> init …`. */
+function runsHeldInit(command: string): boolean {
+  const held = [...command.matchAll(/(?:^|[\s;&|(])([A-Za-z_]\w*)=(?:"[^"\n]*board\.py[^"\n]*"|'[^'\n]*board\.py[^'\n]*'|[^\s"';&|]*board\.py)(?=[\s;&|]|$)/g)].map(match => match[1])
+  return held.length > 0 && scanShell(command).some(({ text }) => {
+    const words = shellWords(unwrap(text).text)
+    const at = words.findIndex(word => held.some(name => word === `$${name}` || word === `\${${name}}`))
+    // The variable is what runs: first, or after a launcher and its options. `echo $S init` runs echo.
+    const isRun = at === 0 || (at > 0 && /^(?:\S*\/)?(?:python3?(?:\.\d+)?|uv)$/.test(words[0]!) &&
+      words.slice(1, at).every(word => word === 'run' || word.startsWith('-')))
+    return isRun && words.includes('init', at + 1)
+  })
+}
+
 // What the coordinator is told when it makes a run. A run can be started from memory, with no /swarm:swarm in the
 // turn and so none of the skill's current rules; and every wake re-reads the whole conversation, so a run started
 // in a long one pays for that history each time.
@@ -872,7 +891,7 @@ async function memberCall($: EngineInterface, call: MemberCall, activeDir: strin
   } else if (call.tool === 'Bash') {
     const spoof = actsAsAnother(command, memberName, member)
     if (spoof) {
-      return { deny: `The board refused this command: ${spoof}. Use the board tool, which acts as you, or the board command under your own name.` }
+      return { deny: `The board refused this command: ${spoof}. Nothing in it ran, whatever was chained before the board command included: run that part again on its own. Use the board tool, which acts as you, or the board command under your own name.` }
     }
     const checkout = activeDir.slice(0, activeDir.lastIndexOf('/.swarm/'))
     if (isShared && await commitsInSharedCheckout($, command, checkout)) {
@@ -2329,25 +2348,34 @@ export const register: Register = on => {
         notesOwed.push(`${moved} while @${headWatch.name} ran a Bash command. Another actor may have moved it, and nothing was undone: check git log before the next candidate.`)
       }
     }
+    // In a substitution the folder is not printed: the script typed out, or a variable of this command that holds it.
+    const isHiddenInit = substitutions(command).some(body => /\bboard\.py\b[^\n;|&]*\sinit\s/.test(body) ||
+      runsHeldInit(`${command.replace(/\$\([\s\S]*$/, '')}\n${body}`))
     if (e.tool === 'Bash' && e.agentId === undefined && !result.isError && !result.deny && !calls.some(c => c.action === 'init') &&
-      substitutions(command).some(body => /\bboard\.py\b[^\n;|&]*\sinit\s/.test(body))) {
+      (isHiddenInit || runsHeldInit(command))) {
       // `R=$(board.py … init …)` keeps the folder out of the output and the call out of what is read off the
       // command. Read loosely, however the script is run, but only inside a substitution: the same words in a
       // quoted string or a heredoc make no run. The pointer `init` just wrote names the run; the board refuses
       // one another conversation owns.
+      // `S=…/board.py; python3 $S … init …` hides the script behind a variable instead: a statement must run that
+      // variable with `init` after it, and the command must have printed the run folder the pointer names, as
+      // `init` does. Text that only prints such words runs nothing and makes no run.
       // The new run also takes the place of one this conversation drove and closed, as a plain `init` does.
+      let isMade = isHiddenInit
       try {
+        const root = `${await $.session.cwd()}/.swarm`
+        const name = (await $.fs.read(`${root}/current`)).trim()
+        const made = /^[\w.-]+$/.test(name) && RUN.test(`${root}/${name}`) ? `${root}/${name}` : ''
+        const printed = String((raw.result as { stdout?: unknown } | undefined)?.stdout ?? '').split('\n').map(line => line.trim())
+        // By its name: the folder is printed as the command spelled it, which a symlink or the letter case can vary.
+        isMade ||= made !== '' && printed.some(line => line.endsWith(`/.swarm/${name}`))
         const ownedNow = await read($, run)
-        if (ownedNow === '' || (ownedRoster?.dir === ownedNow && ownedRoster.closed)) {
-          const root = `${await $.session.cwd()}/.swarm`
-          const name = (await $.fs.read(`${root}/current`)).trim()
-          if (/^[\w.-]+$/.test(name) && RUN.test(`${root}/${name}`)) await bind($, `${root}/${name}`)
-        }
+        if (isMade && made && (ownedNow === '' || (ownedRoster?.dir === ownedNow && ownedRoster.closed))) await bind($, made)
       } catch {
         // No pointer, no run to claim.
       }
-      // Hidden in a substitution or not, it is an `init`: the same words go with it.
-      const notes = await initNotes($).catch(() => [])
+      // Hidden in a substitution, behind a variable or not, it is an `init`: the same words go with it.
+      const notes = isMade ? await initNotes($).catch(() => []) : []
       if (notes.length > 0 && result.deny === undefined && result.isError === undefined) result = { ...result, context: [...(result.context ?? []), ...notes] }
     }
     if (e.tool === 'Bash') result = await boardCallsRan($, e.agentId, calls, String((raw.result as { stdout?: unknown } | undefined)?.stdout ?? ''), result)
@@ -2826,6 +2854,26 @@ export const register: Register = on => {
 
     return {}
   })
+  // A task this long is mostly a paste: a log, a specification. A slash command's arguments reach the model twice,
+  // as typed and inside the skill, and the coordinator re-reads its whole conversation on every step. Seen live: a
+  // 370,000-character console log made a new run's first step cost 440,000 tokens and each later one 45,000. The
+  // whole text goes to a file the coordinator reads from, and the task keeps its two ends, where the request is.
+  on('command.run', async ($, e, next) => {
+    if (!/^(?:swarm:)?swarm$/.test(e.command) || e.args.length < TASK_CHARS) return next(e)
+    let args = e.args
+    try {
+      const stamp = `${new Date(await $.clock.now()).toISOString().replace(/\D/g, '').slice(0, 14)}-${++tasksSaved}`
+      // The conversation's own key in the name: two tasks sent in one second from two conversations are two files.
+      const path = `${await $.session.cwd()}/.swarm/task-${stamp}-${(await lookupKey($)).slice(0, 8)}.md`
+      await $.fs.write(path, e.args)
+      const size = e.args.length.toLocaleString('en-US')
+      args = `${e.args.slice(0, TASK_HEAD)}\n\n[Swarm: the task is ${size} characters long, and its middle is left out here. All of it is in ${path}. What you keep in this conversation is re-read at every step of the run: search that file with Grep and read the parts the task needs, all of it only when it is a specification to follow as a whole, and give a member the path and the lines to look at instead of pasting from it. The task ends:]\n\n${e.args.slice(-TASK_TAIL)}`
+      $.ui.toast(`Swarm: the task holds ${size} characters, so the coordinator got its start and its end and reads the rest from ${path}. Held in the conversation, every step of the run would re-read it.`)
+    } catch {
+      // The file could not be written: the task goes on whole.
+    }
+    return next(args === e.args ? e : { ...e, args })
+  })
 
   on('ui.open', { id: PANE }, async ($, e, next) => {
     isPaneOpen = true
@@ -3172,23 +3220,20 @@ export const register: Register = on => {
       const matching = terms.length === 0
         ? available
         : available.filter(post => terms.every(term => matchesTerm(post, term)))
-      const search = (
-        <Box flexDirection="row" alignItems="center" columnGap={1} flexWrap="wrap" marginTop={1}>
+      const search = [
           <Input
             key="board-search"
             placeholder="Filter: text, @name, from:, to:, kind:"
             value={rawQuery}
             submitLabel="Filter"
             onSubmit={value => update($, query, () => value.trim())}
-          />
-          {terms.length > 0 && (
+          />,
+          terms.length > 0 && (
             <Button key="board-search-clear" plain label={`Clear filter (${matching.length} of ${available.length})`} onPress={() => update($, query, () => '')} />
-          )}
-        </Box>
-      )
+          ),
+      ]
       // The person posts in the coordinator's name, and the coordinator is told with its next tool call.
       const compose = isDriven && (
-        <Box flexDirection="row" alignItems="center" marginTop={1}>
           <Input
             key="board-compose"
             placeholder="Post to the board as the coordinator"
@@ -3214,6 +3259,12 @@ export const register: Register = on => {
               await refresh($)
             }}
           />
+      )
+      // Posting and filtering share one row, and the filter wraps under the post field where the pane is too narrow.
+      const bar = (isSearchable: boolean) => (compose || isSearchable) && (
+        <Box flexDirection="row" alignItems="center" columnGap={1} rowGap={1} flexWrap="wrap" marginTop={1}>
+          {compose}
+          {isSearchable && search}
         </Box>
       )
       const selected = !collapsed && open > 0 ? matching.find(post => post.seq === open) : undefined
@@ -3246,8 +3297,7 @@ export const register: Register = on => {
       body =
         visible.length === 0 ? (
           <Box flexDirection="column">
-            {compose}
-            {shown.posts.length > 0 && search}
+            {bar(shown.posts.length > 0)}
             <Box marginTop={1}>
               <Text dimColor>{shown.posts.length > 0 ? 'No posts match the filter.' : browsed?.boardUnavailable ? 'Board data unavailable: its board could not be read.' : 'No posts yet.'}</Text>
             </Box>
@@ -3255,8 +3305,7 @@ export const register: Register = on => {
           </Box>
         ) : (
           <Box flexDirection="column" gap={1}>
-            {compose}
-            {search}
+            {bar(true)}
             {terms.length === 0 && shown.posts.length > 1 && (
               <Button
                 key="collapse-history"

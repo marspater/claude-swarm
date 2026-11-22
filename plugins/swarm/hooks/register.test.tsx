@@ -1385,6 +1385,37 @@ function owning(on: On, files: { board: () => string; roster: () => string; sess
 const posts = (...list: { agent: string; to: string[]; text: string }[]) =>
   list.map((post, index) => JSON.stringify({ ...post, seq: index + 1, time: '2026-11-16T14:03:22+0100' })).join('\n') + '\n'
 
+test('a task too long to hold is saved to a file, and the coordinator gets its two ends and the path', async ($, on) => {
+  const { seen } = owning(on, { board: () => '', roster: () => '{}' })
+  const written: Record<string, string> = {}
+  const ran: string[] = []
+  on('fs.write', (_, e) => {
+    written[e.path] = e.text
+    return { value: undefined }
+  })
+  on('command.run', (_, e) => {
+    ran.push(e.args)
+    return { text: '' }
+  })
+  mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  const swarm = (args: string) => $.command.run({ command: 'swarm:swarm', args, origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 80 } })
+  await swarm('fix the parser')
+  expect([ran, written]).toEqual([['fix the parser'], {}])
+  const long = `fix what this log shows\n${'x'.repeat(60_000)}\nand keep the parser's tests green`
+  await swarm(long)
+  const [path = ''] = Object.keys(written)
+  expect(path).toMatch(/^\/project\/\.swarm\/task-\d{14}-\d+-[0-9a-f]{8}\.md$/)
+  // a second one in the same second is a second file
+  await swarm(`${long} too`)
+  expect(Object.keys(written).length).toBe(2)
+  expect(written[path]).toBe(long)
+  expect(ran[1]!.length).toBeLessThan(9_000)
+  expect(ran[1]).toMatch(/^fix what this log shows\n[^]*and keep the parser's tests green$/)
+  expect(ran[1]).toContain(`All of it is in ${path}`)
+  expect(seen.toasts.join(' ')).toContain('60,058 characters')
+})
+
 test('where no main view can be moved the pane shows the member\'s conversation, and its posts only when that cannot be read', async ($, on) => {
   const { seen, answer, board } = owning(on, { board: () => BOARD, roster: () => ROSTER })
   on('process.run', (_, e) => answer(board(e)))
@@ -3329,7 +3360,8 @@ test('a run made inside a command substitution takes the place of the closed run
   })
   on('process.run', (_, e) => answer(board(e)))
   on('agent.list', () => ({ value: [] }))
-  on('tool.call', () => ({ result: { stdout: '', stderr: '' } }))
+  let printed = ''
+  on('tool.call', () => ({ result: { stdout: printed, stderr: '' } }))
   mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
   await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
@@ -3337,6 +3369,22 @@ test('a run made inside a command substitution takes the place of the closed run
   // text that only mentions an init, in a quoted string or a heredoc, makes no run
   const noted = await toolCall($, { tool: 'Bash', command: `cat <<'EOF'\nR=$(python3 /p/board.py /project/.swarm/next init "Next")\nEOF\necho 'board.py x init y'` })
   expect(noted.context ?? []).toEqual([])
+  // a script held in a variable is an init once the command printed the run folder the pointer names
+  printed = '/p/board.py\n/Project/.swarm/next-20261117-101010\n'
+  const held = await toolCall($, { tool: 'Bash', command: 'S=/p/board.py; ls $S && python3 $S /project/.swarm/next init "Next"' })
+  expect(held.context?.join(' ')).toContain('A run was made')
+  expect(seen.restore).toBe(OWNED)
+  // text that prints the same words and the folder runs no init
+  const faked = await toolCall($, { tool: 'Bash', command: `printf '%s\\n' 'S=/p/board.py; python3 $S x init y' /project/.swarm/next-20261117-101010` })
+  expect(faked.context ?? []).toEqual([])
+  // nor does a command that only names the variable: echo runs, not the script
+  const named = await toolCall($, { tool: 'Bash', command: 'S=/p/board.py; echo $S init; echo /project/.swarm/next-20261117-101010' })
+  expect(named.context ?? []).toEqual([])
+  printed = ''
+  // the variable run inside a substitution prints no folder and is an init all the same
+  const both = await toolCall($, { tool: 'Bash', command: 'S=/p/board.py; R=$(python3 $S /project/.swarm/next init "Next")' })
+  expect(both.context?.join(' ')).toContain('A run was made')
+  expect(seen.restore).toBe(OWNED)
   // while the owned run is open, a run made in a substitution does not take the conversation from it
   await toolCall($, { tool: 'Bash', command: 'R=$(python3 /p/board.py /project/.swarm/next init "Next")' })
   expect(seen.restore).toBe(OWNED)
