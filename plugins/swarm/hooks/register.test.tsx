@@ -1700,6 +1700,69 @@ test('each model step is charged once, a spent budget stops members mid-turn and
   expect(binds()).toBe(2)
 })
 
+// A run at 95 tokens of a budget of 100 whose board refuses `account` while `isFailing` is set: each attempt's report
+// key is kept, so a retry can be checked against the attempt it repeats.
+async function nearBudget($: Parameters<Extract<Parameters<typeof test>[1], (...args: never[]) => unknown>>[0], on: On) {
+  const state = {
+    title: 'Demo swarm', limits: { budget: '100' }, closed: false, paused: undefined as string | undefined,
+    usage: { tokens: { coordinator: 95 } as Record<string, number> },
+    members: { coordinator: { role: 'coordinator', last_read_seq: 0 } },
+  }
+  const { seen, answer, board } = owning(on, { board: () => posts({ agent: 'coordinator', to: [], text: 'started' }), roster: () => JSON.stringify(state) })
+  const clock = mock.clock(on)
+  const charged = new Set<string>()
+  const fixture = { state, clock, seen, isFailing: true, failed: [] as string[], landed: [] as string[] }
+  on('process.run', async (_, e) => {
+    const stdout = board(e)
+    if (e.argv[3] !== 'account') return answer(stdout)
+    const [turn = '', actor = '', count] = e.argv.slice(4)
+    if (fixture.isFailing) {
+      fixture.failed.push(turn)
+      return { value: { exitCode: 1, stdout: '', stderr: 'disk full', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    fixture.landed.push(turn)
+    if (!charged.has(turn)) state.usage.tokens[actor] = (state.usage.tokens[actor] ?? 0) + Number(count)
+    charged.add(turn)
+    const total = Object.values(state.usage.tokens).reduce((sum, value) => sum + value, 0)
+    const paused = !state.paused && total >= 100
+    if (paused) state.paused = 'token budget of 100 spent'
+    return answer(JSON.stringify({ title: state.title, total, budget: 100, paused }))
+  })
+  on('tool.call', () => ({ result: {} }))
+  on('turn.step', async function* (_, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'tool_use' as const, usage: { model: 'm', input_tokens: 10, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }
+  })
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  return fixture
+}
+const ends = { answer: '', durationMs: 1, isAborted: false, reason: 'answer' } as const
+
+test('a turn\'s end whose write failed is charged in full when it is reported again, under the same report', async ($, on) => {
+  const run = await nearBudget($, on)
+  const ten = { model: 'm', input_tokens: 10, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+  await $.turn.complete({ ...ends, turnId: 'r', usage: ten })
+  expect([run.state.usage.tokens.coordinator, run.failed.length]).toEqual([95, 1])
+  run.isFailing = false
+  await $.turn.complete({ ...ends, turnId: 'r', usage: ten })
+  expect([run.state.usage.tokens.coordinator, run.state.paused, run.landed]).toEqual([105, 'token budget of 100 spent', run.failed])
+  expect(run.seen.prompts.map(text => text.split('\n')[0])).toEqual(['Swarm: Run paused at token budget'])
+  // once it landed, a further report adds nothing
+  await $.turn.complete({ ...ends, turnId: 'r', usage: ten })
+  expect([run.state.usage.tokens.coordinator, run.landed.length]).toEqual([105, 1])
+})
+
+test('a step whose write failed is charged at its turn\'s end under its own report, though the end carries no usage', async ($, on) => {
+  const run = await nearBudget($, on)
+  for await (const _ of $.turn.step({ turnId: 's', index: 0, model: 'm', messageCount: 1 })) { /* no chunks */ }
+  await run.clock.advance(1)
+  expect([run.state.usage.tokens.coordinator, run.failed.length]).toEqual([95, 1])
+  run.isFailing = false
+  await $.turn.complete({ ...ends, turnId: 's' })
+  expect([run.state.usage.tokens.coordinator, run.state.paused, run.landed]).toEqual([105, 'token budget of 100 spent', run.failed])
+  expect(run.seen.prompts.map(text => text.split('\n')[0])).toEqual(['Swarm: Run paused at token budget'])
+})
+
 test('the run is bound from its first planning command, and only a real read of its board answers its mentions', async ($, on) => {
   const roster = JSON.stringify({ title: 'Demo swarm', members: { coordinator: { role: 'coordinator', last_read_seq: 0 }, parser: { role: 'worker', id: 'a1', last_read_seq: 1 } } })
   const { seen, answer, board } = owning(on, { board: () => posts({ agent: 'parser', to: ['coordinator'], text: '@coordinator which file?' }), roster: () => roster })

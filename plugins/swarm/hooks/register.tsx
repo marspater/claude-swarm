@@ -279,7 +279,8 @@ let hadRun = false
 let halted: { dir: string; why: string } | undefined
 // What each turn's model steps have been charged so far, so its end charges only what no step reported.
 const stepped = ledger()
-// The run the coordinator drove when a turn of its own last stepped, until that turn ends.
+// The run the coordinator drove when a turn of its own last stepped. Kept past the turn's end, so a replayed end still
+// finds it: the oldest go first.
 const turnRuns = new Map<string, string>()
 // Past this many running turns, those of agents that have ended are looked for and dropped.
 const TURNS_KEPT = 256
@@ -1630,16 +1631,17 @@ function forgetKills(): void {
 }
 
 // Charges `amount` tokens to the actor's run under `report`, a name the board records once: a model step
-// (`<turn>:<index>`) as it answers, and a turn's end (`<turn>`) for what no step reported. False when the
-// charge is still owed: no run to charge yet, or the board did not take it.
-async function account($: EngineInterface, report: string, agentId: string | undefined, amount: number, at?: string): Promise<boolean> {
-  if (!Number.isSafeInteger(amount) || amount <= 0 || (agentId && strangers.has(agentId) && !agentRuns.has(agentId))) return false
+// (`<turn>:<index>`) as it answers, and a turn's end (`<turn>`) for what no step reported. False when the board
+// did not take it, so it is retried under the same report; undefined when it was never sent (nothing to charge, or no
+// run to charge yet), so a step's falls to its turn's end.
+async function account($: EngineInterface, report: string, agentId: string | undefined, amount: number, at?: string): Promise<boolean | undefined> {
+  if (!Number.isSafeInteger(amount) || amount <= 0 || (agentId && strangers.has(agentId) && !agentRuns.has(agentId))) return undefined
 
   const agent = agentId ? await $.agent.list().then(agents => agents.find(one => one.id === agentId)).catch(() => undefined) : undefined
   const address = agentId && (teammateOf($, agentId, agent) ?? agentId)
   // AT is the run the coordinator drove when it spent this: a charge that waits is not another run's by the time it lands.
   const dir = agentId ? await agentRun($, agentId, agent) : at || await read($, run)
-  if (!dir) return false
+  if (!dir) return undefined
   // A closed run is charged nothing more and is no longer this conversation's run: what the coordinator does next is not its work.
   const isClosed = await $.fs.read(`${dir}/members.json`)
     .then(text => (JSON.parse(text) as { closed?: boolean }).closed === true).catch(() => false)
@@ -2959,7 +2961,8 @@ export const register: Register = on => {
           .then(() => judging)
           .then(() => account($, `${e.turnId}:${e.index}`, e.agentId, delta, at))
           .catch(() => false)
-          .then(landed => { if (landed) stepped.landed(turn, delta) })
+          // One never sent is no longer pending under its own report: its turn's end charges it.
+          .then(landed => { if (landed !== false) stepped.landed(turn, landed ? delta : 0, e.index) })
         try {
           // Only a step of this run's own spends its budget: the coordinator's, or an agent already known to be a member.
           at = e.agentId === undefined ? (await read($, run)) || undefined : undefined
@@ -2984,6 +2987,8 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     moods.delete(e.agentId ?? 'coordinator')
 
+    // Whether this end put anything on the board, so the pane shows it at once.
+    let isCharged = false
     try {
       try {
         // The steps first: what they could not charge is this report's, and a pause one of them set must be known here.
@@ -2992,10 +2997,26 @@ export const register: Register = on => {
           seen = turn.landing
           await seen
         }
-        // What its steps left uncharged goes to the run they were spent under, where one was driven then.
+        // What its steps left uncharged goes to the run they were spent under, where one was driven then: a step charge
+        // the board did not take is retried under its own report, so the board still records it once, and the rest
+        // under the turn's. Kept for the run, not dropped: a replayed end, or one that fails, still finds it.
         const at = turnRuns.get(e.turnId)
-        turnRuns.delete(e.turnId)
-        await account($, e.turnId, e.agentId, e.usage ? stepped.charge(e.turnId, e.usage) : 0, at).catch(() => undefined)
+        const turn = stepped.of(e.turnId)
+        // Each one left was sent and not taken, so it stays pending until the board takes it under its own report, even
+        // when it cannot be sent now: charged under the turn's, it could be taken twice.
+        for (const [index, amount] of turn ? [...turn.pending] : []) {
+          if (await account($, `${e.turnId}:${index}`, e.agentId, amount, at).catch(() => false)) {
+            stepped.landed(turn!, amount, index)
+            isCharged = true
+          }
+        }
+        const owed = stepped.charge(e.turnId, e.usage)
+        if (await account($, e.turnId, e.agentId, owed, at).catch(() => false)) {
+          // The ledger may have been cleared meanwhile (a new session): nothing is left to mark.
+          const ended = stepped.of(e.turnId)
+          if (ended) stepped.landed(ended, owed)
+          isCharged = true
+        }
       } finally {
         // Only once its usage is on the board: a poll in between would act on the roster as it was before a budget pause.
         if (e.agentId === undefined) {
@@ -3024,7 +3045,7 @@ export const register: Register = on => {
         const address = teammateOf($, e.agentId, agent)
         if (dir) await boardCommand($, dir, ['rearm', String(Math.ceil(e.durationMs)), e.agentId, ...(address ? [address] : [])]).catch(() => undefined)
       }
-      if (e.agentId !== undefined || e.usage) $.clock.after(0, () => void refresh($))
+      if (e.agentId !== undefined || e.usage || isCharged) $.clock.after(0, () => void refresh($))
     } catch {
       // A usage failure must not change how a turn ends.
     }

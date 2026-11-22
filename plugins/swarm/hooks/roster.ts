@@ -34,9 +34,10 @@ export function tokensUsed(tokens?: Record<string, unknown> | null): number {
 export type Spent = { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number }
 export const weigh = (spent: Spent | undefined) => spent === undefined ? 0
   : (spent.input_tokens || 0) + (spent.cache_creation_input_tokens || 0) + (spent.output_tokens || 0) + Math.round((spent.cache_read_input_tokens || 0) * 0.1)
-// `sum` is what the steps reported, `charged` the whole tokens the board took for them; `landing` settles once every
-// step charge sent so far has been answered.
-type Turn = { steps: Set<number>; sum: Spent; charged: number; landing: Promise<unknown>; agentId?: string; last: number }
+// `sum` is what the steps reported, `charged` the whole tokens the board took for the turn, `pending` each step charge
+// the board has not acknowledged yet, by step index; `landing` settles once every step charge sent so far has been answered.
+type Turn = { steps: Set<number>; sum: Spent; charged: number; pending: Map<number, number>; landing: Promise<unknown>; agentId?: string; last: number }
+const fresh = (agentId: string | undefined, last: number): Turn => ({ steps: new Set(), sum: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }, charged: 0, pending: new Map(), landing: Promise.resolve(), agentId, last })
 /**
  * What each turn's model steps have been charged so far, so its end charges only what the board did not take. A
  * running turn keeps its entry however long it runs or waits between steps, or its end would charge its steps a
@@ -61,25 +62,25 @@ export function ledger(kept = 256, graceMs = 600_000) {
       ended.clear()
     },
     /**
-     * What this report adds to the turn's charge: a step's own usage, or at the turn's end its whole usage less what the
-     * board took for its steps (`landed`). A step's share is what it adds to the turn's weighed sum, so cached reads
-     * round once over the turn, not once a step.
+     * What this report adds to the turn's charge: a step's own usage, or at the turn's end its whole usage (what its
+     * steps reported, when the end carries none) less what the board took (`landed`) and the step charges still pending,
+     * which are retried under their own report. A step's share is what it adds to the turn's weighed sum, so cached
+     * reads round once over the turn, not once a step. Nothing counts as charged until the board acknowledges it, so a
+     * failed write is owed again when the report is retried, and a retry after it landed adds nothing.
      */
-    charge(turnId: string, spent: Spent, index?: number, agentId?: string, now = 0): number {
+    charge(turnId: string, spent: Spent | undefined, index?: number, agentId?: string, now = 0): number {
       let turn = of(turnId)
       if (index === undefined) {
-        // Kept as charged in full, a turn with no step too: an end reported twice adds nothing the second time.
-        const total = weigh(spent)
-        const closed: Turn = turn ?? { steps: new Set(), sum: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }, charged: 0, landing: Promise.resolve(), agentId, last: now }
-        const owed = total - closed.charged
-        closed.charged = Math.max(closed.charged, total)
+        const closed = turn ?? fresh(agentId, now)
+        const pending = [...closed.pending.values()].reduce((sum, amount) => sum + amount, 0)
         end(turnId, closed)
-        return owed
+        return Math.max(0, weigh(spent ?? closed.sum) - closed.charged - pending)
       }
+      if (spent === undefined) return 0
       // A step that reports after its turn's end was charged with the end.
       if (ended.has(turnId)) return 0
       if (!turn) {
-        turn = { steps: new Set(), sum: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }, charged: 0, landing: Promise.resolve(), agentId, last: now }
+        turn = fresh(agentId, now)
         running.set(turnId, turn)
       }
       turn.last = now
@@ -87,10 +88,17 @@ export function ledger(kept = 256, graceMs = 600_000) {
       turn.steps.add(index)
       const before = weigh(turn.sum)
       for (const key of Object.keys(turn.sum) as (keyof Spent)[]) turn.sum[key] += spent[key] || 0
-      return weigh(turn.sum) - before
+      const delta = weigh(turn.sum) - before
+      if (delta > 0) turn.pending.set(index, delta)
+      return delta
     },
-    /** A step charge the board took. One it did not (no run bound yet, a failed command) is left to the turn's end. */
-    landed(turn: Turn, amount: number): void {
+    /**
+     * A charge the board took: step `index`'s, or the turn's end. A step charge it did not take (a failed command)
+     * stays pending, and the turn's end retries it under the step's own report; one never sent lands as 0, so the turn's
+     * end charges it under its own. A step settled twice (two ends retrying it at once) counts once.
+     */
+    landed(turn: Turn, amount: number, index?: number): void {
+      if (index !== undefined && !turn.pending.delete(index)) return
       turn.charged += amount
     },
     /** Ends the running turns of agents that are no longer live and stepped last `graceMs` or more ago. */

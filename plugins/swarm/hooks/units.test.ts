@@ -722,10 +722,15 @@ test('a turn that runs past any count keeps what its steps were charged until it
   // two thousand turns that all run at once, each charged one step
   for (let i = 0; i < 2000; i++) {
     expect(book.charge(`t${i}`, used, 0, `agent-${i % 3}`, i)).toBe(100)
-    book.landed(book.of(`t${i}`)!, 100)
+    book.landed(book.of(`t${i}`)!, 100, 0)
   }
   // each one's end charges only what its step did not: nothing, the first turn's included
   for (let i = 0; i < 2000; i++) expect(book.charge(`t${i}`, used)).toBe(0)
+  // an end counts as charged only once the board took it
+  for (let i = 0; i < 2000; i++) {
+    const owed = book.charge(`t${i}`, used)
+    book.landed(book.of(`t${i}`)!, owed)
+  }
   // the turns of an agent that ended are dropped only once it has been gone a while
   book.charge('live', used, 0, 'agent-0', 5000)
   book.charge('dead', used, 0, 'agent-9', 5000)
@@ -733,30 +738,48 @@ test('a turn that runs past any count keeps what its steps were charged until it
   expect(book.running).toBe(2)
   book.prune(id => id === 'agent-0', 6000)
   // the dead agent's turn left the running ones, and an end it still reports finds what its step was charged
-  for (const turnId of ['live', 'dead']) book.landed(book.of(turnId)!, 100)
+  for (const turnId of ['live', 'dead']) book.landed(book.of(turnId)!, 100, 0)
   expect([book.running, book.charge('live', used), book.charge('dead', used)]).toEqual([1, 0, 0])
 })
 
-test('a turn\'s end charges its whole usage less what the board took for its steps, cached reads rounded once over the turn', () => {
+test('a turn\'s end charges its whole usage less what the board took and what its steps still owe, cached reads rounded once over the turn', () => {
   const cached = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 5 }
   const both = { ...cached, cache_read_input_tokens: 10 }
-  // two steps of five cached reads: a charge of 1, then 0; the first write fails, so the end owes the 1
+  // two steps of five cached reads: a charge of 1, then 0; the first write fails, so it stays pending under its own report
   const failed = ledger()
   expect([failed.charge('t', cached, 0), failed.charge('t', cached, 1)]).toEqual([1, 0])
-  expect(failed.charge('t', both)).toBe(1)
+  expect([...failed.of('t')!.pending]).toEqual([[0, 1]])
+  expect(failed.charge('t', both)).toBe(0)
+  // its retry lands
+  failed.landed(failed.of('t')!, 1, 0)
+  expect([failed.of('t')!.pending.size, failed.charge('t', both)]).toEqual([0, 0])
   // the first write lands: the end owes nothing
   const landed = ledger()
   expect(landed.charge('t', cached, 0)).toBe(1)
-  landed.landed(landed.of('t')!, 1)
+  landed.landed(landed.of('t')!, 1, 0)
   expect([landed.charge('t', cached, 1), landed.charge('t', both)]).toEqual([0, 0])
   // a step reported twice is charged once
   expect(landed.charge('u', cached, 0)).toBe(1)
   expect(landed.charge('u', cached, 0)).toBe(0)
-  // an end reported twice is charged once, for a turn with steps and for one with none
-  expect([failed.charge('t', both), landed.charge('t', both)]).toEqual([0, 0])
+  // an end that carries no usage owes what its steps reported
+  const steps = ledger()
+  steps.charge('w', { ...cached, input_tokens: 7 }, 0)
+  steps.landed(steps.of('w')!, 8, 0)
+  steps.charge('w', { ...cached, input_tokens: 3 }, 1)
+  steps.landed(steps.of('w')!, 3, 1)
+  expect(steps.charge('w', undefined)).toBe(0)
+  // a step never sent falls to its turn's end, and a step settled twice counts once
+  const unsent = ledger()
+  expect(unsent.charge('x', { ...cached, input_tokens: 5 }, 0)).toBe(6)
+  unsent.landed(unsent.of('x')!, 0, 0)
+  unsent.landed(unsent.of('x')!, 6, 0)
+  expect(unsent.charge('x', undefined)).toBe(6)
+  // an end whose write failed is owed again; once it landed, it is charged once, for a turn with steps and for one with none
   const bare = ledger()
   const whole = bare.charge('v', both)
   expect(whole).toBeGreaterThan(0)
+  expect(bare.charge('v', both)).toBe(whole)
+  bare.landed(bare.of('v')!, whole)
   expect(bare.charge('v', both)).toBe(0)
   // a step that reports after its turn's end was charged with the end
   expect(bare.charge('v', cached, 0)).toBe(0)
