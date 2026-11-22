@@ -29,6 +29,16 @@ export function kindOf(text: string): { label: string; color: 'suggestion' | 'su
   return undefined
 }
 
+// What a post is, as the feed labels it: kindOf, save that a pass of a partial candidate says so and names the
+// workers it covered, in a tone of its own, since it is not the run's pass.
+export function verdictOf(post: Post):
+  (NonNullable<ReturnType<typeof kindOf>> & { covered?: string[] }) | undefined {
+  const kind = kindOf(post.text)
+  if (kind?.label !== 'VERIFIED' || post.partial !== true) return kind
+  const covered = post.members ?? []
+  return { label: 'Partial pass', color: 'warning', covered }
+}
+
 // Removes a leading kind token when the caller already renders it as a header chip.
 export function stripKind(text: string): string {
   return text.replace(/^(?:@[\w-]+[ \t,:]*)*(BRIEF|NOT PASSED|NOT VERIFIED|VERIFIED|READY|REVISE|FINDING|SHUTDOWN)\b[ \t:,-]*(?:\n|$)?/, '')

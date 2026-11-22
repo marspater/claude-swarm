@@ -9,15 +9,18 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
+import shutil
 import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
 sys.dont_write_bytecode = True
-from board import REPORT_WORD, atomic_write, latest_reports, load, load_state, readiness, save
+from board import REPORT_WORD, atomic_write, latest_reports, load, load_state, readiness, save, shown
 
 GIT_ENV_STRIP = {
     "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
@@ -46,16 +49,33 @@ def linked_worktrees(root):
     return inside
 
 
+def not_source(found, run_data=None):
+    """What the fingerprint leaves out, as paths Git names from the repository root: Swarm's run data (the project's
+    .swarm folder, or RUN_DATA for a checkout whose top folder is not the run's project) and linked worktrees inside
+    the repository. FOUND is what `repository` returns."""
+    root, own = found
+    return [run_data or own, *linked_worktrees(root)]
+
+
+def stage_paths(skip):
+    """The pathspecs that stage exactly what verification fingerprints, from any folder of the repository; SKIP is what
+    `not_source` returns. A plain `git add -A` would also stage run data the project's ignore rules let through, and a
+    linked worktree inside the repository as an embedded repository, neither of which any check read."""
+    return [":/", *(":(top,literal,exclude)" + os.fsdecode(b"/".join(path)) for path in skip)]
+
+
 def in_worktree(name, worktrees):
     parts = name.rstrip(b"/").split(b"/")
     return any(parts[:len(w)] == w for w in worktrees)
 
 
-def git(path, *args, optional=False):
+def git(path, *args, optional=False, index=None):
     try:
         # Git translates its messages; toplevel() reads one, so they are asked for untranslated.
         env = clean_env()
         env["LC_ALL"] = "C"
+        if index:  # an index of the caller's own, the repository's left as it is
+            env["GIT_INDEX_FILE"] = index
         result = subprocess.run(["git", "-C", str(path), *args], capture_output=True, env=env)
     except FileNotFoundError:
         if optional:
@@ -95,6 +115,12 @@ def toplevel(project):
         if "not a git repository" in str(error) or "Git is required" in str(error):
             return None
         raise ValueError(f"git could not read {project}: {error}") from None
+
+
+def checked_out(path):
+    """True when PATH is the top of a repository of its own, as a checked-out submodule is."""
+    top = toplevel(path) if (path / ".git").exists() else None
+    return top is not None and Path(os.fsdecode(top.rstrip(b"\n"))).resolve() == path.resolve()
 
 
 def repository(project):
@@ -144,9 +170,13 @@ def _hash_dir(digest, root_dir):
         _hash_entry(digest, root_dir / rel, (root_dir / rel).lstat().st_mode)
 
 
-def source_digest(project, nested=False, seen_roots=None):
+def source_digest(project, nested=False, seen_roots=None, pointers=False):
     """Fingerprint the sources. The project's own .swarm folder holds run data and is left out; a folder of that
-    name anywhere else, a nested repository's included, is the user's and counts as source."""
+    name anywhere else, a nested repository's included, is the user's and counts as source.
+    With POINTERS, as for an isolated candidate, a clean checked-out submodule stands for its commit, as an empty one
+    does: the integration checkout never has it checked out, and the commit that lands records only the pointer.
+    Without, the checks read the submodule's files in place, so a checked-out one is fingerprinted by its contents,
+    which staging its pointer does not change, and one deinitialised after a pass no longer matches it."""
     if seen_roots is None:
         seen_roots = set()
     resolved_project = project.resolve()
@@ -172,38 +202,42 @@ def source_digest(project, nested=False, seen_roots=None):
         files = found_files
         head = b"non-git"
     else:
-        root, run_data = found
+        root = found[0]
         # Every tracked name with its "mode object stage"; a submodule's mode is 160000 and its object the recorded commit.
         tracked = {name: meta.split() for meta, _, name in (
             entry.partition(b"\t") for entry in git(root, "ls-files", "-z", "--stage").split(b"\0") if entry)}
         gitlinks = {name: meta[1] for name, meta in tracked.items() if meta[0] == b"160000"}
-        # Run data is never source, whatever the project's .swarm/.gitignore says.
-        worktrees = linked_worktrees(root)
+        # Run data is never source, whatever the project's .swarm/.gitignore says; a nested repository's is the user's.
+        skip = not_source(found)[1:] if nested else not_source(found)
         files = (file for file in [*tracked, *git(root, "ls-files", "-z", "--others", "--exclude-standard").split(b"\0")]
-                 if file and (nested or not is_run_data(file, run_data)) and not in_worktree(file, worktrees))
+                 if file and not in_worktree(file, skip))
         head = git(root, "rev-parse", "HEAD", optional=True) or b"unborn"
     digest = hashlib.sha256(head + b"\0")
     for name in sorted(set(files)):
         path = root / os.fsdecode(name)
-        digest.update(len(name).to_bytes(8, "big") + name)
         try:
             mode = path.lstat().st_mode
         except (FileNotFoundError, NotADirectoryError):
-            digest.update(b"missing\0")
+            # A deleted file is absent whether or not the index still lists it: staging the deletion changes no source.
             continue
+        if (stat.S_ISDIR(mode) and found is not None and name in tracked and name not in gitlinks
+                and not (path / ".git").exists()):
+            # A tracked file replaced by a folder: the files in it are listed on their own, as they are once staged.
+            continue
+        digest.update(len(name).to_bytes(8, "big") + name)
         if stat.S_ISLNK(mode) or stat.S_ISREG(mode):
             _hash_entry(digest, path, mode)
         elif stat.S_ISDIR(mode) and found is not None and name in gitlinks:
-            sub_top = toplevel(path) if (path / ".git").exists() else None
-            is_sub_repo = sub_top is not None and Path(os.fsdecode(sub_top.rstrip(b"\n"))).resolve() == path.resolve()
-            if is_sub_repo:
-                sub_head = git(path, "rev-parse", "HEAD", optional=True)
-                if sub_head and sub_head.strip() == gitlinks[name] and not git(
+            if checked_out(path):
+                sub_head = git(path, "rev-parse", "HEAD", optional=True) if pointers else None
+                if sub_head and not git(
                         path, "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none"):
-                    # A submodule's recorded commit stands for it when checked out clean at that commit.
-                    digest.update(b"gitlink\0" + gitlinks[name])
+                    # A clean submodule stands for its commit, the one staging records: the recorded one, or a new one
+                    # whose pointer is staged or not yet, alike.
+                    digest.update(b"gitlink\0" + sub_head.strip())
                 else:
-                    digest.update(b"repo\0" + bytes.fromhex(source_digest(path, nested=True, seen_roots=seen_roots)))
+                    digest.update(b"repo\0" + bytes.fromhex(
+                        source_digest(path, nested=True, seen_roots=seen_roots, pointers=pointers)))
             elif not any(path.iterdir()):
                 digest.update(b"gitlink\0" + gitlinks[name])
             else:
@@ -212,14 +246,13 @@ def source_digest(project, nested=False, seen_roots=None):
         elif stat.S_ISDIR(mode) and (path / ".git").exists():  # a nested repository, or a dir with a non-repo .git
             sub_top = toplevel(path)
             if sub_top is not None and Path(os.fsdecode(sub_top.rstrip(b"\n"))).resolve() == path.resolve() and path.resolve() not in seen_roots:
-                digest.update(b"repo\0" + bytes.fromhex(source_digest(path, nested=True, seen_roots=seen_roots)))
+                digest.update(b"repo\0" + bytes.fromhex(
+                    source_digest(path, nested=True, seen_roots=seen_roots, pointers=pointers)))
             elif found is not None and name in tracked:
                 digest.update(b"dir\0")
             else:
                 digest.update(b"dir\0")
                 _hash_dir(digest, path)
-        elif stat.S_ISDIR(mode) and found is not None and name in tracked:
-            digest.update(b"dir\0")  # a tracked file replaced by a folder; the files in it are listed on their own
         else:
             raise ValueError(f"cannot fingerprint {path}")
     return digest.hexdigest()
@@ -285,7 +318,7 @@ def candidate_for(run, project, identifier):
         candidate = json.load(file)
     if not isinstance(candidate, dict):
         raise ValueError("verification.json is not a candidate; prepare a new one")
-    if candidate["candidate"] != identifier or candidate["project"] != str(project):
+    if candidate.get("candidate") != identifier or candidate.get("project") != str(project):
         raise ValueError("that verification candidate has been superseded or belongs to another project")
     return candidate
 
@@ -321,7 +354,7 @@ def check_inputs(run, candidate):
     work = Path(candidate["path"])
     if candidate["mode"] == "isolated" and git(work, "rev-parse", "HEAD").decode().strip() != candidate["commit"]:
         raise ValueError("the integration checkout changed commit")
-    if source_digest(work) != candidate["digest"]:
+    if source_digest(work, pointers=candidate["mode"] == "isolated") != candidate["digest"]:
         raise ValueError("source files changed; prepare and test a new candidate")
 
 
@@ -330,15 +363,13 @@ def is_run_data(name, run_data):
     return name.rstrip(b"/").split(b"/")[:len(run_data)] == run_data
 
 
-def pending_changes(project, run_data=None):
+def pending_changes(project, run_data=None, codes=False):
     """Paths git reports as changed or untracked, other than Swarm's own run data: the project's .swarm folder, or
-    RUN_DATA for a checkout whose top folder is not the run's project."""
+    RUN_DATA for a checkout whose top folder is not the run's project. With CODES, (XY, path) pairs of git's status."""
     found = repository(project)
     if found is None:
         raise ValueError("not a git repository")
-    top, own = found
-    run_data = run_data or own
-    worktrees = linked_worktrees(top)
+    skip = not_source(found, run_data)
     entries = git(project, "status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=none").split(b"\0")
     pending, index = [], 0
     while index < len(entries):
@@ -350,7 +381,8 @@ def pending_changes(project, run_data=None):
         if any(letter in entry[:2] for letter in (b"R", b"C")):
             paths.append(entries[index])  # the other side of a rename can cross the .swarm boundary
             index += 1
-        pending.extend(path for path in paths if not is_run_data(path, run_data) and not in_worktree(path, worktrees))
+        pending.extend((entry[:2], path) if codes else path for path in paths
+                       if not in_worktree(path, skip))
     return pending
 
 
@@ -366,7 +398,7 @@ def check_current(run, candidate):
         raise ValueError("worker readiness changed after acceptance")
     if candidate["mode"] == "isolated" and git(project, "rev-parse", "HEAD").decode().strip() != candidate["commit"]:
         raise ValueError("the project moved off the accepted commit")
-    if source_digest(project) != candidate["digest"]:
+    if source_digest(project, pointers=candidate["mode"] == "isolated") != candidate["digest"]:
         raise ValueError("source files changed after acceptance")
 
 
@@ -426,10 +458,10 @@ def prepare(run, project, mode, checks, onto=None, subset=None):
                                      "project's .swarm folder alone" % (
                                          ", ".join("@" + member for member, (_, revision) in recorded.items() if revision
                                                    and git(integration, "diff", "--no-renames", "--name-only", "-z", base, revision,
-                                                           "--", os.fsdecode(name), optional=True)) or "a member's commit",
-                                         os.fsdecode(name)))
+                                                           "--", ":(top,literal)" + os.fsdecode(name), optional=True))
+                                         or "a member's commit", shown(name)))
                 if b"160000" in meta.lstrip(b":").split()[:2]:
-                    raise ValueError(f"cannot verify submodule update at {os.fsdecode(name)} in isolated mode; "
+                    raise ValueError(f"cannot verify submodule update at {shown(name)} in isolated mode; "
                                      "land submodule pointer changes by hand")
             work = integration / project.relative_to(root)
             if not work.is_dir():
@@ -439,7 +471,10 @@ def prepare(run, project, mode, checks, onto=None, subset=None):
             "mode": mode, "base": base, "onto": onto, "commit": commit, "checks": checks or [], "no_checks": checks is None,
             "branch": os.fsdecode(branch).strip() if branch else None,
             "worktree": str(integration) if integration else None,
-            "inputs": recorded, "digest": source_digest(work),
+            "inputs": recorded, "digest": source_digest(work, pointers=mode == "isolated"),
+            # Every file as prepared: the digest reads a clean submodule of an isolated checkout as its commit, so one
+            # filled in afterwards, with files the landed commit will not bring, would go unseen.
+            "exact": source_digest(work) if mode == "isolated" else None,
             "partial": subset is not None, "members": sorted(recorded),
         }
         with board_lock(run):
@@ -452,6 +487,11 @@ def prepare(run, project, mode, checks, onto=None, subset=None):
                     previous = json.load(file)
             except (OSError, ValueError):
                 previous = None
+            # The candidates this one replaces, with the reports each held: a verdict on one of them that arrives
+            # late is the board's to tell from a verdict on this one.
+            if isinstance(previous, dict) and isinstance(previous.get("candidate"), str):
+                earlier = previous.get("superseded") if isinstance(previous.get("superseded"), list) else []
+                candidate["superseded"] = [*earlier, {"candidate": previous["candidate"], "inputs": previous.get("inputs")}]
             save_candidate(run, candidate)
     except BaseException:  # an interrupt too: a half-built integration worktree is never left behind
         if integration is not None and integration.exists():
@@ -573,6 +613,17 @@ def test_candidate(run, project, identifier, verifier, timeout_arg=None):
         candidate.pop("verified_by", None)
         candidate["attempt"] = attempt
         save_candidate(run, candidate)
+        # Every file as it is while the checks run: the candidate's own digest reads a clean submodule of an isolated
+        # checkout as its commit, so checks that filled one in, with files the landed commit will not bring, went unseen.
+        exact = candidate.get("exact") or (source_digest(Path(candidate["path"])) if candidate["mode"] == "isolated" else None)
+        if exact is not None and source_digest(Path(candidate["path"])) != exact:
+            raise ValueError("the candidate's checkout changed since it was prepared (a submodule filled in or emptied?); "
+                             "prepare and test a new candidate")
+        # The candidate this verifier is testing, until it posts a verdict on it: a verdict that names none answers
+        # this one, even once another candidate has replaced it.
+        state = load_state(run)
+        state["members"][verifier]["tested"] = identifier
+        save(run, state)
 
     failed = []
     for command in candidate["checks"]:
@@ -594,9 +645,169 @@ def test_candidate(run, project, identifier, verifier, timeout_arg=None):
             raise ValueError("the verification attempt was withdrawn or superseded")
         active_verifier(run, verifier)
         check_inputs(run, candidate)
+        if exact is not None and source_digest(Path(candidate["path"])) != exact:
+            raise ValueError("the checks changed files in the candidate's checkout (a submodule they filled in or emptied?), "
+                             "so what they read is not what the commit holds; prepare and test a new candidate")
         candidate["verified_by"] = verifier
         save_candidate(run, candidate)
     print(f"VERIFIED {identifier} {candidate['commit'] or candidate['digest']}")
+
+
+def stray_submodules(root):
+    """The submodules under ROOT, at any depth, that are not checked out and yet hold files, as paths from ROOT."""
+    strays = []
+    for meta, _, name in (entry.partition(b"\t") for entry in git(root, "ls-files", "-z", "--stage").split(b"\0")):
+        if meta.startswith(b"160000 "):
+            path = root / os.fsdecode(name)
+            if checked_out(path):
+                strays += [os.fsdecode(name) + "/" + inner for inner in stray_submodules(path)]
+            elif path.is_dir() and any(path.iterdir()):
+                strays.append(os.fsdecode(name))
+    return strays
+
+
+def landing_guards(project, found):
+    """Raises while the index or the checkout holds something the one commit after a shared `accept` would take unread
+    or leave out. What is merely staged apart from the verified files is no matter: `commit` stages them anew. FOUND is
+    what `repository` returns."""
+    # The one commit after a shared acceptance takes the index. Run data or a linked worktree staged already
+    # would go into it unread: the fingerprint, and so the status read below, leave both out.
+    skip = not_source(found)
+    # Without --no-renames a staged rename out of run data names only its new path.
+    staged = [os.fsdecode(name) for name in git(found[0], "diff", "--cached", "--name-only", "--no-renames", "-z")
+              .split(b"\0") if name and in_worktree(name, skip)]
+    if staged:
+        raise ValueError("the Git index holds %s, which is Swarm's run data or a linked worktree and no source, and the "
+                         "commit after `accept` takes the index. Run `git reset -q -- %s` to unstage it (no file "
+                         "changes), accept again, then commit with the command `accept` prints"
+                         % (", ".join(map(shown, staged[:5])) + (" and more" if len(staged) > 5 else ""),
+                            " ".join(shlex.quote(":(top,literal)" + name) for name in staged)))
+    # `git add` here cannot stage what changed inside a submodule, so the commit would leave out bytes the
+    # checks read; the fingerprint holds them, so nothing else catches this.
+    pointers = {os.fsdecode(name): meta.split()[1].decode() for meta, _, name in (
+        entry.partition(b"\t") for entry in git(found[0], "ls-files", "-z", "--stage").split(b"\0"))
+        if meta.startswith(b"160000 ")}
+    submodules = list(pointers)
+    # A pointer no .gitmodules entry backs is one nobody else can resolve: refused once the commit would record
+    # or move it, staged already or not.
+    registered = {entry.partition(b"\n")[2] for entry in (git(
+        found[0], "config", "-z", "-f", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$", optional=True) or b"").split(b"\0")}
+    # The commit holds .gitmodules as staging takes it: untracked and ignored, it stays out, and registers nothing there.
+    if (git(found[0], "ls-files", "--error-unmatch", "--", ":(top,literal).gitmodules", optional=True) is None
+            and git(found[0], "check-ignore", "-q", "--", ".gitmodules", optional=True) is not None):
+        registered = set()
+    loose = [name for name in submodules if os.fsencode(name) not in registered and git(
+        found[0], "status", "--porcelain", "--ignore-submodules=none", "--", ":(top,literal)" + name)]
+    if loose:
+        raise ValueError("%s is a Git repository of its own that no .gitmodules entry names, so the commit after "
+                         "`accept` would record a pointer to it and none of its files. Add it as a submodule, or "
+                         "unstage it (`git reset -q -- <path>`, or `git rm --cached <path>` once it is committed) and "
+                         "ignore it or move it out, then prepare and test a new candidate" % ", ".join(map(shown, loose)))
+    dirty = [name for name in submodules if checked_out(found[0] / name) and git(
+        found[0] / name, "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none")]
+    if dirty:
+        raise ValueError("the submodule %s holds changes of its own, which `git add` in this repository cannot "
+                         "stage, so the commit after `accept` would leave them out. Commit them inside the "
+                         "submodule, then prepare and test a new candidate" % ", ".join(map(shown, dirty)))
+    # Not checked out, a submodule's folder holds nothing of it: files put there are read by the checks and held
+    # by the fingerprint, and `git add` stages none of them. Inside a checked-out submodule no status shows them.
+    strays = stray_submodules(found[0])
+    if strays:
+        raise ValueError("the submodule %s is not checked out, yet files sit in its folder, which the checks read and "
+                         "the commit after `accept` cannot hold. Move them out, or check the submodule out (`git "
+                         "submodule update --init --recursive`), then prepare and test a new candidate" % ", ".join(map(shown, strays)))
+    # `git add -A` leaves the new commit of a submodule whose .gitmodules entry says ignore = all unstaged, so
+    # the commit would keep the old pointer while the checks ran on the new one.
+    unstaged = [name for name in submodules if checked_out(found[0] / name)
+                and (git(found[0] / name, "rev-parse", "HEAD", optional=True) or b"").decode().strip() not in ("", pointers[name])
+                and not git(found[0], "add", "-A", "--dry-run", "--", ":(top,literal)" + name, optional=True)]
+    if unstaged:
+        raise ValueError("the submodule %s is at a new commit that `git add -A` leaves unstaged (its .gitmodules entry "
+                         "says ignore = all), so the commit after `accept` would keep the old pointer. Run `git add -f "
+                         "-- %s` to stage it (no file changes), accept again, then commit with the command `accept` prints"
+                         % (", ".join(map(shown, unstaged)), " ".join(shlex.quote(":(top,literal)" + name) for name in unstaged)))
+    # Git lists an untracked repository of its own as one name with a slash, and `git add` records it as a pointer
+    # to its commit that nothing can resolve, with none of the files the checks read.
+    nested = [os.fsdecode(name) for name in git(found[0], "ls-files", "-z", "--others", "--exclude-standard").split(b"\0")
+              if name.endswith(b"/") and not in_worktree(name, skip)]
+    if nested:
+        raise ValueError("%s is a Git repository of its own inside this one and no submodule, so the commit after "
+                         "`accept` would record a pointer to it and none of its files. Add it as a submodule, ignore "
+                         "it or move it out, then prepare and test a new candidate" % ", ".join(map(shown, nested)))
+
+
+def landing(run, project, identifier):
+    """The command that makes the one commit after a shared acceptance."""
+    return "Commit with: python3 %s %s %s commit %s -m '<message>'" % (
+        shlex.quote(os.path.abspath(__file__)), shlex.quote(str(run)), shlex.quote(str(project)), identifier)
+
+
+def commit(run, project, identifier, message):
+    """The one commit after a shared acceptance, made of exactly what passed: staged here, compared with the pass, and
+    committed, so nothing edited between a printed `git add` and the commit can go in unread."""
+    with board_lock(run):
+        candidate = candidate_for(run, project, identifier)
+        if candidate["mode"] == "isolated":
+            raise ValueError("an isolated candidate's commits are in the checkout once it is accepted: there is nothing to commit")
+        if not candidate.get("accepted"):
+            raise ValueError("this candidate is not accepted: run `accept` first")
+        found = repository(project)
+        if found is None:
+            raise ValueError("the project is not a Git repository, so there is nothing to commit")
+        check_current(run, candidate)
+        landing_guards(project, found)
+        # Built in an index of its own and checked there, then put in the repository's: whatever was staged before,
+        # the commit takes this tree and no other.
+        skip = not_source(found)
+        live = git(found[0], "rev-parse", "--path-format=absolute", "--git-path", "index").decode().strip()
+        with tempfile.TemporaryDirectory() as scratch:
+            private = os.path.join(scratch, "index")
+            if os.path.exists(live):
+                shutil.copy2(live, private)
+            git(found[0], "add", "-A", "--", *stage_paths(skip), index=private)
+            tree = git(found[0], "write-tree", index=private).decode().strip()
+            names = [name for name in git(found[0], "diff", "--cached", "--name-only", "--no-renames", "-z", index=private)
+                     .split(b"\0") if name]
+            modes = dict((entry.partition(b"\t")[2], entry.split()[0]) for entry in
+                         git(found[0], "ls-files", "-s", "-z", index=private).split(b"\0") if entry)
+        unread = [shown(os.fsdecode(name)) for name in names if in_worktree(name, skip)]
+        if unread:
+            raise ValueError("the commit would hold %s, which is Swarm's run data or a linked worktree and no source"
+                             % ", ".join(unread[:5]))
+        # What Git stores is the file as its filters and line-ending rules convert it: a file a fresh checkout would
+        # not bring back as the checks read it was never tested in the form the commit holds.
+        turned = []
+        for name in names:
+            if modes.get(name) not in (b"100644", b"100755"):
+                continue
+            back = git(found[0], "cat-file", "--filters", "%s:%s" % (tree, os.fsdecode(name)), optional=True)
+            try:
+                same = back is not None and (found[0] / os.fsdecode(name)).read_bytes() == back
+            except OSError:
+                same = False
+            if not same:
+                turned.append(shown(os.fsdecode(name)))
+        if turned:
+            raise ValueError("a fresh checkout of the commit would not bring back %s as the checks read it (a line-ending "
+                             "or filter rule converts it one way only). Fix the file or its .gitattributes rule, then "
+                             "prepare and test a new candidate" % ", ".join(turned[:5]))
+        git(found[0], "read-tree", tree)
+        left = [shown(os.fsdecode(path)) for code, path in pending_changes(project, codes=True) if code[1:] != b" "]
+        if left:
+            raise ValueError("staging left %s apart from the index, so the commit would not hold the verified files; "
+                             "prepare and test a new candidate" % ", ".join(left[:5]))
+        if source_digest(project) != candidate["digest"]:
+            raise ValueError("source files changed after acceptance")
+        if tree == (git(found[0], "rev-parse", "-q", "--verify", "HEAD^{tree}", optional=True) or b"").decode().strip():
+            print("Nothing to commit: HEAD already holds the verified files")
+            return
+    # Outside the board's lock: a commit hook may build and test for minutes.
+    out = git(found[0], "commit", "-m", message)
+    sys.stdout.write(os.fsdecode(out))
+    if git(found[0], "rev-parse", "HEAD^{tree}").decode().strip() != tree:
+        raise ValueError("the commit was made, but its files differ from the verified ones: a commit hook changed them, "
+                         "or the index changed while it ran. Inspect it with `git show --stat HEAD`")
+    print("COMMITTED %s %s" % (identifier, git(found[0], "rev-parse", "HEAD").decode().strip()))
 
 
 def accept(run, project, identifier):
@@ -615,7 +826,14 @@ def accept(run, project, identifier):
             if "accepted_seq" not in state:
                 state["accepted_seq"] = len(posts)
                 save(run, state)
+            # The index may have changed since the first acceptance, and the fingerprint leaves run data out: the
+            # commit this retry prints the command for is guarded as the first one was.
+            found = repository(project) if candidate["mode"] != "isolated" else None
+            if found is not None:
+                landing_guards(project, found)
             print(f"Already accepted {identifier}")
+            if found is not None:
+                print(landing(run, project, identifier))
             return
         active_verifier(run, candidate["verified_by"])
         check_inputs(run, candidate)
@@ -630,6 +848,7 @@ def accept(run, project, identifier):
                 if state["members"].get(p["agent"], {}).get("role") == "verifier"
                 and (word := REPORT_WORD.match(p["text"]))
                 and word[1] in {"NOT PASSED", "NOT VERIFIED"}
+                and p.get("candidate") in (None, identifier)  # a late verdict on a candidate this one replaced
             ),
             default=0,
         )
@@ -642,6 +861,7 @@ def accept(run, project, identifier):
             for p in posts
         ):
             raise ValueError(f"@{verifier} has not posted {expected_line} on the board")
+        guidance = None
         if candidate["mode"] == "isolated":
             # A candidate built on a named base is accepted from whatever branch sits on that base, not from the
             # branch the checkout happened to be on when it was prepared.
@@ -668,19 +888,25 @@ def accept(run, project, identifier):
             try:
                 if git(project, "rev-parse", "HEAD").decode().strip() != candidate["commit"]:
                     raise ValueError("the checkout did not reach the verified commit")
-                if source_digest(project) != candidate["digest"]:
+                if source_digest(project, pointers=True) != candidate["digest"]:
                     raise ValueError("the checkout reached the commit but its files differ from the tested candidate")
             except BaseException as error:  # an interrupt too
                 # A refused acceptance leaves the checkout where it found it; --keep never discards a local change.
                 if moved and git(project, "reset", "--keep", head, optional=True) is None:
                     raise ValueError(f"{error or type(error).__name__}; the checkout could not be rolled back safely") from error
                 raise
+        elif (found := repository(project)) is not None:
+            # Built before the candidate is saved as accepted: a retry after that takes the "already accepted" path.
+            landing_guards(project, found)
+            guidance = landing(run, project, identifier)
         state, posts = load(run)
         state["accepted_seq"] = len(posts)  # the board counts failed verification cycles from here again
         save(run, state)
         candidate["accepted"] = True
         save_candidate(run, candidate)
     print(f"ACCEPTED {identifier} {candidate['commit'] or candidate['digest']}")
+    if guidance:
+        print(guidance)
     integration = candidate.get("worktree") or candidate["path"]
     if candidate["mode"] == "isolated" and git(project, "worktree", "remove", integration, optional=True) is None:
         print(f"Integration checkout retained at {integration}")
@@ -703,6 +929,9 @@ def main():
     test.add_argument("verifier")
     test.add_argument("--timeout", help="per-check timeout in seconds (overrides SWARM_VERIFY_TIMEOUT)")
     actions.add_parser("accept").add_argument("candidate")
+    landed = actions.add_parser("commit")
+    landed.add_argument("candidate")
+    landed.add_argument("-m", "--message", required=True)
     args = parser.parse_args()
     project = args.project.resolve(strict=True)
     run = args.run.resolve(strict=True)
@@ -716,7 +945,8 @@ def main():
                 raise ValueError("each verification check must be a nonempty command")
             if args.base is not None and args.mode != "isolated":
                 raise ValueError("--base is for an isolated candidate; a shared one is the checkout as it stands")
-            if args.base is not None and not args.base.strip():
+            if args.base is not None and (not args.base.strip() or args.base.startswith("-")):
+                # One starting with "-" would reach `git rev-parse` as an option.
                 raise ValueError("--base takes a ref, such as a branch name or a commit")
             subset = None
             if args.members is not None and args.mode != "isolated":
@@ -729,6 +959,10 @@ def main():
             prepare(run, project, args.mode, None if args.no_checks else args.check, args.base, subset)
         elif args.action == "test":
             test_candidate(run, project, args.candidate, args.verifier, args.timeout)
+        elif args.action == "commit":
+            if not args.message.strip():
+                raise ValueError("the commit needs a message")
+            commit(run, project, args.candidate, args.message)
         else:
             accept(run, project, args.candidate)
 

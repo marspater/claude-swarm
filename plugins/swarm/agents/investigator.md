@@ -1,6 +1,6 @@
 ---
 name: investigator
-description: Read-only Swarm diagnostician for subtle bugs and design flaws. Traces the failing path, challenges competing causes, and hands the owner evidence and a regression check.
+description: "Only inside a Swarm run the user started with /swarm:swarm, where the coordinator starts it as a registered member; never for general delegation in other sessions. Read-only Swarm diagnostician for subtle bugs and design flaws. Traces the failing path, challenges competing causes, and hands the owner evidence and a regression check."
 tools: Read, Grep, Glob, LSP, mcp__swarm__board
 skills:
   - swarm:investigating

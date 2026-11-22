@@ -1,12 +1,12 @@
 import { expect, test } from 'claude-code/testing'
 import type { Post } from '../types'
-import { BOARD_CALL, COORDINATOR_READ, RUN, boardCalls, runsNamed, scanShell, shellWords, splitShellSegments, substitutions, unwrap, wakeMessage, wakeSequence } from './command'
+import { BOARD_CALL, CASE_PATTERN, COORDINATOR_READ, RUN, boardCalls, closesAfter, launches, makesCommit, runsNamed, scanShell, scriptsRun, shellLaunch, shellWords, splitShellSegments, substitutions, unwrap, wakeMessage, wakeSequence } from './command'
 import { edgesOf, graphSvg, isBroadcast } from './graph'
-import { hiveArt, toolMood, toolSummary } from './hive'
+import { BOARD_ACTIONS, hiveArt, toolMood, toolSummary } from './hive'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, SWARM_AGENTS, familyOf, latestOf } from './models'
 import { statusCss, statusDot, statusKey } from './palette'
-import { budgetOf, detailOf, findAgent, mentions, parse, parsePosts, statusOf, targets, tokensUsed } from './roster'
-import { bodyOf, chipped, clean, clip, compact, fenceAfter, hasQuestion, head, kindOf, openedText, stripKind, unquoted } from './text'
+import { budgetOf, detailOf, findAgent, ledger, mentions, parse, parsePosts, postFields, statusOf, targets, tokensUsed } from './roster'
+import { bodyOf, chipped, clean, clip, compact, fenceAfter, hasQuestion, head, kindOf, openedText, stripKind, unquoted, verdictOf } from './text'
 
 const post = (text: string, to: string[] = []): Post => ({ seq: 1, agent: 'parser', to, text, time: '2026-11-16T14:03:22+0100' })
 
@@ -125,8 +125,28 @@ test('multi-segment board calls, wakeSequence bounds, and roster status/closed-r
     members: { constructor: { type: 'worker', model: 'sonnet', effort: 'medium', depends: [], owns: '', ready: false, blocked_on: ['x'], asked: 0, unreachable: true } },
   })
   expect(closed.total).toBe(500)
-  expect(closed.members.find(m => m.name === 'constructor')?.status).toBe('waiting')
-  expect(closed.members.find(m => m.name === 'constructor')?.detail).toBe('')
+  // a closed run has no live state: no waiting, no unreachable, nothing waited for; only the last report, or none
+  expect(closed.members.find(m => m.name === 'constructor')?.status).toBe('closed')
+  expect(closed.members.find(m => m.name === 'constructor')?.detail).toBe('No outcome recorded')
+  const sha = 'a'.repeat(40)
+  const reports = [
+    { seq: 1, agent: 'constructor', text: `READY ${sha}\ndone`, time: 't', revision: sha, base: 'b'.repeat(40) },
+    { seq: 2, agent: 'checker', text: 'VERIFIED cand-1 abc', time: 't', partial: true, members: ['constructor', 'x\u001b[31m'] },
+    { seq: 3, agent: 'constructor', text: 'READY', time: 't', base: '--output=/tmp/x' },
+  ].map(post => JSON.stringify(post)).join('\n')
+  const ended = parse('/project/.swarm/demo-20261116-101010', reports, JSON.stringify({
+    title: 'Closed', closed: true,
+    members: { coordinator: { role: 'coordinator', last_read_seq: 0 }, constructor: { role: 'worker', last_read_seq: 0 },
+      checker: { role: 'verifier', last_read_seq: 0 }, old: { role: 'worker', killed: '1', last_read_seq: 0 } },
+  }), [], 300)
+  expect(ended.members.map(m => [m.name, m.status, m.detail])).toEqual([
+    ['coordinator', 'closed', ''], ['constructor', 'closed', 'Last report: READY (#3)'],
+    ['checker', 'closed', 'Last report: Partial pass of @constructor, @x (#2)'], ['old', 'killed', ''],
+  ])
+  // only a full commit id goes on to git's command line
+  expect(ended.posts.map(post => (post as { base?: string }).base)).toEqual(['b'.repeat(40), undefined, undefined])
+  expect(verdictOf(ended.posts[1]!)).toEqual({ label: 'Partial pass', color: 'warning', covered: ['constructor', 'x'] })
+  expect(verdictOf({ ...ended.posts[1]!, partial: false } as never)?.label).toBe('VERIFIED')
 })
 
 test('wave 1/2 design, text, hive and palette helpers', async () => {
@@ -478,18 +498,26 @@ test('a READY keeps its commit only when it is a full id, and a member paused on
 // The cases board.py and these hooks must read alike, kept by the Python side in tests/parity.json. The claude kit
 // reads no files and refuses a dynamic import, so only `bun test` (see bunfig.toml) checks them; anywhere else, and
 // while the file is absent, the test passes with nothing checked. `kind` compares kindOf's label, '' for none.
-test('the hooks read targets, quoting, questions and kinds exactly as board.py does', async () => {
+test('the hooks read targets, quoting, questions, kinds, board subcommands and type defaults exactly as board.py does', async () => {
   type Parity = {
     targets?: { text: string; members: Record<string, { last_read_seq?: number }>; sender?: string; expect: string[] }[]
     quoted?: { text: string; expect: string }[]
     question?: { text: string; expect: boolean }[]
     kind?: { text: string; expect: string }[]
+    actions?: string[]
+    defaults?: Record<string, [string, string]>
   }
   const bun = (globalThis as { Bun?: { file: (path: string) => { exists: () => Promise<boolean>; json: () => Promise<unknown> } } }).Bun
   if (bun === undefined) return
   const file = bun.file(`${decodeURIComponent((import.meta as unknown as { url: string }).url.replace(/^file:\/\//, '').replace(/\/[^/]*$/, ''))}/../tests/parity.json`)
   if (!(await file.exists())) return
   const parity = await file.json() as Parity
+  // A kind of case this test does not read would pass unchecked: it fails instead.
+  expect(Object.keys(parity).filter(kind => !['targets', 'quoted', 'question', 'kind', 'actions', 'defaults'].includes(kind))).toEqual([])
+  if (parity.actions) expect([...BOARD_ACTIONS].sort()).toEqual(parity.actions)
+  for (const [type, [family, effort]] of Object.entries(parity.defaults ?? {})) {
+    expect([type, familyOf(DEFAULT_MODEL[type]!), DEFAULT_EFFORT[type]]).toEqual([type, family, effort])
+  }
   for (const one of parity.targets ?? []) {
     const members = Object.fromEntries(Object.entries(one.members).map(([name, member]) => [name, { last_read_seq: 0, ...member }]))
     expect([one.text, targets(one.text, members, one.sender ?? undefined)]).toEqual([one.text, one.expect])
@@ -565,4 +593,148 @@ test('an unquoted heredoc body runs its substitutions; a quoted one is text', ()
   expect(scanShell('cat <<EOF\n$(git commit -m x) and `git push`\nEOF\necho done')[0]?.inner).toEqual(['git commit -m x', 'git push'])
   expect(scanShell("cat <<'EOF'\n$(git commit -m x)\nEOF")[0]?.inner).toBeUndefined()
   expect(scanShell('cat <<EOF\n\\$(git commit -m x)\nEOF')[0]?.inner).toBeUndefined()
+})
+
+test('a case is read as patterns and arms: a pattern\'s | and ) split and close nothing, and ;; ends an arm', () => {
+  const arms = (c: string) => scanShell(c).map(s => [s.text, s.next])
+  expect(arms('case $x in a|b) git status ;; (c) echo commit ;& *) true ;;& esac | head')).toEqual([
+    ['case $x in a|b) git status', ';;'], ['(c) echo commit', ';&'], ['*) true', ';&'], ['esac', '|'], ['head', ''],
+  ])
+  // an arm ended on a line of its own still ends there
+  expect(arms('case $x in\n a)\n git status\n ;;\nesac')).toEqual([['case $x in', ';'], ['a)', ';'], ['git status', ';;'], ['esac', '']])
+  // a subshell inside an arm is one
+  expect(arms('(case x in a) (cd y) ;; esac); z').map(([text]) => text)).toEqual(['(case x in a) (cd y)', 'esac)', 'z'])
+  expect(CASE_PATTERN.exec('a|"b c") git status')?.[0]).toBe('a|"b c") ')
+  expect(CASE_PATTERN.exec('(*.ts) cmd')?.[0]).toBe('(*.ts) ')
+})
+
+test('a loop, an if and a case piped onward pipe what they run, and a word that only looks like their close does not', () => {
+  const piped = (c: string) => scanShell(c).map(s => [s.text, s.piped])
+  expect(piped('for f in a; do echo $f; done | head')).toEqual([['for f in a', true], ['do echo $f', true], ['done', true], ['head', false]])
+  expect(piped('if a; then b; else c; fi > out; d')).toEqual([['if a', true], ['then b', true], ['else c', true], ['fi > out', true], ['d', false]])
+  expect(piped('case x in a) b ;; esac | head').map(([, isPiped]) => isPiped)).toEqual([true, true, false])
+  expect(piped('while a; do b; done 2>&1; c').map(([, isPiped]) => isPiped)).toEqual([false, false, false, false])
+  expect(boardCalls('if true; then python3 board.py DIR show; fi | head')[0]?.piped).toBe(true)
+  expect(boardCalls('for x in 1; do python3 board.py DIR show; done')[0]?.piped).toBe(false)
+  // `done` as a word of another command closes nothing
+  expect(piped('for f in a; do echo done | head; done; x').map(([, isPiped]) => isPiped)).toEqual([false, true, false, false, false])
+})
+
+test('a comment inside a substitution may hold a quote, and its commands are still listed', () => {
+  expect(scanShell("x=$(echo a # it's fine\n git commit -m x)")[0]?.inner).toEqual(["echo a # it's fine\n git commit -m x"])
+  expect(scanShell('x=$(echo a # (not a group\n git status) && echo b').map(s => s.text)).toEqual(['x=$(echo a # (not a group\n git status)', 'echo b'])
+  // `$#`, `${#a}` and `a#b` open no comment
+  expect(scanShell("x=$(echo $# ${#a} a#b 'it''s') && y")[0]?.inner).toEqual(["echo $# ${#a} a#b 'it''s'"])
+  // an escaped blank is part of the word, so the `#` after it opens no comment; an escaped backslash leaves the blank real
+  expect(scanShell('echo "$(git commit -m a\\ #b)"')[0]?.inner).toEqual(['git commit -m a\\ #b'])
+  expect(scanShell('git commit -m a\\ #b').map(s => s.text)).toEqual(['git commit -m a\\ #b'])
+  expect(scanShell('echo a\\\\ #b').map(s => s.text)).toEqual(['echo a\\\\'])
+  // one that never closes is flagged: what it runs is not listed
+  expect(scanShell('echo "$(git commit -m x"')[0]?.unread).toBe(true)
+  expect(scanShell('echo `git status').map(s => s.unread)).toEqual([true])
+  expect(scanShell('echo "$(git status)"')[0]?.unread).toBeUndefined()
+})
+
+test('a launcher\'s options are read with their values: python\'s -W, a shell\'s -o, and a program given inline or on its input', () => {
+  const words = (c: string) => shellWords(c)
+  expect(launches(words('python3 -Wonce /p/board.py R close'), 'board.py')).toBe('script')
+  expect(launches(words('python3 -W once -X dev -B /p/board.py R close'), 'board.py')).toBe('script')
+  expect(launches(words('python3 -Bc pass /p/board.py'), 'board.py')).toBe('other')
+  expect(launches(words('python3 -c "exec(open(\'/p/board.py\').read())"'), 'board.py')).toBe('other')
+  expect(launches(words('python3 -c "print(1)"'), 'board.py')).toBeUndefined()
+  expect(launches(words('python3 -m py_compile /p/board.py'), 'board.py')).toBeUndefined()
+  expect(launches(words('python3 -m runpy /p/board.py'), 'board.py')).toBe('other')
+  expect(launches(words('python3 tool.py /p/board.py'), 'board.py')).toBeUndefined()
+  expect(launches(words('python3'), 'board.py', 'python3 <<EOF\nboard.py\nEOF')).toBe('other')
+  expect(launches(words('perl -e "system(\'board.py\')"'), 'board.py')).toBe('other')
+  expect(launches(words('echo perl'), 'board.py', 'board.py')).toBeUndefined()
+  expect(launches(words('bash -o pipefail'), 'board.py', 'echo board.py | bash -o pipefail')).toBe('other')
+  expect(launches(words('bash -o pipefail x.sh'), 'board.py', 'board.py')).toBeUndefined()
+  expect(shellLaunch(words('-o pipefail -ec "git status" _ a'))).toEqual({ code: 'git status', operands: ['_', 'a'], stdin: false })
+  expect(shellLaunch(words('-O cdspell script.sh'))).toEqual({ operands: ['script.sh'], file: 'script.sh', stdin: false })
+  expect(shellLaunch(words('<<< "git status"'))).toEqual({ operands: [], stdin: true, fed: 'git status' })
+  expect(scriptsRun("env -S 'git commit -m x'")).toContain('git commit -m x')
+})
+
+test('the git commands that make a commit, and the options that make them make none', () => {
+  for (const [sub, args] of [['commit', []], ['commit-tree', ['HEAD^{tree}']], ['merge', ['main']], ['merge', ['--continue']], ['cherry-pick', ['abc']],
+    ['revert', ['HEAD']], ['am', ['x.patch']], ['rebase', ['main']], ['pull', []], ['pull', ['--rebase', '--ff-only']], ['filter-branch', []], ['subtree', ['add']]] as const) {
+    expect(makesCommit(sub, args), `${sub} ${args.join(' ')}`).toBe(true)
+  }
+  for (const [sub, args] of [['merge', ['--abort']], ['merge', ['--no-commit', 'main']], ['cherry-pick', ['-n', 'abc']], ['cherry-pick', ['-xn', 'abc']],
+    ['revert', ['--no-commit', 'HEAD']], ['am', ['--abort']], ['rebase', ['--abort']], ['pull', ['--ff-only']], ['stash', []], ['stash', ['pop']],
+    ['reset', ['--hard']], ['update-ref', ['HEAD', 'abc']], ['status', []]] as const) {
+    expect(makesCommit(sub, args), `${sub} ${args.join(' ')}`).toBe(false)
+  }
+  // a value-taking option is read with its value, in either form, and the last of two opposite options wins
+  const reads = (line: string) => makesCommit(line.split(' ')[0]!, line.split(' ').slice(1))
+  for (const line of ['cherry-pick -Xignore-space-change abc', 'cherry-pick -X ignore-space-change abc', 'cherry-pick -mn abc',
+    'cherry-pick --strategy-option -n abc', 'cherry-pick --strategy-opt -n abc', 'cherry-pick -n --commit abc', 'revert -Sn HEAD',
+    'merge --no-commit --commit --no-ff --no-edit topic', 'merge -m --no-commit topic', 'merge -n topic', 'merge -- --no-commit',
+    'merge --no-commit --comm topic', 'pull --ff-only --ff', 'pull --ff-only --rebase', 'pull --ff-only -r', 'pull --ff-only --reb',
+    'am --directory --abort x.patch', 'rebase --exec --abort main', 'rebase -x --abort main']) expect(reads(line), line).toBe(true)
+  for (const line of ['cherry-pick -m 1 -n abc', 'cherry-pick --commit -n abc', 'merge --commit --no-commit topic', 'pull --ff --ff-only',
+    'pull --ff-only --rebase=false', 'pull --rebase --ff-only --no-rebase', 'pull -X ours --ff-only', 'am --show-current-patch=diff',
+    'rebase --edit-todo', 'revert -n HEAD']) expect(reads(line), line).toBe(false)
+  expect(closesAfter('git commit -m "a)" ) > out')).toEqual({ text: 'git commit -m "a)"  > out', closes: 1 })
+  expect(closesAfter('a=(1 2) b\\))')).toEqual({ text: 'a=(1 2) b\\)', closes: 1 })
+})
+
+test('a post keeps the fields board.py adds only in their own shape, and an except only beside a base with full ids', () => {
+  const [a, b, c] = ['a', 'b', 'c'].map(ch => ch.repeat(40))
+  expect(postFields({ revision: a, base: b, except: [c], partial: true, members: ['x', 3], rejects: ['y'], candidate: 'k1' }))
+    .toEqual({ revision: a, base: b, except: [c], partial: true, members: ['x'], rejects: ['y'], candidate: 'k1' })
+  expect(postFields({ revision: a, base: b, except: [c, '--output=x'] })).toEqual({ revision: a, base: b })
+  expect(postFields({ revision: a, except: [c] })).toEqual({ revision: a })
+  expect(postFields({ base: b, except: [] })).toEqual({ base: b })
+  expect(postFields({ base: 'HEAD', partial: 'yes', members: 'x', candidate: 4 })).toEqual({})
+  // parsePosts goes through the same check
+  const line = JSON.stringify({ seq: 1, agent: 'w', text: 'READY', time: 't', to: [], revision: a, base: b, except: [c, 'x'], conflicts: {} })
+  expect(parsePosts(line, {})[0]).toEqual({ seq: 1, agent: 'w', text: 'READY', time: 't', to: [], revision: a, base: b })
+})
+
+test('a turn that runs past any count keeps what its steps were charged until it ends; only an ended agent\'s turn goes', () => {
+  const book = ledger(4, 1000)
+  const used = { input_tokens: 100, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+  // two thousand turns that all run at once, each charged one step
+  for (let i = 0; i < 2000; i++) {
+    expect(book.charge(`t${i}`, used, 0, `agent-${i % 3}`, i)).toBe(100)
+    book.landed(book.of(`t${i}`)!, 100)
+  }
+  // each one's end charges only what its step did not: nothing, the first turn's included
+  for (let i = 0; i < 2000; i++) expect(book.charge(`t${i}`, used)).toBe(0)
+  // the turns of an agent that ended are dropped only once it has been gone a while
+  book.charge('live', used, 0, 'agent-0', 5000)
+  book.charge('dead', used, 0, 'agent-9', 5000)
+  book.prune(id => id === 'agent-0', 5500)
+  expect(book.running).toBe(2)
+  book.prune(id => id === 'agent-0', 6000)
+  // the dead agent's turn left the running ones, and an end it still reports finds what its step was charged
+  for (const turnId of ['live', 'dead']) book.landed(book.of(turnId)!, 100)
+  expect([book.running, book.charge('live', used), book.charge('dead', used)]).toEqual([1, 0, 0])
+})
+
+test('a turn\'s end charges its whole usage less what the board took for its steps, cached reads rounded once over the turn', () => {
+  const cached = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 5 }
+  const both = { ...cached, cache_read_input_tokens: 10 }
+  // two steps of five cached reads: a charge of 1, then 0; the first write fails, so the end owes the 1
+  const failed = ledger()
+  expect([failed.charge('t', cached, 0), failed.charge('t', cached, 1)]).toEqual([1, 0])
+  expect(failed.charge('t', both)).toBe(1)
+  // the first write lands: the end owes nothing
+  const landed = ledger()
+  expect(landed.charge('t', cached, 0)).toBe(1)
+  landed.landed(landed.of('t')!, 1)
+  expect([landed.charge('t', cached, 1), landed.charge('t', both)]).toEqual([0, 0])
+  // a step reported twice is charged once
+  expect(landed.charge('u', cached, 0)).toBe(1)
+  expect(landed.charge('u', cached, 0)).toBe(0)
+  // an end reported twice is charged once, for a turn with steps and for one with none
+  expect([failed.charge('t', both), landed.charge('t', both)]).toEqual([0, 0])
+  const bare = ledger()
+  const whole = bare.charge('v', both)
+  expect(whole).toBeGreaterThan(0)
+  expect(bare.charge('v', both)).toBe(0)
+  // a step that reports after its turn's end was charged with the end
+  expect(bare.charge('v', cached, 0)).toBe(0)
 })

@@ -1,6 +1,27 @@
-import type { McpToolInputs } from 'claude-code'
-import { expect, mock, test } from 'claude-code/testing'
+import type { AgentLoop, McpToolInputs, ToolCallEnvelope, ToolCallReserved, ToolCallResult } from 'claude-code'
+import { expect, mock, test, type Engine } from 'claude-code/testing'
 import { wakeMessage } from './command'
+
+// `$.tool.call`, its input checked per tool as the engine's own overloads check it. Those overloads (ToolCallArgs)
+// relate every declared tool to every other: with the session's MCP tools declared, as `plugin validate` declares
+// them, one call costs the type check gigabytes. This union is built per tool, once. The id is dropped by a key
+// remap, not Omit: Omit over an MCP tool's input, which has an index signature, would drop its named fields too.
+type ToolInput = ToolCallEnvelope extends infer I ? I extends { tool: string }
+  ? { [K in keyof I as K extends 'tool_use_id' ? never : K]: I[K] } & ToolCallReserved<I['tool']> & AgentLoop : never : never
+const toolCall = ($: Engine, input: ToolInput) => ($.tool.call as unknown as (input: ToolInput) => Promise<ToolCallResult>)(input)
+// Pinned at compile time: each tool's own input holds through the helper, and a field only another tool takes is refused.
+void (($: Engine) => [
+  toolCall($, { tool: 'Monitor', command: 'tail -f log', description: 'watch the log', timeout_ms: 60_000 }),
+  toolCall($, { tool: 'mcp__swarm__board', action: 'read', agentId: 'a1' }),
+  // @ts-expect-error Edit's field is no Monitor field
+  toolCall($, { tool: 'Monitor', command: 'tail -f log', description: 'watch the log', timeout_ms: 60_000, old_string: 'a' }),
+  // @ts-expect-error Monitor needs its description
+  toolCall($, { tool: 'Monitor', command: 'tail -f log', timeout_ms: 60_000 }),
+  // @ts-expect-error the board knows no such action
+  toolCall($, { tool: 'mcp__swarm__board', action: 'bogus' }),
+  // @ts-expect-error the board's seq is a number
+  toolCall($, { tool: 'mcp__swarm__board', action: 'show', seq: 'two' }),
+])
 
 // Agent lists are cast with `as never`: the fixtures name only the fields this plugin reads, and the engine's
 // AgentInfo gains required fields between builds, so a literal typed against one build fails the next.
@@ -97,8 +118,10 @@ test('the pane draws the board, the members and the graph', async ($, on) => {
     // a sender's name opens that agent's own conversation
     viewed.length = 0
     await ui.press({ key: 'agent-3' })
+    // the coordinator of a run this conversation does not drive is not this conversation: its posts are shown
     await ui.press({ key: 'agent-1' })
-    expect(viewed).toEqual(['a2', undefined])
+    expect(viewed).toEqual(['a2'])
+    await ui.press({ key: 'board-search-clear' })
 
     await ui.press({ key: 'tab-members' })
     expect(await ui.find({ type: 'Text', text: /working · 1 post$/ })).toBeDefined()
@@ -147,7 +170,7 @@ test('the pane draws the board, the members and the graph', async ($, on) => {
       expect(String(badge?.props.source)).toContain('prefers-reduced-motion')
       expect(await ui.find({ type: 'Button', text: 'Go live' })).toBeUndefined()
       await ui.press({ key: 'hide-inactive' })
-      const focusedGraph = String((await findSvg(ui, /^Post 3 · @verifier to @parser$/))?.props.source)
+      const focusedGraph = String((await findSvg(ui, /^Post 3 · @verifier to @parser\./))?.props.source)
       expect(focusedGraph).toContain('verifier · waiting')
       expect(focusedGraph).not.toContain('old · killed')
       expect(focusedGraph).not.toContain('later · not started')
@@ -209,18 +232,18 @@ test('the pane draws the board, the members and the graph', async ($, on) => {
   }) + '\n'
   await clock.advance(2000 - clock.now() % 2000)
   expect(String((await findSvg(ui, /^Post /))?.props.source)).toContain('animateMotion')
-  expect(await findSvg(ui, /^Post /).then(svg => svg?.props.alt)).toBe('Post 4 · @parser to @later')
+  expect(await findSvg(ui, /^Post /).then(svg => svg?.props.alt)).toMatch(/^Post 4 · @parser to @later\. A mention graph of /)
   await clock.advance(1200)
-  expect(await findSvg(ui, /^Post /).then(svg => svg?.props.alt)).toBe('Post 5 · @later to @verifier')
+  expect(await findSvg(ui, /^Post /).then(svg => svg?.props.alt)).toMatch(/^Post 5 · @later to @verifier\. A mention graph of /)
   expect(String((await findSvg(ui, /^Post /))?.props.source)).toContain('animateMotion')
   await clock.advance(1200)
   expect(String((await findSvg(ui, /^Post /))?.props.source)).toContain('repeatCount="indefinite"')
   await ui.press({ key: 'tab-board' })
   await ui.press({ key: 'graph-post-4' })
-  expect(await findSvg(ui, /^Post /).then(svg => svg?.props.alt)).toBe('Post 4 · @parser to @later')
+  expect(await findSvg(ui, /^Post /).then(svg => svg?.props.alt)).toMatch(/^Post 4 · @parser to @later\. A mention graph of /)
   parserStatus = 'idle'
   await clock.advance(2000)
-  expect(await findSvg(ui, /^Post /).then(svg => svg?.props.alt)).toBe('Post 4 · @parser to @later')
+  expect(await findSvg(ui, /^Post /).then(svg => svg?.props.alt)).toMatch(/^Post 4 · @parser to @later\. A mention graph of /)
   await ui.press({ key: 'replay-live' })
   expect(String((await findSvg(ui, /^Post /))?.props.source)).toContain('parser · waiting')
   await ui.press({ key: 'hide-inactive' })
@@ -233,7 +256,12 @@ test('the pane draws the board, the members and the graph', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: /^Latest post$/ })).toBeDefined()
   expect(await findSvg(ui, /^Live activity$/)).toBeUndefined()
   await ui.press({ key: 'tab-members' })
-  expect(await ui.find({ type: 'Text', text: /waiting · 2 posts/ })).toBeDefined()
+  // a closed run lists who was there at the close and what each last reported, never as standing by
+  expect(await ui.find({ type: 'Text', text: /^closed · 2 posts$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^At close · 4$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Standing by/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /^No outcome recorded$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Retired · 1$/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -300,7 +328,7 @@ test('the owning conversation retries failed wakes, acknowledges only the delive
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
   await clock.advance(2000)
   expect(sends).toEqual([])
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${RUN}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${RUN}" read coordinator` })
   await clock.advance(1)
   expect(sends.length).toBe(1)
   expect(sends[0]).toContain('a1')
@@ -346,6 +374,8 @@ test('the board command opens immediately and only opens the pane', async ($, on
 
     return { value: '/project' }
   })
+  // the project has had a run: only then is the shortcut offered unasked
+  on('fs.read', (_, e) => e.path === '/project/.swarm/current' ? { value: 'old-20261101-090000' } : { value: '' })
   on('fs.exists', () => ({ value: false }))
   on('prompt.submit', (_, e) => {
     actions.push('prompt')
@@ -397,6 +427,12 @@ test('the shortcut leads crab-buddy\'s row and Swarm\'s own row goes', async ($,
   const props = { hasSurvey: false, isCollapsed: false, isWorking: false, maxRows: 3, bodyColumns: 80, scroll: { offset: 0, bodyRows: 3 }, view: {} }
   const keys = (tree: Tree): string[] => [...(tree.props?.key ? [tree.props.key] : []), ...(tree.children ?? []).flatMap(keys)]
 
+  // the project has had a run: only then is the shortcut offered unasked
+  on('fs.read', (_, e) => e.path === '/project/.swarm/current' ? { value: 'old-20261101-090000' } : { value: '' })
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('tool.register', (_, spec) => ({ value: { tool: `mcp__swarm__${spec.name}` } }))
+  on('command.register', (_, spec) => ({ value: { command: spec.name } }))
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
   const band = await $.ui.mount({ component: 'AbovePrompt', plugin: 'swarm', surface: 'desktop', props })
   // One row: the shortcut first on the crab's line, Swarm's own row left out.
   expect(keys(await band.drawn() as Tree)).toEqual(['swarm-board-shortcut', 'crab-band', 'crab-fill', 'crab-text', 'crab-buddy'])
@@ -566,7 +602,8 @@ test('an unnamed Swarm agent is refused while the project has an open run, and a
   expect(starts.map(args => args[0])).toEqual(['later'])
   agents = agents.slice(0, 1)
   roster = JSON.stringify({ ...JSON.parse(ROSTER), closed: true })
-  expect((await $.agent.spawn(spawn)).agentId).toBe('started')
+  // a closed run starts no swarm: agent that is none of its members
+  expect((await $.agent.spawn(spawn)).deny).toContain('swarm: agents run only inside a Swarm run the user started with /swarm:swarm')
   // a refused resume whose description names nobody still reads as a sentence
   const refused = (await $.agent.spawn({ ...spawn, resume: { agentId: 'a9' } })).deny
   expect(refused).toContain('is closed, so this member is not started')
@@ -679,25 +716,25 @@ test('a read-only specialist can report to the board under its own assignment', 
   mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
   const call = { tool: 'mcp__swarm__board' as const, agentId: 'scout-address' }
-  expect((await $.tool.call({ ...call, action: 'read' })).deny).toBeUndefined()
+  expect((await toolCall($, { ...call, action: 'read' })).deny).toBeUndefined()
   // The board cuts a post longer than a page; how to open it whole is said in the tool's words, not the shell's.
   isTooLong = true
-  const paged = await $.tool.call({ ...call, action: 'read' })
+  const paged = await toolCall($, { ...call, action: 'read' })
   expect(String(paged.result)).toContain('[cut to fit the page. The whole post: action "show" with seq 3]')
   // `show` is cut to a page too, keeping the newest posts whole
-  const history = String((await $.tool.call({ ...call, action: 'show' })).result)
+  const history = String((await toolCall($, { ...call, action: 'show' })).result)
   expect(history.length).toBeLessThan(48200)
   expect(history).toMatch(/^Earlier posts are left out/)
   expect(history).toMatch(/\n#2000 @parser x+$/)
   expect(history.split('\n')[1]).toMatch(/^#\d+ @parser/)
   isTooLong = false
   // A member filter is taken as a member would write the name.
-  expect((await $.tool.call({ ...call, action: 'show', member: '@Scout' })).deny).toBeUndefined()
+  expect((await toolCall($, { ...call, action: 'show', member: '@Scout' })).deny).toBeUndefined()
   expect(processed.at(-1)?.args.slice(-2)).toEqual(['show', 'scout'])
   processed.length = 1  // the assertions below count the calls from the first read on
-  expect((await $.tool.call({ ...call, action: 'ready', text: 'Parser is in src/parser.ts.' })).deny).toBeUndefined()
-  expect((await $.tool.call({ ...call, action: 'post', member: 'other', text: 'Spoofed' })).deny).toBeDefined()
-  expect((await $.tool.call({ ...call, action: 'post', agentId: 'other-address', text: 'Retired' })).deny).toBeDefined()
+  expect((await toolCall($, { ...call, action: 'ready', text: 'Parser is in src/parser.ts.' })).deny).toBeUndefined()
+  expect((await toolCall($, { ...call, action: 'post', member: 'other', text: 'Spoofed' })).deny).toBeDefined()
+  expect((await toolCall($, { ...call, action: 'post', agentId: 'other-address', text: 'Retired' })).deny).toBeDefined()
   expect(processed).toEqual([
     { args: [directory, 'read', 'scout', '--max-bytes=48000'] },
     { args: [directory, 'ready', 'scout'], stdin: 'Parser is in src/parser.ts.' },
@@ -781,7 +818,7 @@ test('attention items open their post, members say what they wait for, and a spe
   })
 
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${RUN}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${RUN}" read coordinator` })
   await clock.advance(2000)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
@@ -825,7 +862,8 @@ test('attention items open their post, members say what they wait for, and a spe
   await spend('second')
   await spend('second')
   expect(Object.values(state.usage.tokens)).toEqual([1400])
-  expect(runs.filter(run => run.startsWith('account')).length).toBe(3)
+  // an end reported twice reaches the board once: the hook charges nothing the second time
+  expect(runs.filter(run => run.startsWith('account')).length).toBe(2)
   expect(prompts.filter(text => text.includes('reached its budget')).length).toBe(1)
   // members mid-turn finish; nobody new is started on a spent budget
   const started = await $.agent.spawn({
@@ -938,10 +976,10 @@ test('a member starts only on the model the roster and the limits allow', async 
   // a prompt that also names the conversation's own run starts under it
   const both = { ...parser, prompt: `Board: python3 b.py /project/.swarm/other-20261117-090000 read parser. Earlier: /project/.swarm/gone-20261117-100000` }
   expect((await $.agent.spawn(both)).agentId).toBe('started')
-  // a closed run starts none of its members, and stops policing agents that are not its members
+  // a closed run starts none of its members, nor any other swarm: agent: it drives no run
   closed = true
   expect((await $.agent.spawn(parser)).deny).toContain('is closed')
-  expect((await $.agent.spawn({ ...parser, description: 'no name', isTeammate: true })).agentId).toBe('started')
+  expect((await $.agent.spawn({ ...parser, description: 'no name', isTeammate: true })).deny).toContain('swarm: agents run only inside a Swarm run')
   // with the last run closed, a new run is open and unowned: a name it does not know is refused, not waved through
   unregistered = true
   expect((await $.agent.spawn({ ...parser, description: '@ghost: anything' })).deny).toContain('Register the member')
@@ -1018,8 +1056,8 @@ test('starting a registered member binds the run, however the board commands wer
     tool_use_id: 'fixture', prompt: 'Use the board.', subagentType: 'swarm:worker',
     provider: { plugin: 'swarm', tier: 'core' as const }, parentModel: 'sonnet', background: true, fork: false,
   }
-  // an unknown name adopts nothing, so the call passes as before; a registered one binds the run
-  expect((await $.agent.spawn({ ...spawn, description: '@ghost: anything' })).agentId).toBe('started')
+  // an unknown name adopts nothing, and a swarm: agent outside a run is not started; a registered one binds the run
+  expect((await $.agent.spawn({ ...spawn, description: '@ghost: anything' })).deny).toContain('swarm: agents run only inside a Swarm run')
   expect((await $.agent.spawn({ ...spawn, description: '@parser: date.ts' })).agentId).toBe('started')
   expect(adopted).toEqual(['ghost', 'parser'])
   // bound now: the limits apply, and the chat holds the row that opens the pane
@@ -1057,6 +1095,8 @@ test('starting a registered member binds the run, however the board commands wer
 test('a specialist whose run was never bound adopts it on its first board call', async ($, on) => {
   const run = '/project/.swarm/demo-20261116-101010'
   let isRegistered = false
+  // board.py's locate: 4 when an open run this conversation could drive does not know the name
+  let locateExit = 0
   on('command.register', (_, spec) => ({ value: { command: spec.name } }))
   on('tool.register', (_, spec) => ({ value: { tool: `mcp__swarm__${spec.name}` } }))
   on('session.start', (_, event) => ({ cwd: event.cwd }))
@@ -1068,7 +1108,7 @@ test('a specialist whose run was never bound adopts it on its first board call',
   }))
   on('process.run', (_, event) => ({
     value: {
-      exitCode: 0, stderr: '', isStdoutTruncated: false, isStderrTruncated: false,
+      exitCode: event.argv.includes('locate') ? locateExit : 0, stderr: '', isStdoutTruncated: false, isStderrTruncated: false,
       stdout: event.argv.includes('locate') ? (isRegistered ? run : '') : event.argv.includes('read') ? 'brief for probe' : '',
     },
   }))
@@ -1079,9 +1119,13 @@ test('a specialist whose run was never bound adopts it on its first board call',
 
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
   const call = { tool: 'mcp__swarm__board' as const, tool_use_id: 'fixture', agentId: 'probe-address', action: 'read' as const }
-  expect((await $.tool.call(call)).deny).toContain('No Swarm run is bound')
+  expect((await toolCall($, call)).deny).toContain('There is no Swarm run here')
+  // a run is near, only not bound for it: the coordinator is asked to register it
+  locateExit = 4
+  expect((await toolCall($, call)).deny).toContain('No Swarm run is bound to the conversation that started you')
+  locateExit = 0
   isRegistered = true
-  expect((await $.tool.call(call)).result).toBe('brief for probe')
+  expect((await toolCall($, call)).result).toBe('brief for probe')
 })
 
 test('concurrent starts reserve a member once and a recorded agent is resumed rather than duplicated', async ($, on) => {
@@ -1222,14 +1266,14 @@ test('the coordinator is told of unread mentions mid-turn and when idle, and a m
 
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
   // the read that binds the run is itself the read: it carries no reminder
-  const bound = await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${RUN}" read coordinator` })
+  const bound = await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${RUN}" read coordinator` })
   expect(bound.context).toBeUndefined()
   await clock.advance(2000)
-  const told = await $.tool.call({ tool: 'Read', file_path: '/project/a.ts' })
+  const told = await toolCall($, { tool: 'Read', file_path: '/project/a.ts' })
   expect(told.context?.join(' ')).toContain('1 board post addresses you from #2')
   expect(told.context?.join(' ')).toContain(`'${RUN}' read coordinator`)
   // once per newest unread post, not on every call
-  expect((await $.tool.call({ tool: 'Read', file_path: '/project/a.ts' })).context).toBeUndefined()
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts' })).context).toBeUndefined()
   // mid-turn nothing is submitted; once the turn ends with the post still unread, one prompt is
   await clock.advance(20000)
   expect(prompts).toEqual([])
@@ -1276,16 +1320,16 @@ test('the hive follows roster actions, coordinator turns and sleep', async ($, o
   await check('sleep', false)
   await $.turn.start({ text: 'Work', turnId: 'c' })
   await check('forage', true)
-  await $.tool.call({ tool: 'Read', file_path: '/project/a' })
+  await toolCall($, { tool: 'Read', file_path: '/project/a' })
   await check('inspect', true)
   worker = 'running'
-  await $.tool.call({ tool: 'Bash', command: 'npm test', agentId: 'a1' })
+  await toolCall($, { tool: 'Bash', command: 'npm test', agentId: 'a1' })
   await check('verify', true)
-  await $.tool.call({ tool: 'Bash', command: 'touch scratch', agentId: 'outsider' })
+  await toolCall($, { tool: 'Bash', command: 'touch scratch', agentId: 'outsider' })
   await check('verify', true)
-  await $.tool.call({ tool: 'Write', file_path: '/project/a', content: '', agentId: 'a1' })
+  await toolCall($, { tool: 'Write', file_path: '/project/a', content: '', agentId: 'a1' })
   await check('build', true)
-  await $.tool.call({ tool: 'Bash', command: 'python3 board.py run post worker', agentId: 'a1' })
+  await toolCall($, { tool: 'Bash', command: 'python3 board.py run post worker', agentId: 'a1' })
   await check('relay', true)
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'c', reason: 'answer' })
   await check('relay', false)
@@ -1358,7 +1402,7 @@ test('where no main view can be moved the pane shows the member\'s conversation,
   })
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await clock.advance(2000)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
@@ -1439,7 +1483,7 @@ test('one relay notice names every specialist with its address, an exhausted one
   on('agent.list', () => ({ value: ['s1', 'r1', 'x1'].map(id => ({ id, description: '', type: 'swarm:explorer', status: 'idle' })) as never }))
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'c1', reason: 'answer' })
   await clock.advance(14000)
   expect(seen.prompts.length).toBe(1)
@@ -1459,7 +1503,7 @@ test('one relay notice names every specialist with its address, an exhausted one
   expect(relay).not.toContain('BOARD wake')
   // the turn those prompts start is not told again on its first tool call
   await $.turn.start({ text: relay, turnId: 'c2' })
-  expect((await $.tool.call({ tool: 'Read', file_path: '/project/a.ts' })).context).toBeUndefined()
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts' })).context).toBeUndefined()
 })
 
 test('a poll during /clear does not look the next session\'s run up under the old session', async ($, on) => {
@@ -1529,7 +1573,7 @@ test('each model step is charged once, a spent budget stops members mid-turn and
   const done = { answer: '', durationMs: 1, isAborted: false, reason: 'answer' } as const
 
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await clock.advance(14000)  // the coordinator is mid-turn, so its unread mention is not prompted
 
   // a step is charged as it answers, cached reads at a tenth, and never twice; the turn's end adds only what no step reported
@@ -1541,7 +1585,7 @@ test('each model step is charged once, a spent budget stops members mid-turn and
   expect([total(), accounts().length]).toEqual([400, 1])
   await $.turn.complete({ ...done, turnId: 'm', agentId: 'a1', usage: usage(350, 1000) })
   expect([total(), accounts().length]).toEqual([450, 2])
-  expect((await $.tool.call({ tool: 'Read', file_path: '/project/a.ts', agentId: 'a1' })).deny).toBeUndefined()
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts', agentId: 'a1' })).deny).toBeUndefined()
 
   // the coordinator's last step crosses the budget: until that is on the board its turn is not over, so no poll
   // prompts it on the roster as it was; and a pause prompt that does not land is told to the person
@@ -1555,16 +1599,16 @@ test('each model step is charged once, a spent budget stops members mid-turn and
   expect(seen.toasts.join(' ')).toContain('the coordinator could not be told')
 
   // the member's next tool call is refused, on the board tool too; the coordinator and other agents go on
-  const refused = await $.tool.call({ tool: 'Read', file_path: '/project/a.ts', agentId: 'a1' })
+  const refused = await toolCall($, { tool: 'Read', file_path: '/project/a.ts', agentId: 'a1' })
   expect(refused.deny).toMatch(/run is paused \(token budget of 1k spent\).*end your turn now/)
-  expect((await $.tool.call({ tool: 'mcp__swarm__board', action: 'read', agentId: 'a1' })).deny).toContain('run is paused')
-  expect((await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" status` })).deny).toBeUndefined()
-  expect((await $.tool.call({ tool: 'Read', file_path: '/project/a.ts', agentId: 'outsider' })).deny).toBeUndefined()
+  expect((await toolCall($, { tool: 'mcp__swarm__board', action: 'read', agentId: 'a1' })).deny).toContain('run is paused')
+  expect((await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" status` })).deny).toBeUndefined()
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts', agentId: 'outsider' })).deny).toBeUndefined()
   // a resume with a raised budget lets it through again
   state.paused = undefined
   state.limits.budget = '5000'
   await clock.advance(2000)
-  expect((await $.tool.call({ tool: 'Read', file_path: '/project/a.ts', agentId: 'a1' })).deny).toBeUndefined()
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts', agentId: 'a1' })).deny).toBeUndefined()
 
   // once the run is closed, later turns are not charged to it, its members are still refused by name, and it is no longer owned
   state.closed = true
@@ -1579,7 +1623,7 @@ test('each model step is charged once, a spent budget stops members mid-turn and
   expect(again.deny).toContain('is closed')
   const binds = () => seen.commands.filter(command => command.startsWith('bind')).length
   expect(binds()).toBe(1)
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   expect(binds()).toBe(2)
 })
 
@@ -1594,7 +1638,7 @@ test('the run is bound from its first planning command, and only a real read of 
   on('tool.call', (_, e) => ({ result: { stdout: e.tool === 'Bash' && String(e.command).includes(' init ') ? `${OWNED}\n` : '' } as never }))
   const clock = mock.clock(on)
   const binds = () => seen.commands.filter(command => command.startsWith('bind')).length
-  const bash = (command: string) => $.tool.call({ tool: 'Bash', command })
+  const bash = (command: string) => toolCall($, { tool: 'Bash', command })
 
   // planning done before the run is bound is charged to it at the turn's end: no step's usage is lost on the way
   let spent = { model: 'm', input_tokens: 250, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
@@ -1660,7 +1704,7 @@ test('a bind still waiting for the board when /clear fires does not bring the ol
   on('agent.list', () => ({ value: [] }))
   on('tool.call', () => ({ result: {} }))
   mock.clock(on)
-  const read = () => $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  const read = () => toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   const binds = () => seen.commands.filter(command => command.startsWith('bind')).length
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
   isClearing = true
@@ -1705,7 +1749,7 @@ test('the pane pauses, resumes and answers attention items on the board itself, 
   on('tool.call', () => ({ result: {} }))
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await clock.advance(2000)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   const ran = () => seen.commands.filter(command => /^(pause|resume|limit|retry)\b/.test(command))
@@ -1781,7 +1825,7 @@ test('the run switcher shows the project\'s other runs read-only and leaves the 
   on('session.send', (_, e) => { sends.push(`${e.to}: ${e.text}`); return { isDelivered: true } })
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await clock.advance(2000)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await ui.find({ type: 'Text', text: /read-only/ })).toBeUndefined()
@@ -1814,16 +1858,26 @@ test('the run switcher shows the project\'s other runs read-only and leaves the 
   expect(sends.length).toBeGreaterThan(0)
   expect(sends.every(send => send.includes('a1') && send.includes(`'${OWNED}' read parser`))).toBe(true)
   expect(await ui.find({ type: 'Text', text: /^Older swarm$/ })).toBeDefined()
-  // the folder with no roster and `archive` are no runs: nothing lies further back
-  await ui.press({ key: 'run-prev' })
-  expect(seen.toasts).toEqual(['No earlier run in this project.'])
+  // the folder with no roster and `archive` are no runs: nothing lies further back, so the step back is no control
+  expect(await ui.find({ type: 'Button', key: 'run-prev' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /^‹ Prev run$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'run-next' })).toBeDefined()
+  expect(seen.toasts).toEqual([])
   // one press back to the live run, by the button or by stepping forward onto it
   await ui.press({ key: 'run-live' })
   expect(await ui.find({ type: 'Text', text: /^Demo swarm$/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /read-only/ })).toBeUndefined()
+  // before the run list is read, both steps are offered
+  expect(await ui.find({ type: 'Button', key: 'run-prev' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'run-next' })).toBeDefined()
   await ui.press({ key: 'run-prev' })
   await ui.press({ key: 'run-next' })
   expect(await ui.find({ type: 'Text', text: /^Demo swarm$/ })).toBeDefined()
+  // the live run is the newest: stepped onto, it offers the step back only
+  expect(await ui.find({ type: 'Button', key: 'run-next' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /^Next run ›$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'run-prev' })).toBeDefined()
+  expect(seen.toasts).toEqual([])
   expect(seen.commands.filter(command => command.startsWith('bind')).length).toBe(0)
   await ui.unmount()
 })
@@ -1853,7 +1907,7 @@ test('a pause nobody made in front of the coordinator is told to it once, and a 
   })
   const clock = mock.clock(on)
   const done = { answer: '', durationMs: 1, isAborted: false, reason: 'answer' } as const
-  const bash = (command: string) => $.tool.call({ tool: 'Bash', command })
+  const bash = (command: string) => toolCall($, { tool: 'Bash', command })
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
   await bash(`python3 /p/board.py "${OWNED}" read coordinator`)
   await $.turn.complete({ ...done, turnId: 'c1' })
@@ -1886,8 +1940,8 @@ test('a pause nobody made in front of the coordinator is told to it once, and a 
   state.paused = '@art failed verification 4 times in a row'
   await clock.advance(4000)
   expect(seen.prompts.length).toBe(1)
-  expect((await $.tool.call({ tool: 'Read', file_path: '/project/a.ts' })).context?.join(' ')).toContain('is paused: @art failed verification 4 times')
-  expect((await $.tool.call({ tool: 'Read', file_path: '/project/a.ts' })).context).toBeUndefined()
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts' })).context?.join(' ')).toContain('is paused: @art failed verification 4 times')
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts' })).context).toBeUndefined()
   await $.turn.complete({ ...done, turnId: 'c3' })
   state.paused = undefined
   await clock.advance(12000)
@@ -2033,7 +2087,7 @@ test('agent.spawn handles model=inherit, exact older IDs, spawnEfforts, parallel
   expect((await $.agent.spawn({ ...base, description: '@bedrock: test', model: 'opus' })).agentId).toBe('id-5')
   expect(spawned.at(-1)?.model).toBe('us.anthropic.claude-opus-4-6-v1')
   // spawnEfforts enforcement via tool.call('Agent')
-  await $.tool.call({ tool: 'Agent', tool_use_id: 'eff-1', effort: 'high' } as never)
+  await toolCall($, { tool: 'Agent', tool_use_id: 'eff-1', effort: 'high' } as never)
   expect(effortDeny).toContain('medium effort')
 
   // Parallel bind on an unbound run succeeds for both workers
@@ -2185,8 +2239,10 @@ test('wave 2 UI: off-tab clock, dimmed replay guards, markdown fences, hide-inac
   const returnVisit = String((await ui.findAll({ type: 'Svg' })).find(el => /^Post /.test(String(el.props.alt)))?.props.source)
   expect(returnVisit).toContain('animateMotion begin="-400ms"')
 
-  // Dimmed Replay Next button at the newest post does not exit Live mode
-  await ui.press({ key: 'replay-next' })
+  // At the newest post Next leads nowhere: it is text, not a control, and Live stays
+  expect(await ui.find({ type: 'Button', key: 'replay-next' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /^Next ›$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'replay-back' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /^Live$/ })).toBeDefined()
 
   // Hide inactive empty state in Members tab when all members are inactive
@@ -2267,35 +2323,35 @@ test('a post already opened is not announced again, a run made from memory is po
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
   // `init` always points at the skill, since a run can be made from memory; a long conversation is named with it.
   // The run folder is found on whichever line of the output holds it.
-  const made = await $.tool.call({ tool: 'Bash', command: 'python3 /p/board.py /project/.swarm/demo init "Demo swarm" && echo ok' })
+  const made = await toolCall($, { tool: 'Bash', command: 'python3 /p/board.py /project/.swarm/demo init "Demo swarm" && echo ok' })
   expect(made.context?.join(' ')).toContain('skills/swarm/SKILL.md')
   expect(made.context?.join(' ')).toContain('already holds about 300k tokens')
   held = 20_000
-  const again = await $.tool.call({ tool: 'Bash', command: 'python3 /p/board.py /project/.swarm/demo init "Demo swarm"' })
+  const again = await toolCall($, { tool: 'Bash', command: 'python3 /p/board.py /project/.swarm/demo init "Demo swarm"' })
   expect(again.context?.join(' ')).toContain('name the token budget')
   expect(again.context?.join(' ')).not.toContain('already holds')
   await clock.advance(2000)
   // one member's posts were shown: the other member's post is still owed, and said so on that very result
-  const some = await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py ${RUN} show parser` })
+  const some = await toolCall($, { tool: 'Bash', command: `python3 /p/board.py ${RUN} show parser` })
   expect(some.context?.join(' ')).toContain('1 board post addresses you from #3')
   // a show piped to `head` or redirected to a file was not seen: the post stays owed
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py ${RUN} show --post=3 | head -1` })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py ${RUN} show --post=3 > /tmp/x` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py ${RUN} show --post=3 | head -1` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py ${RUN} show --post=3 > /tmp/x` })
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't0', reason: 'answer' })
   await clock.advance(30000)
   expect(prompts.filter(text => text.includes('addresses you')).length).toBeGreaterThan(0)
   prompts.length = 0
   // opening that post is reading it: no reminder then, and no prompt when idle
-  const shown = await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py ${RUN} show --post=3` })
+  const shown = await toolCall($, { tool: 'Bash', command: `python3 /p/board.py ${RUN} show --post=3` })
   expect(shown.context).toBeUndefined()
-  expect((await $.tool.call({ tool: 'Read', file_path: '/project/a.ts' })).context).toBeUndefined()
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts' })).context).toBeUndefined()
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' })
   await clock.advance(30000)
   expect(prompts.filter(text => text.includes('addresses you'))).toEqual([])
   // the run folder is deleted under the pane: the next polls are quiet and a tool call is not disturbed
   isGone = true
   await clock.advance(6000)
-  const after = await $.tool.call({ tool: 'Read', file_path: '/project/a.ts' })
+  const after = await toolCall($, { tool: 'Read', file_path: '/project/a.ts' })
   expect(after.context).toBeUndefined()
   expect(after.deny).toBeUndefined()
 })
@@ -2349,7 +2405,7 @@ test('a READY is held while others still work, and a run made inside a command s
 
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
   // the folder never reaches the output and no board call can be read off the command: the pointer names the run
-  const made = await $.tool.call({ tool: 'Bash', command: 'R=$(python3 /p/board.py /project/.swarm/demo init "Demo swarm")' })
+  const made = await toolCall($, { tool: 'Bash', command: 'R=$(python3 /p/board.py /project/.swarm/demo init "Demo swarm")' })
   expect(commands).toContain(`bind ${RUN}`)
   expect(made.context?.join(' ')).toContain('skills/swarm/SKILL.md')
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' })
@@ -2444,10 +2500,10 @@ test('wave 3 fixes: multi-word kind filter, non-round budget pause dedup, specia
   expect(conflict.deny).toContain('The roster has @exact on claude-opus-4-6, but this call would start it on claude-opus-4-5')
 
   // 2. specialistBoard treats empty member="" as undefined when seq is passed, and translates ready/revise usage errors
-  const showSeq = await $.tool.call({ tool: 'mcp__swarm__board', tool_use_id: 'b1', agentId: 's1', action: 'show', member: '  ', seq: 2 } as never)
+  const showSeq = await toolCall($, { tool: 'mcp__swarm__board', tool_use_id: 'b1', agentId: 's1', action: 'show', member: '  ', seq: 2 } as never)
   expect(showSeq.result).toBe('shown:--post=2')
   failReady = true
-  const readyErr = await $.tool.call({ tool: 'mcp__swarm__board', tool_use_id: 'b2', agentId: 's1', action: 'ready', text: 'done' } as never)
+  const readyErr = await toolCall($, { tool: 'mcp__swarm__board', tool_use_id: 'b2', agentId: 's1', action: 'ready', text: 'done' } as never)
   expect(readyErr.deny).toContain('action "ready" with text')
   failReady = false
 
@@ -2460,7 +2516,7 @@ test('wave 3 fixes: multi-word kind filter, non-round budget pause dedup, specia
   expect(prompts.filter(p => p.includes('paused')).length).toBe(1)
 
   // 4. specialistBoard refuses calls when the run is paused or over budget even if halted was not pre-populated
-  const pausedCall = await $.tool.call({ tool: 'mcp__swarm__board', tool_use_id: 'b3', agentId: 's1', action: 'read' } as never)
+  const pausedCall = await toolCall($, { tool: 'mcp__swarm__board', tool_use_id: 'b3', agentId: 's1', action: 'read' } as never)
   expect(pausedCall.deny).toContain('paused')
 
   // 5. Board search filter matches multi-word negative kinds (`not passed`, `kind:not passed`, `kind:not-verified`)
@@ -2477,7 +2533,7 @@ test('wave 3 fixes: multi-word kind filter, non-round budget pause dedup, specia
   await ui.unmount()
 })
 
-test('an agent outside the roster neither joins the run by resuming nor pauses its members by spending', async ($, on) => {
+test('an agent outside the roster is not resumed into the run and does not pause its members by spending', async ($, on) => {
   const state = {
     title: 'Demo swarm', limits: { budget: '1000' }, paused: undefined as string | undefined,
     usage: { tokens: { coordinator: 900 } as Record<string, number> },
@@ -2515,21 +2571,21 @@ test('an agent outside the roster neither joins the run by resuming nor pauses i
     await clock.advance(1)
   }
   const accounts = () => seen.commands.filter(command => command.startsWith('account')).length
-  const reads = (agentId: string) => $.tool.call({ tool: 'Read', file_path: '/project/a.ts', agentId })
+  const reads = (agentId: string) => toolCall($, { tool: 'Read', file_path: '/project/a.ts', agentId })
 
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await clock.advance(2000)
   expect((await reads('a1')).deny).toBeUndefined()
 
-  // An unrelated agent is resumed while the run is open: it is let through, and is no member for that.
+  // An unrelated swarm: agent is not resumed while the run is open: it belongs to no run.
   const resumed = await $.agent.spawn({
     tool_use_id: 'again', prompt: 'Go on.', description: 'Continue previous work', subagentType: 'swarm:worker',
     provider: { plugin: 'swarm', tier: 'core' as const }, parentModel: 'sonnet', background: true, fork: false,
     resume: { agentId: 'outsider' },
   } as never)
-  expect(resumed.deny).toBeUndefined()
-  // Its model step would cross the budget, were it the run's: nothing is charged and no member is stopped.
+  expect(resumed.deny).toContain('is no member of this Swarm run')
+  // Still running from before, its model step would cross the budget, were it the run's: nothing is charged and no member is stopped.
   await step('foreign', 200, 'outsider')
   expect(accounts()).toBe(0)
   expect((await reads('a1')).deny).toBeUndefined()
@@ -2559,7 +2615,7 @@ test('a mention older than the tail of a large board is still delivered', async 
   const clock = mock.clock(on)
 
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'c', reason: 'answer' })
   await clock.advance(4000)
   expect(seen.commands).toContain('claim parser a1 1')
@@ -2589,11 +2645,11 @@ test('a retired member that is still mid-turn has its tool calls refused, and it
   const clock = mock.clock(on)
 
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await clock.advance(2000)
-  expect((await $.tool.call({ tool: 'Bash', command: './test.sh', agentId: 'old' })).deny).toContain('has been retired')
-  expect((await $.tool.call({ tool: 'Bash', command: './test.sh', agentId: 'new' })).deny).toBeUndefined()
-  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).deny).toBeUndefined()
+  expect((await toolCall($, { tool: 'Bash', command: './test.sh', agentId: 'old' })).deny).toContain('has been retired')
+  expect((await toolCall($, { tool: 'Bash', command: './test.sh', agentId: 'new' })).deny).toBeUndefined()
+  expect((await toolCall($, { tool: 'Bash', command: 'ls' })).deny).toBeUndefined()
 })
 
 test('a replacement is not started while the member it replaces is still running', async ($, on) => {
@@ -2621,7 +2677,7 @@ test('a replacement is not started while the member it replaces is still running
   })
 
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await clock.advance(2000)
   const held = await start()
   expect(held.deny).toContain('@parser, which @parser-2 replaces, is still running as agent old')
@@ -2663,13 +2719,13 @@ test('hardening: native retired enforcement, immediate sync after coordinator co
 
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
   // Binding via read immediately populates retired (including native teammate id) before any poll.
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
-  expect((await $.tool.call({ tool: 'Bash', command: 'echo hi', agentId: 'tm-1' })).deny).toContain('has been retired')
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  expect((await toolCall($, { tool: 'Bash', command: 'echo hi', agentId: 'tm-1' })).deny).toContain('has been retired')
 
   // Coordinator replace immediately syncs retired and attaches zombie notice when w-1 is waiting.
-  const rep = await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" replace worker worker-2` })
+  const rep = await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" replace worker worker-2` })
   expect(rep.context?.join('\n')).toContain('@worker was retired, but agent w-1 is still waiting')
-  expect((await $.tool.call({ tool: 'Bash', command: 'echo hi', agentId: 'w-1' })).deny).toContain('has been retired')
+  expect((await toolCall($, { tool: 'Bash', command: 'echo hi', agentId: 'w-1' })).deny).toContain('has been retired')
 })
 
 test('hardening: transitive predecessor chain, overlapping paths, spawnIsolations, and exact model guidance', async ($, on) => {
@@ -2715,7 +2771,7 @@ test('hardening: transitive predecessor chain, overlapping paths, spawnIsolation
   mock.clock(on)
 
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
 
   // Transitive chain a -> a-2 -> a-3 blocked while a-old is waiting.
   const chainDeny = await $.agent.spawn({
@@ -2739,7 +2795,7 @@ test('hardening: transitive predecessor chain, overlapping paths, spawnIsolation
   expect(modelDeny.deny).toContain('Omit model or pass model: "opus" on the Agent call')
 
   // spawnIsolations passes isolated=1 for worktree.
-  await $.tool.call({
+  await toolCall($, {
     tool: 'Agent', tool_use_id: 'wt-call', subagent_type: 'swarm:worker', description: '@wt: go',
     prompt: 'Use the board.', isolation: 'worktree',
   })
@@ -2777,32 +2833,32 @@ test('hardening: runtime file edit guards, shared git commit guard, coordinator 
   const clock = mock.clock(on)
 
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await clock.advance(2000)
 
   // File edit guards inside cwd
-  expect((await $.tool.call({ tool: 'Edit', file_path: '/project/.swarm/r/board.jsonl', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toContain('.swarm/')
-  expect((await $.tool.call({ tool: 'Write', file_path: '/project/src/alice/a.ts', content: 'x', agentId: 'ver-1' })).deny).toContain('read-only')
-  expect((await $.tool.call({ tool: 'Edit', file_path: '/project/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toContain('claimed by @bob')
-  expect((await $.tool.call({ tool: 'Edit', file_path: '/project/README.md', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toContain('claimed paths')
-  expect((await $.tool.call({ tool: 'Edit', file_path: '/project/src/alice/a.ts', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toBeUndefined()
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/.swarm/r/board.jsonl', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toContain('.swarm/')
+  expect((await toolCall($, { tool: 'Write', file_path: '/project/src/alice/a.ts', content: 'x', agentId: 'ver-1' })).deny).toContain('read-only')
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toContain('claimed by @bob')
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/README.md', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toContain('claimed paths')
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/src/alice/a.ts', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toBeUndefined()
   // Outside cwd (/tmp and worktrees) are untouched
-  expect((await $.tool.call({ tool: 'Write', file_path: '/tmp/design.html', content: '<html/>', agentId: 'ver-1' })).deny).toBeUndefined()
-  expect((await $.tool.call({ tool: 'Edit', file_path: '/worktrees/wt1/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'bob-1' })).deny).toBeUndefined()
+  expect((await toolCall($, { tool: 'Write', file_path: '/tmp/design.html', content: '<html/>', agentId: 'ver-1' })).deny).toBeUndefined()
+  expect((await toolCall($, { tool: 'Edit', file_path: '/worktrees/wt1/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'bob-1' })).deny).toBeUndefined()
 
   // Shared git commit guard
   for (const command of ['git -C . commit', 'cd . && git commit', 'cd /tmp/wt && git -C /project commit']) {
-    expect((await $.tool.call({ tool: 'Bash', command, agentId: 'alice-1' })).deny).toContain('Shared-checkout writers')
+    expect((await toolCall($, { tool: 'Bash', command, agentId: 'alice-1' })).deny).toContain('Shared-checkout writers')
   }
-  expect((await $.tool.call({ tool: 'Bash', command: 'git commit -m "wip"', agentId: 'alice-1' })).deny).toContain('Shared-checkout writers must not run `git commit`')
-  expect((await $.tool.call({ tool: 'Bash', command: 'git -C /tmp/wt commit -m "wip"', agentId: 'alice-1' })).deny).toBeUndefined()
-  expect((await $.tool.call({ tool: 'Bash', command: 'cd /tmp/wt && git commit -m "wip"', agentId: 'alice-1' })).deny).toBeUndefined()
-  expect((await $.tool.call({ tool: 'Bash', command: 'git commit -m "wip"', agentId: 'bob-1' })).deny).toBeUndefined()
+  expect((await toolCall($, { tool: 'Bash', command: 'git commit -m "wip"', agentId: 'alice-1' })).deny).toContain('Shared-checkout writers must not run `git commit`')
+  expect((await toolCall($, { tool: 'Bash', command: 'git -C /tmp/wt commit -m "wip"', agentId: 'alice-1' })).deny).toBeUndefined()
+  expect((await toolCall($, { tool: 'Bash', command: 'cd /tmp/wt && git commit -m "wip"', agentId: 'alice-1' })).deny).toBeUndefined()
+  expect((await toolCall($, { tool: 'Bash', command: 'git commit -m "wip"', agentId: 'bob-1' })).deny).toBeUndefined()
 
   // Coordinator Monitor & background Bash guards
-  expect((await $.tool.call({ tool: 'Monitor', command: 'tail -f log' } as never)).deny).toContain('Monitor')
-  expect((await $.tool.call({ tool: 'Bash', command: 'sleep 10 && echo hi', run_in_background: true })).deny).toContain('background watcher')
-  const bgOk = await $.tool.call({ tool: 'Bash', command: 'bun test', run_in_background: true })
+  expect((await toolCall($, { tool: 'Monitor', command: 'tail -f log' } as never)).deny).toContain('Monitor')
+  expect((await toolCall($, { tool: 'Bash', command: 'sleep 10 && echo hi', run_in_background: true })).deny).toContain('background watcher')
+  const bgOk = await toolCall($, { tool: 'Bash', command: 'bun test', run_in_background: true })
   expect(bgOk.deny).toBeUndefined()
   expect(bgOk.context?.join('\n')).toContain('wake the coordinator')
 
@@ -2845,10 +2901,10 @@ test('guard regressions: commit wrappers, worktree paths, ignored claims, case, 
   on('tool.call', () => ({ result: {} }))
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await clock.advance(2000)
-  const bash = (command: string, agentId = 'alice-1') => $.tool.call({ tool: 'Bash', command, agentId })
-  const edit = (file_path: string, agentId = 'alice-1') => $.tool.call({ tool: 'Edit', file_path, old_string: 'a', new_string: 'b', agentId })
+  const bash = (command: string, agentId = 'alice-1') => toolCall($, { tool: 'Bash', command, agentId })
+  const edit = (file_path: string, agentId = 'alice-1') => toolCall($, { tool: 'Edit', file_path, old_string: 'a', new_string: 'b', agentId })
 
   // R1/R8: commit guard sees through wrappers, multi-line commands, subdirectories and background operators.
   for (const command of [
@@ -2952,15 +3008,15 @@ test('a retired member whose build is still running in its worktree is reported 
   mock.clock(on)
 
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
-  const gone = await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" member parser killed=1` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  const gone = await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" member parser killed=1` })
   expect(gone.context?.join('\n')).toContain('@parser was retired, but 2 processes it started are still running in its worktree: 202 (xcodebuild), 404 (zsh)')
   expect(gone.context?.join('\n')).toContain('kill 202 404')
   expect(gone.context?.join('\n')).not.toContain('303')
   // a shared writer's build cannot be attributed: said when it is replaced, and not when it is simply removed
-  const removed = await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" member shared killed=1` })
+  const removed = await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" member shared killed=1` })
   expect(removed.context?.join('\n') ?? '').not.toContain('@shared was retired')
-  const other = await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" replace shared shared-2` })
+  const other = await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" replace shared shared-2` })
   expect(other.context?.join('\n')).toContain('@shared was retired. A build or test it started in the shared folder cannot be told')
 })
 
@@ -3005,10 +3061,10 @@ test('a member whose agent ended without a report is flagged while others work, 
   ] as never }))
   on('tool.call', () => ({ result: {} }))
   const clock = mock.clock(on)
-  const told = async () => (await $.tool.call({ tool: 'Bash', command: 'ls' })).context?.join('\n') ?? ''
+  const told = async () => (await toolCall($, { tool: 'Bash', command: 'ls' })).context?.join('\n') ?? ''
 
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await clock.advance(2000)
   // a turn may have just ended: nothing is said within the first minute
   expect(await told()).not.toContain('stopped without reporting')
@@ -3058,9 +3114,9 @@ test('F3: the shared-checkout commit guard reads a commit however it is quoted, 
   })
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await clock.advance(2000)
-  const bash = (command: string) => $.tool.call({ tool: 'Bash', command, agentId: 'alice-1' })
+  const bash = (command: string) => toolCall($, { tool: 'Bash', command, agentId: 'alice-1' })
   for (const command of [
     // quoted and escaped words
     '"git" commit -m x', '\\git commit -m x', 'git "commit" -m x', "'git' 'commit'", '/usr/bin/git commit',
@@ -3117,9 +3173,9 @@ test('F4, F25, F28: an isolated member is guarded in its worktree wherever the c
   on('tool.call', () => ({ result: {} }))
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await clock.advance(2000)
-  const edit = async (file_path: string, agentId: string) => (await $.tool.call({ tool: 'Edit', file_path, old_string: 'a', new_string: 'b', agentId })).deny
+  const edit = async (file_path: string, agentId: string) => (await toolCall($, { tool: 'Edit', file_path, old_string: 'a', new_string: 'b', agentId })).deny
   const own = '/main/.claude/worktrees/agent-bob-1'
   // F4: beside the coordinator's worktree, under the main checkout, the roster's rules still hold
   expect(await edit(`${own}/src/bob/b.ts`, 'bob-1')).toBeUndefined()
@@ -3149,8 +3205,8 @@ test('F25: a pause typed for a run this conversation does not own halts nobody h
   on('tool.call', () => ({ result: {} }))
   mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${other}" pause` })
-  expect((await $.tool.call({ tool: 'Read', file_path: '/project/a.ts', agentId: 'zed-1' } as never)).deny).toBeUndefined()
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${other}" pause` })
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts', agentId: 'zed-1' } as never)).deny).toBeUndefined()
 })
 
 test('F5: Show earlier in a member conversation still works after a poll', async ($, on) => {
@@ -3163,7 +3219,7 @@ test('F5: Show earlier in a member conversation still works after a poll', async
   on('session.messages', () => ({ value: said as never }))
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await clock.advance(2000)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'tab-members' })
@@ -3201,9 +3257,9 @@ test('F6: a run folder that is deleted takes its pause and its retired members w
   on('tool.call', () => ({ result: {} }))
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await clock.advance(2000)
-  const read = async (agentId: string) => (await $.tool.call({ tool: 'Read', file_path: '/project/a.ts', agentId } as never)).deny
+  const read = async (agentId: string) => (await toolCall($, { tool: 'Read', file_path: '/project/a.ts', agentId } as never)).deny
   expect(await read('a1')).toContain('paused (awaiting the user)')
   expect(await read('a0')).toContain('has been retired')
   isGone = true
@@ -3237,7 +3293,7 @@ test('F24: the Board filter finds @all and group posts, and a kind is a whole wo
   ] as never }))
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' })
   await clock.advance(2000)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
@@ -3269,18 +3325,18 @@ test('a run made inside a command substitution takes the place of the closed run
   on('tool.call', () => ({ result: { stdout: '', stderr: '' } }))
   mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   expect(seen.restore).toBe(OWNED)
   // text that only mentions an init, in a quoted string or a heredoc, makes no run
-  const noted = await $.tool.call({ tool: 'Bash', command: `cat <<'EOF'\nR=$(python3 /p/board.py /project/.swarm/next init "Next")\nEOF\necho 'board.py x init y'` })
+  const noted = await toolCall($, { tool: 'Bash', command: `cat <<'EOF'\nR=$(python3 /p/board.py /project/.swarm/next init "Next")\nEOF\necho 'board.py x init y'` })
   expect(noted.context ?? []).toEqual([])
   // while the owned run is open, a run made in a substitution does not take the conversation from it
-  await $.tool.call({ tool: 'Bash', command: 'R=$(python3 /p/board.py /project/.swarm/next init "Next")' })
+  await toolCall($, { tool: 'Bash', command: 'R=$(python3 /p/board.py /project/.swarm/next init "Next")' })
   expect(seen.restore).toBe(OWNED)
   isClosed = true
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" close` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" close` })
   // however the script is run inside the substitution
-  const made = await $.tool.call({ tool: 'Bash', command: 'R=$(uv run /p/board.py /project/.swarm/next init "Next")' })
+  const made = await toolCall($, { tool: 'Bash', command: 'R=$(uv run /p/board.py /project/.swarm/next init "Next")' })
   expect(seen.restore).toBe('/project/.swarm/next-20261117-101010')
   expect(made.context?.join(' ')).toContain('skills/swarm/SKILL.md')
 })
@@ -3304,12 +3360,12 @@ test('the coordinator drives its run through the board tool, and what a typed bo
   on('agent.list', () => ({ value: [{ id: 'a1', description: '@parser', type: 'swarm:worker', status: 'running' }] as never }))
   on('tool.call', () => ({ result: {} }))
   const clock = mock.clock(on)
-  const tool = (input: McpToolInputs['mcp__swarm__board']) => $.tool.call({ tool: 'mcp__swarm__board', ...input })
+  const tool = (input: McpToolInputs['mcp__swarm__board']) => toolCall($, { tool: 'mcp__swarm__board', ...input })
   const last = (action: string) => ran.findLast(one => one.args.split(' ')[0] === action)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
 
   // nothing to drive before a run is made; a field an action does not take is refused before the board runs
-  expect((await tool({ action: 'status' })).deny).toContain('No Swarm run is bound')
+  expect((await tool({ action: 'status' })).deny).toContain('There is no Swarm run here')
   expect((await tool({ action: 'init', title: 'Demo swarm' })).deny).toContain('name missing')
   expect((await tool({ action: 'init', name: '../up', title: 'Demo swarm' })).deny).toContain('folder name')
   expect((await tool({ action: 'ready', text: 'done' })).deny).toContain('Unknown board action')
@@ -3356,7 +3412,7 @@ test('the coordinator drives its run through the board tool, and what a typed bo
   expect(last('replace')?.args).toBe('replace parser parser-2 model=opus')
   expect(replaced.context?.join(' ')).toContain('@parser was retired, but agent a1 is still running')
   // and its tool calls are refused from here, with no poll in between
-  expect((await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'a1' })).deny).toContain('retired')
+  expect((await toolCall($, { tool: 'Bash', command: 'ls', agentId: 'a1' })).deny).toContain('retired')
 })
 
 test('workers, designers and verifiers use the board tool as themselves, within what each may report', async ($, on) => {
@@ -3388,9 +3444,9 @@ test('workers, designers and verifiers use the board tool as themselves, within 
   on('tool.call', () => ({ result: {} }))
   mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   ran.length = 0
-  const as = (agentId: string, input: McpToolInputs['mcp__swarm__board']) => $.tool.call({ tool: 'mcp__swarm__board', agentId, ...input })
+  const as = (agentId: string, input: McpToolInputs['mcp__swarm__board']) => toolCall($, { tool: 'mcp__swarm__board', agentId, ...input })
 
   expect((await as('alice-1', { action: 'read' })).deny).toBeUndefined()
   expect((await as('alice-1', { action: 'status' })).deny).toBeUndefined()
@@ -3453,26 +3509,26 @@ test('a member that spends its own token budget is stopped at once, the coordina
   on('tool.call', () => ({ result: {} }))
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'coordinator-turn', reason: 'answer' })
   await clock.advance(2000)
 
   const usage = { model: 'm', input_tokens: 600, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'alice-turn', reason: 'answer', agentId: 'alice-1', usage })
   // refused from its next tool call on, before any poll reads the roster
-  expect((await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'alice-1' })).deny).toContain('spent its own token budget')
-  expect((await $.tool.call({ tool: 'mcp__swarm__board', agentId: 'alice-1', action: 'read' })).deny).toContain('spent its own token budget')
-  expect((await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'bob-1' })).deny).toBeUndefined()
+  expect((await toolCall($, { tool: 'Bash', command: 'ls', agentId: 'alice-1' })).deny).toContain('spent its own token budget')
+  expect((await toolCall($, { tool: 'mcp__swarm__board', agentId: 'alice-1', action: 'read' })).deny).toContain('spent its own token budget')
+  expect((await toolCall($, { tool: 'Bash', command: 'ls', agentId: 'bob-1' })).deny).toBeUndefined()
   // an idle coordinator is told by a prompt, once
   await clock.advance(2000)
   await clock.advance(12_000)
   expect(seen.prompts.filter(text => text.startsWith('Swarm: Member paused\n@alice has spent its own token budget'))).toHaveLength(1)
   // a busy one with its next tool call, once
-  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).context ?? []).toEqual([])
+  expect((await toolCall($, { tool: 'Bash', command: 'ls' })).context ?? []).toEqual([])
   spender = 'bob'
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'bob-turn', reason: 'answer', agentId: 'bob-1', usage })
-  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).context?.join(' ')).toContain('@bob has spent its own token budget')
-  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).context?.join(' ') ?? '').not.toContain('@bob')
+  expect((await toolCall($, { tool: 'Bash', command: 'ls' })).context?.join(' ')).toContain('@bob has spent its own token budget')
+  expect((await toolCall($, { tool: 'Bash', command: 'ls' })).context?.join(' ') ?? '').not.toContain('@bob')
   expect(seen.prompts.filter(text => text.includes('@bob'))).toEqual([])
 
   // the pane names it, and Resume runs the board's resume for that member
@@ -3489,7 +3545,7 @@ test('a member that spends its own token budget is stopped at once, the coordina
   expect(seen.commands.some(command => /^member alice budget=\d+$/.test(command))).toBe(true)
   expect(seen.commands).toContain('resume alice')
   // the roster no longer shows it paused: its tools run again
-  expect((await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'alice-1' })).deny).toBeUndefined()
+  expect((await toolCall($, { tool: 'Bash', command: 'ls', agentId: 'alice-1' })).deny).toBeUndefined()
   await ui.unmount()
 })
 
@@ -3524,37 +3580,37 @@ test('a shared-checkout writer is told when HEAD moved during its command, and t
   on('tool.call', (_, e) => e.tool === 'Bash' && e.command === './commit-then-fail.sh' ? { isError: true as const, result: 'exit 1' } : { result: {} })
   mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   const [before, after] = ['a'.repeat(40), 'b'.repeat(40)]
 
   heads = [before, after]
-  const moved = await $.tool.call({ tool: 'Bash', command: './scripts/release.sh', agentId: 'alice-1' })
+  const moved = await toolCall($, { tool: 'Bash', command: './scripts/release.sh', agentId: 'alice-1' })
   expect(reads).toEqual(['git -C /project rev-parse HEAD', 'git -C /project rev-parse HEAD'])
   expect(moved.deny).toBeUndefined()
   expect(moved.context?.join(' ')).toContain(`HEAD of the shared checkout moved from ${before.slice(0, 12)} to ${after.slice(0, 12)} during this command`)
   expect(moved.context?.join(' ')).toContain('Tell the coordinator in your report that HEAD moved')
-  const told = await $.tool.call({ tool: 'Bash', command: 'ls' })
+  const told = await toolCall($, { tool: 'Bash', command: 'ls' })
   expect(told.context?.join(' ')).toContain('while @alice ran a Bash command. Another actor may have moved it')
-  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).context ?? []).toEqual([])
+  expect((await toolCall($, { tool: 'Bash', command: 'ls' })).context ?? []).toEqual([])
   // a command that commits and then fails is told too
   heads = [after, before]
-  const failed = await $.tool.call({ tool: 'Bash', command: './commit-then-fail.sh', agentId: 'alice-1' })
+  const failed = await toolCall($, { tool: 'Bash', command: './commit-then-fail.sh', agentId: 'alice-1' })
   expect(failed.isError).toBe(true)
   expect(failed.context?.join(' ')).toContain('HEAD of the shared checkout moved')
-  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).context?.join(' ')).toContain('while @alice ran a Bash command')
+  expect((await toolCall($, { tool: 'Bash', command: 'ls' })).context?.join(' ')).toContain('while @alice ran a Bash command')
 
   // a HEAD that stayed, a read that failed, a background command and an isolated writer change nothing
   reads.length = 0
   heads = [before, before]
-  expect((await $.tool.call({ tool: 'Bash', command: 'make', agentId: 'alice-1' })).context ?? []).toEqual([])
+  expect((await toolCall($, { tool: 'Bash', command: 'make', agentId: 'alice-1' })).context ?? []).toEqual([])
   heads = []
-  expect((await $.tool.call({ tool: 'Bash', command: 'make', agentId: 'alice-1' })).context ?? []).toEqual([])
+  expect((await toolCall($, { tool: 'Bash', command: 'make', agentId: 'alice-1' })).context ?? []).toEqual([])
   expect(reads).toHaveLength(3)
   reads.length = 0
-  await $.tool.call({ tool: 'Bash', command: 'make', agentId: 'alice-1', run_in_background: true })
-  await $.tool.call({ tool: 'Bash', command: 'make', agentId: 'bob-1' })
+  await toolCall($, { tool: 'Bash', command: 'make', agentId: 'alice-1', run_in_background: true })
+  await toolCall($, { tool: 'Bash', command: 'make', agentId: 'bob-1' })
   expect(reads).toEqual([])
-  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).context ?? []).toEqual([])
+  expect((await toolCall($, { tool: 'Bash', command: 'ls' })).context ?? []).toEqual([])
 })
 
 test('a READY with a commit opens its diff, the run exports to Markdown, and the person posts from the pane in the coordinator\'s name', async ($, on) => {
@@ -3577,7 +3633,7 @@ test('a READY with a commit opens its diff, the run exports to Markdown, and the
   on('tool.call', () => ({ result: {} }))
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await clock.advance(2000)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
 
@@ -3596,7 +3652,7 @@ test('a READY with a commit opens its diff, the run exports to Markdown, and the
   await ui.input({ key: 'board-compose', text: 'Please also cover leap years @alice' })
   const posted = runs.findLast(one => one.argv.endsWith(`${OWNED} post coordinator`))
   expect(posted?.stdin).toBe('(from the user, in the pane)\nPlease also cover leap years @alice')
-  const told = await $.tool.call({ tool: 'Bash', command: 'ls' })
+  const told = await toolCall($, { tool: 'Bash', command: 'ls' })
   expect(told.context?.join(' ')).toContain('The user posted #3 to the board in your name from the Swarm pane')
   expect(told.context?.join(' ')).toContain("the board's show --post=3")
   await ui.unmount()
@@ -3628,18 +3684,18 @@ test('S1: a member started after the roster was cached is guarded from its first
   on('tool.call', () => ({ result: {} }))
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await clock.advance(2000)
   // the registration caches the roster while @alice has no agent yet, and no poll runs after its start
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" member alice paths=src/alice` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" member alice paths=src/alice` })
   const started = await $.agent.spawn({
     tool_use_id: 'start-alice', prompt: 'Use the board.', description: '@alice: parser', subagentType: 'swarm:worker',
     provider: { plugin: 'swarm', tier: 'core' as const }, parentModel: 'sonnet', background: true, fork: false,
   })
   expect(started.agentId).toBe('alice-1')
-  expect((await $.tool.call({ tool: 'Edit', file_path: '/project/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toContain('claimed by @bob')
-  expect((await $.tool.call({ tool: 'Bash', command: 'git commit -m x', agentId: 'alice-1' })).deny).toContain('Shared-checkout writers')
-  expect((await $.tool.call({ tool: 'Edit', file_path: '/project/src/alice/a.ts', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toBeUndefined()
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toContain('claimed by @bob')
+  expect((await toolCall($, { tool: 'Bash', command: 'git commit -m x', agentId: 'alice-1' })).deny).toContain('Shared-checkout writers')
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/src/alice/a.ts', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toBeUndefined()
 })
 
 test('S2: the commit guard follows escapes, case arms, env options and clustered shell flags', async ($, on) => {
@@ -3656,9 +3712,9 @@ test('S2: the commit guard follows escapes, case arms, env options and clustered
   on('tool.call', () => ({ result: {} }))
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await clock.advance(2000)
-  const bash = (command: string) => $.tool.call({ tool: 'Bash', command, agentId: 'alice-1' })
+  const bash = (command: string) => toolCall($, { tool: 'Bash', command, agentId: 'alice-1' })
   for (const command of [
     '(echo \\) && cd /tmp/wt) && git commit -m x', '(echo "\\")" && cd /tmp/wt) && git commit -m x',
     'case x in *) git commit -m x ;; esac', 'case x in a) true ;; *) git commit -m x ;; esac',
@@ -3687,13 +3743,13 @@ test('S3: a member name that is only "@" is refused rather than read as no name'
   on('tool.call', () => ({ result: {} }))
   mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   for (const name of ['@', ' @ ']) {
-    expect((await $.tool.call({ tool: 'mcp__swarm__board', action: 'resume', name })).deny, name).toContain('A member name')
+    expect((await toolCall($, { tool: 'mcp__swarm__board', action: 'resume', name })).deny, name).toContain('A member name')
   }
-  expect((await $.tool.call({ tool: 'mcp__swarm__board', action: 'replace', name: 'alice', newName: '@' })).deny).toContain('A member name')
+  expect((await toolCall($, { tool: 'mcp__swarm__board', action: 'replace', name: 'alice', newName: '@' })).deny).toContain('A member name')
   expect(seen.commands.filter(command => /^(?:resume|replace)\b/.test(command))).toEqual([])
-  expect((await $.tool.call({ tool: 'mcp__swarm__board', action: 'resume', name: '@alice' })).deny).toBeUndefined()
+  expect((await toolCall($, { tool: 'mcp__swarm__board', action: 'resume', name: '@alice' })).deny).toBeUndefined()
   expect(seen.commands).toContain('resume alice')
 })
 
@@ -3710,17 +3766,17 @@ test('S4: a page of the board neither answers nor reminds, and a new run hears n
   on('tool.call', () => ({ result: {} }))
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await clock.advance(2000)
-  const page = await $.tool.call({ tool: 'mcp__swarm__board', action: 'read' })
+  const page = await toolCall($, { tool: 'mcp__swarm__board', action: 'read' })
   expect(page.result).toContain('1 more post(s) remain')
   expect(page.context?.join(' ') ?? '').not.toContain('you have not read')
   // what the page left out is still owed, and told with the next call
-  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).context?.join(' ')).toContain('you have not read it')
+  expect((await toolCall($, { tool: 'Bash', command: 'ls' })).context?.join(' ')).toContain('you have not read it')
 
   list.push({ agent: 'alice', to: ['coordinator'], text: '@coordinator and another thing' })
   await clock.advance(2000)
-  const made = await $.tool.call({ tool: 'mcp__swarm__board', action: 'init', name: 'two', title: 'Two' })
+  const made = await toolCall($, { tool: 'mcp__swarm__board', action: 'init', name: 'two', title: 'Two' })
   expect(made.context?.join(' ')).toContain('A run was made')
   expect(made.context?.join(' ')).not.toContain('you have not read')
 })
@@ -3758,19 +3814,19 @@ test('S5: a member pause the coordinator settled is not told to it afterwards', 
   })
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await clock.advance(2000)
   const usage = { model: 'm', input_tokens: 600, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
   const told = (result: { context?: readonly string[] }) => result.context?.join(' ') ?? ''
 
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'alice-turn', reason: 'answer', agentId: 'alice-1', usage })
-  expect(told(await $.tool.call({ tool: 'mcp__swarm__board', action: 'resume', name: 'alice' }))).not.toContain('has spent its own token budget')
-  expect(told(await $.tool.call({ tool: 'Bash', command: 'ls' }))).not.toContain('has spent its own token budget')
+  expect(told(await toolCall($, { tool: 'mcp__swarm__board', action: 'resume', name: 'alice' }))).not.toContain('has spent its own token budget')
+  expect(told(await toolCall($, { tool: 'Bash', command: 'ls' }))).not.toContain('has spent its own token budget')
 
   spender = 'bob'
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'bob-turn', reason: 'answer', agentId: 'bob-1', usage })
-  expect(told(await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" member bob killed=1` }))).not.toContain('has spent its own token budget')
-  expect(told(await $.tool.call({ tool: 'Bash', command: 'ls' }))).not.toContain('has spent its own token budget')
+  expect(told(await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" member bob killed=1` }))).not.toContain('has spent its own token budget')
+  expect(told(await toolCall($, { tool: 'Bash', command: 'ls' }))).not.toContain('has spent its own token budget')
 })
 
 test('S6: a request sent from the pane holds the poll\'s own notice until its turn starts', async ($, on) => {
@@ -3789,7 +3845,7 @@ test('S6: a request sent from the pane holds the poll\'s own notice until its tu
   on('tool.call', () => ({ result: {} }))
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'coordinator-turn', reason: 'answer' })
   await clock.advance(2000)
   await clock.advance(6000)
@@ -3840,7 +3896,7 @@ test('S7: a browsed run keeps its conversation when the live run goes, and a slo
   on('tool.call', () => ({ result: {} }))
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await clock.advance(2000)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
 
@@ -3860,4 +3916,1424 @@ test('S7: a browsed run keeps its conversation when the live run goes, and a slo
   await clock.advance(2000)
   expect(await ui.find({ key: 'talk-back' })).toBeDefined()
   await ui.unmount()
+})
+
+// The tests below pin the fixes of the 0.3.47 audit; the first three are its host probes, made to assert the fix.
+
+const AUDIT_RUN = '/project/.swarm/audit-20261122-090000'
+const OLD_RUN = 'old-20261121-090000'
+function auditEngine(on: On, read: (path: string) => string, agents: () => unknown[] | Promise<unknown[]> = () => []) {
+  const toasts: string[] = []
+  on('command.register', () => ({ value: { command: 'swarm-board' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('tool.register', (_, spec) => ({ value: { tool: `mcp__swarm__${spec.name}` } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.cwd', () => ({ value: '/project' }))
+  on('fs.exists', () => ({ value: true }))
+  on('fs.list', () => ({ value: [{ name: OLD_RUN, kind: 'dir' }, { name: AUDIT_RUN.split('/').at(-1)!, kind: 'dir' }] as never }))
+  on('fs.read', (_, e) => ({ value: e.path.endsWith('/current') ? AUDIT_RUN.split('/').at(-1)! : read(e.path) }))
+  on('agent.list', async () => ({ value: await agents() as never }))
+  on('ui.toast', (_, e) => { toasts.push(e.text); return { value: undefined } })
+  return toasts
+}
+
+// One test a team size: a dense graph takes about a second to route, and a test has five.
+for (const members of [18, 24]) test(`audit: a dense graph of ${members} never hands the host a source over its limit, and a narrow pane lists the routes`, async ($, on) => {
+  const size = members
+  const fixture = () => {
+    const names = ['coordinator', ...Array.from({ length: size - 1 }, (_, i) => `worker-${i}`)]
+    const members = Object.fromEntries(names.map((name, index) => [name, { role: index === 0 ? 'coordinator' : 'worker', id: `agent-${index}`, last_read_seq: size * 2 }]))
+    const board = Array.from({ length: size * 2 }, (_, i) => {
+      const agent = names[i % names.length]!
+      const to = i === size * 2 - 1 ? ['coordinator'] : names.filter(name => name !== agent)
+      return JSON.stringify({ seq: i + 1, agent, to, text: i < size ? '@all' : to.map(name => `@${name}`).join(' '), time: '2026-11-22T09:00:00+0100' })
+    }).join('\n')
+    return { roster: JSON.stringify({ title: 'Dense graph fixture', members }), board }
+  }
+  auditEngine(on, path => path.endsWith('/board.jsonl') ? fixture().board : fixture().roster)
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  const sources = async (ui: Pick<Awaited<ReturnType<typeof $.ui.mount>>, 'findAll'>) => (await ui.findAll({ type: 'Svg' })).map(svg => String(svg.props.source))
+  {
+    await clock.advance(2000)
+    const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    await ui.press({ key: 'tab-graph' })
+    for (const stage of ['collapsed', 'expanded']) {
+      const drawn = await sources(ui)
+      expect({ members, stage, longest: Math.max(...drawn.map(source => source.length)) <= 131072 }).toEqual({ members, stage, longest: true })
+      const graph = (await ui.findAll({ type: 'Svg' })).find(svg => String(svg.props.alt).startsWith('Post '))
+      expect({ members, stage, hasSvg: graph !== undefined }).toEqual({ members, stage, hasSvg: true })
+      // the route of the post shown is always drawn; the key is pane text
+      const [, from, to] = /^Post \d+ · @(\S+) to @([\w-]+)/.exec(String(graph?.props.alt)) ?? []
+      // on the highlighted route itself: an earlier @all route between the same two members carries a like title
+      expect(String(graph?.props.source)).toMatch(new RegExp(`<path class="route(?: motion-route)?" d="[^"]*" pathLength="100"[^>]*><title>${from} to ${to} · \\d+ mentions?</title>`))
+      expect(await ui.find({ type: 'Text', text: /^Arrow: @mention, thicker for more · Dashed arrow: reached via @all/ })).toBeDefined()
+      // expanded, there are more routes than one drawing holds, and the pane says how many it left out
+      if (stage === 'expanded') expect(await ui.find({ type: 'Text', text: /^\d+ quieter routes? not drawn/ })).toBeDefined()
+      if (stage === 'collapsed') await ui.press({ key: 'expand-all' })
+    }
+    await ui.unmount()
+    // too narrow for names to be read: the routes are listed, with how many more there are
+    const narrow = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, bodyColumns: 30 } })
+    await narrow.press({ key: 'tab-graph' })
+    expect((await narrow.findAll({ type: 'Svg' })).find(svg => String(svg.props.alt).startsWith('Post '))).toBeUndefined()
+    expect(await narrow.find({ type: 'Text', text: /too narrow to draw this graph legibly/ })).toBeDefined()
+    expect(await narrow.find({ type: 'Text', text: /@worker-\d+ → @/ })).toBeDefined()
+    expect(await narrow.find({ type: 'Text', text: /^… and \d+ more$/ })).toBeDefined()
+    await narrow.unmount()
+  }
+})
+
+test('audit: a failed load of a browsed run says so, and Retry reads it again in place', async ($, on) => {
+  // the current run has a title of its own, so a Retry that went back to it would show
+  const roster = (title: string) => JSON.stringify({ title, closed: true, members: { coordinator: { role: 'coordinator', last_read_seq: 1 } } })
+  let isBoardReadable = false
+  // the browsed run's reads, of its board (directly or through the board's tail) and of its attention
+  let boardReads = 0
+  let attentionReads = 0
+  auditEngine(on, path => {
+    if (path.includes(OLD_RUN) && path.endsWith('/board.jsonl')) {
+      boardReads++
+      if (!isBoardReadable) throw new Error('EIO')
+    }
+    return path.endsWith('/board.jsonl') ? '' : roster(path.includes(OLD_RUN) ? 'Archive fixture' : 'Current fixture')
+  })
+  let isAttentionReadable = false
+  on('process.run', (_, e) => {
+    if (String(e.argv[2]).includes(OLD_RUN)) {
+      if (e.argv[3] === 'attention') attentionReads++
+      if (e.argv[3] === 'tail') boardReads++
+    }
+    return isAttentionReadable
+      ? { value: { exitCode: 0, stdout: JSON.stringify({ items: [], members: {}, limits: {} }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      : { value: { exitCode: 1, stdout: '', stderr: 'no python', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await clock.advance(2000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'run-prev' })
+  await ui.press({ key: 'tab-attention' })
+  expect(await ui.find({ type: 'Button', key: 'run-live' })).toBeDefined()
+  // nothing promises a retry that a browsed run never makes, nor makes one unasked, and a board that could not be
+  // read is not an empty one
+  const tried = { boardReads, attentionReads }
+  expect(tried.boardReads > 0 && tried.attentionReads > 0).toBe(true)
+  await clock.advance(20000)
+  expect({ boardReads, attentionReads }).toEqual(tried)
+  expect(await ui.find({ type: 'Text', text: /Swarm will retry/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /^Attention details unavailable for this run\.$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Board data unavailable/ })).toBeDefined()
+  await ui.press({ key: 'tab-board' })
+  expect(await ui.find({ type: 'Text', text: /^Board data unavailable/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /No posts yet/ })).toBeUndefined()
+  await ui.press({ key: 'tab-attention' })
+  isBoardReadable = isAttentionReadable = true
+  const asked = { boardReads, attentionReads }
+  expect(asked).toEqual(tried)
+  await ui.press({ key: 'run-retry' })
+  expect(boardReads > asked.boardReads && attentionReads > asked.attentionReads).toBe(true)
+  // read again where the person stood: the same run, the same tab
+  expect(await ui.find({ type: 'Text', text: /^Nothing needs attention\.$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Archive fixture$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Current fixture$/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'run-retry' })).toBeUndefined()
+  await ui.press({ key: 'tab-board' })
+  expect(await ui.find({ type: 'Text', text: /^No posts yet\.$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('audit: a slow conversation cannot open under a different run', async ($, on) => {
+  const roster = (title: string, name: string) => JSON.stringify({ title, closed: true, members: {
+    coordinator: { role: 'coordinator', last_read_seq: 1 }, [name]: { role: 'worker', id: `${name}-id`, last_read_seq: 1 },
+  } })
+  const toasts = auditEngine(on, path => path.endsWith('/board.jsonl') ? '' : path.includes(OLD_RUN) ? roster('Older fixture', 'old-worker') : roster('Current fixture', 'live-worker'))
+  on('ui.view', () => ({ value: { deny: 'no main view here' } }))
+  let started = () => {}
+  let release = () => {}
+  let requesting = Promise.resolve()
+  let delay = Promise.resolve()
+  let answer: unknown
+  on('session.messages', async () => {
+    started()
+    await delay
+    return { value: answer as never }
+  })
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await clock.advance(2000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  // the audit's case, then a read that cannot be answered: either falls to nothing once the person has moved on
+  for (const reply of [[{ role: 'user', text: 'Conversation from the current run', toolUses: [] }], { deny: 'agent live-worker-id cannot be read.' }]) {
+    answer = reply
+    requesting = new Promise<void>(resolve => { started = resolve })
+    delay = new Promise<void>(resolve => { release = resolve })
+    await ui.press({ key: 'tab-members' })
+    const pending = ui.press({ key: 'view-live-worker' })
+    try {
+      await requesting
+      await ui.press({ key: 'run-prev' })
+    } finally {
+      release()
+      await pending
+    }
+    expect(await ui.find({ type: 'Text', text: /Older fixture/ })).toBeDefined()
+    expect(await ui.find({ type: 'Markdown', text: /Conversation from the current run/ })).toBeUndefined()
+    // nothing was done in the dropped answer's place: no toast, no switch away from Members, no filter
+    expect(toasts).toEqual([])
+    expect(await ui.find({ type: 'Text', text: /@old-worker/ })).toBeDefined()
+    await ui.press({ key: 'tab-board' })
+    expect(await ui.find({ type: 'Button', text: /Clear filter/ })).toBeUndefined()
+    await ui.press({ key: 'run-live' })
+  }
+  await ui.unmount()
+})
+
+test('audit: the coordinator\'s conversation opens in the pane where this session drives the run, and is not offered where it does not', async ($, on) => {
+  const { seen, answer, board } = owning(on, { board: () => BOARD, roster: () => ROSTER })
+  on('process.run', (_, e) => answer(board(e)))
+  on('tool.call', () => ({ result: {} }))
+  on('agent.list', () => ({ value: [{ id: 'a1', description: '@parser', type: 'swarm:worker', status: 'running' }] as never }))
+  on('ui.view', () => ({ value: { deny: 'no main view here' } }))
+  const asked: (string | undefined)[] = []
+  on('session.messages', (_, e) => {
+    asked.push(e.agentId)
+    return { value: [{ role: 'user', text: 'Plan the parser fix with two workers', toolUses: [] }, { role: 'assistant', text: 'Deploying the swarm.', toolUses: [] }] as never }
+  })
+  on('fs.list', () => ({ value: [{ name: 'older-20261101-090000', kind: 'dir' }, { name: OWNED.split('/').at(-1)!, kind: 'dir' }] as never }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-members' })
+  await ui.press({ key: 'view-coordinator' })
+  // the main conversation, in the pane, and no Board filter in its place
+  expect(asked).toEqual([undefined])
+  expect(await ui.find({ type: 'Markdown', text: /Plan the parser fix/ })).toBeDefined()
+  expect(await ui.find({ type: 'Markdown', text: /Deploying the swarm/ })).toBeDefined()
+  expect(seen.toasts).toEqual([])
+  // the poller keeps it fresh: the main conversation never ends while the session runs
+  await clock.advance(2000)
+  expect(asked.length).toBeGreaterThan(1)
+  expect(asked.every(id => id === undefined)).toBe(true)
+  await ui.press({ key: 'talk-back' })
+  // a run only looked at: its coordinator is another session, so only its posts are offered
+  await ui.press({ key: 'run-prev' })
+  await ui.press({ key: 'tab-members' })
+  expect(await ui.find({ type: 'Button', key: 'view-coordinator' })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'feed-coordinator' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Its conversation is not available here\.$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('audit: a READY with a base shows the first-parent commits since it and says merges are omitted; one without says it shows the last commit only', async ($, on) => {
+  const sha = 'c'.repeat(40)
+  const base = 'b'.repeat(40)
+  const lines = [
+    { seq: 1, agent: 'alice', to: ['coordinator'], text: `READY ${sha}\nParser done.`, time: '2026-11-16T14:04:22+0100', kind: 'ready', revision: sha, base },
+    { seq: 2, agent: 'bob', to: ['coordinator'], text: `READY ${sha}\nLexer done.`, time: '2026-11-16T14:04:22+0100', kind: 'ready', revision: sha },
+    { seq: 3, agent: 'carol', to: ['coordinator'], text: `READY ${sha}\nRuns done.`, time: '2026-11-16T14:04:22+0100', kind: 'ready', revision: sha, base: '--output=/tmp/x' },
+  ].map(line => JSON.stringify(line)).join('\n') + '\n'
+  const state = { title: 'Team', members: { coordinator: { role: 'coordinator', last_read_seq: 3 }, alice: { role: 'worker', id: 'alice-1', last_read_seq: 1 },
+    bob: { role: 'worker', id: 'bob-1', last_read_seq: 1 }, carol: { role: 'worker', id: 'carol-1', last_read_seq: 1 } } }
+  const { answer, board } = owning(on, { board: () => lines, roster: () => JSON.stringify(state) })
+  const git: string[] = []
+  on('process.run', (_, e) => {
+    if (e.argv[0] !== 'git') return answer(board(e))
+    git.push(e.argv.join(' '))
+    // the work is in HEAD already, so what it adds to HEAD is nothing
+    return answer(e.argv.includes('diff') ? '' : 'commit cccc\n piece.txt | 1 +\n')
+  })
+  on('agent.list', () => ({ value: [] }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'diff-1' })
+  expect(git).toEqual([`git -C /project log --first-parent --no-merges --reverse --stat --patch --no-color --no-ext-diff ${sha} --not ${base}`])
+  expect(await ui.find({ type: 'Text', text: /^First-parent commits since bbbbbbb · merges omitted$/ })).toBeDefined()
+  expect(String((await ui.find({ type: 'Markdown', text: /piece\.txt/ }))?.text)).toMatch(/^```diff\n/)
+  git.length = 0
+  await ui.press({ key: 'diff-2' })
+  expect(git).toEqual([`git -C /project diff --stat --patch --no-color --no-ext-diff HEAD...${sha}`, `git -C /project show --first-parent --stat --patch --no-color --no-ext-diff ${sha}`])
+  expect(await ui.find({ type: 'Text', text: /^Last commit only \(ccccccc\): this report records no base/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /commits since/ })).toBeUndefined()
+  // a base that is no full commit id never reaches git's command line
+  git.length = 0
+  await ui.press({ key: 'diff-3' })
+  expect(git).toEqual([`git -C /project diff --stat --patch --no-color --no-ext-diff HEAD...${sha}`, `git -C /project show --first-parent --stat --patch --no-color --no-ext-diff ${sha}`])
+  expect(await ui.find({ type: 'Text', text: /^Last commit only \(ccccccc\): this report records no base/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'diff-3' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('audit: a partial pass is labelled as one, a long recipient list opens, the replay and run steps are told apart, and a long title shows two lines with the rest a press away', async ($, on) => {
+  const title = 'Normalize every input path, index the article metadata, and verify the release packaging end to end'
+  const names = ['parser', 'lexer', 'indexer', 'packager', 'checker']
+  const lines = [
+    { seq: 1, agent: 'coordinator', to: names, text: `${names.map(name => `@${name}`).join(' ')} BRIEF\nStart.` },
+    { seq: 2, agent: 'checker', to: ['coordinator'], text: '@coordinator VERIFIED cand-1 abcdef', partial: true, members: ['parser', 'lexer'] },
+    { seq: 3, agent: 'checker', to: ['coordinator'], text: '@coordinator VERIFIED cand-2 abcdef' },
+  ].map(line => JSON.stringify({ ...line, time: '2026-11-16T14:04:22+0100' })).join('\n') + '\n'
+  const state = { title, members: Object.fromEntries([['coordinator', { role: 'coordinator', last_read_seq: 3 }],
+    ...names.map(name => [name, { role: name === 'checker' ? 'verifier' : 'worker', last_read_seq: 3 }])]) }
+  const { answer, board } = owning(on, { board: () => lines, roster: () => JSON.stringify(state) })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({ value: [] }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  for (const columns of [36, 60, 140]) {
+    const ui = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, bodyColumns: columns } })
+    // at most two lines of the title, cut at a word, beside a hive that gives way in a narrow pane; the whole title a press away
+    const heading = async () => (await ui.find({ type: 'Text', text: /^Normalize every input path/ }))?.text
+    const hive = (await ui.findAll({ type: 'Svg' })).find(svg => /Swarm hive/.test(String(svg.props.alt)))
+    expect(hive?.props.width).toBe(columns < 48 ? 56 : 88)
+    if (columns === 140) {
+      expect(await heading()).toBe(title)
+      expect(await ui.find({ type: 'Button', key: 'title-more' })).toBeUndefined()
+    } else {
+      const cut = await heading()
+      expect(cut).toMatch(/\S …$/)
+      expect(cut!.length).toBeLessThanOrEqual(2 * Math.floor((columns - (columns < 48 ? 8 : 11)) / 1.25) + 2)
+      expect(title.startsWith(cut!.slice(0, -2))).toBe(true)
+      await ui.press({ key: 'title-more' })
+      expect(await heading()).toBe(title)
+      expect((await ui.find({ type: 'Button', key: 'title-more' }))?.props.label).toBe('Show less of the title')
+      await ui.press({ key: 'title-more' })
+      expect(await heading()).toBe(cut)
+    }
+    await ui.unmount()
+  }
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  // a partial pass names the workers it covered, in a tone of its own; a full pass is still VERIFIED
+  const partial = await ui.find({ type: 'Text', text: /^Partial pass · @parser @lexer$/ })
+  expect(partial?.props.color).toBe('warning')
+  expect((await ui.find({ type: 'Text', text: /^VERIFIED$/ }))?.props.color).toBe('success')
+  // three recipients past the first two are one press away, and the opened post names them all
+  expect(await ui.find({ type: 'Text', text: /^→ @parser @lexer$/ })).toBeDefined()
+  await ui.press({ key: 'recipients-1' })
+  expect(await ui.find({ type: 'Text', text: /^→ @parser @lexer @indexer @packager @checker$/ })).toBeDefined()
+  await ui.press({ key: 'recipients-1' })
+  expect(await ui.find({ type: 'Text', text: /^→ @parser @lexer$/ })).toBeDefined()
+  // the expanded partial pass says what it is not
+  await ui.press({ key: 'recipients-1' })
+  await ui.press({ key: 'graph-post-2' })
+  expect(await ui.find({ type: 'Text', text: / · Partial pass of @parser, @lexer$/ })).toBeDefined()
+  // the run's steps and the replay's are labelled, and a step that leads nowhere is no control
+  expect(await ui.find({ type: 'Text', text: /^Run$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Replay$/ })).toBeDefined()
+  await ui.press({ key: 'replay-first' })
+  expect(await ui.find({ type: 'Button', key: 'replay-first' })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'replay-back' })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'replay-next' })).toBeDefined()
+  await ui.press({ key: 'tab-board' })
+  await ui.unmount()
+  // in the terminal an opened post lists every recipient too
+  const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await term.press({ key: 'recipients-1' })
+  expect(await term.find({ type: 'Text', text: /@indexer @packager @checker/ })).toBeDefined()
+  await term.unmount()
+})
+
+// The forensic scan of fb0ab9b: commits the shared-writer guard let through, members acting as another in Bash,
+// and the guards a close turned off.
+
+test('forensic: a shared writer\'s commit is refused through wrappers, functions, fed shells, aliases, expanded paths and exported repositories', async ($, on) => {
+  const state = { title: 'Guard swarm', members: {
+    coordinator: { role: 'coordinator', last_read_seq: 1 },
+    alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '0', last_read_seq: 1 },
+    vera: { role: 'verifier', id: 'vera-1', last_read_seq: 1 },
+  } }
+  const { answer, board } = owning(on, { board: () => posts({ agent: 'coordinator', to: ['alice'], text: '@alice BRIEF' }), roster: () => JSON.stringify(state) })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({ value: [{ id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' }, { id: 'vera-1', description: '@vera', type: 'swarm:verifier', status: 'running' }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const bash = (command: string, agentId = 'alice-1', run_in_background?: true) => toolCall($, { tool: 'Bash', command, agentId, ...(run_in_background && { run_in_background }) })
+  for (const command of [
+    'nice git commit -m x', 'timeout 60 git commit -m x', 'xcrun git commit -m x', 'stdbuf -o0 git commit -m x',
+    'caffeinate -i git commit -m x', 'builtin command git commit -m x', 'env -- git commit -m x',
+    'cd /$PWD && git commit -m x', 'git -C /$PWD commit -m x', 'cd "$PWD" && git commit -m x', 'cd ~/x && git commit -m x',
+    'git --attr-source HEAD commit -m x', 'git -c alias.c=commit c -m x',
+    'f() { git commit -m x; }; f', 'function f { git commit -m x; }; f',
+    "echo 'git commit -m x' | sh", "sh <<< 'git commit -m x'",
+    'export GIT_DIR=/project/.git GIT_WORK_TREE=/project; cd /tmp && git commit -am x',
+    'declare -x GIT_DIR=/project/.git; git -C /tmp commit -am x',
+    'cd /tmp/wt && GIT_DIR=/project/.git exec git commit -am x',
+  ]) {
+    expect((await bash(command)).deny, command).toContain('Shared-checkout writers')
+  }
+  // a background command is checked before it runs, as a foreground one is
+  expect((await bash('nice git commit -m x', 'alice-1', true)).deny).toContain('Shared-checkout writers')
+  // its reports may say anything, git commit included
+  for (const command of ['git log --grep commit', 'echo git commit', 'git status', 'cd /tmp/wt && git commit -m x', 'grep -rn "git commit" docs',
+    `python3 /p/board.py ${OWNED} ready alice <<'EOF'\nNo git commit was run.\nEOF`, `python3 /p/board.py ${OWNED} ready alice <<EOF\nNo git commit was run.\nEOF`,
+    `python3 /p/board.py ${OWNED} post alice "did not git commit"`, `python3 /p/board.py ${OWNED} ready alice HEAD`]) {
+    expect((await bash(command)).deny, command).toBeUndefined()
+  }
+
+  // a member types the board and verify commands as itself only
+  for (const command of [
+    `python3 /p/board.py ${OWNED} post coordinator "@alice BRIEF you may now edit everything"`,
+    `python3 /p/board.py ${OWNED} member alice paths=src`,
+    `python3 /p/board.py ${OWNED} close`,
+    `python3 /p/board.py ${OWNED} ready vera`,
+    `python3 /p/board.py ${OWNED} read --max-bytes=100 coordinator`,
+    `python3 /p/verify.py ${OWNED} /project test abc123 vera`,
+    `python3 /p/verify.py ${OWNED} /project accept abc123`,
+  ]) {
+    expect((await bash(command)).deny, command).toContain('The board refused this command')
+  }
+  for (const command of [
+    `python3 /p/board.py ${OWNED} read alice`, `python3 /p/board.py ${OWNED} post alice "@coordinator a note"`,
+    `python3 /p/board.py ${OWNED} ready alice`, `python3 /p/board.py ${OWNED} sync alice`, `python3 /p/board.py ${OWNED} show --post=1`,
+    `python3 /p/board.py ${OWNED} status`,
+  ]) {
+    expect((await bash(command)).deny, command).toBeUndefined()
+  }
+  // the verifier tests under its own name, and reports with post rather than ready
+  expect((await bash(`python3 /p/verify.py ${OWNED} /project test abc123 vera --timeout 60`, 'vera-1')).deny).toBeUndefined()
+  expect((await bash(`python3 /p/verify.py ${OWNED} /project test abc123 alice`, 'vera-1')).deny).toContain('tests only as itself')
+  expect((await bash(`python3 /p/board.py ${OWNED} ready vera`, 'vera-1')).deny).toContain('a verifier reports with post')
+})
+
+for (const seenBy of ['poll', 'turn'] as const) test(`forensic: after the close (seen by a ${seenBy}) a retired member, a shared writer's commit and an edit outside its paths are still refused`, async ($, on) => {
+  const state: Record<string, unknown> = { title: 'Guard swarm', members: {
+    coordinator: { role: 'coordinator', last_read_seq: 1 },
+    alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '0', last_read_seq: 1 },
+    zed: { role: 'worker', id: 'zed-1', paths: 'src/zed', isolated: '0', killed: '1', last_read_seq: 1 },
+  } }
+  const { answer, board } = owning(on, { board: () => posts({ agent: 'coordinator', to: ['alice'], text: '@alice BRIEF' }), roster: () => JSON.stringify(state) })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({ value: [{ id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' }, { id: 'zed-1', description: '@zed', type: 'swarm:worker', status: 'running' }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const refusals = async () => [
+    (await toolCall($, { tool: 'Edit', file_path: '/project/src/zed/a.ts', old_string: 'a', new_string: 'b', agentId: 'zed-1' })).deny,
+    (await toolCall($, { tool: 'Bash', command: 'git commit -m x', agentId: 'alice-1' })).deny,
+    (await toolCall($, { tool: 'Edit', file_path: '/project/README.md', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny,
+  ]
+  const open = await refusals()
+  expect(open.every(deny => deny !== undefined)).toBe(true)
+  state.closed = true
+  // the close seen by one poll, or by the coordinator's own turn as it charges its usage, checked right after it:
+  // guards the turn dropped and a later poll restored would pass otherwise
+  if (seenBy === 'turn') {
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'c1', reason: 'answer',
+      usage: { model: 'm', input_tokens: 100, output_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } })
+  } else await clock.advance(2000)
+  const closed = await refusals()
+  expect(closed.map(deny => deny?.slice(0, 40))).toEqual(open.map(deny => deny?.slice(0, 40)))
+  // inside its own paths it still edits
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/src/alice/a.ts', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toBeUndefined()
+})
+
+for (const isClosed of [false, true]) test(`forensic: once this conversation drives another run, the members of the ${isClosed ? 'closed' : 'open'} run it drove before are refused, and the new run's are judged by its own roster`, async ($, on) => {
+  const NEXT = '/project/.swarm/next-20261122-100000'
+  const stateA: Record<string, unknown> = { title: 'First swarm', members: {
+    coordinator: { role: 'coordinator', last_read_seq: 1 },
+    alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '0', last_read_seq: 1 },
+    zed: { role: 'worker', id: 'zed-1', paths: 'src/zed', isolated: '0', killed: '1', last_read_seq: 1 },
+    quiet: { role: 'worker', id: 'quiet-1', paths: 'src/quiet', isolated: '0', last_read_seq: 1 },
+  } }
+  // the same name in the next run, under another agent and other paths
+  const stateB = { title: 'Next swarm', members: {
+    coordinator: { role: 'coordinator', last_read_seq: 1 },
+    alice: { role: 'worker', id: 'alice-b', paths: 'src/b', isolated: '0', last_read_seq: 1 },
+  } }
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['alice'], text: '@alice BRIEF' }),
+    roster: () => JSON.stringify(stateA),
+    read: path => path === `${NEXT}/members.json` ? JSON.stringify(stateB) : undefined,
+  })
+  // the board's agent-run lookup, as board.py answers it from the rosters
+  const runOf: Record<string, string> = { 'alice-1': OWNED, 'zed-1': OWNED, 'quiet-1': OWNED, 'alice-b': NEXT }
+  on('process.run', (_, e) => answer(e.argv[3] === 'agent-run' ? runOf[e.argv[5] ?? ''] ?? '' : board(e)))
+  on('agent.list', () => ({ value: [
+    ...['alice-1', 'zed-1', 'quiet-1', 'alice-b', 'helper-1'].map(id => ({ id, description: `@${id.split('-')[0]}`, type: 'swarm:worker', status: 'running' })),
+  ] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  const drive = async (dir: string) => {
+    await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${dir}" read coordinator` })
+    await clock.advance(2000)
+  }
+  const edit = async (file: string, agentId: string) => (await toolCall($, { tool: 'Edit', file_path: `/project/${file}`, old_string: 'a', new_string: 'b', agentId })).deny
+  const commit = async (agentId: string) => (await toolCall($, { tool: 'Bash', command: 'git commit -m x', agentId })).deny
+  const OVER = 'This Swarm run is over'
+  await drive(OWNED)
+  // under the first run: its own rules
+  expect(await edit('src/zed/a.ts', 'zed-1')).toBeDefined()
+  expect(await commit('alice-1')).toContain('Shared-checkout writers')
+  expect(await edit('README.md', 'alice-1')).toBeDefined()
+  if (isClosed) {
+    stateA.closed = true
+    await clock.advance(2000)
+  }
+  await drive(NEXT)
+  // the first run's members, the one that never made a call under it included, are refused whatever they try
+  for (const deny of [await edit('src/zed/a.ts', 'zed-1'), await commit('alice-1'), await edit('README.md', 'alice-1'),
+    await edit('src/alice/a.ts', 'alice-1'), await edit('src/quiet/a.ts', 'quiet-1')]) {
+    expect(deny).toContain(OVER)
+  }
+  // the next run's @alice by its own roster: inside its paths it edits, outside and committing it is refused, never as over
+  expect(await edit('src/b/a.ts', 'alice-b')).toBeUndefined()
+  expect(await edit('src/alice/a.ts', 'alice-b')).not.toContain(OVER)
+  expect(await edit('src/alice/a.ts', 'alice-b')).toBeDefined()
+  expect(await commit('alice-b')).toContain('Shared-checkout writers')
+  // a subagent of no run is untouched
+  expect(await edit('README.md', 'helper-1')).toBeUndefined()
+  expect(await commit('helper-1')).toBeUndefined()
+  // the next run closes: that makes no earlier run's agents welcome, and its own members keep its rules
+  ;(stateB as Record<string, unknown>).closed = true
+  // the coordinator's turn ends after the close: the hook sees it there and drives no run from then on
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'closing', reason: 'answer', usage: { model: 'm', input_tokens: 10, output_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } })
+  await clock.advance(2000)
+  expect(await edit('src/alice/a.ts', 'alice-1')).toContain(OVER)
+  expect(await edit('src/quiet/a.ts', 'quiet-1')).toContain(OVER)
+  expect(await commit('alice-b')).toContain('Shared-checkout writers')
+  expect(await edit('src/alice/a.ts', 'alice-b')).not.toContain(OVER)
+  // driving the first run again: its members are judged by its roster again, and the next run is the one over
+  await drive(OWNED)
+  expect(await edit('src/alice/a.ts', 'alice-1')).toBeUndefined()
+  expect(await commit('alice-1')).toContain('Shared-checkout writers')
+  expect(await edit('src/zed/a.ts', 'zed-1')).not.toContain(OVER)
+  expect(await edit('src/zed/a.ts', 'zed-1')).toBeDefined()
+  expect(await edit('src/b/a.ts', 'alice-b')).toContain(OVER)
+})
+
+test('review: what the coordinator spent under one run is charged to that run, though it drives another by the time the charge lands', async ($, on) => {
+  const NEXT = '/project/.swarm/next-20261122-100000'
+  const state = (title: string) => JSON.stringify({ title, members: { coordinator: { role: 'coordinator', last_read_seq: 1 } } })
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: [], text: 'plan' }), roster: () => state('First swarm'),
+    read: path => path === `${NEXT}/members.json` ? state('Next swarm') : undefined,
+  })
+  const charged: string[] = []
+  let isFailing = true
+  on('process.run', (_, e) => {
+    if (e.argv[3] !== 'account') return answer(board(e))
+    // the step's own charge does not reach the board: it is left to the turn's end
+    if (isFailing) return { value: { exitCode: 1, stdout: '', stderr: 'busy', isStdoutTruncated: false, isStderrTruncated: false } }
+    charged.push(`${e.argv[2]} ${e.argv.at(-1)}`)
+    return answer(JSON.stringify({ title: 'x', total: 0, budget: 0, paused: false }))
+  })
+  on('agent.list', () => ({ value: [] }))
+  on('tool.call', () => ({ result: {} }))
+  const spent = { model: 'm', input_tokens: 250, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+  on('turn.step', async function* (_, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'tool_use' as const, usage: spent }
+  })
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  const drive = async (dir: string) => {
+    await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${dir}" read coordinator` })
+    await clock.advance(2000)
+  }
+  await drive(OWNED)
+  for await (const _ of $.turn.step({ turnId: 'long', index: 0, model: 'm', messageCount: 1 })) { /* no chunks */ }
+  await clock.advance(0)
+  isFailing = false
+  await drive(NEXT)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'long', usage: spent })
+  expect(charged).toEqual([`${OWNED} 250`])
+})
+
+// The review of the 0.3.47 audit fixes.
+
+test('review: a slow agent list cannot move the main view to a run the person left, and an unchanged run still opens it', async ($, on) => {
+  const roster = (title: string, name: string) => JSON.stringify({ title, closed: true, members: {
+    coordinator: { role: 'coordinator', last_read_seq: 1 }, [name]: { role: 'worker', id: `${name}-id`, last_read_seq: 1 },
+  } })
+  // only the call the press makes is held: polls and renders are answered at once
+  let gate: Promise<void> | undefined
+  let started = () => {}
+  const toasts = auditEngine(on, path => path.endsWith('/board.jsonl') ? '' : path.includes(OLD_RUN) ? roster('Older fixture', 'old-worker') : roster('Current fixture', 'live-worker'), async () => {
+    const wait = gate
+    gate = undefined
+    if (wait) {
+      started()
+      await wait
+    }
+    return [{ id: 'live-worker-id', description: '@live-worker', type: 'swarm:worker', status: 'running' }]
+  })
+  const viewed: unknown[] = []
+  on('ui.view', (_, e) => { viewed.push(e); return { value: {} as never } })
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await clock.advance(2000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-members' })
+  let release = () => {}
+  const requesting = new Promise<void>(resolve => { started = resolve })
+  gate = new Promise<void>(resolve => { release = resolve })
+  const pending = ui.press({ key: 'view-live-worker' })
+  try {
+    await requesting
+    await ui.press({ key: 'run-prev' })
+  } finally {
+    release()
+    await pending
+  }
+  // the main view stays where it was, and the run the person moved to is still shown
+  expect(viewed).toEqual([])
+  expect(await ui.find({ type: 'Text', text: /Older fixture/ })).toBeDefined()
+  expect(toasts).toEqual([])
+  // nobody moved: the main view opens the agent's conversation
+  await ui.press({ key: 'run-live' })
+  await ui.press({ key: 'tab-members' })
+  await ui.press({ key: 'view-live-worker' })
+  expect(viewed).toEqual([{ agentId: 'live-worker-id' }])
+  await ui.unmount()
+})
+
+test('review: the main view is moved to the coordinator only for the run this session drives; another run\'s author shows its posts', async ($, on) => {
+  const { seen, answer, board } = owning(on, { board: () => BOARD, roster: () => ROSTER })
+  on('process.run', (_, e) => answer(board(e)))
+  on('tool.call', () => ({ result: {} }))
+  on('agent.list', () => ({ value: [{ id: 'a1', description: '@parser', type: 'swarm:worker', status: 'running' }] as never }))
+  const viewed: unknown[] = []
+  on('ui.view', (_, e) => { viewed.push(e); return { value: {} as never } })
+  on('fs.list', () => ({ value: [{ name: 'older-20261101-090000', kind: 'dir' }, { name: OWNED.split('/').at(-1)!, kind: 'dir' }] as never }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  // the run driven here: its coordinator is the main conversation, which the main view shows
+  await ui.press({ key: 'agent-1' })
+  expect(viewed).toEqual([{}])
+  expect(await ui.find({ type: 'Button', text: /Clear filter/ })).toBeUndefined()
+  // a run only looked at: the main view is not touched, and the author's posts are shown
+  await ui.press({ key: 'run-prev' })
+  await ui.press({ key: 'tab-board' })
+  await ui.press({ key: 'agent-1' })
+  expect(viewed).toEqual([{}])
+  expect(await ui.find({ type: 'Button', text: /Clear filter/ })).toBeDefined()
+  expect(seen.toasts).toEqual([])
+  await ui.unmount()
+})
+
+test('review: routes listed in place of a graph count only the posts up to the replayed one; the terminal counts them all', async ($, on) => {
+  const state = { title: 'Routes', members: { coordinator: { role: 'coordinator', last_read_seq: 3 },
+    alice: { role: 'worker', id: 'alice-1', last_read_seq: 3 }, bob: { role: 'worker', id: 'bob-1', last_read_seq: 3 } } }
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['alice'], text: '@alice BRIEF' }, { agent: 'alice', to: ['bob'], text: '@bob a question' },
+      { agent: 'coordinator', to: ['alice'], text: '@alice go on' }),
+    roster: () => JSON.stringify(state),
+  })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({ value: [] }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const route = (count: number, edge: string) => ({ type: 'Text' as const, text: new RegExp(`^\\S+ ${count} {2}${edge}$`) })
+  const narrow = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, bodyColumns: 12 } })
+  await narrow.press({ key: 'tab-graph' })
+  expect(await narrow.find({ type: 'Text', text: /too narrow to draw this graph legibly/ })).toBeDefined()
+  expect(await narrow.find(route(2, '@coordinator → @alice'))).toBeDefined()
+  expect(await narrow.find(route(1, '@alice → @bob'))).toBeDefined()
+  // at the first post, the later ones are neither listed nor counted
+  await narrow.press({ key: 'replay-first' })
+  expect(await narrow.find({ type: 'Text', text: /too narrow to draw this graph legibly/ })).toBeDefined()
+  expect(await narrow.find(route(1, '@coordinator → @alice'))).toBeDefined()
+  expect(await narrow.find({ type: 'Text', text: /@alice → @bob/ })).toBeUndefined()
+  await narrow.unmount()
+  const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await term.press({ key: 'tab-graph' })
+  expect(await term.find(route(2, '@coordinator → @alice'))).toBeDefined()
+  expect(await term.find(route(1, '@alice → @bob'))).toBeDefined()
+  await term.unmount()
+})
+
+test('review: a long route list shows a short page and the rest a press at a time, still counting only the posts up to the replayed one', async ($, on) => {
+  const names = Array.from({ length: 30 }, (_, i) => `w${String(i + 1).padStart(2, '0')}`)
+  const state = { title: 'Routes', members: { coordinator: { role: 'coordinator', last_read_seq: 30 },
+    ...Object.fromEntries(names.map(name => [name, { role: 'worker', id: `${name}-id`, last_read_seq: 30 }])) } }
+  const { answer, board } = owning(on, {
+    board: () => posts(...names.map(name => ({ agent: name, to: ['coordinator'], text: '@coordinator a note' }))),
+    roster: () => JSON.stringify(state),
+  })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({ value: [] }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const narrow = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, bodyColumns: 12 } })
+  await narrow.press({ key: 'tab-graph' })
+  // replayed to post 20: its twenty routes, a short page of them first
+  for (let i = 0; i < 10; i++) await narrow.press({ key: 'replay-back' })
+  // a route's line is tabular; the post shown below names its own route too
+  const listed = async () => (await narrow.findAll({ type: 'Text', text: /→ @coordinator$/ })).filter(line => line.props.tabular).length
+  expect(await listed()).toBe(12)
+  expect(await narrow.find({ type: 'Text', text: '… and 8 more' })).toBeDefined()
+  await narrow.press({ key: 'routes-more' })
+  expect(await listed()).toBe(20)
+  expect(await narrow.find({ type: 'Text', text: /\d {2}@w2[1-9] → / })).toBeUndefined()
+  expect(await narrow.find({ key: 'routes-more' })).toBeUndefined()
+  await narrow.press({ key: 'routes-fewer' })
+  expect(await listed()).toBe(12)
+  await narrow.unmount()
+})
+
+test('review: a shared writer\'s command is read through the wrappers it knows, and one it cannot read is still refused when it names a commit', async ($, on) => {
+  const state = { title: 'Guard swarm', members: {
+    coordinator: { role: 'coordinator', last_read_seq: 1 },
+    alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '0', last_read_seq: 1 },
+  } }
+  const { answer, board } = owning(on, { board: () => posts({ agent: 'coordinator', to: ['alice'], text: '@alice BRIEF' }), roster: () => JSON.stringify(state) })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({ value: [{ id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const deny = async (command: string) => (await toolCall($, { tool: 'Bash', command, agentId: 'alice-1' })).deny
+  for (const command of [
+    'timeout 60 git commit -m x', 'timeout -s KILL -k 5 --foreground --signal=TERM 60 git commit -m x', 'nice -n 5 git commit -m x',
+    'nice -5 git commit -m x', 'nice --adjustment=5 git commit -m x', 'xcrun --sdk macosx -r git commit -m x', 'stdbuf -o L -eL git commit -m x',
+    'caffeinate -di -t 60 git commit -m x', 'nohup time builtin command git commit -m x',
+    // an option a wrapper is not known to take leaves the command unread: naming git and commit, it is refused
+    'timeout --weird 60 git log --grep commit', 'caffeinate -z git log --grep commit', 'stdbuf --line git log --grep commit',
+    // a cd or an exit a wrapper runs is a child's: the shell stays where it was
+    'nice cd /tmp && git commit -m x', 'timeout 60 cd /tmp; git commit -m x', 'caffeinate -i exit; git commit -m x',
+    'stdbuf -oL popd; git commit -m x', 'env cd /tmp && git commit -m x', 'nohup cd /tmp && git commit -m x',
+  ]) {
+    expect(await deny(command), command).toContain('Shared-checkout writers')
+  }
+  for (const command of [
+    'timeout 60 git log --grep commit', 'timeout -s KILL --preserve-status 60 git log --grep commit', 'nice -n 5 git -C /x status',
+    'nice -5 git log --grep commit', 'xcrun --sdk macosx git log --grep commit', 'stdbuf -oL -e 0 git log --grep commit',
+    'caffeinate -i -w 123 git log --grep commit', 'caffeinate -it60 git log --grep commit',
+  ]) {
+    expect(await deny(command), command).toBeUndefined()
+  }
+})
+
+// The shell reader behind the shared-checkout commit guard: compound commands, wrappers and the commands that commit.
+
+/** A conversation driving a run whose @alice writes in the shared checkout; `config` answers `git config --get alias.<name>`. */
+async function sharedWriter($: Parameters<Extract<Parameters<typeof test>[1], (...args: never[]) => unknown>>[0], on: On, config: Record<string, { exitCode: number; stdout?: string }> = {}) {
+  const state = { title: 'Guard swarm', members: {
+    coordinator: { role: 'coordinator', last_read_seq: 1 },
+    alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '0', last_read_seq: 1 },
+  } }
+  const { answer, board } = owning(on, { board: () => posts({ agent: 'coordinator', to: ['alice'], text: '@alice BRIEF' }), roster: () => JSON.stringify(state) })
+  on('process.run', (_, e) => {
+    const asked = e.argv[0] === 'git' && e.argv[3] === 'config' ? config[e.argv[5]?.replace(/^alias\./, '') ?? ''] : undefined
+    return asked ? { value: { exitCode: asked.exitCode, stdout: asked.stdout ?? '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } } : answer(board(e))
+  })
+  on('agent.list', () => ({ value: [{ id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  return async (command: string) => (await toolCall($, { tool: 'Bash', command, agentId: 'alice-1' })).deny
+}
+const REFUSED = 'Shared-checkout writers'
+
+test('guard: a case is read arm by arm, so only an arm that commits is refused, wherever the arms leave the shell', async ($, on) => {
+  const deny = await sharedWriter($, on)
+  for (const command of [
+    'case $x in a) git status ;; b) git commit -m x ;; esac', 'case $x in\n  a)\n    git commit -m x\n    ;;\nesac',
+    // the arm that ran decides where the shell is after it, and no arm at all leaves it where it was
+    'cd /tmp/wt && case $x in a) cd /project ;; esac && git commit -m x', 'case $x in a) cd /tmp/wt ;; esac && git commit -m x',
+    // an arm that goes on into the next takes its folder with it
+    'cd /tmp/wt && case $x in a) cd /project ;& b) git commit -m x ;; esac',
+    // a pattern this cannot read leaves the case unread: it names a commit, so it is refused
+    'case x in @(a|b)) git commit -m x ;; esac',
+  ]) expect(await deny(command), command).toContain(REFUSED)
+  for (const command of [
+    'case $x in a) git status ;; b) echo commit ;; esac', 'case $x in a|b) git status ;; *) echo commit ;; esac',
+    'cd /tmp/wt && case $x in a) echo ;; esac && git commit -m x', 'case "$1" in (--all) git add -A ;; esac',
+  ]) expect(await deny(command), command).toBeUndefined()
+})
+
+test('guard: a compound piped onward keeps its cd to itself, and a comment in a substitution hides nothing', async ($, on) => {
+  const deny = await sharedWriter($, on)
+  for (const command of [
+    '{ cd /tmp/wt; } | cat; git commit -m x', 'cd /project; while true; do cd /tmp/wt; break; done | cat; git commit -m x',
+    'if true; then cd /tmp/wt; fi | cat; git commit -m x', 'cd /tmp/wt && { cd /project; } && git commit -m x',
+    "x=$(echo a # it's fine\n git commit -m x)", '(git commit -m x) > /dev/null', 'cd /tmp/wt && (cd /project; git commit -m x)',
+  ]) expect(await deny(command), command).toContain(REFUSED)
+  for (const command of [
+    '{ cd /tmp/wt; } && git commit -m x', "x=$(echo a # it's fine\n git status)", '(cd /tmp/wt && git commit -m x)',
+    'cd /tmp/wt && (cd /project) && git commit -m x',
+  ]) expect(await deny(command), command).toBeUndefined()
+})
+
+test('guard: an if, a loop, a function and eval are followed as the shell runs them', async ($, on) => {
+  const deny = await sharedWriter($, on)
+  for (const command of [
+    // the branch not taken leaves the shell where the condition left it
+    'if false; then cd /tmp/wt || exit; fi; git commit -m x',
+    // a loop's second pass starts where its first one ended
+    'cd /tmp/wt && for i in 1 2; do git commit -m x; cd /project; done', 'while read l; do git commit -m "$l"; done < list',
+    // a function's body commits wherever it is called, and a call may move the shell
+    'f() { git commit -m x; }', 'f() { cd /project; }; cd /tmp/wt && f && git commit -m x',
+    // eval runs in this shell, and words a variable fills in may be any command
+    'cd /tmp/wt && eval "cd /project" && git commit -m x', "C='git commit -m x'; eval \"$C\"", 'GIT=git; $GIT commit -m x',
+    'cd /tmp/wt || git commit -m x', 'false && cd /tmp/wt; git commit -m x',
+  ]) expect(await deny(command), command).toContain(REFUSED)
+  for (const command of [
+    'for f in a b; do git add "$f"; done', 'cd /tmp/wt && for i in 1 2; do git commit -m x; done',
+    'if git diff --quiet; then echo clean; else echo commit needed; fi', 'cd /tmp/wt && eval "git commit -m x"',
+    'cd /tmp/wt && cd .. && for i in 1 2 3 4 5 6 7 8; do cd ..; git commit -m x; done', 'f() { git status; }; f',
+  ]) expect(await deny(command), command).toBeUndefined()
+})
+
+test('guard: every common wrapper is read through, or refused for sure when it cannot be', async ($, on) => {
+  const deny = await sharedWriter($, on)
+  // read: the commit refused, anything else let through
+  for (const [refused, allowed] of [
+    ['xargs git commit -m x', 'printf a | xargs git log --grep commit'],
+    ['echo commit | xargs git', 'find . -name "*.ts" -exec git log --grep commit {} \;'],
+    ['xargs -I{} git {} -m x', 'watch -n 5 git status'],
+    ['find . -name x -exec git commit -m x \;', "watch -n 1 'git log --grep commit'"],
+    ['cd /tmp/wt && find . -execdir git commit -m x {} +', 'sudo -u bob git status'],
+    ['watch -n 5 git commit -m x', 'cd /tmp/wt && sudo git commit -m x'],
+    ["watch 'git commit -m x'", 'time -p git status'],
+    ['sudo -u bob git commit -m x', 'env -i PATH=/usr/bin git log --grep commit'],
+    ['cd /tmp/wt && sudo -D /project git commit -m x', "bash -lc 'git log --grep commit'"],
+    ['cd /tmp/wt && sudo -i git commit -m x', 'sh -c "git status"'],
+    ['time -p git commit -m x', 'eval "git status"'],
+    ['env -i git commit -m x', 'bash <<< \'git status\''],
+    ["bash -lc 'git commit -m x'", 'cat <<< "git commit"'],
+    ['cd /tmp/wt && sh -c "cd /project && git commit -m x"', 'diff <(git show HEAD:a) a'],
+    ['eval "git commit -m x"', 'cd /tmp/wt && sh -c "git commit -m x"'],
+    ["sh <<< 'git commit -m x'", 'flock /tmp/l git status'],
+    ['git commit -F - <<< "msg"', 'git status && git diff'],
+    ['diff <(git commit -m x) /dev/null', 'git log | grep commit'],
+    ['git status && git commit -m x', 'git stash && git stash pop'],
+  ] as const) {
+    expect(await deny(refused), refused).toContain(REFUSED)
+    expect(await deny(allowed), allowed).toBeUndefined()
+  }
+  // deliberately refused: a wrapper it does not know before a command that names one, read or not, and a script a
+  // substitution writes for a shell, a trap's script, wherever the shell is when it runs
+  for (const command of ['flock /tmp/l git commit -m x', 'doas git commit -m x', 'parallel git log --grep commit ::: a', 'echo "git commit" | sh',
+    "trap 'git commit -m x' EXIT", '. <(echo "git commit -m x")', 'source <(echo "git commit -m x")', "bash <(echo 'git commit -m x')"]) {
+    expect(await deny(command), command).toContain(REFUSED)
+  }
+  // what only a report or a variable that names no commit says is not read as one
+  for (const command of [
+    `B="python3 /p/board.py ${OWNED}"; $B ready alice <<'EOF'\nNo git commit was run.\nEOF`, `$PY /p/board.py ${OWNED} post alice "git diff is clean, I am done"`,
+    "trap 'rm -f /tmp/x' EXIT", '. ./env.sh && git status',
+  ]) expect(await deny(command), command).toBeUndefined()
+})
+
+test('guard: every git command that makes a commit is refused, and aliases are followed to what they run', async ($, on) => {
+  const deny = await sharedWriter($, on, { ci: { exitCode: 0, stdout: 'commit -v' }, lg: { exitCode: 0, stdout: 'log --oneline' }, sh: { exitCode: 0, stdout: '!git commit -am wip' }, zz: { exitCode: 2 } })
+  for (const command of [
+    'git merge feature', 'git merge --continue', 'git cherry-pick abc', 'git revert HEAD', 'git am x.patch', 'git rebase main', 'git pull',
+    'git pull --rebase --ff-only', 'git commit-tree HEAD^{tree} -m x', 'git update-ref HEAD $(git commit-tree HEAD^{tree} -m x)',
+    'git filter-branch --tree-filter true HEAD', 'git subtree add --prefix=x repo main', '/usr/lib/git-core/git-commit -m x',
+    'git -c alias.p=cherry-pick p abc', 'git --config-env=alias.x=X x', 'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0=commit git x -m y',
+    // the repository's own aliases, a shell alias, one that cannot be read, and one this command sets
+    'git ci -m x', 'git sh', 'git zz', 'git config alias.c commit && git c -m x',
+  ]) expect(await deny(command), command).toContain(REFUSED)
+  for (const command of [
+    'git merge --abort', 'git merge --no-commit feature', 'git cherry-pick -n abc', 'git revert --no-commit HEAD', 'git rebase --abort',
+    'git am --abort', 'git pull --ff-only', 'git stash', 'git stash pop', 'git -c alias.p=cherry-pick status', 'git lg', 'git update-ref refs/x HEAD',
+  ]) expect(await deny(command), command).toBeUndefined()
+})
+
+test('guard: a member\'s board and verify commands are read through cd, env, python flags, quoting, shells and eval, and refused when hidden', async ($, on) => {
+  const state = { title: 'Guard swarm', members: {
+    coordinator: { role: 'coordinator', last_read_seq: 1 },
+    alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '1', last_read_seq: 1 },
+    vera: { role: 'verifier', id: 'vera-1', last_read_seq: 1 },
+  } }
+  const { answer, board } = owning(on, { board: () => posts({ agent: 'coordinator', to: ['alice'], text: '@alice BRIEF' }), roster: () => JSON.stringify(state) })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({ value: [{ id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' }, { id: 'vera-1', description: '@vera', type: 'swarm:verifier', status: 'running' }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const deny = async (command: string, agentId = 'alice-1') => (await toolCall($, { tool: 'Bash', command, agentId })).deny
+  const B = `python3 /p/skills/swarm/scripts/board.py ${OWNED}`
+  for (const command of [
+    `cd /project/.claude/worktrees/agent-alice-1 && python3 -B /p/board.py ${OWNED} close`, `FOO=1 env python3 /p/board.py ${OWNED} close`,
+    `python3 "/p/my scripts/board.py" ${OWNED} post coordinator x`, `python3 ./board.py ${OWNED} member alice paths=.`,
+    `bash -c '${B} close'`, `sh -c "${B} post bob hi"`, `eval "${B} close"`, `X=$(${B} close)`, `echo "$(${B} member alice paths=.)"`,
+    // a subcommand or a name that cannot be read
+    `${B} $ACTION alice`, `${B} "$(echo close)"`, `${B} post "$ME" hi`, `${B} post $(whoami) hi`, `sudo ${B} close`, `timeout 9 ${B} read alice`,
+    `python3 /p/verify.py ${OWNED} /project $ACT abc alice`,
+  ]) expect(await deny(command), command).toContain('The board refused this command')
+  // every documented member command still runs, in each documented form
+  for (const command of [
+    `${B} read alice`, `${B} show --post=3`, `${B} post alice <<'EOF'\n@coordinator a note\nEOF`, `${B} ready alice <<'EOF'\nREADY\nEOF`,
+    `cd /project/.claude/worktrees/agent-alice-1 && ${B} ready alice HEAD`, `${B} revise alice "a reason"`, `${B} sync alice`,
+    `${B} sync alice --check-only`, `${B} status`, `"${B.split(' ')[1]}" ${OWNED} read alice`, `python3 -B ${B.split(' ')[1]} "${OWNED}" read @alice`,
+    'cat /p/skills/swarm/scripts/board.py', 'python3 -m py_compile /p/skills/swarm/scripts/board.py', 'git diff -- skills/swarm/scripts/board.py',
+    // a command that only names the script runs none of it
+    'find . -name board.py', 'ruff check skills/swarm/scripts/board.py', 'find . -name verify.py', 'mypy verify.py',
+  ]) expect(await deny(command), command).toBeUndefined()
+  expect(await deny(`python3 /p/verify.py ${OWNED} /project test abc vera`, 'vera-1')).toBeUndefined()
+  expect(await deny(`python3 /p/verify.py ${OWNED} /project test abc "$WHO"`, 'vera-1')).toContain('tests only as itself')
+  expect(await deny(`bash -c 'python3 /p/verify.py ${OWNED} /project accept abc'`, 'vera-1')).toContain("the coordinator's")
+  // the commit after an acceptance is the coordinator's too, for a worker and for a verifier
+  expect(await deny(`python3 /p/verify.py ${OWNED} /project commit abc -m land`, 'vera-1')).toContain("verify.py commit is the coordinator's")
+})
+
+test('guard: a # inside a word is no comment, a substitution that never closes is refused, and git options are read in order with their values', async ($, on) => {
+  const deny = await sharedWriter($, on)
+  for (const command of [
+    // an escaped blank is part of the word: `#b` opens no comment, and the substitution runs the commit
+    'echo "$(git commit -m a\\ #b)"', 'x=$(git commit -m a\\ #b)', 'echo "$(git commit -m x"', 'echo `git commit -m x',
+    // a value is never read as an option: -X ignore-space-change holds no -n
+    'git cherry-pick -Xignore-space-change abc', 'git cherry-pick -X ignore-space-change abc', 'git cherry-pick --strategy-option -n abc',
+    'git cherry-pick -mn abc', 'git merge -m --no-commit topic', 'git rebase --exec --abort main', 'git am --directory --abort x.patch',
+    // the last of two opposite options wins
+    'git merge --no-commit --commit --no-ff --no-edit topic', 'git cherry-pick -n --commit abc', 'git merge --no-commit --comm topic',
+    'git pull --ff-only --ff', 'git pull --ff-only --reb', 'git pull --ff-only -r',
+    // an alias this command defines, found by its name, whatever options stand before it
+    'git config --file .git/config alias.c commit && git c -m x', 'git config -f .git/config alias.c commit; git c', 'alias g=git\ng commit -m x',
+  ]) expect(await deny(command), command).toContain(REFUSED)
+  for (const command of [
+    'echo "$(git status # a\\ comment\n)"', 'echo a\\ \\#b # git commit', 'echo "$(git status a\\ #b)" commit', 'git cherry-pick -xn abc', 'git cherry-pick -m 1 -n abc',
+    'git merge --commit --no-commit topic', 'git pull --ff --ff-only', 'git pull --ff-only --rebase=false', 'git pull --rebase --ff-only --no-rebase',
+    'git am --show-current-patch=diff', 'git rebase --edit-todo', 'alias g=git\ng status', 'alias ll="ls -l"; ll',
+  ]) expect(await deny(command), command).toBeUndefined()
+})
+
+test('guard: an interpreter\'s options are read with their values, and a program that names the board is refused', async ($, on) => {
+  const state = { title: 'Guard swarm', members: {
+    coordinator: { role: 'coordinator', last_read_seq: 1 },
+    alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '1', last_read_seq: 1 },
+  } }
+  const { answer, board } = owning(on, { board: () => posts({ agent: 'coordinator', to: ['alice'], text: '@alice BRIEF' }), roster: () => JSON.stringify(state) })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({ value: [{ id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const deny = async (command: string) => (await toolCall($, { tool: 'Bash', command, agentId: 'alice-1' })).deny
+  for (const command of [
+    // -Wonce is a warning option with its value: no c in it is a -c
+    `python3 -Wonce /plugin/board.py ${OWNED} $ACTION`, `python3 -Wonce /p/verify.py ${OWNED} /project accept abc`, `python3 -W once -X dev /p/verify.py ${OWNED} /project prepare shared`,
+    // a program that runs the board some other way
+    `python3 -c "exec(open('/p/board.py').read())" ${OWNED} close`, `python3 -Bc 'import runpy' /p/board.py ${OWNED} close`, `python3 -m runpy /p/board.py ${OWNED} close`,
+    `perl -e 'system("python3 /p/board.py ${OWNED} close")'`, `node -e 'require("child_process").execSync("python3 /p/board.py ${OWNED} close")'`,
+    `echo "python3 /p/board.py ${OWNED} close" | bash -o pipefail`, `bash <<'EOF'\npython3 /p/board.py ${OWNED} close\nEOF`, `python3 - <<'EOF'\nimport os; os.system("python3 /p/board.py ${OWNED} close")\nEOF`,
+    `env -S 'python3 /p/board.py ${OWNED} close'`, `echo "$(python3 /p/board.py ${OWNED} close"`,
+    // -i reads more python from the input once the script has run
+    `printf 'import os' | python3 -i /p/board.py ${OWNED} read alice`, `python3 -Bi /p/board.py ${OWNED} read alice`,
+  ]) expect(await deny(command), command).toContain('The board refused this command')
+  for (const command of [
+    `python3 -Wonce /p/board.py ${OWNED} read alice`, "python3 -c 'print(1)'", 'python3 -m py_compile /p/board.py', "bash -o pipefail -c 'git status'",
+    'perl -ne "print if /x/" notes.txt', `echo sh; python3 /p/board.py ${OWNED} read alice`,
+  ]) expect(await deny(command), command).toBeUndefined()
+})
+
+test('guard: an agent of the run that its roster names nowhere is looked for again only once the roster changes or a start is recorded', async ($, on) => {
+  const state = { title: 'Guard swarm', members: {
+    coordinator: { role: 'coordinator', last_read_seq: 1 },
+    alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '0', last_read_seq: 1 } as Record<string, unknown>,
+  } }
+  let rosterReads = 0
+  let stamp = 1
+  const { answer, board } = owning(on, { board: () => '', roster: () => { rosterReads++; return JSON.stringify(state) } })
+  // the board places the agent in the owned run, though the roster has no member for it
+  on('process.run', (_, e) => answer(e.argv[3] === 'agent-run' ? OWNED : board(e)))
+  on('fs.stat', (_, e) => e.path.endsWith('/members.json') ? { value: { size: JSON.stringify(state).length, mtimeMs: stamp } as never } : { deny: 'none' })
+  on('agent.list', () => ({ value: [{ id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' }, { id: 'ghost-1', description: 'a helper', type: 'swarm:worker', status: 'running' }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const bash = async (command: string, agentId = 'ghost-1') => (await toolCall($, { tool: 'Bash', command, agentId })).deny
+  expect(await bash('git status')).toBeUndefined()
+  const after = rosterReads
+  for (let i = 0; i < 5; i++) expect(await bash('git status')).toBeUndefined()
+  expect(rosterReads).toBe(after)
+  // the roster changes: the agent is now @alice's successor, and is guarded from that call on
+  state.members.alice.id = 'ghost-1'
+  stamp = 2
+  expect(await bash('git commit -m x')).toContain('Shared-checkout writers')
+  expect(rosterReads).toBe(after + 1)
+  // a known member is never let past by the cache
+  expect(await bash('git commit -m x')).toContain('Shared-checkout writers')
+})
+
+test('guard: a resume forgets no run driven before, a teammate is known by its address, and the coordinator is never a member', async ($, on) => {
+  const NEXT = '/project/.swarm/next-20261122-100000'
+  const stateA = { title: 'First swarm', members: {
+    coordinator: { role: 'coordinator', last_read_seq: 1 },
+    alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '0', last_read_seq: 1 },
+    tess: { role: 'worker', id: 'tess@team', paths: 'src/tess', isolated: '0', last_read_seq: 1 },
+  } }
+  const stateB: Record<string, unknown> = { title: 'Next swarm', members: {
+    coordinator: { role: 'coordinator', last_read_seq: 1 },
+    bob: { role: 'worker', id: 'bob-b', paths: 'src/b', isolated: '0', last_read_seq: 1 },
+  } }
+  const { answer, board } = owning(on, {
+    board: () => '', roster: () => JSON.stringify(stateA),
+    read: path => path === `${NEXT}/members.json` ? JSON.stringify(stateB) : undefined,
+  })
+  // the board's own answers: which run an agent (or its address) belongs to, and what a resumed conversation restores
+  const runOf: Record<string, string> = { 'alice-1': OWNED, 'tess@team': OWNED, 'bob-b': NEXT }
+  let restored = ''
+  on('process.run', (_, e) => answer(e.argv[3] === 'agent-run' ? e.argv.slice(5).map(id => runOf[id]).find(Boolean) ?? ''
+    : e.argv[3] === 'restore' ? restored : board(e)))
+  on('agent.list', () => ({ value: [
+    { id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' },
+    { id: 'tm-1', teammateId: 'tess@team', description: '@tess', type: 'swarm:worker', status: 'running' },
+    { id: 'bob-b', description: '@bob', type: 'swarm:worker', status: 'running' },
+  ] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  const drive = async (dir: string) => {
+    await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${dir}" read coordinator` })
+    await clock.advance(2000)
+  }
+  const resume = async () => {
+    await $.session.end({ reason: 'resume', sessionId: 'fixture-conversation', resume: { id: 'fixture-conversation' } })
+    await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+    await clock.advance(2000)
+  }
+  const OVER = 'This Swarm run is over'
+  await drive(OWNED)
+  await drive(NEXT)
+  restored = NEXT
+  await resume()
+  // the first run's members, the teammate known only by its address among them, are refused every tool, the board's included
+  expect((await toolCall($, { tool: 'Bash', command: 'git status', agentId: 'alice-1' })).deny).toContain(OVER)
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/a', agentId: 'alice-1' })).deny).toContain(OVER)
+  expect((await toolCall($, { tool: 'mcp__swarm__board', action: 'read', agentId: 'alice-1' })).deny).toContain(OVER)
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/src/tess/a.ts', old_string: 'a', new_string: 'b', agentId: 'tm-1' })).deny).toContain(OVER)
+  // the run driven now judges its own, and the coordinator is no member of any
+  expect((await toolCall($, { tool: 'Bash', command: 'git status', agentId: 'bob-b' })).deny).toBeUndefined()
+  expect((await toolCall($, { tool: 'Bash', command: 'git commit -m x', agentId: 'bob-b' })).deny).toContain('Shared-checkout writers')
+  expect((await toolCall($, { tool: 'Bash', command: 'git commit -m x' })).deny).toBeUndefined()
+  // closed, then resumed: the board restores no closed run, and its members are still guarded by its roster
+  stateB.closed = true
+  await clock.advance(2000)
+  restored = ''
+  await resume()
+  expect((await toolCall($, { tool: 'Bash', command: 'git commit -m x', agentId: 'bob-b' })).deny).toContain('Shared-checkout writers')
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/README.md', old_string: 'a', new_string: 'b', agentId: 'bob-b' })).deny).toContain('may only edit')
+  expect((await toolCall($, { tool: 'Bash', command: 'git commit -m x' })).deny).toBeUndefined()
+})
+
+test('review: a member of a run this conversation no longer drives is refused its resume up front, and one of the run it drives resumes', async ($, on) => {
+  const NEXT = '/project/.swarm/next-20261122-100000'
+  const member = (id: string) => ({ role: 'worker', id, paths: 'src', isolated: '0', last_read_seq: 1 })
+  const stateA = { title: 'First swarm', members: { coordinator: { role: 'coordinator', last_read_seq: 1 }, alice: member('alice-1') } }
+  const stateB = { title: 'Second swarm', members: { coordinator: { role: 'coordinator', last_read_seq: 1 }, bob: member('bob-b') } }
+  const { answer, board } = owning(on, { board: () => '', roster: () => JSON.stringify(stateA), read: path => path === `${NEXT}/members.json` ? JSON.stringify(stateB) : undefined })
+  const runOf: Record<string, string> = { 'alice-1': OWNED, 'bob-b': NEXT }
+  on('process.run', (_, e) => answer(e.argv[3] === 'agent-run' ? e.argv.slice(5).map(id => runOf[id]).find(Boolean) ?? '' : board(e)))
+  on('agent.list', () => ({ value: [
+    { id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'completed' },
+    { id: 'bob-b', description: '@bob', type: 'swarm:worker', status: 'completed' },
+  ] as never }))
+  on('agent.spawn', (_, e) => ({ model: 'sonnet', agentId: e.resume?.agentId ?? 'started' }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  for (const dir of [OWNED, NEXT]) {
+    await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${dir}" read coordinator` })
+    await clock.advance(2000)
+  }
+  const resume = (agentId: string, name: string) => $.agent.spawn({
+    tool_use_id: `again-${agentId}`, prompt: 'Go on.', description: `@${name}: go on`, subagentType: 'swarm:worker',
+    provider: { plugin: 'swarm', tier: 'core' as const }, parentModel: 'sonnet', background: true, fork: false, resume: { agentId },
+  } as never)
+  // still open, the first run is no longer this conversation's: its member would be refused every tool call
+  const refused = (await resume('alice-1', 'alice')).deny
+  expect(refused).toContain('not resumed')
+  expect(refused).toContain('next-20261122-100000')
+  expect((await resume('bob-b', 'bob')).deny).toBeUndefined()
+})
+
+test('review: a run bound while the closed run\'s roster is read again keeps its own pause; with no such run the closed one keeps its retired members refused', async ($, on) => {
+  const NEXT = '/project/.swarm/next-20261122-100000'
+  const THIRD = '/project/.swarm/third-20261122-110000'
+  const lead = { role: 'coordinator', last_read_seq: 1 }
+  const member = (id: string, killed?: string) => ({ role: 'worker', id, paths: 'src', isolated: '0', last_read_seq: 1, ...killed ? { killed } : {} })
+  const stateA = { title: 'First swarm', closed: false, members: { coordinator: lead, alice: member('alice-1'), old: member('old-1', '1') } }
+  const stateB = { title: 'Second swarm', closed: false, members: { coordinator: lead, bob: member('bob-b') } }
+  const stateC = { title: 'Third swarm', paused: 'held by the user', members: { coordinator: lead, cara: member('cara-c') } }
+  // The second roster read of the closing run waits until the test lets it go: in between, another run is bound.
+  let holdAt: string | undefined
+  let reads = 0
+  let reached = () => {}
+  let release = () => {}
+  const atHold = new Promise<void>(resolve => { reached = resolve })
+  const held = new Promise<void>(resolve => { release = resolve })
+  const rosters: Record<string, () => object> = { [OWNED]: () => stateA, [NEXT]: () => stateB, [THIRD]: () => stateC }
+  on('command.register', () => ({ value: { command: 'swarm-board' } }))
+  on('tool.register', (_, spec) => ({ value: { tool: `mcp__swarm__${spec.name}` } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 'fixture-conversation' }))
+  on('session.cwd', () => ({ value: '/project' }))
+  on('fs.exists', () => ({ value: false }))
+  on('turn.complete', () => ({ text: '' }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('prompt.submit', (_, e) => ({ text: e.text }))
+  on('fs.read', async (_, e) => {
+    const dir = e.path.slice(0, -'/members.json'.length)
+    if (!e.path.endsWith('/members.json') || !rosters[dir]) return { value: '' }
+    if (dir === holdAt && ++reads === 2) {
+      reached()
+      await held
+    }
+    return { value: JSON.stringify(rosters[dir]!()) }
+  })
+  const runOf: Record<string, string> = { 'alice-1': OWNED, 'old-1': OWNED, 'bob-b': NEXT, 'cara-c': THIRD }
+  const answer = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  on('process.run', (_, e) => answer(e.argv[3] === 'agent-run' ? e.argv.slice(5).map(id => runOf[id]).find(Boolean) ?? ''
+    : e.argv[3] === 'account' ? JSON.stringify({ title: 't', total: 1, budget: 0, paused: false }) : ''))
+  on('agent.list', () => ({ value: ['alice-1', 'old-1', 'bob-b', 'cara-c'].map(id => ({ id, description: id, type: 'swarm:worker', status: 'running' })) as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  const drive = async (dir: string) => {
+    await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${dir}" read coordinator` })
+    await clock.advance(2000)
+  }
+  const usage = { model: 'm', input_tokens: 10, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+  const complete = (turnId: string) => $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId, reason: 'answer', usage })
+  const reads$ = (agentId: string) => toolCall($, { tool: 'Read', file_path: '/project/a.ts', agentId })
+  // closed with no run taking over: the run's retired member is still refused by name
+  await drive(OWNED)
+  stateA.closed = true
+  await complete('c1')
+  expect((await reads$('old-1')).deny).toContain('has been retired')
+  // closed while a paused run is bound before its roster is read again: the bound run keeps its pause
+  await drive(NEXT)
+  stateB.closed = true
+  holdAt = NEXT
+  const completing = complete('c2')
+  await atHold
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${THIRD}" read coordinator` })
+  release()
+  await completing
+  expect((await reads$('cara-c')).deny).toContain('paused')
+})
+
+test('review: a roster that could not be read is read again on the next call, so a member assigned since is guarded', async ($, on) => {
+  const state = { title: 'Guard swarm', members: {
+    coordinator: { role: 'coordinator', last_read_seq: 1 },
+    alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '0', last_read_seq: 1 } as Record<string, unknown>,
+  } }
+  let isBroken = false
+  const { answer, board } = owning(on, { board: () => '', roster: () => { if (isBroken) throw new Error('EIO'); return JSON.stringify(state) } })
+  on('process.run', (_, e) => answer(e.argv[3] === 'agent-run' ? OWNED : board(e)))
+  on('fs.stat', (_, e) => e.path.endsWith('/members.json') ? { value: { size: 10, mtimeMs: 1 } as never } : { deny: 'none' })
+  on('agent.list', () => ({ value: [{ id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' }, { id: 'ghost-1', description: 'a helper', type: 'swarm:worker', status: 'running' }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  // the roster's stat answers and its read fails: the agent is no known miss of that stamp
+  state.members.alice.id = 'ghost-1'
+  isBroken = true
+  expect((await toolCall($, { tool: 'Bash', command: 'git status', agentId: 'ghost-1' })).deny).toBeUndefined()
+  // readable again under the same stamp: the agent is now @alice, and its commit is refused
+  isBroken = false
+  expect((await toolCall($, { tool: 'Bash', command: 'git commit -m x', agentId: 'ghost-1' })).deny).toContain('Shared-checkout writers')
+})
+
+test('view diff: a READY\'s except leaves those commits out beside its base, and an except that is not all full ids is dropped', async ($, on) => {
+  const [sha, base, one, two] = ['c', 'b', 'd', 'e'].map(ch => ch.repeat(40)) as [string, string, string, string]
+  const lines = [
+    { seq: 1, agent: 'alice', to: ['coordinator'], text: `READY ${sha}\nParser done.`, time: '2026-11-16T14:04:22+0100', kind: 'ready', revision: sha, base, except: [one, two] },
+    { seq: 2, agent: 'bob', to: ['coordinator'], text: `READY ${sha}\nLexer done.`, time: '2026-11-16T14:04:22+0100', kind: 'ready', revision: sha, base, except: [one, '--output=/tmp/x'] },
+    { seq: 3, agent: 'carol', to: ['coordinator'], text: `READY ${sha}\nRuns done.`, time: '2026-11-16T14:04:22+0100', kind: 'ready', revision: sha, except: [one] },
+  ].map(line => JSON.stringify(line)).join('\n') + '\n'
+  const state = { title: 'Team', members: { coordinator: { role: 'coordinator', last_read_seq: 3 }, alice: { role: 'worker', id: 'alice-1', last_read_seq: 1, start: sha },
+    bob: { role: 'worker', id: 'bob-1', last_read_seq: 1 }, carol: { role: 'worker', id: 'carol-1', last_read_seq: 1 } } }
+  const { answer, board } = owning(on, { board: () => lines, roster: () => JSON.stringify(state) })
+  const git: string[] = []
+  on('process.run', (_, e) => {
+    if (e.argv[0] !== 'git') return answer(board(e))
+    git.push(e.argv.slice(3).join(' '))
+    return answer('commit cccc\n piece.txt | 1 +\n')
+  })
+  on('agent.list', () => ({ value: [] }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const shape = '--first-parent --no-merges --reverse --stat --patch --no-color --no-ext-diff'
+  for (const [key, expected] of [['diff-1', `log ${shape} ${sha} --not ${base} ${one} ${two}`], ['diff-2', `log ${shape} ${sha} --not ${base}`]] as const) {
+    git.length = 0
+    await ui.press({ key })
+    expect(git).toEqual([expected])
+    expect(await ui.find({ type: 'Text', text: /^First-parent commits since bbbbbbb · merges omitted$/ })).toBeDefined()
+  }
+  // without a base an except means nothing
+  git.length = 0
+  await ui.press({ key: 'diff-3' })
+  expect(git).toEqual([`diff --stat --patch --no-color --no-ext-diff HEAD...${sha}`])
+  expect(await ui.find({ type: 'Text', text: /^What ccccccc changes since it branched from HEAD/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /commits since/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a run the coordinator\'s read could not bind is said so in the tool result', async ($, on) => {
+  const { answer, board, seen } = owning(on, { board: () => '', roster: () => ROSTER })
+  on('process.run', (_, e) => e.argv[3] === 'bind' ? { value: { exitCode: 1, stdout: '', stderr: 'owned elsewhere', isStdoutTruncated: false, isStderrTruncated: false } } : answer(board(e)))
+  on('agent.list', () => ({ value: [] }))
+  on('tool.call', () => ({ result: {} }))
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  const result = await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  expect(result.context?.join('\n')).toContain('could not be bound to this conversation')
+  expect(seen.toasts).toEqual([])
+})
+
+test('the run row knows its ends as the pane opens: a step that leads nowhere is text from the first look, with no toast', async ($, on) => {
+  const { seen, answer, board } = owning(on, { board: () => BOARD, roster: () => ROSTER })
+  on('process.run', (_, e) => answer(board(e)))
+  on('tool.call', () => ({ result: {} }))
+  on('agent.list', () => ({ value: [] }))
+  let listed = [{ name: OWNED.split('/').at(-1)!, kind: 'dir' }]
+  on('fs.list', () => ({ value: listed as never }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await clock.advance(0)
+  // the only run: neither step leads anywhere, and neither was pressed to find that out
+  expect(await ui.find({ type: 'Button', key: 'run-prev' })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'run-next' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /^‹ Prev run$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Next run ›$/ })).toBeDefined()
+  expect(seen.toasts).toEqual([])
+  await ui.unmount()
+  // an older run beside it: that way is a control
+  listed = [{ name: 'older-20261101-090000', kind: 'dir' }, ...listed]
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const again = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await clock.advance(0)
+  expect(await again.find({ type: 'Button', key: 'run-prev' })).toBeDefined()
+  expect(await again.find({ type: 'Button', key: 'run-next' })).toBeUndefined()
+  await again.unmount()
+})
+
+test('review: a folder whose roster is no roster is no run to step to, and a pane opened again reads the run row anew', async ($, on) => {
+  const { answer, board } = owning(on, {
+    board: () => BOARD, roster: () => ROSTER,
+    // parses, and holds neither a title nor a coordinator: board.py would not read it either
+    read: path => path.includes('/broken-') && path.endsWith('/members.json') ? '{"members":{}}' : undefined,
+  })
+  on('process.run', (_, e) => answer(board(e)))
+  on('tool.call', () => ({ result: {} }))
+  on('agent.list', () => ({ value: [] }))
+  let listed = [{ name: 'broken-20261001-090000', kind: 'dir' }, { name: OWNED.split('/').at(-1)!, kind: 'dir' }]
+  on('fs.list', () => ({ value: listed as never }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await clock.advance(0)
+  expect(await ui.find({ type: 'Button', key: 'run-prev' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /^‹ Prev run$/ })).toBeDefined()
+  await ui.unmount()
+  // a run made meanwhile, in the same session: the pane opened again finds it
+  listed = [{ name: 'older-20261101-090000', kind: 'dir' }, ...listed]
+  await $.command.run({ command: 'swarm-board', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 80 } })
+  const again = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await clock.advance(0)
+  expect(await again.find({ type: 'Button', key: 'run-prev' })).toBeDefined()
+  await again.unmount()
+})
+
+test('the graph says in its alt what it draws, and its routes are listed in words a press away, with no attribute the host ignores', async ($, on) => {
+  const state = { title: 'Routes', members: { coordinator: { role: 'coordinator', last_read_seq: 2 },
+    alice: { role: 'worker', id: 'alice-1', last_read_seq: 2 }, bob: { role: 'worker', id: 'bob-1', last_read_seq: 2 } } }
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['alice'], text: '@alice BRIEF' }, { agent: 'alice', to: ['bob'], text: '@bob a question' }),
+    roster: () => JSON.stringify(state),
+  })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({ value: [] }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, bodyColumns: 120 } })
+  await ui.press({ key: 'tab-graph' })
+  const graph = (await ui.findAll({ type: 'Svg' })).find(svg => /mention graph/.test(String(svg.props.alt)))
+  expect(String(graph?.props.alt)).toBe('Post 2 · @alice to @bob. A mention graph of 3 members: List the routes below for each one in words.')
+  expect(String(graph?.props.source)).not.toContain('aria-')
+  expect(await ui.find({ type: 'Text', text: /^\S+ 1 {2}@alice → @bob$/ })).toBeUndefined()
+  await ui.press({ key: 'graph-routes' })
+  expect(await ui.find({ type: 'Text', text: /1 {2}@coordinator → @alice$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /1 {2}@alice → @bob$/ })).toBeDefined()
+  await ui.press({ key: 'graph-routes' })
+  expect(await ui.find({ type: 'Text', text: /^\S+ 1 {2}@alice → @bob$/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+// A conversation that drives no run, in a project whose open run another conversation owns: Swarm stays out of its way.
+function strangerTo(on: On, agents: unknown[] = [{ id: 'gp1', description: 'Fix the tests', type: 'general-purpose', status: 'running' }]) {
+  const other = '/project/.swarm/other-20261117-090000'
+  const seen = { commands: [] as string[], placed: [] as string[], opened: [] as string[], toasts: [] as string[], prompts: [] as string[], sends: [] as string[] }
+  on('command.register', () => ({ value: { command: 'swarm-board' } }))
+  on('tool.register', (_, spec) => ({ value: { tool: `mcp__swarm__${spec.name}` } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 'this-conversation' }))
+  on('session.cwd', () => ({ value: '/project' }))
+  on('session.usage', () => ({ value: { context: { tokens: 900_000 } } as never }))
+  on('ui.panes', () => ({ value: [] }))
+  on('ui.place', (_, e) => { seen.placed.push(e.id); return { value: { isPlaced: true, requestId: e.id } } })
+  on('ui.open', (_, e) => { seen.opened.push(e.id); return { value: { isPlaced: true } } })
+  on('ui.toast', (_, e) => { seen.toasts.push(e.text); return { value: undefined } })
+  on('prompt.submit', (_, e) => { seen.prompts.push(e.text); return { text: e.text } })
+  on('session.send', (_, e) => { seen.sends.push(e.text); return { isDelivered: true } })
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }))
+  on('fs.exists', () => ({ value: true }))
+  on('fs.stat', () => ({ value: { size: 1, mtimeMs: 1 } as never }))
+  on('fs.read', (_, e) => ({
+    value: e.path === '/project/.swarm/current' ? 'other-20261117-090000\n'
+      : e.path.endsWith('/members.json') ? JSON.stringify({ title: 'Theirs', binding: 'another-conversation', members: { coordinator: { role: 'coordinator' }, alice: { role: 'worker', id: 'alice-1' } } })
+      : e.path.endsWith('/board.jsonl') ? posts({ agent: 'coordinator', to: ['alice'], text: '@alice BRIEF' }) : '',
+  }))
+  // The board answers as board.py does for a run of another conversation's: nothing restores, locates or binds here.
+  on('process.run', (_, e) => {
+    const isBoard = e.argv[0] === 'python3'
+    if (isBoard) seen.commands.push(e.argv.slice(3).join(' '))
+    const refused = isBoard && e.argv[3] === 'bind'
+    return { value: { exitCode: refused ? 1 : 0, stdout: '', stderr: refused ? 'owned by another conversation' : '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('agent.list', () => ({ value: agents as never }))
+  on('agent.spawn', (_, e) => ({ model: 'sonnet', agentId: e.resume?.agentId ?? 'started' }))
+  on('tool.call', () => ({ result: {} }))
+  return { other, seen }
+}
+
+test('no run here: a swarm: agent is not started or resumed, and Explore and general-purpose agents start as ever', async ($, on) => {
+  const { seen } = strangerTo(on)
+  mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  const spawn = {
+    tool_use_id: 'fixture', prompt: 'Look around.', description: 'scout the parser', subagentType: 'swarm:explorer',
+    provider: { plugin: 'swarm', tier: 'core' as const }, parentModel: 'sonnet', background: true, fork: false,
+  }
+  // Unnamed, the project's open run is pointed at; named, the name is on no run this conversation could drive.
+  expect((await $.agent.spawn(spawn)).deny).toContain('open Swarm run')
+  expect((await $.agent.spawn({ ...spawn, description: '@scout: the parser' })).deny).toContain('swarm: agents run only inside a Swarm run the user started with /swarm:swarm')
+  expect((await $.agent.spawn({ ...spawn, description: '@alice: the parser', subagentType: 'swarm:worker' })).deny).toContain('swarm: agents run only inside a Swarm run')
+  expect((await $.agent.spawn({ ...spawn, resume: { agentId: 'alice-1' } })).deny).toContain('swarm: agents run only inside a Swarm run')
+  for (const subagentType of ['Explore', 'general-purpose']) {
+    const started = await $.agent.spawn({ ...spawn, subagentType })
+    expect(started.deny).toBeUndefined()
+    expect(started.agentId).toBe('started')
+  }
+  expect(seen.commands.filter(command => command.startsWith('bind'))).toEqual([])
+})
+
+test('no run here: the board tool refuses in a sentence, and makes, adopts and reads nothing', async ($, on) => {
+  const { seen } = strangerTo(on, [
+    { id: 'gp1', description: 'Fix the tests', type: 'general-purpose', status: 'running' },
+    { id: 'x1', description: '@scout: look', type: 'swarm:explorer', status: 'running' },
+  ])
+  mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  const before = seen.commands.length
+  for (const caller of [{}, { agentId: 'gp1' }, { agentId: 'x1' }]) {
+    for (const action of ['read', 'status', 'post'] as const) {
+      const answer = await toolCall($, { tool: 'mcp__swarm__board', action, ...(action === 'post' && { text: 'hello' }), ...caller })
+      expect(answer.deny).toBe('There is no Swarm run here: the board tool works only inside a Swarm run the user started with /swarm:swarm.')
+    }
+  }
+  // Only lookups that consider no other conversation's run: none reads its board, binds or makes one.
+  expect(seen.commands.slice(before).filter(command => !/^(agent-run|locate) /.test(command))).toEqual([])
+  expect(seen.placed).toEqual([])
+})
+
+test('no run here: tool calls, turns and the chat are left as they are, though another conversation runs one in the project', async ($, on) => {
+  const { other, seen } = strangerTo(on)
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: 'Fix the tests', turnId: 't1' })
+  const calls = [
+    { tool: 'Bash', command: 'npm test' },
+    { tool: 'Bash', command: 'npm run watch', run_in_background: true },
+    { tool: 'Monitor', command: 'tail -f log', description: 'watch the log', timeout_ms: 60_000 },
+    { tool: 'Edit', file_path: '/project/src/a.ts', old_string: 'a', new_string: 'b', agentId: 'gp1' },
+    { tool: 'Write', file_path: '/project/src/b.ts', content: '', agentId: 'gp1' },
+    { tool: 'Bash', command: 'git add -A && git commit -m fix', agentId: 'gp1' },
+    { tool: 'Bash', command: 'git commit -m fix' },
+  ] as const
+  for (const call of calls) {
+    const answer = await toolCall($, call)
+    expect(answer.deny).toBeUndefined()
+    expect(answer.context).toBeUndefined()
+  }
+  await clock.advance(5000)
+  await $.turn.complete({ answer: 'Done.', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  await clock.advance(60_000)
+  expect({ placed: seen.placed, opened: seen.opened, toasts: seen.toasts, prompts: seen.prompts, sends: seen.sends }).toEqual({ placed: [], opened: [], toasts: [], prompts: [], sends: [] })
+  expect(seen.commands.filter(command => command.startsWith(other) || /^(bind|tail|account|read|started) /.test(command))).toEqual([])
+  // Only a board command typed for that run claims it; the board refuses, and the claim that failed is said.
+  const claimed = await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${other}" read coordinator` })
+  expect(claimed.deny).toBeUndefined()
+  expect(claimed.context?.join('\n')).toContain('could not be bound to this conversation')
+  expect(seen.placed).toEqual([])
+  // Above the prompt the terminal draws nothing of Swarm's; the desktop keeps the button that lets the person look.
+  const above = (surface: 'desktop' | 'terminal') => $.ui.mount({
+    component: 'AbovePrompt', plugin: 'swarm', surface,
+    props: { hasSurvey: false, isCollapsed: false, isWorking: false, maxRows: 3, bodyColumns: 60, scroll: { offset: 0, bodyRows: 3 }, view: {} },
+  })
+  const terminal = await above('terminal')
+  expect(await terminal.find({ type: 'Button', text: /Swarm/ })).toBeUndefined()
+  await terminal.unmount()
+  const desktop = await above('desktop')
+  expect(await desktop.find({ type: 'Button', text: 'Swarm: The Board' })).toBeDefined()
+  await desktop.unmount()
+  expect(seen.opened).toEqual([])
+})
+
+test('no run here: a project Swarm never ran in shows no board shortcut on Desktop', async ($, on) => {
+  on('ui.panes', () => ({ value: [] }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('tool.register', (_, spec) => ({ value: { tool: `mcp__swarm__${spec.name}` } }))
+  on('command.register', (_, spec) => ({ value: { command: spec.name } }))
+  on('fs.exists', () => ({ value: false }))
+  on('fs.read', () => { throw new Error('ENOENT') })
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({
+    component: 'AbovePrompt', plugin: 'swarm', surface: 'desktop',
+    props: { hasSurvey: false, isCollapsed: false, isWorking: false, maxRows: 3, bodyColumns: 80, scroll: { offset: 0, bodyRows: 3 }, view: {} },
+  })
+  expect(await band.find({ key: 'swarm-board-shortcut' })).toBeUndefined()
 })

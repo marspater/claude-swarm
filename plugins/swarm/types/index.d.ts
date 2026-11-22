@@ -7,6 +7,16 @@ export type Post = {
   to: string[]
   /** The full commit id a READY reported, when it reported one. */
   revision?: string
+  /** A READY's base: the project's HEAD when it was posted, a full commit id. Its diff is the first-parent commits since. */
+  base?: string
+  /** Full commit ids a READY with a base also leaves out of its diff; never empty. */
+  except?: string[]
+  /** A VERIFIED of a partial candidate, and the workers it covered: not the run's pass. */
+  partial?: true
+  members?: string[]
+  /** The workers a verifier's NOT PASSED rejects, and the candidate a verifier's verdict answers. */
+  rejects?: string[]
+  candidate?: string
 }
 
 export type Member = {
@@ -23,7 +33,7 @@ export type Member = {
   /** The members whose READY it waits for, and what it owns, as the roster records them. */
   depends: string[]
   owns: string
-  /** `coordinating`, `working`, `waiting`, `not started`, `failed`, `stopped` (its agent was killed while it is still on the roster), `unreachable` or `killed` (retired). */
+  /** `coordinating`, `working`, `waiting`, `not started`, `failed`, `stopped` (its agent was killed while it is still on the roster), `unreachable`, `killed` (retired), or in a closed run `closed` (there at the close). */
   status: string
   /** What a member that is not working waits for, in words; empty when nothing is pending. A member paused on its own token budget says so even while it works. */
   detail: string

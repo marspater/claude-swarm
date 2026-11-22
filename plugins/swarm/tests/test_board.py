@@ -826,11 +826,11 @@ def audit(name):
     assert os.path.isdir(loop) and run(parent, "prune", "--days=0").strip() == "remove 0 worktree(s) and archive 0 run(s)"
     run(parent, "prune", "--weeks=2", ok=False)
     # the run the `current` pointer names stays, closed or not: the pane of a conversation without a run shows it
-    # closing with a candidate that passed and was never accepted says so
+    # closing with a pass the record no longer bears out says it is stale
     with open(os.path.join(loop, "verification.json"), "w") as f:
         json.dump({"candidate": "abc", "verified_by": "v"}, f)
     run(loop, "read", "coordinator")
-    assert "passed verification and was never accepted" in run(loop, "close")
+    assert "abc, passed earlier, now stale" in run(loop, "close")
     with open(os.path.join(parent, "current")) as f:
         assert f.read().strip() == os.path.basename(loop)
     assert os.path.isdir(loop) and "archive 0 run(s)" in run(parent, "prune", "--days=0")
@@ -1667,6 +1667,10 @@ class BoardRegressions(unittest.TestCase):
         assert saved(d)["members"]["down"]["synced_deps"] == {"up": up}
         assert "in sync" in board("sync", "down", "--check-only")
         board("ready", "down", "HEAD", stdin="b is down, on top of up")
+        # its base is the project checkout's HEAD, not the worktree's: from there the log shows down's work, not up's
+        report = json.loads(run(d, "show", "--post=2", "--json"))
+        assert report["base"] == git("rev-parse", "main")
+        assert git("log", "--first-parent", "--no-merges", "--format=", "--name-only", report["revision"], "--not", report["base"]) == "b"
         # a full commit ID is checked in the project's repository
         assert "sync clash" in board("ready", "clash", commit("clash", "main", "a", "clash\n"), ok=False, stdin="a too")
         assert "@up" in board("sync", "clash", ok=False)  # both change a: the merge is aborted, the checkout left clean
@@ -1925,6 +1929,11 @@ class BoardRegressions(unittest.TestCase):
         import board  # noqa: E402
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "parity.json"), encoding="utf-8") as f:
             vectors = json.load(f)
+        # A kind of vector added to the file and checked here by nobody would let drift through unseen.
+        assert set(vectors) == {"targets", "quoted", "question", "kind", "actions", "defaults"}, sorted(vectors)
+        # The pane's list of board commands (hooks/hive.ts) and its starting model and effort per type (hooks/models.ts).
+        assert vectors["actions"] == sorted(board.ARG_COUNTS)
+        assert vectors["defaults"] == {kind: list(pair) for kind, pair in board.DEFAULTS.items()}
         for case in vectors["targets"]:
             assert board.targets(case["text"], case["members"], sender=case["sender"]) == case["expect"], case
         for case in vectors["quoted"]:
@@ -1934,6 +1943,504 @@ class BoardRegressions(unittest.TestCase):
         for case in vectors["kind"]:
             word = board.REPORT_WORD.match(case["text"])
             assert (word[1] if word else "") == case["expect"], case
+
+    # The audit of 0.3.47.
+
+    def test_resume_wakes_a_verifier_stopped_in_a_review(self):
+        d = self.init_run()
+        for who, extra in (("done", []), ("ongoing", []), ("v", ["role=verifier"])):
+            run(d, "member", who, "id=agent-" + who, *extra)
+        run(d, "ready", "done", stdin="done")
+
+        def table(identifier):  # a partial candidate holding done's current report
+            with open(os.path.join(d, "verification.json"), "w", encoding="utf-8") as f:
+                json.dump({"candidate": identifier, "inputs": {"done": [1, None]}, "partial": True, "members": ["done"]}, f)
+
+        table("c1aaaaaaaaaaaaaa")
+        run(d, "post", "coordinator", "@v Please test partial candidate c1aaaaaaaaaaaaaa")
+        run(d, "read", "v")
+        run(d, "pause", "hold")
+        out = run(d, "resume")
+        assert "@v" in out and "@ongoing" in out, out
+        # A finished review is no stopped one.
+        run(d, "read", "v")
+        run(d, "read", "ongoing")
+        run(d, "post", "v", "@coordinator NOT VERIFIED: the check cannot run here")
+        assert json.loads(run(d, "show", "--post=4", "--json"))["candidate"] == "c1aaaaaaaaaaaaaa"
+        run(d, "pause", "hold")
+        out = run(d, "resume")
+        assert "@v" not in out and "@ongoing" in out, out
+        # A note that only mentions the candidate asks for nothing: the review stays finished.
+        run(d, "post", "coordinator", "@v c1aaaaaaaaaaaaaa is in the summary now")
+        run(d, "read", "v")
+        run(d, "pause", "hold")
+        assert "@v" not in run(d, "resume")
+        # Asked to run the same candidate again, it owes a new verdict.
+        run(d, "post", "coordinator", "@v Please run c1aaaaaaaaaaaaaa again")
+        run(d, "read", "v")
+        run(d, "read", "ongoing")
+        run(d, "pause", "hold")
+        assert "@v" in run(d, "resume")
+        run(d, "read", "v")
+        # A request still unread is a wake already owed: `resume` posts nothing more for it.
+        table("c2bbbbbbbbbbbbbb")
+        run(d, "post", "coordinator", "@v Please test partial candidate c2bbbbbbbbbbbbbb")
+        run(d, "read", "ongoing")
+        run(d, "pause", "hold")
+        out = run(d, "resume")
+        assert "@v" not in out and "@ongoing" in out, out
+        assert "@v" in woken(d)
+
+    def test_resume_wakes_a_verifier_whose_not_passed_is_about_a_worker_outside_the_candidate(self):
+        d = self.init_run()
+        for who, extra in (("done", []), ("ongoing", []), ("v", ["role=verifier"])):
+            run(d, "member", who, "id=agent-" + who, *extra)
+        run(d, "ready", "done", stdin="done")
+        with open(os.path.join(d, "verification.json"), "w", encoding="utf-8") as f:  # a partial candidate holding done
+            json.dump({"candidate": "c1aaaaaaaaaaaaaa", "inputs": {"done": [1, None]}, "partial": True, "members": ["done"]}, f)
+        run(d, "post", "coordinator", "@v Please test partial candidate c1aaaaaaaaaaaaaa")
+        run(d, "read", "v")
+        # A NOT PASSED of a worker the candidate does not hold leaves its review unfinished.
+        run(d, "post", "v", "@coordinator NOT PASSED @ongoing: its piece breaks the build")
+        assert json.loads(run(d, "show", "--post=3", "--json"))["rejects"] == ["ongoing"]
+        run(d, "read", "ongoing")
+        run(d, "pause", "hold")
+        assert "@v" in run(d, "resume")
+        # One of a worker it holds finishes it.
+        run(d, "read", "v")
+        run(d, "post", "v", "@coordinator NOT PASSED @done: the parser test fails")
+        run(d, "read", "done")
+        run(d, "pause", "hold")
+        assert "@v" not in run(d, "resume")
+
+    def test_a_partial_pass_finishes_its_review_and_the_close_names_what_it_held(self):
+        project = os.path.join(self.root, "proj")
+        os.makedirs(project)
+
+        def git(*args):
+            return subprocess.run(["git", "-C", project, *args], check=True, capture_output=True, text=True).stdout.strip()
+        git("init", "-q", "-b", "main")
+        for key, value in (("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")):
+            git("config", key, value)
+        with open(os.path.join(project, "file.txt"), "w") as f:
+            f.write("v1")
+        git("add", "file.txt")
+        git("commit", "-q", "-m", "init")
+        git("switch", "-q", "-c", "work")
+        with open(os.path.join(project, "file.txt"), "w") as f:
+            f.write("v2")
+        git("commit", "-q", "-am", "work")
+        commit = git("rev-parse", "HEAD")
+        git("switch", "-q", "main")
+        d = run(os.path.join(project, ".swarm", "reg"), "init", "Partial").strip()
+        for who, extra in (("w", []), ("other", []), ("v", ["role=verifier"])):
+            run(d, "member", who, "id=agent-" + who, *extra)
+        run(d, "ready", "w", commit, stdin="done")
+
+        def gate(*args):
+            r = subprocess.run([sys.executable, os.path.join(os.path.dirname(BOARD), "verify.py"), d, project, *args],
+                               capture_output=True, text=True)
+            assert r.returncode == 0, (args, r.stdout, r.stderr)
+            return r.stdout
+
+        cand = json.loads(gate("prepare", "isolated", "--check", "true", "--members", "w"))["candidate"]
+        run(d, "post", "coordinator", "@v Please test partial candidate " + cand)
+        run(d, "read", "v")
+        run(d, "pause", "hold")
+        assert "@v" in run(d, "resume")
+        run(d, "read", "v")
+        run(d, "post", "v", "@coordinator " + gate("test", cand, "v").splitlines()[-1])
+        run(d, "pause", "hold")
+        assert "@v" not in run(d, "resume")
+        # A partial pass that still holds at the close is named as one, with the workers it held.
+        run(d, "read", "coordinator")
+        assert "passed but was partial: it held only @w" in run(d, "close")
+
+    def test_export_and_close_show_a_voided_pass_as_stale(self):
+        verify_py = os.path.join(os.path.dirname(BOARD), "verify.py")
+        project = os.path.join(self.root, "proj")
+        os.makedirs(project)
+        d = run(os.path.join(project, ".swarm", "reg"), "init", "Stale").strip()
+        run(d, "member", "w")
+        run(d, "member", "v", "role=verifier")
+        run(d, "ready", "w", stdin="done")
+
+        def gate(*args, ok=True):
+            r = subprocess.run([sys.executable, verify_py, d, project, *args], capture_output=True, text=True)
+            assert (r.returncode == 0) == ok, (args, r.stdout, r.stderr)
+            return r.stdout
+
+        def verification():
+            with open(run(d, "export").strip(), encoding="utf-8") as f:
+                return next(line for line in f if line.startswith("Candidate "))
+
+        cand = json.loads(gate("prepare", "shared", "--check", "true"))["candidate"]
+        line = gate("test", cand, "v").splitlines()[-1]
+        run(d, "post", "v", "@coordinator " + line)
+        assert "passed, verified by @v" in verification()
+        run(d, "revise", "w", "one more fix")
+        stale = verification()
+        assert "passed earlier, now stale: waiting for READY from @w" in stale and "passed, verified" not in stale, stale
+        refused = subprocess.run([sys.executable, BOARD, d, "post", "v", "@coordinator " + line], capture_output=True, text=True)
+        assert refused.returncode and "waiting for READY from @w" in refused.stderr, refused.stderr
+        run(d, "read", "coordinator")
+        assert "passed earlier, now stale: waiting for READY from @w" in run(d, "close")
+        assert verification() == stale  # judged while the run was open, not as "the run is closed"
+        # A pass that still holds is reported as one.
+        d = run(os.path.join(project, ".swarm", "reg"), "init", "Held").strip()
+        run(d, "member", "w")
+        run(d, "member", "v", "role=verifier")
+        run(d, "ready", "w", stdin="done")
+        cand = json.loads(gate("prepare", "shared", "--check", "true"))["candidate"]
+        run(d, "post", "v", "@coordinator " + gate("test", cand, "v").splitlines()[-1])
+        run(d, "read", "coordinator")
+        assert "passed verification and was never accepted" in run(d, "close")
+        assert "passed, verified by @v" in verification()
+
+    def test_regrouping_moves_no_rejection(self):
+        d = self.init_run()
+        run(d, "member", "first", "group=platform")
+        run(d, "member", "second")
+        run(d, "member", "v", "role=verifier")
+        run(d, "ready", "first", stdin="First piece")
+        run(d, "ready", "second", stdin="Second piece")
+        run(d, "post", "v", stdin="NOT PASSED @platform\n@second for awareness only")
+        assert json.loads(run(d, "show", "--post=3", "--json"))["rejects"] == ["first"]
+
+        def ready():
+            return {name for name, view in json.loads(run(d, "attention", "--json"))["members"].items() if view["ready"]}
+
+        assert ready() == {"second"}
+        run(d, "member", "first", "group=elsewhere")
+        assert ready() == {"second"}
+        sys.path.insert(0, os.path.dirname(BOARD))
+        import board  # noqa: E402
+        members = {"v": {"role": "verifier"}, "a": {"role": "worker"}}
+        legacy = {"seq": 1, "agent": "v", "text": "NOT PASSED: broken", "to": ["a"]}
+        assert board.rejected(legacy, members) == ["a"]  # a post from before the field is worked out as it was
+        assert board.rejected(dict(legacy, rejects=[]), members) == []  # a recorded empty answer stands
+
+    def test_ready_records_the_base_the_pane_diffs_from(self):
+        project, commit = self.git_project()
+
+        def git(*args):
+            return subprocess.run(["git", "-C", project, *args], check=True, capture_output=True, text=True).stdout.strip()
+
+        d = run(os.path.join(project, ".swarm", "reg"), "init", "Base").strip()
+        run(d, "member", "dep")
+        run(d, "member", "piece", "depends=dep")
+        upstream = commit("dependency", "main", "upstream.txt", "dependency\n")
+        commit("piece", "main", "piece.txt", "worker work\n")
+        commit("piece", "piece", "second.txt", "more work\n")
+        git("merge", "-q", "--no-ff", "--no-edit", upstream)  # as `sync` merges a dependency
+        rev = git("rev-parse", "HEAD")
+        git("switch", "-q", "main")
+        run(d, "ready", "dep", upstream, stdin="upstream")
+        run(d, "ready", "piece", rev, stdin="piece")
+        base = json.loads(run(d, "show", "--post=2", "--json"))["base"]
+        assert base == git("rev-parse", "HEAD")
+
+        def own():
+            return set(git("log", "--first-parent", "--no-merges", "--format=", "--name-only", rev, "--not", base).split())
+
+        assert own() == {"piece.txt", "second.txt"}
+        git("merge", "-q", "--no-ff", "--no-edit", upstream)
+        git("merge", "-q", "--no-ff", "--no-edit", rev)
+        assert own() == {"piece.txt", "second.txt"}  # the recorded base still tells the work apart once it is merged
+        run(d, "ready", "piece", rev, stdin="piece again")
+        # HEAD holds it now, but where the branch started still tells the work apart, the dependency left out
+        again = json.loads(run(d, "show", "--post=3", "--json"))
+        assert again["base"] == git("rev-parse", "main~2") and again["except"] == [upstream], again
+        assert set(git("log", "--first-parent", "--no-merges", "--format=", "--name-only", rev, "--not", again["base"],
+                       *again["except"]).split()) == {"piece.txt", "second.txt"}
+
+    def test_a_post_keeps_only_the_optional_fields_that_are_what_they_say(self):
+        sys.path.insert(0, os.path.dirname(BOARD))
+        import board  # noqa: E402
+        full = "a" * 40
+        post = {"seq": 1, "agent": "w", "text": "READY", "time": "t", "to": [], "kind": "ready"}
+        # a commit that is no full id never reaches git, and costs the post only that field
+        kept = dict(post, revision=full, base="--upload-pack=x", **{"except": [full]})
+        assert board.is_post(kept) and kept.get("revision") == full and "base" not in kept and "except" not in kept, kept
+        kept = dict(post, revision=full, base=full, **{"except": [full, "-x"]})
+        assert board.is_post(kept) and kept["base"] == full and "except" not in kept, kept
+        kept = dict(post, revision="HEAD")
+        assert board.is_post(kept) and "revision" not in kept, kept
+        kept = dict(post, revision=full, base=full, **{"except": [full]})
+        assert board.is_post(kept) and kept["except"] == [full], kept
+        assert not board.is_post(dict(post, seq="1")) and not board.is_post(dict(post, to="w"))
+        # rejects is read only as a list of names; anything else falls back to who the verdict reaches
+        members = {"v": {"role": "verifier"}, "w": {"role": "worker"}, "x": {"role": "worker"}}
+        verdict = {"seq": 2, "agent": "v", "text": "@w NOT PASSED: tabs", "time": "t", "to": ["w"]}
+        assert board.rejected(dict(verdict, rejects=[]), members) == []
+        assert board.rejected(dict(verdict, rejects=["x"]), members) == ["x"]
+        for odd in ("w", None, [1], {"w": 1}):
+            assert board.rejected(dict(verdict, rejects=odd), members) == ["w"], odd
+
+    def test_ready_and_sync_hold_no_lock_while_git_works(self):
+        project, commit = self.git_project()
+
+        def git(*args, cwd=project):
+            return subprocess.run(["git", "-C", cwd, *args], check=True, capture_output=True, text=True).stdout.strip()
+
+        # A git that takes its time over the trial merge `ready` runs and the merge `sync` makes, as a large
+        # repository or a hook would.
+        shim, mark = os.path.join(self.root, "shim"), os.path.join(self.root, "mark")
+        os.makedirs(shim)
+        with open(os.path.join(shim, "git"), "w") as f:
+            f.write('#!/bin/sh\ncase " $* " in *" merge-tree "*|*" merge --no-autostash "*) touch "%s"; sleep 3;; esac\n'
+                    'exec "%s" "$@"\n' % (mark, shutil.which("git")))
+        os.chmod(os.path.join(shim, "git"), 0o755)
+        env = dict(os.environ, PATH=shim + os.pathsep + os.environ["PATH"])
+        d = run(os.path.join(project, ".swarm", "reg"), "init", "Slow git").strip()
+        for who, extra in (("up", []), ("down", ["depends=up"]), ("gone", []), ("later", ["depends=up"])):
+            run(d, "member", who, *extra)
+        run(d, "ready", "up", commit("up", "main", "a", "up\n"), stdin="a is up")
+
+        def slowly(*args, cwd=None):
+            if os.path.exists(mark):
+                os.unlink(mark)
+            started = subprocess.Popen([sys.executable, BOARD, d, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True, env=env, cwd=cwd)
+            started.stdin.write("done")
+            started.stdin.close()
+            started.stdin = None  # communicate() on Python 3.12 and older flushes a closed stdin and raises ValueError
+            deadline = time.monotonic() + 20
+            while not os.path.exists(mark):
+                assert started.poll() is None and time.monotonic() < deadline, started.communicate()
+                time.sleep(0.05)
+            return started
+
+        def quickly(*args):  # another member's command, while git works
+            began = time.monotonic()
+            out = run(d, *args)
+            assert time.monotonic() - began < 2, "the board was locked while git worked"
+            return out
+
+        slow = slowly("ready", "down", commit("down", "up", "b", "down\n"))
+        quickly("post", "coordinator", "@up thanks")
+        assert slow.communicate()[0].startswith("posted #3") and slow.returncode == 0
+        # what changed meanwhile is checked again: a member retired while git worked posts nothing
+        slow = slowly("ready", "gone", commit("gone", "main", "c", "gone\n"))
+        quickly("member", "gone", "killed=1")
+        assert "no longer is one" in slow.communicate()[1] and slow.returncode
+        assert "READY" not in run(d, "show", "gone")
+        run(d, "member", "reader")
+        slow = slowly("ready", "reader", commit("reader", "main", "e", "reader\n"))
+        quickly("member", "reader", "writes=0")
+        assert "was made read-only while git checked it" in slow.communicate()[1] and slow.returncode
+        # a first READY has no earlier report a scope change could withdraw: the work was done for the old scope
+        run(d, "member", "scoped", "paths=src")
+        slow = slowly("ready", "scoped", commit("scoped", "main", "s", "scoped\n"))
+        quickly("member", "scoped", "paths=src,tests")
+        assert "assignment changed while git checked" in slow.communicate()[1] and slow.returncode
+        assert "READY" not in run(d, "show", "scoped")
+        # a change that leaves the scope alone keeps the report valid
+        run(d, "member", "tuned", "paths=lib")
+        slow = slowly("ready", "tuned", commit("tuned", "main", "t", "tuned\n"))
+        quickly("member", "tuned", "model=opus")
+        assert slow.communicate()[0].startswith("posted #") and slow.returncode == 0
+        # an agent put in its place while git worked is another: the first one's report is not posted for it
+        run(d, "member", "swapped", "paths=bin")
+        slow = slowly("ready", "swapped", commit("swapped", "main", "w", "swapped\n"))
+        state = saved(d)
+        state["members"]["swapped"]["id"] = "agent-2"
+        with open(os.path.join(d, "members.json"), "w") as f:
+            json.dump(state, f)
+        assert "assignment changed while git checked" in slow.communicate()[1] and slow.returncode
+        assert "READY" not in run(d, "show", "swapped")
+        # sync records the merges it made, and says the scope moved under it
+        tree = os.path.join(self.root, "moved")
+        run(d, "member", "moved", "depends=up")
+        git("worktree", "add", "-q", "-b", "moved", tree, "main")
+        slow = slowly("sync", "moved", cwd=tree)
+        quickly("member", "moved", "paths=docs")
+        out, err = slow.communicate()
+        assert slow.returncode and "assignment changed while sync ran" in err, (out, err)
+        assert saved(d)["members"]["moved"]["synced_deps"] == {"up": git("rev-parse", "up")}
+        # an agent put in the member's place while sync ran works elsewhere: this checkout's merges are not its record
+        tree = os.path.join(self.root, "handed")
+        run(d, "member", "handed", "depends=up")
+        git("worktree", "add", "-q", "-b", "handed", tree, "main")
+        slow = slowly("sync", "handed", cwd=tree)
+        state = saved(d)
+        state["members"]["handed"]["id"] = "agent-2"
+        with open(os.path.join(d, "members.json"), "w") as f:
+            json.dump(state, f)
+        out, err = slow.communicate()
+        assert slow.returncode and "assignment changed while sync ran" in err, (out, err)
+        assert "synced_deps" not in saved(d)["members"]["handed"]
+        # a branch that merely ends at the reported commit is no evidence of where the work began when there are two
+        run(d, "member", "twin")
+        first = commit("twin", "main", "tw", "twin\n")
+        git("branch", "other", first)  # begun inside the work: taken for its start, it would hide the first commit
+        tip = commit("twin", "twin", "tw2", "more\n")
+        git("branch", "-f", "other", tip)
+        git("checkout", "-q", "main")  # the project's HEAD does not hold the work yet
+        run(d, "ready", "twin", tip, stdin="twin is ready")
+        assert json.loads(run(d, "tail").splitlines()[-1])["base"] == git("rev-parse", "main")
+        # sync merges in the member's own worktree, and records the merge on the board as it stands afterwards
+        tree = os.path.join(self.root, "later")
+        git("worktree", "add", "-q", "-b", "later", tree, "main")
+        slow = slowly("sync", "later", cwd=tree)
+        # one sync a member at a time: a second would write its own list of merges over the first one's
+        second = subprocess.run([sys.executable, BOARD, d, "sync", "later"], cwd=tree, capture_output=True, text=True, env=env)
+        assert second.returncode and "another sync for @later is still running" in second.stderr, second.stderr
+        quickly("post", "coordinator", "@later sync is running")
+        assert "synced" in slow.communicate()[0] and slow.returncode == 0
+        state = saved(d)
+        assert state["members"]["later"]["synced_deps"] == {"up": git("rev-parse", "up")}
+        assert state["members"]["later"]["start"] == git("rev-parse", "main")
+        assert "@later sync is running" in run(d, "show", "later")
+
+    def test_of_two_overlapping_readies_the_later_names_their_clash(self):
+        project, commit = self.git_project()
+        # A git whose trial merge takes as long as SLOW says, so the two reports overlap in a known order.
+        shim, mark = os.path.join(self.root, "shim"), os.path.join(self.root, "mark")
+        os.makedirs(shim)
+        with open(os.path.join(shim, "git"), "w") as f:
+            f.write('#!/bin/sh\ncase " $* " in *" merge-tree "*) touch "%s"; sleep "${SLOW:-0}";; esac\nexec "%s" "$@"\n'
+                    % (mark, shutil.which("git")))
+        os.chmod(os.path.join(shim, "git"), 0o755)
+        d = run(os.path.join(project, ".swarm", "reg"), "init", "Overlap").strip()
+        for who in ("base", "first", "second"):
+            run(d, "member", who)
+        run(d, "ready", "base", commit("base", "main", "base.txt", "base\n"), stdin="base")  # a peer to compare with
+        one, two = commit("first", "main", "same", "first\n"), commit("second", "main", "same", "second\n")
+
+        report = os.path.join(self.root, "report")
+        with open(report, "w") as f:
+            f.write("done")
+
+        def ready(who, revision, slow):
+            env = dict(os.environ, PATH=shim + os.pathsep + os.environ["PATH"], SLOW=slow)
+            with open(report) as stdin:
+                return subprocess.Popen([sys.executable, BOARD, d, "ready", who, revision], stdin=stdin,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+
+        early = ready("first", one, "2")
+        deadline = time.monotonic() + 20
+        while not os.path.exists(mark):
+            assert early.poll() is None and time.monotonic() < deadline, early.communicate()
+            time.sleep(0.05)
+        late = ready("second", two, "4")  # starts while the first is in git, and posts after it
+        assert early.communicate()[0].startswith("posted #2") and early.returncode == 0
+        out, err = late.communicate()
+        assert late.returncode == 0 and "conflict: @first's READY #2" in out, (out, err)
+        assert json.loads(run(d, "show", "--post=3", "--json"))["conflicts"]["first"]["files"] == ["same"]
+
+    def test_ready_and_sync_name_the_remedy_that_fits(self):
+        project, commit = self.git_project()
+
+        def git(*args, cwd=project):
+            return subprocess.run(["git", "-C", cwd, *args], check=True, capture_output=True, text=True).stdout.strip()
+
+        d = run(os.path.join(project, ".swarm", "reg"), "init", "Remedies").strip()
+        for who, extra in (("up", []), ("down", ["depends=up"]), ("solo", [])):
+            run(d, "member", who, *extra)
+        up = commit("up", "main", "a", "up\n")
+        # git reads a commit ID in either case: so does the board, which keeps one
+        run(d, "ready", "up", up.upper(), stdin="a is up")
+        assert json.loads(run(d, "show", "--post=1", "--json"))["revision"] == up
+        # a commit only a separate clone holds is none verification can merge
+        clone = os.path.join(self.root, "clone")
+        subprocess.run(["git", "clone", "-q", project, clone], check=True, capture_output=True)
+        for key, value in (("user.name", "T"), ("user.email", "t@example.invalid"), ("commit.gpgsign", "false")):
+            git("config", key, value, cwd=clone)
+        with open(os.path.join(clone, "solo.txt"), "w") as f:
+            f.write("solo")
+        git("add", "solo.txt", cwd=clone)
+        git("commit", "-q", "-m", "solo", cwd=clone)
+        refused = subprocess.run([sys.executable, BOARD, d, "ready", "solo", "HEAD"], input="done", capture_output=True,
+                                 text=True, cwd=clone)
+        assert refused.returncode and "no commit in the project's repository" in refused.stderr, refused.stderr
+        # a merge Git cannot sign is aborted, and the message says what to configure
+        git("switch", "-q", "main")
+        tree = os.path.join(self.root, "down")
+        git("worktree", "add", "-q", "-b", "down", tree, "main")
+        env = dict(os.environ, GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0="commit.gpgsign", GIT_CONFIG_VALUE_0="true",
+                   GIT_CONFIG_KEY_1="gpg.program", GIT_CONFIG_VALUE_1="false")
+        failed = subprocess.run([sys.executable, BOARD, d, "sync", "down"], capture_output=True, text=True, cwd=tree, env=env)
+        assert failed.returncode and "so it was aborted" in failed.stderr and "signing key" in failed.stderr, failed.stderr
+        assert git("status", "--porcelain", cwd=tree) == "" and git("rev-parse", "HEAD", cwd=tree) == git("rev-parse", "main")
+
+    def test_ready_base_and_except_hold_only_the_members_own_work(self):
+        project, commit = self.git_project()
+
+        def git(*args, cwd=project):
+            return subprocess.run(["git", "-C", cwd, *args], check=True, capture_output=True, text=True).stdout.strip()
+
+        d = run(os.path.join(project, ".swarm", "reg"), "init", "Own work").strip()
+        for who, extra in (("dep", []), ("ff", ["depends=dep"]), ("w", []), ("x", []), ("y", []), ("v", ["role=verifier"])):
+            run(d, "member", who, *extra)
+
+        def ready(who, revision, cwd=None):
+            r = subprocess.run([sys.executable, BOARD, d, "ready", who, revision], input="done", capture_output=True,
+                               text=True, cwd=cwd)
+            assert r.returncode == 0 and r.stdout.startswith("posted #"), r.stderr
+            return int(r.stdout.split()[1][1:])
+
+        def own(seq):  # what the pane shows: git log --first-parent --no-merges REVISION --not BASE EXCEPT...
+            post = json.loads(run(d, "show", "--post=%d" % seq, "--json"))
+            return set(git("log", "--first-parent", "--no-merges", "--format=", "--name-only", post["revision"], "--not",
+                           post["base"], *post.get("except", [])).split())
+
+        # a dependency fast-forwarded into the branch sits on its first-parent line: `except` leaves it out
+        up = commit("dep", "main", "dep.txt", "dep\n")
+        git("switch", "-q", "-c", "ff", "main")
+        git("merge", "-q", "--ff-only", up)
+        mine = commit("ff", "ff", "ff.txt", "ff\n")
+        git("switch", "-q", "main")
+        ready("dep", up)
+        assert own(ready("ff", mine)) == {"ff.txt"}
+        # a branch, several commits long, from a side ref the project's HEAD lacks: the base is where it started
+        commit("develop", "main", "side.txt", "side\n")
+        commit("w", "develop", "w1.txt", "1\n")
+        first = commit("w", "w", "w2.txt", "2\n")
+        git("switch", "-q", "main")
+        seq = ready("w", first)
+        assert json.loads(run(d, "show", "--post=%d" % seq, "--json"))["base"] == git("rev-parse", "develop")
+        assert own(seq) == {"w1.txt", "w2.txt"}
+        # rejected, fixed and reported again: the whole branch is still the work
+        run(d, "post", "v", "@w NOT PASSED: w2 is wrong")
+        fixed = commit("w", "w", "w3.txt", "3\n")
+        git("switch", "-q", "main")
+        again = ready("w", fixed)
+        assert own(again) == {"w1.txt", "w2.txt", "w3.txt"}
+        # a fix begun on a new branch made from the reported work: that branch began inside the work, not before it
+        git("switch", "-q", "-c", "w-fix", "w")
+        refix = commit("w-fix", "w-fix", "w4.txt", "4\n")
+        git("switch", "-q", "main")
+        assert own(ready("w", refix)) == {"w1.txt", "w2.txt", "w3.txt", "w4.txt"}
+        # from a worktree on another side ref: `ready HEAD` records where its branch began, and a later READY of a
+        # commit no branch ends at is told apart from there
+        commit("topic", "main", "topic.txt", "topic\n")
+        git("switch", "-q", "main")
+        tree = os.path.join(self.root, "agent-x")
+        git("worktree", "add", "-q", "-b", "agent-x", tree, "topic")
+        for name in ("x1.txt", "x2.txt"):
+            with open(os.path.join(tree, name), "w") as f:
+                f.write(name)
+            git("add", name, cwd=tree)
+            git("commit", "-q", "-m", name, cwd=tree)
+            if name == "x1.txt":
+                assert own(ready("x", "HEAD", cwd=tree)) == {"x1.txt"}
+                assert saved(d)["members"]["x"]["start"] == git("rev-parse", "topic")
+                x1 = git("rev-parse", "HEAD", cwd=tree)
+        assert own(ready("x", x1)) == {"x1.txt"}
+        # a detached worktree began where its own HEAD reflog starts
+        detached = os.path.join(self.root, "agent-y")
+        git("worktree", "add", "-q", "--detach", detached, "topic")
+        with open(os.path.join(detached, "y1.txt"), "w") as f:
+            f.write("y1")
+        git("add", "y1.txt", cwd=detached)
+        git("commit", "-q", "-m", "y1", cwd=detached)
+        assert own(ready("y", "HEAD", cwd=detached)) == {"y1.txt"}
+        assert saved(d)["members"]["y"]["start"] == git("rev-parse", "topic")
+        # integrated into HEAD, the recorded range still tells the work apart, and a new READY records one too
+        git("merge", "-q", "--no-ff", "--no-edit", refix)
+        assert own(again) == {"w1.txt", "w2.txt", "w3.txt"}
+        assert own(ready("w", refix)) == {"w1.txt", "w2.txt", "w3.txt", "w4.txt"}
 
 
 if __name__ == "__main__":

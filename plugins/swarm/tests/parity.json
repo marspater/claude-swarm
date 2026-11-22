@@ -704,6 +704,282 @@
    },
    "sender": "coordinator",
    "expect": []
+  },
+  {
+   "text": "https://e.com/x\u0085@parser",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "v",
+   "expect": []
+  },
+  {
+   "text": "x\r~~~\n@parser\r~~~\n@api",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "v",
+   "expect": [
+    "api"
+   ]
+  },
+  {
+   "text": "café@parser and x.@api",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "v",
+   "expect": [
+    "parser"
+   ]
+  },
+  {
+   "text": "@fix- @FIX_ ok",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "coordinator",
+   "expect": [
+    "parser",
+    "api"
+   ]
+  },
+  {
+   "text": "@all@parser",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "v",
+   "expect": [
+    "coordinator",
+    "parser",
+    "api",
+    "docs",
+    "v",
+    "v2",
+    "old_"
+   ]
+  },
+  {
+   "text": "@parser/@api",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "v",
+   "expect": [
+    "parser"
+   ]
+  },
+  {
+   "text": "@josé",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "v",
+   "expect": []
   }
  ],
  "quoted": [
@@ -770,6 +1046,30 @@
   {
    "text": "```\nfence\n````\nout",
    "expect": " \nout"
+  },
+  {
+   "text": "see café://x? now",
+   "expect": "see café://x? now"
+  },
+  {
+   "text": "see https://e.com/x\u0085? now",
+   "expect": "see  ? now"
+  },
+  {
+   "text": "x\r~~~\n@parser?\r~~~\nout",
+   "expect": "x\r \nout"
+  },
+  {
+   "text": "go https://e.com/a\ufeffb now",
+   "expect": "go  \ufeffb now"
+  },
+  {
+   "text": "go https://e.com/a\u001cb? now",
+   "expect": "go  ? now"
+  },
+  {
+   "text": "a\u2028~~~\nq?\u2028~~~ b",
+   "expect": "a\u2028  b"
   }
  ],
  "question": [
@@ -840,6 +1140,26 @@
   {
    "text": "use A?  (Option A  : yes)",
    "expect": true
+  },
+  {
+   "text": "really?é",
+   "expect": true
+  },
+  {
+   "text": "is https://e.com/x\u0085?",
+   "expect": true
+  },
+  {
+   "text": "x\r~~~\nwhy?\r~~~",
+   "expect": false
+  },
+  {
+   "text": "see https://e.com/a\ufeff?",
+   "expect": true
+  },
+  {
+   "text": "here\u00a0?",
+   "expect": true
   }
  ],
  "kind": [
@@ -906,6 +1226,44 @@
   {
    "text": "NOT PASSEDX",
    "expect": ""
+  },
+  {
+   "text": "@José NOT PASSED: tests fail",
+   "expect": ""
+  },
+  {
+   "text": "@josé READY",
+   "expect": ""
+  },
+  {
+   "text": "@Zoë VERIFIED x y",
+   "expect": ""
+  },
+  {
+   "text": "READYé",
+   "expect": "READY"
+  },
+  {
+   "text": "@parser\tREADY",
+   "expect": "READY"
+  },
+  {
+   "text": "@a,@b:READY x",
+   "expect": "READY"
+  },
+  {
+   "text": "READY\rmore",
+   "expect": "READY"
+  },
+  {
+   "text": "@api-NOT VERIFIED",
+   "expect": "VERIFIED"
+  },
+  {
+   "text": "VERIFIED\u00a0x",
+   "expect": "VERIFIED"
   }
- ]
+ ],
+ "actions": ["account", "adopt", "agent-run", "attention", "bind", "claim", "close", "confirm", "export", "init", "limit", "locate", "member", "pause", "plan", "post", "prune", "read", "ready", "rearm", "replace", "restore", "resume", "retry", "revise", "show", "started", "status", "sync", "tail", "wake", "woke"],
+ "defaults": {"worker": ["sonnet", "medium"], "verifier": ["sonnet", "medium"], "explorer": ["haiku", "medium"], "investigator": ["opus", "high"], "architect": ["fable", "high"], "designer": ["opus", "high"]}
 }

@@ -1,6 +1,6 @@
 ---
 name: architect
-description: Read-only Swarm software architect and the coordinator's consultant. Designs, reviews, and stages architecture for new and existing systems, and gives a reasoned recommendation when the coordinator needs advice on a complex topic or decision.
+description: "Only inside a Swarm run the user started with /swarm:swarm, where the coordinator starts it as a registered member; never for general delegation in other sessions. Read-only Swarm software architect and the coordinator's consultant. Designs, reviews, and stages architecture for new and existing systems, and gives a reasoned recommendation when the coordinator needs advice on a complex topic or decision."
 tools: Read, Grep, Glob, LSP, mcp__swarm__board
 skills:
   - swarm:architecting

@@ -1,6 +1,6 @@
 ---
 name: explorer
-description: Fast, read-only Swarm scout for locating entry points, registrations, definitions, callers, and tests. Reports a small, verified map or analyzes a bounded file slice.
+description: "Only inside a Swarm run the user started with /swarm:swarm, where the coordinator starts it as a registered member; never for general delegation in other sessions. Fast, read-only Swarm scout for locating entry points, registrations, definitions, callers, and tests. Reports a small, verified map or analyzes a bounded file slice."
 tools: Read, Grep, Glob, mcp__swarm__board
 skills:
   - swarm:exploring

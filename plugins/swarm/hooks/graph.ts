@@ -3,12 +3,17 @@ import { head as clipHead, unquoted as stripCode } from './text'
 import type { Post, Swarm } from '../types'
 
 const BROADCAST = /(?<![\w.@/])@all[-_]*(?![\w-])/i
+// `text` is stripped of code already.
 const named = (text: string, name: string) =>
-  new RegExp(`(?<![\\w.@/])@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[-_]*(?![\\w-])`, 'i').test(stripCode(text))
+  new RegExp(`(?<![\\w.@/])@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[-_]*(?![\\w-])`, 'i').test(text)
 
 /** True when the post addresses `@all`: the members it does not also name are reached through that alone. */
 export const isBroadcast = (post: Post) => BROADCAST.test(stripCode(post.text))
-const viaAll = (post: Post, to: string) => isBroadcast(post) && !named(post.text, to)
+/** The recipients a post reached through `@all` alone, its text stripped of code once for all of them. */
+function viaAllOf(post: Post): ReadonlySet<string> {
+  const text = stripCode(post.text)
+  return BROADCAST.test(text) ? new Set(post.to.filter(to => !named(text, to))) : new Set()
+}
 
 /**
  * How often each member addressed each other, keyed `from>to`. A recipient reached only through `@all` is
@@ -20,9 +25,10 @@ export function edgesOf(posts: Post[]): Record<string, number> {
   const add = (key: string) => { counts[key] = (counts[key] ?? 0) + 1 }
   for (const post of posts) {
     // An @all that reached nobody (a team of one, or all retired) is still an @all post, not one with no mention.
+    const viaAll = viaAllOf(post)
     if (isBroadcast(post)) add(`${post.agent}>@all`)
     else if (post.to.length === 0) add(`${post.agent}>@none`)
-    for (const to of post.to) add(viaAll(post, to) ? `${post.agent}>${to}>all` : `${post.agent}>${to}`)
+    for (const to of post.to) add(viaAll.has(to) ? `${post.agent}>${to}>all` : `${post.agent}>${to}`)
   }
   return counts
 }
@@ -34,7 +40,10 @@ export function pairOf(edge: string): [string, string] | undefined {
 }
 
 const PILL_HEIGHT = 38
-const LEGEND = 50
+// The host refuses an Svg source longer than this, and the whole pane with it.
+export const SVG_LIMIT = 131_072
+// The name font is 14px in the drawing's own units; drawn smaller than this on screen, the graph gives way to a list.
+export const MIN_LABEL_PX = 9
 
 // Past this many members round the coordinator the ring gives way to two arcs, one name to a row.
 const RING_LIMIT = 10
@@ -46,7 +55,9 @@ const CURVE_SAMPLES = Array.from({ length: 23 }, (_, index) => (index + 1) / 24)
 function pillDist(x: number, y: number, pill: { x: number; y: number; half: number }): number {
   const qx = Math.abs(x - pill.x) - (pill.half - 13)
   const qy = Math.abs(y - pill.y) - (PILL_HEIGHT / 2 - 13)
-  return Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - 13
+  // Math.hypot(q, 0) is |q| exactly, so the square root is taken only where both sides stick out.
+  const out = qx > 0 ? (qy > 0 ? Math.hypot(qx, qy) : qx) : qy > 0 ? qy : 0
+  return out + Math.min(Math.max(qx, qy), 0) - 13
 }
 
 /** Members shown in the graph for the current replay cursor and filter state. */
@@ -174,10 +185,40 @@ const COLUMN_WIDTH = 8.77
 export function graphHeight(columns: number, members: Swarm['members']): number {
   // The desktop clamps the frame width to the actual slot. Columns estimate its height only, so a change in font
   // metrics cannot narrow the frame. The height follows the drawing's shape: a frame taller than the drawing
-  // leaves the difference empty above the graph and below its legend.
+  // leaves the difference empty above and below the graph.
   const { width, height } = stageOf(members)
-  return Math.max(200, Math.min(members.length > 22 ? 780 : 620, Math.round(columns * COLUMN_WIDTH * (height + LEGEND) / width)))
+  return Math.max(200, Math.min(members.length > 22 ? 780 : 620, Math.round(columns * COLUMN_WIDTH * height / width)))
 }
+
+/** The on-screen size of a member's name, in CSS pixels, in a pane `columns` wide: an estimate, at 8.77 px a column. */
+export function labelPx(columns: number, members: Swarm['members']): number {
+  const { width, height } = stageOf(members)
+  return 14 * Math.min(columns * COLUMN_WIDTH / width, graphHeight(columns, members) / height)
+}
+
+/** Each member's name as its pill shows it: a long one keeps its start and its end, and two never read the same. */
+function labelsOf(names: string[]): Map<string, string> {
+  const labels = new Map<string, string>()
+  const taken = new Set(names.filter(name => name.length <= 15))
+  for (const name of names) {
+    if (name.length <= 15) {
+      labels.set(name, name)
+      continue
+    }
+    const cut = (start: number) => `${clipHead(name, start)}…${name.slice(start - 14)}`
+    // Names alike at both ends get a number: of as many numbers as names, one is always free.
+    const label = [7, 4, 10, 2, 12].map(cut).find(one => !taken.has(one)) ??
+      names.map((_, index) => `${clipHead(name, 11)}…${index + 2}`).find(one => !taken.has(one))!
+    taken.add(label)
+    labels.set(name, label)
+  }
+  return labels
+}
+
+// The control point and the two ends of each routed edge, for the layout last drawn: one graph is shown at a time,
+// so the routes of the previous layout are dropped when another is drawn.
+type Route = readonly [number, number, number, number, number, number]
+let routeCache: { layout: string; routes: Map<string, Route> } = { layout: '', routes: new Map() }
 
 const esc = (text: string) =>
   text.replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`)
@@ -195,6 +236,25 @@ export function graphSvg(
   elapsed = 0,
   expandAll = false,
 ): string {
+  return drawGraph(swarm, upTo, hidden, animate, live, repeat, elapsed, expandAll, Infinity).svg ?? ''
+}
+
+/**
+ * The graph as the pane draws it: the SVG within `limit` characters, the routes left out of it to stay there, and
+ * the key in words. Every route of the post at `upTo` is kept; the quietest others go first, @all ones before
+ * named ones. No `svg` when even that much does not fit.
+ */
+export function drawGraph(
+  swarm: Swarm,
+  upTo: number,
+  hidden: ReadonlySet<string>,
+  animate: boolean,
+  live: boolean,
+  repeat = false,
+  elapsed = 0,
+  expandAll = false,
+  limit = SVG_LIMIT,
+): { svg?: string; hidden: number; key: string } {
   const phase = Number.isFinite(elapsed) && elapsed > 0 ? Math.floor(elapsed) % 3600 : 0
   const current = swarm.posts.find(post => post.seq === upTo)
   const earlier = Object.entries(swarm.earlierEdges ?? {})
@@ -215,16 +275,18 @@ export function graphSvg(
   }
   for (const post of swarm.posts) {
     if (post.seq > upTo) break
+    const viaAll = viaAllOf(post)
     if (isBroadcast(post)) bump(broadcasts, post.agent)
     else if (post.to.length === 0) bump(unaddressed, post.agent)
-    for (const to of post.to) bump(viaAll(post, to) ? broadcastTo : direct, `${post.agent}>${to}`)
+    for (const to of post.to) bump(viaAll.has(to) ? broadcastTo : direct, `${post.agent}>${to}`)
   }
 
   const { coordinator, outerMembers, width, height, place } = stageOf(members, direct)
   const centerHalf = coordinator ? halfOf(coordinator.name) : 0
   const outerIndex = new Map(outerMembers.map((member, index) => [member.name, index]))
+  const labels = labelsOf(members.map(member => member.name))
   const positions = new Map(members.map(member => {
-    const label = member.name.length > 15 ? `${clipHead(member.name, 14)}…` : member.name
+    const label = labels.get(member.name)!
     const half = halfOf(member.name)
     const isCenter = member === coordinator || (coordinator === undefined && members.length === 1)
     const spot = isCenter ? { x: width / 2, y: height / 2 } : place(outerIndex.get(member.name)!)
@@ -240,27 +302,45 @@ export function graphSvg(
   const isCurrentBroadcast = current !== undefined && isBroadcast(current)
   // Solid for mentions by name. What reached a member through @all is a dashed line of its own, drawn only
   // when asked for; where the two members also named each other it runs beside the solid one.
-  const edges = [
+  const currentViaAll = current ? viaAllOf(current) : new Set<string>()
+  const isCurrentEdge = (edge: string, isDashed: boolean) => {
+    const [from = '', to = ''] = edge.split('>')
+    return current?.agent === from && current.to.includes(to) && currentViaAll.has(to) === isDashed
+  }
+  const candidates = [
     ...[...direct].map(([edge, total]) => ({ edge, total, isDashed: false })),
     ...(expandAll ? [...broadcastTo].map(([edge, total]) => ({ edge, total, isDashed: true })) : []),
-  ]
+  ].filter(({ edge }) => {
+    const [from = '', to = ''] = edge.split('>')
+    return from !== to && visible.has(from) && visible.has(to)
+  })
+  // The current post's routes first, then the busiest named ones, then the busiest via @all.
+  const rank = ({ edge, total, isDashed }: (typeof candidates)[number]) =>
+    isCurrentEdge(edge, isDashed) ? Infinity : isDashed ? total : total + 1e9
+  const edges = candidates.map((one, index) => ({ ...one, index })).sort((a, b) => rank(b) - rank(a) || a.index - b.index)
   const drawn = new Set(edges.map(({ edge }) => edge))
 
-  const history: string[] = []
   const active: string[] = []
   const badges: string[] = []
   const ripples: string[] = []
   const outerCount = outerMembers.length
   const pad = outerCount <= 6 ? 8 : 4.5
-  for (const { edge, total, isDashed } of edges) {
+  // Everything a route depends on besides its own edge: the frame and where each member's pill stands.
+  const layout = JSON.stringify([width, height, coordinator?.name ?? null, outerCount,
+    members.map(member => { const p = positions.get(member.name)!; return [member.name, p.x, p.y, p.half] })])
+  if (routeCache.layout !== layout) routeCache = { layout, routes: new Map() }
+  const { routes } = routeCache
+  // Routes one edge. A route of the current post is drawn into `active`; any other is returned, for the history.
+  const routeOf = ({ edge, total, isDashed }: (typeof edges)[number]): string | undefined => {
+    const isCurrent = isCurrentEdge(edge, isDashed)
     const [from = '', to = ''] = edge.split('>')
-    if (from === to || !visible.has(from) || !visible.has(to)) continue
+    if (from === to || !visible.has(from) || !visible.has(to)) return
     const a = positions.get(from)
     const b = positions.get(to)
-    if (!a || !b) continue
+    if (!a || !b) return
     const dx = b.x - a.x
     const dy = b.y - a.y
-    if (dx === 0 && dy === 0) continue  // two members on one spot have no direction to draw
+    if (dx === 0 && dy === 0) return  // two members on one spot have no direction to draw
     const length = Math.hypot(dx, dy)
     const ux = dx / length
     const uy = dy / length
@@ -307,99 +387,95 @@ export function graphSvg(
       const [ex, ey] = leave(b, kx, ky, 4)
       return [kx, ky, sx, sy, ex, ey] as const
     }
-    let [cx, cy, x1, y1, x2, y2] = chordBow(baseBow)
-    const isForward = (controlX: number, controlY: number, ex: number, ey: number) =>
-      (ex - controlX) * (b.x - ex) + (ey - controlY) * (b.y - ey) > 0
-    const obstacles = members.filter(m => m.name !== from && m.name !== to).map(m => positions.get(m.name)!).filter(Boolean)
-    const minClearance = (controlX: number, controlY: number, sx: number, sy: number, ex: number, ey: number) => {
-      let min = Infinity
-      for (const t of CURVE_SAMPLES) {
-        const x = (1 - t) ** 2 * sx + 2 * (1 - t) * t * controlX + t ** 2 * ex
-        const y = (1 - t) ** 2 * sy + 2 * (1 - t) * t * controlY + t ** 2 * ey
-        for (const o of obstacles) {
-          const dist = pillDist(x, y, o)
-          if (dist < min) min = dist
+    // The same members in the same places route an edge the same way: a redraw that changed nothing else
+    // (a press, the next frame of a replay) takes the route found before.
+    const routeKey = `${edge}|${isMutual}|${beside}`
+    const [cx, cy, x1, y1, x2, y2] = routes.get(routeKey) ?? (() => {
+      let [cx, cy, x1, y1, x2, y2] = chordBow(baseBow)
+      const isForward = (controlX: number, controlY: number, ex: number, ey: number) =>
+        (ex - controlX) * (b.x - ex) + (ey - controlY) * (b.y - ey) > 0
+      const obstacles = members.filter(m => m.name !== from && m.name !== to).map(m => positions.get(m.name)!).filter(Boolean)
+      // The least distance from the curve to a pill in its way. Once it is at or below `floor` the caller has no use for
+      // the exact value, so the search stops there. A pill whose box is no nearer than the least so far cannot be nearer
+      // itself: the rounded pill lies inside its box.
+      const minClearance = (controlX: number, controlY: number, sx: number, sy: number, ex: number, ey: number, floor = -Infinity) => {
+        let min = Infinity
+        for (const t of CURVE_SAMPLES) {
+          const x = (1 - t) ** 2 * sx + 2 * (1 - t) * t * controlX + t ** 2 * ex
+          const y = (1 - t) ** 2 * sy + 2 * (1 - t) * t * controlY + t ** 2 * ey
+          for (const o of obstacles) {
+            if (Math.abs(x - o.x) - o.half > min + 1e-6 || Math.abs(y - o.y) - PILL_HEIGHT / 2 > min + 1e-6) continue
+            const dist = pillDist(x, y, o)
+            if (dist < min) {
+              min = dist
+              if (min <= floor) return min
+            }
+          }
         }
+        return min
       }
-      return min
-    }
-    const initialForward = isForward(cx, cy, x2, y2)
-    if (!initialForward || (obstacles.length > 0 && minClearance(cx, cy, x1, y1, x2, y2) < pad)) {
-      // Route around non-endpoint pills with graduated detours while keeping mutual and @all edges separated,
-      // and scale down bow on short diagonal chords if the default bow reverses the arrival tangent.
-      const shrinkCandidates = !initialForward
-        ? [baseBow * 0.6, baseBow * 0.35, baseBow * 0.15, 0].map(offset => ({ useChord: true, offset }))
-        : []
-      const bowCandidates = (isMutual ? [baseBow, baseBow * 1.45, baseBow * 1.9, -baseBow] : [baseBow, -baseBow])
-        .map(offset => ({ useChord: true, offset }))
-      const stepCandidates = [24, 36, 52, 70, 90, 120, 155, 195, 235].flatMap(mag => [
-        { useChord: mag <= 70, offset: bowSign * (mag + beside) },
-        { useChord: mag <= 70, offset: -bowSign * (mag + beside) },
-      ])
-      const innerFace = (p: { x: number; y: number; half: number }, targetX: number, gap: number) => {
-        const dir = p.x < width / 2 ? 1 : p.x > width / 2 ? -1 : (targetX >= p.x ? 1 : -1)
-        return [p.x + dir * (p.half + gap), p.y] as const
-      }
-      const [isx, isy] = innerFace(a, b.x, 3)
-      const [iex, iey] = innerFace(b, a.x, 4)
-      const corridorCandidates = (() => {
-        if (outerCount <= RING_LIMIT && beside === 0) return []
-        const list: Array<readonly [number, number, number, number, number, number]> = []
-        const idx = iex - isx, idy = iey - isy
-        const ilen = Math.hypot(idx, idy) || 1
-        const iux = idx / ilen, iuy = idy / ilen
-        const midX = (isx + iex) / 2, midY = (isy + iey) / 2
-        const small = beside > 0 ? [16, -16, 24, -24, 32, -32] : []
-        for (const offset of [...small, baseBow, -baseBow, 24, -24, 36, -36, 52, -52, 70, -70, 90, -90, 120, -120, 155, -155, 195, -195, 235, -235]) {
-          const [kx, ky] = clampStage(midX - iuy * offset, midY + iux * offset)
-          list.push([kx, ky, isx, isy, iex, iey])
+      const initialForward = isForward(cx, cy, x2, y2)
+      if (!initialForward || (obstacles.length > 0 && minClearance(cx, cy, x1, y1, x2, y2, pad - 1e-9) < pad)) {
+        // Route around non-endpoint pills with graduated detours while keeping mutual and @all edges separated,
+        // and scale down bow on short diagonal chords if the default bow reverses the arrival tangent.
+        const shrinkCandidates = !initialForward
+          ? [baseBow * 0.6, baseBow * 0.35, baseBow * 0.15, 0].map(offset => ({ useChord: true, offset }))
+          : []
+        const bowCandidates = (isMutual ? [baseBow, baseBow * 1.45, baseBow * 1.9, -baseBow] : [baseBow, -baseBow])
+          .map(offset => ({ useChord: true, offset }))
+        const stepCandidates = [24, 36, 52, 70, 90, 120, 155, 195, 235].flatMap(mag => [
+          { useChord: mag <= 70, offset: bowSign * (mag + beside) },
+          { useChord: mag <= 70, offset: -bowSign * (mag + beside) },
+        ])
+        const innerFace = (p: { x: number; y: number; half: number }, targetX: number, gap: number) => {
+          const dir = p.x < width / 2 ? 1 : p.x > width / 2 ? -1 : (targetX >= p.x ? 1 : -1)
+          return [p.x + dir * (p.half + gap), p.y] as const
         }
-        const laneLeft = width / 2 - (centerHalf + 28)
-        const laneRight = width / 2 + (centerHalf + 28)
-        const minSideX = Math.min(isx, iex) - 28
-        const maxSideX = Math.max(isx, iex) + 28
-        for (const [kx, ky] of [
-          [width / 2, height / 2 - 48],
-          [width / 2, height / 2 + 48],
-          [laneLeft, midY],
-          [laneRight, midY],
-          [laneLeft, height / 2 - 48],
-          [laneLeft, height / 2 + 48],
-          [laneRight, height / 2 - 48],
-          [laneRight, height / 2 + 48],
-          [minSideX, midY],
-          [maxSideX, midY],
-          [width / 2, 24],
-          [width / 2, height - 24],
-        ] as const) {
-          const [cxC, cyC] = clampStage(kx, ky)
-          list.push([cxC, cyC, isx, isy, iex, iey])
-        }
-        return list
-      })()
-      let bestClear = -Infinity
-      let bestCand: readonly [number, number, number, number, number, number] | undefined
-      let found = false
-      for (const { useChord, offset } of [...shrinkCandidates, ...bowCandidates, ...stepCandidates]) {
-        const cand = useChord ? chordBow(offset) : detourBow(offset)
-        const [candX, candY, sx, sy, ex, ey] = cand
-        if (!isForward(candX, candY, ex, ey)) continue
-        const clear = obstacles.length > 0 ? minClearance(candX, candY, sx, sy, ex, ey) : Infinity
-        if (clear >= pad) {
-          cx = candX; cy = candY; x1 = sx; y1 = sy; x2 = ex; y2 = ey
-          found = true
-          break
-        }
-        if (clear > bestClear) {
-          bestClear = clear
-          bestCand = cand
-        }
-      }
-      if (!found) {
-        for (const cand of corridorCandidates) {
+        const [isx, isy] = innerFace(a, b.x, 3)
+        const [iex, iey] = innerFace(b, a.x, 4)
+        const corridorCandidates = (() => {
+          if (outerCount <= RING_LIMIT && beside === 0) return []
+          const list: Array<readonly [number, number, number, number, number, number]> = []
+          const idx = iex - isx, idy = iey - isy
+          const ilen = Math.hypot(idx, idy) || 1
+          const iux = idx / ilen, iuy = idy / ilen
+          const midX = (isx + iex) / 2, midY = (isy + iey) / 2
+          const small = beside > 0 ? [16, -16, 24, -24, 32, -32] : []
+          for (const offset of [...small, baseBow, -baseBow, 24, -24, 36, -36, 52, -52, 70, -70, 90, -90, 120, -120, 155, -155, 195, -195, 235, -235]) {
+            const [kx, ky] = clampStage(midX - iuy * offset, midY + iux * offset)
+            list.push([kx, ky, isx, isy, iex, iey])
+          }
+          const laneLeft = width / 2 - (centerHalf + 28)
+          const laneRight = width / 2 + (centerHalf + 28)
+          const minSideX = Math.min(isx, iex) - 28
+          const maxSideX = Math.max(isx, iex) + 28
+          for (const [kx, ky] of [
+            [width / 2, height / 2 - 48],
+            [width / 2, height / 2 + 48],
+            [laneLeft, midY],
+            [laneRight, midY],
+            [laneLeft, height / 2 - 48],
+            [laneLeft, height / 2 + 48],
+            [laneRight, height / 2 - 48],
+            [laneRight, height / 2 + 48],
+            [minSideX, midY],
+            [maxSideX, midY],
+            [width / 2, 24],
+            [width / 2, height - 24],
+          ] as const) {
+            const [cxC, cyC] = clampStage(kx, ky)
+            list.push([cxC, cyC, isx, isy, iex, iey])
+          }
+          return list
+        })()
+        let bestClear = -Infinity
+        let bestCand: readonly [number, number, number, number, number, number] | undefined
+        let found = false
+        for (const { useChord, offset } of [...shrinkCandidates, ...bowCandidates, ...stepCandidates]) {
+          const cand = useChord ? chordBow(offset) : detourBow(offset)
           const [candX, candY, sx, sy, ex, ey] = cand
           if (!isForward(candX, candY, ex, ey)) continue
-          const clear = obstacles.length > 0 ? minClearance(candX, candY, sx, sy, ex, ey) : Infinity
+          const clear = obstacles.length > 0 ? minClearance(candX, candY, sx, sy, ex, ey, bestClear) : Infinity
           if (clear >= pad) {
             cx = candX; cy = candY; x1 = sx; y1 = sy; x2 = ex; y2 = ey
             found = true
@@ -410,12 +486,30 @@ export function graphSvg(
             bestCand = cand
           }
         }
+        if (!found) {
+          for (const cand of corridorCandidates) {
+            const [candX, candY, sx, sy, ex, ey] = cand
+            if (!isForward(candX, candY, ex, ey)) continue
+            const clear = obstacles.length > 0 ? minClearance(candX, candY, sx, sy, ex, ey, bestClear) : Infinity
+            if (clear >= pad) {
+              cx = candX; cy = candY; x1 = sx; y1 = sy; x2 = ex; y2 = ey
+              found = true
+              break
+            }
+            if (clear > bestClear) {
+              bestClear = clear
+              bestCand = cand
+            }
+          }
+        }
+        if (!found && bestCand) {
+          [cx, cy, x1, y1, x2, y2] = bestCand
+        }
       }
-      if (!found && bestCand) {
-        [cx, cy, x1, y1, x2, y2] = bestCand
-      }
-    }
-    const isCurrent = current?.agent === from && current.to.includes(to) && viaAll(current, to) === isDashed
+      const routed: Route = [cx, cy, x1, y1, x2, y2]
+      routes.set(routeKey, routed)
+      return routed
+    })()
     const weight = weightOf(total)
     // The head is drawn by hand so it sits on the pill's border, turned the way the curve arrives, and the
     // line stops at its base instead of showing through its tip.
@@ -432,16 +526,16 @@ export function graphSvg(
     const d = `M${n1(x1)} ${n1(y1)} Q${n1(cx)} ${n1(cy)} ${n1(bx + tx)} ${n1(by + ty)}`
     const description = `<title>${esc(from)} to ${esc(to)} · ` +
       (isDashed ? `${total} via @all` : `${total} ${total === 1 ? 'mention' : 'mentions'}`) + '</title>'
+    // One description a route, on the line that is always drawn: a tooltip where the host draws the frame live. The host
+    // gives a reader only the drawing's alt, so the pane lists the routes in words beside it.
     if (!isCurrent) {
-      history.push(
-        `<g class="history-edge"><path class="edge${isDashed ? ' via-all' : ''}" d="${dHistory}" stroke-width="${n1(weight)}">${description}</path>` +
-        `<path class="tip" d="${tip}"/></g>`)
-      continue
+      return `<g class="history-edge"><path class="edge${isDashed ? ' via-all' : ''}" d="${dHistory}" stroke-width="${n1(weight)}">${description}</path>` +
+        `<path class="tip" d="${tip}"/></g>`
     }
 
     const draw = '<animate attributeName="stroke-dashoffset" from="102" to="0" dur="0.8s" calcMode="spline" keyTimes="0;1" keySplines=".22 .61 .36 1" fill="freeze"/>'
-    active.push(`<path class="route-base" d="${d}" stroke-width="${n1(weight + 4)}">${description}</path>`)
-    if (animate) active.push(`<path class="route reduced-route${isDashed ? ' via-all' : ''}" d="${d}" stroke-width="${n1(weight + 0.9)}">${description}</path>`)
+    active.push(`<path class="route-base" d="${d}" stroke-width="${n1(weight + 4)}"/>`)
+    if (animate) active.push(`<path class="route reduced-route${isDashed ? ' via-all' : ''}" d="${d}" stroke-width="${n1(weight + 0.9)}"/>`)
     // A dashed line cannot also be drawn on by its dashes, so it fades in instead.
     active.push(isDashed
       ? `<path class="route via-all${animate ? ' motion' : ''}" d="${d}" stroke-width="${n1(weight + 0.9)}"${animate ? ' opacity="0"' : ''}>${description}` +
@@ -482,7 +576,11 @@ export function graphSvg(
         `<rect class="badge" x="${n1(-bw / 2)}" y="-10" width="${n1(bw)}" height="20" rx="10"/><text class="count" y="0" dy=".35em">${total}</text></g>`,
       )
     }
+    return undefined
   }
+  // The current post's routes, ranked first, are always drawn; the rest are routed only as far as they are kept.
+  const quieter = edges.filter(one => !isCurrentEdge(one.edge, one.isDashed))
+  for (const one of edges) if (isCurrentEdge(one.edge, one.isDashed)) routeOf(one)
 
   const allPosts = [...broadcasts.values()].reduce((sum, count) => sum + count, 0)
   const pulse = (beginMs: number) => repeat
@@ -492,7 +590,8 @@ export function graphSvg(
     const p = positions.get(member.name)!
     const sender = current?.agent === member.name
     const recipient = current?.to.includes(member.name)
-    const status = live ? member.status : ''
+    // A closed run has no live state to show, only who was retired.
+    const status = live && (!swarm.isClosed || member.status === 'killed') ? member.status : ''
     const silent = unaddressed.get(member.name) ?? 0
     const sent = broadcasts.get(member.name) ?? 0
     const title = [member.name, status, silent > 0 ? `${silent} ${silent === 1 ? 'post' : 'posts'} with no mention` : '',
@@ -527,7 +626,7 @@ export function graphSvg(
     const px = -p.half + 14
     const skey = statusKey(status)
     const scls = esc(status.replace(/\s+/g, '-'))
-    const dot = !live ? ''
+    const dot = status === '' ? ''
       : skey === 'working' ? `<circle class="presence working" cx="${px}" r="3.7"/>`
       : skey === 'waiting' ? `<circle class="presence-ring waiting" cx="${px}" r="3.1"/><circle class="presence waiting" cx="${px}" r="1.4"/>`
       : skey === 'coordinating' ? `<path class="presence coordinating" d="M${px} -4L${px + 4} 0 ${px} 4 ${px - 4} 0z"/>`
@@ -537,25 +636,16 @@ export function graphSvg(
       `<g transform="translate(${p.x.toFixed(1)} ${p.y.toFixed(1)})"${status === 'killed' ? ' class="killed"' : ''}>` +
       `<title>${esc(title)}</title><rect class="pill${emphasis}${silent > 0 ? ' quiet' : ''}" ${rect}/>` +
       arrival + dot +
-      `<text class="name" x="${live ? 7 : 0}" dy=".35em">${esc(p.label)}</text>` + chip + '</g>'
+      `<text class="name" x="${dot ? 7 : 0}" dy=".35em">${esc(p.label)}</text>` + chip + '</g>'
     )
   })
 
-  // The key under the diagram is drawn with the diagram's own classes, so it cannot say one thing and the lines another.
-  const row = height + 16
-  const lcw = Math.max(44, 30 + String(allPosts).length * 6.5)
-  const legend =
-    `<g class="legend"><g opacity=".72"><path class="edge" d="M16 ${row}H40" stroke-width="2.4"/><path class="tip" d="M48 ${row}l-9 -4.2v8.4z"/></g>` +
-    `<text x="56" y="${row}" dy=".35em">@mention, width = count</text>` +
-    `<g opacity=".72"><path class="edge via-all" d="M224 ${row}H248" stroke-width="1.6"/><path class="tip" d="M256 ${row}l-9 -4.2v8.4z"/></g>` +
-    `<text x="264" y="${row}" dy=".35em">via @all</text>` +
-    `<rect class="pill quiet" x="336" y="${row - 7}" width="26" height="14" rx="6"/>` +
-    `<text x="370" y="${row}" dy=".35em">posted with no mention</text>` +
-    `<g class="chip" transform="translate(${n1(16 + lcw / 2)} ${row + 22})"><rect x="${n1(-lcw / 2)}" y="-8" width="${n1(lcw)}" height="16" rx="8"/><text dy=".35em">@all ${allPosts}</text></g>` +
-    `<text x="${n1(16 + lcw + 8)}" y="${row + 22}" dy=".35em">${allPosts === 0 ? 'no @all posts yet' : expandAll ? '@all posts, drawn as dashed arrows' : '@all posts, drawn by Expand @all'}</text></g>`
+  // The key is pane text beside the drawing, where it keeps its size however small the drawing is scaled.
+  const key = 'Arrow: @mention, thicker for more · Dashed arrow: reached via @all · Dashed outline: posted with no mention · ' +
+    (allPosts === 0 ? 'No @all posts yet' : `“@all N” on a member: its @all posts (${allPosts} in all), ${expandAll ? 'drawn as dashed arrows' : 'drawn by Expand @all'}`)
 
-  return (
-    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height + LEGEND}" width="100%" height="100%" font-family="system-ui, sans-serif">` +
+  const open =
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="100%" height="100%" font-family="system-ui, sans-serif">` +
     `<defs><clipPath id="stage"><rect width="${width}" height="${height}"/></clipPath></defs>` +
     `<style>
       svg{--edge:#596375;--pill:#f8f8f7;--border:#87909d;--ink:#252628;--accent:#235fc4;--tint:#eaf2ff;--packet:#fff}
@@ -577,7 +667,6 @@ export function graphSvg(
       .badge{fill:var(--tint);stroke:var(--accent)}
       .chip rect{fill:var(--pill);stroke:var(--border)}.chip text{fill:var(--ink);opacity:.82;font-size:10.5px;font-weight:600;text-anchor:middle}
       .chip.on rect{fill:var(--tint);stroke:var(--accent)}
-      .legend>text{fill:var(--ink);opacity:.72;font-size:12px}
       ${statusCss}
       .presence{fill:none;stroke:var(--status-inactive);stroke-width:1.2}
       .presence-ring{fill:none;stroke:var(--status-waiting);stroke-width:1.2}
@@ -587,10 +676,19 @@ export function graphSvg(
       @media (prefers-reduced-motion: reduce){.motion,.motion-route{display:none}.reduced-route{display:inline}}
     </style>
     ` +
-    `<g clip-path="url(#stage)">${ripples.join('')}</g>` +
-    history.join('') + active.join('') + nodes.join('') + badges.join('') +
-    `<line x1="16" y1="${height}" x2="${width - 16}" y2="${height}" stroke="var(--border)" opacity=".35"/>` +
-    legend +
-    '</svg>'
-  )
+    `<g clip-path="url(#stage)">${ripples.join('')}</g>`
+  const close = active.join('') + nodes.join('') + badges.join('') + '</svg>'
+  // Measured whole: the history goes in, busiest first, until the first route that would take the drawing past the
+  // limit. A shorter, quieter one after it stays out too, so what is left out is always the quietest; and no route
+  // after that one is routed at all, since none could be drawn.
+  let room = limit - open.length - close.length
+  if (room < 0) return { hidden: quieter.length, key }
+  const history: string[] = []
+  for (const [index, one] of quieter.entries()) {
+    const route = routeOf(one)
+    if (route === undefined) continue
+    if ((room -= route.length) < 0) return { svg: open + history.join('') + close, hidden: quieter.length - index, key }
+    history.push(route)
+  }
+  return { svg: open + history.join('') + close, hidden: 0, key }
 }

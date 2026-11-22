@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import type { Post, Swarm } from '../types'
-import { edgesOf, graphHeight, graphSvg, isBroadcast, orderOuterMembers, visibleMembers } from './graph'
+import { SVG_LIMIT, drawGraph, edgesOf, graphHeight, graphSvg, isBroadcast, labelPx, orderOuterMembers, visibleMembers } from './graph'
 import { statusDot } from './palette'
 
 test('the graph counts posts the pane no longer keeps', async () => {
@@ -120,15 +120,17 @@ test('an @all post is counted on its sender, drawn dashed only when expanded, an
   expect(collapsed).toContain('coordinator to parser · 2 mentions')
   expect(collapsed).toMatch(/class="chip on"[^>]*><rect[^>]*\/><text[^>]*>@all 1</)
   expect(collapsed).toContain('class="motion ripple"')
-  expect(collapsed).toContain('@all posts, drawn by Expand @all')
-  // a post that names nobody leaves a dashed outline on its sender, as the key shows it
+  // the key is pane text, beside the drawing rather than scaled down inside it
+  expect(collapsed).not.toContain('class="legend"')
+  expect(drawGraph(swarm, 3, new Set(), true, true).key).toContain('(1 in all), drawn by Expand @all')
+  // a post that names nobody leaves a dashed outline on its sender, as the key says
   expect(collapsed).toMatch(/<title>coordinator · waiting · 1 post with no mention · 1 to @all<\/title>.*?class="pill sender quiet"/)
-  expect(collapsed).toContain('class="pill quiet" x="336"')
+  expect(drawGraph(swarm, 3, new Set(), true, true).key).toContain('Dashed outline: posted with no mention')
 
   const expanded = graphSvg(swarm, 3, new Set(), true, true, false, 0, true)
   expect(expanded).toMatch(/class="route via-all[^"]*"[^>]*><title>coordinator to lexer · 1 via @all/)
   expect(expanded).not.toContain('class="motion ripple"')
-  expect(expanded).toContain('@all posts, drawn as dashed arrows')
+  expect(drawGraph(swarm, 3, new Set(), true, true, false, 0, true).key).toContain('drawn as dashed arrows')
   // a member named before and reached through @all later gets both lines, side by side
   const later = { ...swarm, posts: [...posts, { seq: 4, agent: 'coordinator', to: ['parser', 'lexer'], text: '@all wrap up', time: '' },
     { seq: 5, agent: 'coordinator', to: ['all-hands'], text: '@all-hands report', time: '' }] }
@@ -140,8 +142,8 @@ test('an @all post is counted on its sender, drawn dashed only when expanded, an
   expect(edgesOf(later.posts)['coordinator>@all']).toBe(2)
   // before the @all post the key counts none, and replay does not show what has not happened yet
   const before = graphSvg(swarm, 2, new Set(), false, false, false, 0, true)
-  expect(before).toContain('no @all posts yet')
-  expect(before.split('via-all" d=').length - 1).toBe(1) // only the key's own sample is dashed
+  expect(drawGraph(swarm, 2, new Set(), false, false, false, 0, true).key).toContain('No @all posts yet')
+  expect(before).not.toContain('via-all" d=')
   expect(before).not.toContain('coordinator to lexer')
   // posts the pane no longer keeps still count
   const kept = graphSvg({ ...swarm, posts: [], earlierEdges: edgesOf(posts) }, 0, new Set(), false, true, false, 0, true)
@@ -202,7 +204,7 @@ test('arrowheads point into destination pills without overlap or clipping across
       }
       const svg = graphSvg(swarm, posts[posts.length - 1]!.seq, new Set(), false, true)
       const vb = svg.match(/viewBox="0 0 ([\d.]+) ([\d.]+)"/)!
-      const vw = Number(vb[1]), vh = Number(vb[2]) - 50
+      const vw = Number(vb[1]), vh = Number(vb[2])
       const boxes = members.map(m => {
         const [x, y] = svg.match(new RegExp(`translate\\(([\\d.]+) ([\\d.]+)\\)"><title>${m.name}`))!.slice(1).map(Number) as [number, number]
         const half = halfOf(m.name)
@@ -224,7 +226,7 @@ test('arrowheads point into destination pills without overlap or clipping across
       }
       // Every arrowhead points toward its destination center (dot > 0)
       const posMap = new Map(boxes.map(b => [b.name, b]))
-      const tipRegex = /<title>([^<]+) to ([^<]+) · [^<]+<\/title><\/path><path class="tip[^"]*" d="M([\d.]+) ([\d.]+)L([\d.]+) ([\d.]+)L([\d.]+) ([\d.]+)z"\/>/g
+      const tipRegex = /<title>([^<]+) to ([^<]+) · [^<]+<\/title><\/path><path class="tip[^"]*" d="M([\d.]+) ([\d.]+)L([\d.]+) ([\d.]+)L([\d.]+) ([\d.]+)z"[^>]*\/>/g
       let match: RegExpExecArray | null
       let checked = 0
       while ((match = tipRegex.exec(svg)) !== null) {
@@ -325,7 +327,7 @@ test('a large team is drawn in two arcs: names keep their size and no two overla
     expect(a[0]).toBeGreaterThan(80)
     expect(a[0]).toBeLessThan(width - 80)
     expect(a[1]).toBeGreaterThan(18)
-    expect(a[1]).toBeLessThan(height - 50 - 18)
+    expect(a[1]).toBeLessThan(height - 18)
     for (const b of spots.slice(i + 1)) expect(Math.abs(a[0] - b[0]) >= 170 || Math.abs(a[1] - b[1]) >= 46).toBe(true)
   }
 })
@@ -343,7 +345,7 @@ function assertCleanGraphLayout(svg: string, expectedNames: string[], maxControl
   const vb = svg.match(/viewBox="0 0 ([\d.]+) ([\d.]+)"/)
   expect(vb).not.toBeNull()
   const vw = Number(vb![1])
-  const vh = Number(vb![2]) - 50
+  const vh = Number(vb![2])
   const halfOf = (name: string) => Math.max(38, 22 + Math.min(15, name.length) * 4.7)
 
   const boxes: PillBox[] = expectedNames.map(name => {
@@ -369,7 +371,7 @@ function assertCleanGraphLayout(svg: string, expectedNames: string[], maxControl
   }
 
   const posMap = new Map(boxes.map(box => [box.name, box]))
-  const edgeRegex = /<path class="(?:edge|route-base)[^"]*" d="M([\d.]+) ([\d.]+) Q([\d.]+) ([\d.]+) ([\d.]+) ([\d.]+)"[^>]*><title>([^<]+) to ([^<]+) · [^<]+<\/title><\/path>/g
+  const edgeRegex = /<path class="(?:edge|route)[^"]*" d="M([\d.]+) ([\d.]+) Q([\d.]+) ([\d.]+) ([\d.]+) ([\d.]+)"[^>]*><title>([^<]+) to ([^<]+) · [^<]+<\/title><\/path>/g
   let edgeCount = 0
   for (const match of svg.matchAll(edgeRegex)) {
     edgeCount++
@@ -400,7 +402,7 @@ function assertCleanGraphLayout(svg: string, expectedNames: string[], maxControl
   }
   expect(edgeCount).toBeGreaterThan(0)
 
-  const tipRegex = /<title>([^<]+) to ([^<]+) · [^<]+<\/title><\/path><path class="tip[^"]*" d="M([\d.]+) ([\d.]+)L([\d.]+) ([\d.]+)L([\d.]+) ([\d.]+)z"\/>/g
+  const tipRegex = /<title>([^<]+) to ([^<]+) · [^<]+<\/title><\/path><path class="tip[^"]*" d="M([\d.]+) ([\d.]+)L([\d.]+) ([\d.]+)L([\d.]+) ([\d.]+)z"[^>]*\/>/g
   let tipCount = 0
   for (const match of svg.matchAll(tipRegex)) {
     const dest = posMap.get(match[2]!)!
@@ -448,7 +450,7 @@ test('hiding inactive workers dynamically re-layouts visible members symmetrical
   for (const inactive of wave1) expect(svg).not.toContain(`<title>${inactive}`)
 
   const { vw, vh, posMap } = assertCleanGraphLayout(svg, visible.map(m => m.name), 60)
-  expect(vh + 50).toBeLessThan(500)
+  expect(vh).toBeLessThan(500)
   expect(graphHeight(75, visible)).toBeLessThan(500)
   expect(graphHeight(75, visible)).toBeLessThan(graphHeight(75, swarm.members))
 
@@ -569,4 +571,140 @@ test('topology-aware peer ordering clusters communicating outer peers adjacent t
 test('URLs containing @all do not trigger isBroadcast', () => {
   expect(isBroadcast({ seq: 1, agent: 'parser', to: ['coordinator'], text: 'See https://example.com/?@all for details', time: '' })).toBe(false)
   expect(isBroadcast({ seq: 2, agent: 'parser', to: ['coordinator'], text: '@all please check https://example.com/?@all', time: '' })).toBe(true)
+})
+
+// The tests below pin the fixes of the 0.3.47 audit.
+
+const teamOf = (names: string[], status = 'working') => names.map((name, index) => ({
+  id: undefined, profile: undefined, model: '', effort: '', depends: [], owns: '', detail: '', unread: 0, posts: 1,
+  name, role: index === 0 ? 'coordinator' : 'worker', type: index === 0 ? 'coordinator' : 'worker', status,
+}))
+
+test('long names that share a start stay told apart, and a narrow pane is too small for a large graph', () => {
+  const members = teamOf(['coordinator', 'input-normalization', 'input-normalizer', 'article-search'])
+  const svg = graphSvg({ title: 'T', dir: '/r', isClosed: false, attention: [], budget: 0, tokens: {}, posts: [], members }, 0, new Set(), false, true)
+  const labels = [...svg.matchAll(/<text class="name"[^>]*>([^<]+)</g)].map(match => match[1])
+  expect(labels).toContain('input-n…ization')
+  expect(labels).toContain('input-n…malizer')
+  expect(new Set(labels).size).toBe(labels.length)
+  // eleven members in a 316 px pane draw names near 5 px; at 737 px they are readable
+  const eleven = teamOf(['coordinator', ...Array.from({ length: 10 }, (_, i) => `metadata-index-${i}`)])
+  expect(labelPx(36, eleven)).toBeLessThan(9)
+  expect(labelPx(84, eleven)).toBeGreaterThan(9)
+})
+
+test('a dense graph stays within the host limit, keeps the latest route, and says what it left out', () => {
+  // the audit's fixture: its collapsed graph drew 146,806 characters and its expanded one 279,215
+  const names = ['coordinator', 'input-normalization', 'input-normalizer', 'article-search', 'metadata-indexing', 'delivery-queue',
+    'background-sync', 'auth-refresh', 'visual-review', 'accessibility-review', 'release-packaging', 'acceptance-verifier',
+    ...Array.from({ length: 12 }, (_, i) => `worker-${i + 12}`)]
+  const posts: Post[] = Array.from({ length: 48 }, (_, i) => {
+    const agent = names[i % names.length]!
+    const to = names.filter(name => name !== agent)
+    return { seq: i + 1, agent, to, text: i < 24 ? '@all' : to.map(name => `@${name}`).join(' '), time: '' }
+  })
+  const swarm: Swarm = { title: 'Dense', dir: '/r', isClosed: false, attention: [], budget: 0, tokens: {}, posts, members: teamOf(names) }
+  let collapsed = 0
+  for (const expandAll of [false, true]) {
+    const graph = drawGraph(swarm, 48, new Set(), false, true, true, 0, expandAll)
+    if (!expandAll) collapsed = graph.hidden
+    expect(graph.svg!.length).toBeLessThanOrEqual(SVG_LIMIT)
+    expect(graph.hidden).toBeGreaterThan(0)
+    // every route of the newest post is drawn, each with one description
+    for (const to of posts[47]!.to) expect(graph.svg!.split(`<title>${posts[47]!.agent} to ${to} · `).length - 1).toBe(1)
+  }
+  // under a tighter limit more history goes, and the newest post's routes stay
+  const tight = drawGraph(swarm, 48, new Set(), false, true, false, 0, false, 40_000)
+  expect(tight.svg!.length).toBeLessThanOrEqual(40_000)
+  expect(tight.hidden).toBeGreaterThan(collapsed)
+  expect(tight.svg).toContain(`<title>${posts[47]!.agent} to ${posts[47]!.to[0]} · `)
+  // nothing fits under a limit smaller than the members and the newest post alone
+  expect(drawGraph(swarm, 48, new Set(), false, true, false, 0, false, 2000).svg).toBeUndefined()
+})
+
+test('a closed run shows no live state on its graph, only who was retired', () => {
+  const members = teamOf(['coordinator', 'parser', 'old'], 'closed')
+  members[2]!.status = 'killed'
+  const posts: Post[] = [{ seq: 1, agent: 'coordinator', to: ['parser'], text: '@parser go', time: '' }]
+  const svg = graphSvg({ title: 'T', dir: '/r', isClosed: true, attention: [], budget: 0, tokens: {}, posts, members }, 1, new Set(), false, true)
+  expect(svg).toContain('<title>parser</title>')
+  expect(svg).not.toMatch(/<title>[^<]*(?:waiting|working|closed)|class="presence[^"]*(?:waiting|working|closed)"/)
+  expect(svg).toContain('class="killed"')
+  // the current route has one description, on the line always drawn
+  expect(svg.split('<title>coordinator to parser').length - 1).toBe(1)
+})
+
+// The review of the 0.3.47 audit fixes.
+
+const swarmOf = (names: string[], posts: Post[]): Swarm =>
+  ({ title: 'T', dir: '/r', isClosed: false, attention: [], budget: 0, tokens: {}, posts, members: teamOf(names) })
+
+test('long names alike at both ends still read apart, and other names keep their cut', () => {
+  // five cuts serve five such names; the sixth used to read as the first
+  const alike = ['one', 'two', 'three', 'four', 'five', 'six'].map(word => `abcdefghijkl-${word}-uvwxyzabcdef`)
+  const svg = graphSvg(swarmOf(['coordinator', ...alike, 'input-normalization'], []), 0, new Set(), false, true)
+  const labels = [...svg.matchAll(/<text class="name"[^>]*>([^<]+)</g)].map(match => match[1]!)
+  expect(new Set(labels).size).toBe(8)
+  expect(labels.every(label => label.length <= 15)).toBe(true)
+  expect(labels).toContain('coordinator')
+  expect(labels).toContain('input-n…ization')
+})
+
+test('the size limit alone decides how much history is drawn', () => {
+  // twenty short names that all name each other: 380 routes, and all of them fit
+  const names = ['c', ...Array.from({ length: 19 }, (_, i) => `m${i}`)]
+  const posts: Post[] = names.map((agent, i) => {
+    const to = names.filter(name => name !== agent)
+    return { seq: i + 1, agent, to, text: to.map(name => `@${name}`).join(' '), time: '' }
+  })
+  const graph = drawGraph(swarmOf(names, posts), names.length, new Set(), false, true)
+  expect(graph.svg!.length).toBeLessThanOrEqual(SVG_LIMIT)
+  expect(graph.hidden).toBe(0)
+  expect(graph.svg!.split('class="history-edge"').length - 1).toBe(380 - (names.length - 1))
+})
+
+test('a route left out for size takes every quieter one with it', () => {
+  // a named route between long names outranks a shorter @all one, so it is never the one dropped while the other stays
+  const names = ['coordinator', 'ab', 'cd', 'long-name-number-one', 'long-name-number-two']
+  const posts: Post[] = [
+    { seq: 1, agent: 'long-name-number-one', to: ['long-name-number-two'], text: '@long-name-number-two', time: '' },
+    { seq: 2, agent: 'ab', to: ['cd'], text: '@all hi', time: '' },
+    { seq: 3, agent: 'coordinator', to: ['ab'], text: '@ab go', time: '' },
+  ]
+  const swarm = swarmOf(names, posts)
+  const named = 'long-name-number-one to long-name-number-two'
+  const full = drawGraph(swarm, 3, new Set(), false, true, false, 0, true, Infinity).svg!
+  expect(full).toContain(named)
+  expect(full).toContain('class="edge via-all"')
+  let namedLeftOut = 0
+  for (let limit = full.length; ; limit--) {
+    const graph = drawGraph(swarm, 3, new Set(), false, true, false, 0, true, limit)
+    if (graph.svg === undefined) break
+    expect(graph.svg.length).toBeLessThanOrEqual(limit)
+    if (!graph.svg.includes(named)) namedLeftOut++
+    expect({ limit, quieterKept: graph.svg.includes('class="edge via-all"') && !graph.svg.includes(named) })
+      .toEqual({ limit, quieterKept: false })
+  }
+  expect(namedLeftOut).toBeGreaterThan(0)
+})
+
+test('a redraw of an unchanged layout reuses its routes, and another layout in between changes nothing drawn', () => {
+  const names = ['coordinator', ...Array.from({ length: 17 }, (_, i) => `member-${i}`)]
+  const posts: Post[] = names.flatMap((agent, i) => [
+    { seq: i * 2 + 1, agent, to: [names[(i + 1) % 18]!, names[(i + 5) % 18]!], text: `@${names[(i + 1) % 18]} @${names[(i + 5) % 18]}`, time: '' },
+    { seq: i * 2 + 2, agent, to: names.filter(name => name !== agent), text: '@all hi', time: '' },
+  ])
+  const swarm = swarmOf(names, posts)
+  const first = drawGraph(swarm, 36, new Set(), false, true, true, 100, true)
+  // another layout (a member hidden) and another post drawn in between
+  const other = drawGraph(swarm, 36, new Set(['member-3']), false, true, true, 100, true)
+  expect(other.svg).not.toBe(first.svg)
+  drawGraph(swarm, 20, new Set(), true, false, false, 0, false)
+  expect(drawGraph(swarm, 36, new Set(), false, true, true, 100, true)).toEqual(first)
+  expect(drawGraph(swarm, 36, new Set(['member-3']), false, true, true, 100, true)).toEqual(other)
+  // a status change redraws its member, and the routes stay as they were
+  const moved = drawGraph({ ...swarm, members: swarm.members.map(m => m.name === 'member-4' ? { ...m, status: 'failed' } : m) }, 36, new Set(), false, true, true, 100, true)
+  expect(moved.svg).not.toBe(first.svg)
+  const routesOf = (svg = '') => svg.match(/class="(?:edge|route)[^"]*" d="[^"]*"/g)
+  expect(routesOf(moved.svg)).toEqual(routesOf(first.svg))
 })

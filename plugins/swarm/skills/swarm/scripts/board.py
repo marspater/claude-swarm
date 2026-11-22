@@ -40,7 +40,10 @@ usage: board.py DIR init TITLE                    prints the run folder it creat
 `init` takes <project>/.swarm/<name> and creates <project>/.swarm/<name>-<timestamp>, so every
 run has its own folder. A run folder holds board.jsonl, one {"seq","agent","text","time","to"}
 per line, and members.json: {"title","closed","members":{name:{role,group,model,id,
-last_read_seq,last_nudged_seq,killed,budget,paused,synced_deps}}}.
+last_read_seq,last_nudged_seq,killed,budget,paused,synced_deps,start,tested}}}; a verifier's "tested" is the
+candidate it is testing and has posted no verdict on. A READY with a commit records "revision",
+and "base" and "except" when it can: the reporter's own work is `git log --first-parent --no-merges REVISION --not
+BASE EXCEPT...`.
 """
 import hashlib
 import fcntl  # ponytail: POSIX only; swap in msvcrt.locking if Windows support is needed
@@ -73,17 +76,23 @@ COMMIT = re.compile(r"(?:[a-f0-9]{40}|[a-f0-9]{64})")
 RUN_NAME = re.compile(r"[a-zA-Z0-9_.-]+-\d{8}-\d{6}x*")
 BIND_KEY = re.compile(r"[a-f0-9]{64}")
 # The first line says what a post is. Mentions before the word stay on that line: a word on line two is prose.
-REPORT_WORD = re.compile(r"^(?:@[\w-]+[ \t,:]*)*(READY|REVISE|BRIEF|SHUTDOWN|FINDING|VERIFIED|NOT (?:PASSED|VERIFIED))\b")
+# ASCII word characters, as in MENTION and the pane's mirror: "@José READY" is no report to either.
+REPORT_WORD = re.compile(r"^(?:@[\w-]+[ \t,:]*)*(READY|REVISE|BRIEF|SHUTDOWN|FINDING|VERIFIED|NOT (?:PASSED|VERIFIED))\b", re.ASCII)
 # Code spans and URLs carry question marks that ask nothing, as do `name?: type` and `a?.b` left outside a span.
 # A fence closes on a run at least as long as the one that opened it, and the whole run goes with it, so a longer
 # fence can quote a shorter one.
 # What is taken out leaves a space: with nothing there, the words on either side would join into one.
-QUOTED = re.compile(r"(?P<f>`{3,}).*?(?P=f)`*|^ {0,3}(?P<t>~{3,}).*?^ {0,3}(?P=t)~*|(?P<s>`+)[^\n]*?(?P=s)"
-                    r"|\w+://\S+?(?=[.,;:!)]*(?:\?(?=\s|$))?(?:\s|$))", re.DOTALL | re.MULTILINE)
+# Blanks and line starts are JavaScript's, as the pane reads them: its \s has U+FEFF and lacks U+001C-U+001F and U+0085,
+# and its ^ also follows a CR, U+2028 or U+2029.
+_BLANK = "\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+_LINE = "(?:^|(?<=[\r\u2028\u2029]))"
+QUOTED = re.compile(r"(?P<f>`{3,}).*?(?P=f)`*|%s {0,3}(?P<t>~{3,}).*?%s {0,3}(?P=t)~*|(?P<s>`+)[^\n]*?(?P=s)"
+                    r"|[A-Za-z0-9_]+://[^%s]+?(?=[.,;:!)]*(?:\?(?=[%s]|$))?(?:[%s]|$))"
+                    % (_LINE, _LINE, _BLANK, _BLANK, _BLANK), re.DOTALL | re.MULTILINE)
 # `c ? a : b` asks nothing, and neither does `a ?? b`; "sure??" and "A? (Option A : yes)" do.
 # One blank after the mark and one before the colon are enough to look for: the class between them takes any more,
 # and a quantifier on each blank would backtrack cubically on a long run of spaces.
-QUESTION = re.compile(r"(?<![ \t]\?)(?:(?<![ \t])\?|\?(?![ \t][^\n?]*[ \t]:))(?!\?|\.?\w|:)")
+QUESTION = re.compile(r"(?<![ \t]\?)(?:(?<![ \t])\?|\?(?![ \t][^\n?]*[ \t]:))(?!\?|\.?[A-Za-z0-9_]|:)")
 SUMMARY_CHARS = 200
 ARG_COUNTS = {
     "init": (1, None), "restore": (1, 1), "adopt": (2, None), "locate": (2, None),
@@ -126,9 +135,20 @@ def load_state(d):
 
 
 def is_post(post):
-    return (isinstance(post, dict) and type(post.get("seq")) is int
+    if not (isinstance(post, dict) and type(post.get("seq")) is int
             and all(isinstance(post.get(key), str) for key in ("agent", "text", "time"))
-            and ("to" not in post or (isinstance(post["to"], list) and all(isinstance(name, str) for name in post["to"]))))
+            and ("to" not in post or (isinstance(post["to"], list) and all(isinstance(name, str) for name in post["to"])))):
+        return False
+    # Commits go on git's command line (`sync` merges them, the pane logs them): only full IDs. A post is kept without
+    # the ones that are not, since they only say more about a report that stands without them.
+    full = lambda commit: isinstance(commit, str) and COMMIT.fullmatch(commit) is not None
+    for key in ("revision", "base"):
+        if post.get(key) is not None and not full(post[key]):
+            del post[key]
+    if "except" in post and not ("base" in post and isinstance(post["except"], list) and post["except"]
+                                 and all(full(commit) for commit in post["except"])):
+        del post["except"]
+    return True
 
 
 def load(d, *, repair=True):
@@ -180,6 +200,13 @@ def load(d, *, repair=True):
     return state, posts
 
 
+def shown(path):
+    """A path as a message names it: one with a control character or a byte that is no UTF-8 is quoted, so it can
+    neither break the message nor forge a line of it."""
+    name = os.fsdecode(path)
+    return name if name.isprintable() else json.dumps(name)
+
+
 def append_post(d, post):
     with open(os.path.join(d, "board.jsonl"), "a", encoding="utf-8") as f:
         f.write(json.dumps(post) + "\n")
@@ -214,7 +241,12 @@ def latest_reports(posts):
 
 
 def rejected(post, members):
-    """The workers a verifier's NOT PASSED is about: those its first line names, or failing that every worker it reaches."""
+    """The workers a verifier's NOT PASSED is about: those its first line names, or failing that every worker it reaches.
+    A post records them when it is written, so a later change of groups or roles moves no verdict; older posts are
+    worked out from the roster as it stands."""
+    recorded = post.get("rejects")
+    if isinstance(recorded, list) and all(isinstance(name, str) for name in recorded):
+        return recorded
     word = REPORT_WORD.match(post["text"])
     if not word or word[1] != "NOT PASSED" or members.get(post["agent"], {}).get("role") != "verifier":
         return []
@@ -474,13 +506,23 @@ def verified_line(d, verifier, first):
     line = "VERIFIED %s %s" % (candidate.get("candidate"), candidate.get("commit") or candidate.get("digest"))
     if candidate.get("verified_by") != verifier or re.search(r"(?<!\w)%s(?!\w)" % re.escape(line), first) is None:
         return False
-    # A pass describes the sources and reports it ran on: a change since then voids it, accepted or not.
+    stale = stale_pass(d, candidate)
+    if stale:
+        sys.exit("that VERIFIED is void: %s. Post NOT VERIFIED or a note, and wait for a new candidate." % stale)
+    return candidate
+
+
+def stale_pass(d, candidate, closed=False):
+    """Why CANDIDATE's pass no longer holds, or None while it does. A pass describes the sources and reports it ran on:
+    a change since then voids it, accepted or not. A closed run keeps the answer `close` recorded."""
+    if closed:
+        return candidate.get("stale")
     import verify  # late: verify.py imports this module
     try:
         verify.check_current(verify.Path(d), candidate)
     except (ValueError, OSError, KeyError, TypeError) as error:
-        sys.exit("that VERIFIED is void: %s. Post NOT VERIFIED or a note, and wait for a new candidate." % error)
-    return candidate
+        return str(error) or type(error).__name__
+    return None
 
 
 def held(candidate, members):
@@ -513,14 +555,49 @@ def void_pass(d, members, rejected_names=()):
         atomic_write(path, json.dumps(candidate, indent=2))
 
 
-def candidate_on_table(d):
-    """The identifier of the candidate being verified, or None when there is none or it was accepted."""
+# What makes a post that names a candidate a request to its verifier: "test", "run it again", "re-check", "review".
+REQUEST = re.compile(r"\b(?:re-?)?(?:test|verify|review|run|check)\b", re.I)
+
+
+def answered(d, sender, first, members, posts):
+    """The candidate VERIFIER SENDER's verdict answers, as (its id, the reports it held, why, the id on the table,
+    sure): the one FIRST (the verdict's first line) names; else the one the verifier is testing and has given no
+    verdict on, as verify.py records it; else the one the newest request it has read names, which is not sure; else
+    the one on the table. A verdict written while a replacement was prepared answers the candidate it was about, not
+    whatever is on the table by the time it is posted. All None when no candidate is being verified."""
     try:
         with open(os.path.join(d, "verification.json"), encoding="utf-8") as f:
             candidate = json.load(f)
     except (FileNotFoundError, ValueError):
-        return None
-    return candidate.get("candidate") if isinstance(candidate, dict) and not candidate.get("accepted") else None
+        candidate = None
+    if not isinstance(candidate, dict) or not isinstance(candidate.get("candidate"), str):
+        return None, None, None, None, False
+    # An accepted candidate is past any verdict: only the ones it replaced can still be answered, and such a verdict
+    # holds no report (None), so it withdraws nothing the accepted one was made of.
+    accepted = bool(candidate.get("accepted"))
+    current = None if accepted else candidate["candidate"]
+    known = {entry["candidate"]: None if accepted else entry.get("inputs") for entry in candidate.get("superseded") or []
+             if isinstance(entry, dict) and isinstance(entry.get("candidate"), str)}
+    if not accepted:
+        known[current] = candidate.get("inputs")
+
+    def named(text):  # the newest known candidate TEXT names, the one on the table first
+        found = [name for name in known if re.search(r"(?<![0-9A-Za-z])%s(?![0-9A-Za-z])" % re.escape(name), text)]
+        return current if current in found else found[-1] if found else None
+
+    def requested(text):  # only a request to test it: a post that merely mentions a candidate asks for nothing
+        return named(text) if REQUEST.search(text) else None
+
+    reader = members.get(sender, {})
+    asked = next((hit for p in reversed(posts) if p["seq"] <= reader.get("last_read_seq", 0) and p["agent"] != sender
+                  and sender in p["to"] and (hit := requested(p["text"]))), None)
+    for answer, why, sure in ((named(first), "which its first line names", True),
+                              (reader.get("tested") if reader.get("tested") in known else None, "the one you tested last", True),
+                              (asked, "the one the latest request you read names", False), (current, "", True)):
+        if answer:
+            held = known[answer]
+            return answer, held if isinstance(held, dict) else None, why, current, sure
+    return None, None, None, None, False
 
 
 def in_play(d, name, members):
@@ -532,6 +609,87 @@ def in_play(d, name, members):
     except (OSError, ValueError):
         return False
     return isinstance(candidate, dict) and not candidate.get("accepted") and name in held(candidate, members)
+
+
+def fork_point(repo, ref):
+    """The commit branch REF started from, as the "branch: Created from" entry of its reflog records it, or None."""
+    import verify  # late: verify.py imports this module
+    log = verify.git(repo, "reflog", "show", "--format=%H %gs", ref, "--", optional=True) or b""
+    created = [commit.decode() for commit, _, subject in (line.partition(b" ") for line in log.splitlines())
+               if subject.startswith(b"branch: Created from")]
+    return created[-1] if created and COMMIT.fullmatch(created[-1]) else None
+
+
+def checkout_start(here):
+    """Where the checkout at HERE began: where its branch started, or, detached in a linked worktree, the commit the
+    worktree was made at, the oldest entry of its own HEAD reflog. None when neither is known."""
+    import verify  # late: verify.py imports this module
+    branch = verify.git(here, "symbolic-ref", "-q", "HEAD", optional=True)
+    if branch:
+        return fork_point(here, branch.decode().strip())
+    dirs = verify.git(here, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir", optional=True)
+    if not dirs or len(set(dirs.splitlines())) < 2:  # the main checkout's HEAD reflog goes back to the first commit
+        return None
+    log = (verify.git(here, "reflog", "show", "--format=%H", "HEAD", "--", optional=True) or b"").split()
+    return log[-1].decode() if log and COMMIT.fullmatch(log[-1].decode()) else None
+
+
+def branch_starts(repo, revision):
+    """Where each branch whose tip is REVISION started."""
+    import verify  # late: verify.py imports this module
+    refs = verify.git(repo, "for-each-ref", "--format=%(refname)", "--points-at", revision, "refs/heads/", optional=True) or b""
+    return [start for ref in refs.decode(errors="replace").splitlines() if (start := fork_point(repo, ref))]
+
+
+def fresh(repo, start, earlier):
+    """START, unless it holds one of EARLIER, the member's own commits reported before: a branch made from its own work
+    (a fix begun on a new branch after a rejection) began inside that work, not before it."""
+    import verify  # late: verify.py imports this module
+    if not start or not COMMIT.fullmatch(start):
+        return None
+    return None if any(verify.git(repo, "merge-base", "--is-ancestor", commit, start, optional=True) is not None
+                       for commit in dict.fromkeys(earlier)) else start
+
+
+def earlier_commits(name, posts):
+    """The commits NAME has reported READY with."""
+    return [post["revision"] for post in posts if post.get("kind") == "ready" and post.get("revision")
+            and post.get("subject", post["agent"]) == name]
+
+
+def own_range(repo, revision, starts, merged, earlier=()):
+    """BASE and EXCEPT of a READY for REVISION: the member's own work is `git log --first-parent --no-merges REVISION
+    --not BASE EXCEPT...`. BASE is whichever of the project's HEAD and the commits the member's branch started from
+    (STARTS, less any that holds one of EARLIER, its own reported commits) meets REVISION highest; EXCEPT is each other one that still hides something, and each of MERGED (its
+    dependencies' commits) REVISION holds and BASE does not: one brought in by a fast-forward or by hand sits on the
+    first-parent line. (None, []) when HEAD already holds REVISION and no start is known, which leaves nothing to show."""
+    import verify  # late: verify.py imports this module
+
+    def ancestor(older, newer):
+        return verify.git(repo, "merge-base", "--is-ancestor", older, newer, optional=True) is not None
+
+    cuts = {}  # each candidate base, with the commit it meets REVISION at
+    head = verify.git(repo, "rev-parse", "--verify", "HEAD^{commit}", optional=True)
+    head = head.decode().strip() if head else None
+    if head and not ancestor(revision, head):  # a HEAD that holds the commit hides all of it
+        met = verify.git(repo, "merge-base", head, revision, optional=True)
+        if met:
+            cuts[head] = met.decode().split()[0]
+    for start in dict.fromkeys(starts):  # a start equal to REVISION would hide the whole report: it is no start of this work
+        if start and start not in cuts and start != revision and ancestor(start, revision) and fresh(repo, start, earlier):
+            cuts[start] = start
+    base = None
+    for commit, cut in cuts.items():  # HEAD first: it stays the base unless a start meets the commit above it
+        if base is None or (cut != cuts[base] and ancestor(cuts[base], cut)):
+            base = commit
+    if base is None:
+        return None, []
+    rest = [commit for commit, cut in cuts.items() if commit != base and not ancestor(cut, base)]
+    for commit in dict.fromkeys(merged):
+        if (commit and COMMIT.fullmatch(commit) and commit not in rest and commit not in (base, revision)
+                and ancestor(commit, revision) and not ancestor(commit, base)):
+            rest.append(commit)
+    return base, rest
 
 
 def successor(name, members):
@@ -1182,10 +1340,16 @@ def main(argv):
             except (ValueError, OSError) as error:
                 sys.exit("git could not read this checkout, so HEAD cannot be %s: %s" % ("reported" if cmd == "ready" else "used", error))
             if loose:
-                names = ", ".join(os.fsdecode(path) for path in loose[:5]) + (" and more" if len(loose) > 5 else "")
+                names = ", ".join(shown(path) for path in loose[:5]) + (" and more" if len(loose) > 5 else "")
                 sys.exit("this checkout has uncommitted changes or untracked files, so %s: %s. "
                          "Commit them or add them to .gitignore first%s" % (why, names, tail))
             return here, found.decode().strip()
+
+        def relocked():
+            """The board as it stands once the lock, let go while git worked, is held again: the caller checks anew
+            whatever it had checked, since any member's command may have run meanwhile."""
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return load(d)
 
         def unmerged(repo, deps, revision):
             """The dependencies, of {name: READY post}, whose READY commit REVISION does not contain."""
@@ -1472,11 +1636,34 @@ def main(argv):
             if passed and passed.get("partial"):  # a pass of some workers' pieces, never the run's
                 verdict = {"partial": True, "members": passed.get("members", [])}
             if word == "NOT PASSED" and members[sender].get("role") == "verifier":
-                tested = candidate_on_table(d)
-                if tested:
-                    verdict = {"candidate": tested}
+                verdict["rejects"] = rejected({"agent": sender, "text": text, "to": recipients}, members)
+            answer = why = current = None
             if word in {"NOT PASSED", "NOT VERIFIED"} and members[sender].get("role") == "verifier":
-                void_pass(d, members, rejected({"agent": sender, "text": text, "to": recipients}, members))
+                answer, held, why, current, sure = answered(d, sender, first, members, posts)
+                if answer:  # the candidate a verdict answers, so `resume` knows whose review is finished
+                    verdict["candidate"] = answer
+                if answer and current is None:
+                    if "rejects" in verdict:  # about a candidate the accepted one replaced: it rejects no standing report
+                        verdict["rejects"] = []
+                elif answer == current:
+                    void_pass(d, members, verdict.get("rejects", ()))
+                elif held is not None and "rejects" in verdict:
+                    # A verdict on a candidate since replaced withdraws the reports it held that still stand. A worker's
+                    # newer report it withdraws only when the verifier has read it and nothing ties the verdict to the
+                    # old candidate but the request it read last: a piece's NOT PASSED answers the READY reviewed.
+                    latest, seen = latest_reports(posts), members[sender].get("last_read_seq", 0)
+
+                    def answers(name):
+                        standing = latest.get(name, {}).get("seq")
+                        was = held[name][0] if isinstance(held.get(name), list) and held[name] else None
+                        return standing is not None and (standing == was or (not sure and standing <= seen))
+
+                    verdict["rejects"] = [name for name in verdict["rejects"] if answers(name)]
+            # The verifier's verdict on the candidate it was testing: a later verdict naming none no longer answers it.
+            done = members[sender].get("tested") if members[sender].get("role") == "verifier" else None
+            done = bool(done) and done in (answer, passed and passed.get("candidate"))
+            if done:
+                del members[sender]["tested"]
             if word == "NOT PASSED" and members[sender].get("role") == "verifier" and not state.get("paused"):
                 # Paused by the verdict itself, so a resumed run is stopped again only by a further one. Counted as the
                 # board will count it once posted: a second verdict on one candidate is no new failure.
@@ -1486,7 +1673,11 @@ def main(argv):
                               if seqs[-1] == seq and len(seqs) >= REWORK_PAUSE), "")
                 if stuck:
                     state["paused"] = stuck
-            post_message(sender, text, recipients, save_roster=bool(stuck), **verdict)
+            post_message(sender, text, recipients, save_roster=bool(stuck) or done, **verdict)
+            if answer != current:
+                print("note: this verdict is recorded as answering candidate %s, %s, so candidate %s, the one being verified "
+                      "now, keeps its test and its pass. If it is about %s, post it again with that id in its first line"
+                      % (answer, why, current, current))
             if verdict.get("partial"):
                 print("note: this pass is of a partial candidate holding %s. It is not the run's pass, and verify.py never "
                       "accepts it" % ", ".join("@" + name for name in verdict["members"]))
@@ -1506,30 +1697,94 @@ def main(argv):
                 revision = args[1] if len(args) > 1 else None
                 if revision is not None and (member.get("writes") == "0" or kind_of(member) in READ_ONLY):
                     sys.exit("a read-only report cannot include a commit")
-                repo = os.path.dirname(os.path.dirname(os.path.abspath(d)))  # the project, which holds every member's commits
-                if revision == "HEAD":
-                    repo, revision = checkout_head("HEAD is not what you are reporting", ", or give the full commit ID")
-                if revision is not None and not COMMIT.fullmatch(revision):
-                    sys.exit("expected a full commit ID")
-                conflicts = {}
+                if revision not in (None, "HEAD"):
+                    revision = revision.lower()  # git reads either case; the board keeps one
+                    if not COMMIT.fullmatch(revision):
+                        sys.exit("expected a full commit ID, or HEAD from your checkout")
+                conflicts, base, exclude, start = {}, None, [], None
                 if revision is not None:
                     import verify  # late: verify.py imports this module
-                    # A mistyped ID would otherwise stand as a report until verification failed to merge it.
-                    if verify.git(repo, "cat-file", "-e", revision + "^{commit}", optional=True) is None:
-                        sys.exit("%s is no commit in the project's repository. Commit your work and give its full ID, or HEAD "
-                                 "from your checkout" % revision)
+                    repo = home = os.path.dirname(os.path.dirname(os.path.abspath(d)))  # the project, which holds every member's commits
+                    deps = {dep: through[dep] for dep in dependencies(member)}
+                    reported = latest_reports(posts).get(sender, {}).get("seq")
+                    # Compared with the reports that stay current once this one is posted: a member that depends on the
+                    # sender loses its READY to it and will sync this commit anyway.
+                    peers = {n: p["revision"] for n, p in readiness(members, [*posts, {"seq": len(posts) + 1, "agent": sender,
+                             "text": "READY", "kind": "ready"}]).items() if n != sender and p.get("revision")}
+                    synced = member.get("synced_deps") if isinstance(member.get("synced_deps"), dict) else {}
+                    merged = [post.get("revision") for post in deps.values()] + [str(rev) for rev in synced.values()]
+                    earlier = earlier_commits(sender, posts)
+                    # Where the member's work began, as far as the board knows: the start its checkout recorded, and the
+                    # base each READY of its own recorded (a fix on a new branch began inside the work it reported).
+                    starts = [member["start"]] if isinstance(member.get("start"), str) else []
+                    starts += [post["base"] for post in posts if post.get("kind") == "ready" and post.get("base")
+                               and post.get("subject", post["agent"]) == sender]
+                    scope = (assignment_scope(member), member.get("id"))  # a replaced or restarted agent is another
+                    # Git may take long (a large repository, hooks): every other board command runs meanwhile, and
+                    # what was checked above is checked again once the lock is back.
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                    if revision == "HEAD":
+                        repo, revision = checkout_head("HEAD is not what you are reporting", ", or give the full commit ID")
+                        if verify.git(home, "rev-parse", "--git-dir", optional=True) is None:
+                            home = repo  # a project outside Git has no repository of its own to hold the commit
+                        start = fresh(home, checkout_start(repo), earlier)
+                    # A mistyped ID would otherwise stand as a report until verification failed to merge it, and so
+                    # would a commit only a separate clone holds.
+                    if verify.git(home, "cat-file", "-e", revision + "^{commit}", optional=True) is None:
+                        sys.exit("%s is no commit in the project's repository. Commit your work in a worktree of the project "
+                                 "(or fetch it into the project's repository) and give its full ID, or HEAD from your checkout"
+                                 % revision)
                     # A dependency's commit missing from this one would be merged beside it, untested with it.
-                    behind = unmerged(repo, {dep: through[dep] for dep in dependencies(member)}, revision)
+                    behind = unmerged(home, deps, revision)
                     if behind:
                         sys.exit("your commit does not contain the READY commit of %s. Run `board.py DIR sync %s` from your "
                                  "checkout, check the result, then report again" % (", ".join("@" + n for n in behind), sender))
-                    # Compared with the reports that stay current once this one is posted: a member that depends on the
-                    # sender loses its READY to it and will sync this commit anyway.
+                    clashes = verify.trial_merge(home, None, revision, peers)
+                    # A branch that merely ends at this commit says where the work began only when nothing better is
+                    # known and it is the one such branch: of several, any could be somebody else's.
+                    known_starts = [one for one in (start, *starts) if one]
+                    guessed = [] if known_starts else branch_starts(home, revision)
+                    base, exclude = own_range(home, revision, [*(guessed if len(guessed) == 1 else []), *known_starts],
+                                              merged, earlier)
+                    report = sys.stdin.read().strip()
+                    if not report:
+                        sys.exit("READY needs a report on stdin")
+                    state, posts = relocked()
+                    members = state["members"]
+                    member = members[sender]
+                    through = readiness(members, posts)
+                    if state.get("closed") or member.get("role") != "worker" or member.get("killed"):
+                        sys.exit("only an active worker of an open run can ready, and @%s no longer is one: the board changed "
+                                 "while git checked the commit. Nothing was posted" % sender)
+                    if member.get("writes") == "0" or kind_of(member) in READ_ONLY:
+                        sys.exit("a read-only report cannot include a commit, and @%s was made read-only while git checked "
+                                 "it. Nothing was posted" % sender)
+                    if (dependencies(member) != list(deps) or latest_reports(posts).get(sender, {}).get("seq") != reported
+                            or any(through.get(dep, {}).get("seq") != post["seq"] for dep, post in deps.items())):
+                        sys.exit("a dependency's report, @%s's own or its dependencies changed while git checked the commit, "
+                                 "so nothing was posted. Read the board, then report again" % sender)
+                    # A first READY has no earlier report a scope change withdraws: the work was done for the old scope.
+                    if (assignment_scope(member), member.get("id")) != scope:
+                        sys.exit("@%s's assignment changed while git checked the commit, so nothing was posted. Read the "
+                                 "board, check the work against the new assignment, then report again" % sender)
                     stays = readiness(members, [*posts, {"seq": len(posts) + 1, "agent": sender, "text": "READY", "kind": "ready"}])
-                    for peer, files in verify.trial_merge(repo, None, revision, {n: p["revision"] for n, p in stays.items()
-                                                                                if n != sender and p.get("revision")}).items():
-                        conflicts[peer] = {"seq": stays[peer]["seq"], "files": files}
-                report = sys.stdin.read().strip()
+                    # A peer that reported while git worked, a `ready` running beside this one included, was never
+                    # compared: it is now, under the lock, so of two overlapping reports the later one names the clash.
+                    arrived = {n: p["revision"] for n, p in stays.items()
+                               if n != sender and p.get("revision") and peers.get(n) != p["revision"]}
+                    if arrived:
+                        for peer in arrived:
+                            clashes.pop(peer, None)  # found against the commit it reported before
+                        clashes.update(verify.trial_merge(home, None, revision, arrived))
+                        peers.update(arrived)
+                    conflicts = {peer: {"seq": stays[peer]["seq"], "files": files} for peer, files in clashes.items()
+                                 if stays.get(peer, {}).get("revision") == peers[peer]}
+                    if start and member.get("start") != start:
+                        member["start"] = start  # where its branch began, for a later READY given as a bare commit ID
+                    else:
+                        start = None
+                else:
+                    report = sys.stdin.read().strip()
                 if not report:
                     sys.exit("READY needs a report on stdin")
                 if kind_of(member) == "investigator":
@@ -1544,7 +1799,7 @@ def main(argv):
                     return
                 text = "READY" + (" " + revision if revision else "") + "\n" + report
             else:
-                revision, conflicts = None, {}
+                revision, conflicts, base, exclude, start = None, {}, None, [], None
                 text = ("REVISE " + " ".join(args[1:])).strip()
             # An investigator withdrawing a finding nobody confirmed changes nothing for anyone but the coordinator.
             notify = kind_of(member) != "investigator" or sender in readiness(members, posts)
@@ -1561,7 +1816,10 @@ def main(argv):
                               or (name == COORDINATOR and kind_of(member) == "investigator")]
             if cmd == "ready" and kind_of(member) != "investigator" and not is_consultant:
                 recipients.extend(name for name in targets(report, members, sender=sender) if name != sender and name not in recipients)
-            post_message(sender, text, recipients, kind=cmd, revision=revision, **({"conflicts": conflicts} if conflicts else {}))
+            post_message(sender, text, recipients, kind=cmd, revision=revision, **({"conflicts": conflicts} if conflicts else {}),
+                         **({"base": base} if base else {}), **({"except": exclude} if exclude else {}))
+            if start:
+                save(d, state)
             for peer, clash in conflicts.items():
                 print("conflict: @%s's READY #%d and this commit both change %s. Agree with @%s who changes what before "
                       "the candidate is prepared" % (peer, clash["seq"], ", ".join(clash["files"]), peer))
@@ -1580,7 +1838,19 @@ def main(argv):
             if blocked:
                 sys.exit("waiting for " + ", ".join(blocked))
             deps = {dep: through[dep] for dep in dependencies(member) if through[dep].get("revision")}
+            earlier = earlier_commits(name, posts)
+            scope = assignment_scope(member)
             import verify  # late: verify.py imports this module
+            # A merge may take long (a large repository, hooks): every other board command runs meanwhile, and the
+            # record is written to the board as it stands once the lock is back. One sync a member at a time: a second
+            # would merge into the same checkout and write its own, older, list of what was merged over this one's.
+            syncing = open(os.path.join(d, ".sync-%s.lock" % name), "w")  # held until this command ends
+            try:
+                fcntl.flock(syncing, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                sys.exit("another sync for @%s is still running: wait for it, then sync again" % name)
+            agent = member.get("id")
+            fcntl.flock(lock, fcntl.LOCK_UN)
             here = os.getcwd()
             head = verify.git(here, "rev-parse", "--verify", "HEAD^{commit}", optional=True)
             if head is None:
@@ -1598,6 +1868,8 @@ def main(argv):
                 return
             if behind:
                 checkout_head("a merge would mix them into its commit", "")
+            # Where this checkout's branch began, before anything is merged: a later READY reports the work from there.
+            start = fresh(here, checkout_start(here), earlier)
             synced = {dep: post["revision"] for dep, post in deps.items() if dep not in behind}
             try:
                 for dep in behind:
@@ -1605,13 +1877,35 @@ def main(argv):
                         verify.git(here, "merge", "--no-autostash", "--no-edit", "--no-ff", deps[dep]["revision"])
                     except ValueError as error:
                         verify.git(here, "merge", "--abort", optional=True)
-                        sys.exit("merging @%s's commit %s failed, so it was aborted: %s. Resolve it with @%s on the board, "
-                                 "or merge it yourself, then sync again" % (dep, deps[dep]["revision"][:12], error, dep))
+                        if verify.git(here, "rev-parse", "-q", "--verify", "MERGE_HEAD", optional=True) is not None:
+                            sys.exit("merging @%s's commit %s failed and git could not abort it: %s. The checkout is in the "
+                                     "middle of that merge: finish it or run `git merge --abort`, then sync again"
+                                     % (dep, deps[dep]["revision"][:12], error))
+                        sys.exit("merging @%s's commit %s failed, so it was aborted: %s. If it conflicts, resolve it with @%s "
+                                 "on the board or merge it yourself; if Git asks for an identity or a signing key, configure "
+                                 "it for this repository. Then sync again" % (dep, deps[dep]["revision"][:12], error, dep))
                     synced[dep] = deps[dep]["revision"]
                     print("merged @%s's commit %s" % (dep, deps[dep]["revision"][:12]))
             finally:  # merges made before one failed are in the checkout, so the record holds them too
-                member["synced_deps"] = synced
-                save(d, state)
+                state, posts = relocked()
+                members = state["members"]
+                member = members[name]
+                # Written for the agent that merged, in its checkout: one put in its place meanwhile works elsewhere.
+                if member.get("id") == agent and not member.get("killed") and (
+                        member.get("synced_deps") != synced or (start and member.get("start") != start)):
+                    member["synced_deps"] = synced
+                    if start:
+                        member["start"] = start
+                    save(d, state)
+            if (member.get("killed") or member.get("role") != "worker" or assignment_scope(member) != scope
+                    or member.get("id") != agent):
+                sys.exit("@%s's assignment changed while sync ran. The merges it made are in the checkout and recorded: "
+                         "read the board and check them against the new assignment before you report" % name)
+            now = readiness(members, posts)
+            moved = [dep for dep, revision in synced.items() if now.get(dep, {}).get("revision") != revision]
+            if moved:  # reported again, or withdrawn, while the merge ran
+                print("note: %s changed while sync ran, so HEAD may not hold the READY commit now on the board: "
+                      "sync again" % ", ".join("@" + dep for dep in moved))
             print("in sync: HEAD contains every dependency's READY commit" if not behind else
                   "synced: check the merged work, then report with ready %s HEAD" % name)
 
@@ -1835,11 +2129,35 @@ def main(argv):
                 # reviewing anything a pause could have stopped.
                 unverified = any(p["seq"] > verified_seq for n, p in ready.items() if members.get(n, {}).get("consult") != "1") and all(
                     name in ready for name, entry in team_of(members).items() if entry.get("role") == "worker" and entry.get("consult") != "1")
+                # A candidate, partial ones included, whose reports are all still current: a verifier asked to test it
+                # that has posted no verdict on it was stopped in the middle of that review.
+                try:
+                    with open(os.path.join(d, "verification.json"), encoding="utf-8") as f:
+                        candidate = json.load(f)
+                except (OSError, ValueError):
+                    candidate = None
+                live = (isinstance(candidate, dict) and not candidate.get("accepted") and isinstance(candidate.get("inputs"), dict)
+                        and all(isinstance(seen, list) and seen and ready.get(n, {}).get("seq") == seen[0]
+                                for n, seen in candidate["inputs"].items()))
+
+                def reviewing(name):  # answered only by a verdict after the latest request: a re-test is asked anew
+                    tested = str(candidate.get("candidate")) if live else None
+                    # A request to test it, as `answered` reads one: a note that only mentions the candidate asks nothing.
+                    asked = max((p["seq"] for p in posts if tested and name in p["to"] and tested in p["text"]
+                                 and REQUEST.search(p["text"])), default=0)
+                    return bool(asked) and not any(
+                        p["seq"] > asked and p["agent"] == name and (w := REPORT_WORD.match(p["text"]))
+                        and w[1] in {"VERIFIED", "NOT PASSED", "NOT VERIFIED"}
+                        and (p.get("candidate") == tested or tested in p["text"].split("\n")[0])
+                        # a NOT PASSED of workers this candidate does not hold leaves its review unfinished
+                        and (not p.get("rejects") or set(p["rejects"]) & set(candidate["inputs"])) for p in posts)
+
                 halted = [name for name, member in team_of(members).items() if member.get("id") and not member.get("paused")
                           and name not in asking and (
                     (member.get("role") == "worker" and name not in ready and all(dep in ready for dep in dependencies(member))
                      and reports.get(name, {}).get("kind") != "finding" and (not unread(name) or bool(member.get("told", {}).get("ended"))))
-                    or (member.get("role") == "verifier" and (bool(member.get("told", {}).get("ended")) or (not unread(name) and unverified)))
+                    or (member.get("role") == "verifier" and (bool(member.get("told", {}).get("ended"))
+                                                              or (not unread(name) and (unverified or reviewing(name)))))
                 )]
                 if state.pop("paused", None) and halted:
                     return post_message(COORDINATOR, "%s The run is resumed. Go on from where the pause stopped you."
@@ -1851,15 +2169,25 @@ def main(argv):
             if owed:
                 sys.exit("@coordinator has not read %d post(s) addressed to it, from #%d on. Run: read coordinator, then close"
                          % (len(owed), owed[0]))
-            state["closed"] = True
-            state.pop("paused", None)
-            save(d, state)
             try:
                 with open(os.path.join(d, "verification.json"), encoding="utf-8") as f:
                     candidate = json.load(f)
             except (OSError, ValueError):
                 candidate = None
-            if isinstance(candidate, dict) and candidate.get("verified_by") and candidate.get("partial"):
+            stale = None
+            if isinstance(candidate, dict) and candidate.get("verified_by") and not candidate.get("accepted"):
+                # Judged while the run is open, as the board judges a VERIFIED post, and kept for `export` afterwards.
+                stale = stale_pass(d, candidate, bool(state.get("closed")))
+                if stale and not state.get("closed"):
+                    candidate["stale"] = stale
+                    atomic_write(os.path.join(d, "verification.json"), json.dumps(candidate, indent=2))
+            state["closed"] = True
+            state.pop("paused", None)
+            save(d, state)
+            if stale:
+                print("note: the last candidate, %s, passed earlier, now stale: %s. It is not the run's pass and was never "
+                      "accepted" % (candidate.get("candidate"), stale))
+            elif isinstance(candidate, dict) and candidate.get("verified_by") and candidate.get("partial"):
                 print("note: the last candidate, %s, passed but was partial: it held only %s, so it is not the run's pass "
                       "and was never accepted" %(candidate.get("candidate"), ", ".join("@" + n for n in candidate.get("members", []))))
             elif isinstance(candidate, dict) and candidate.get("verified_by") and not candidate.get("accepted"):
@@ -1896,12 +2224,15 @@ def main(argv):
             except (OSError, ValueError):
                 candidate = None
             if isinstance(candidate, dict):
+                passed = candidate.get("verified_by") and not candidate.get("accepted")
+                stale = passed and stale_pass(d, candidate, bool(state.get("closed")))
                 lines.append("Candidate %s (%s%s), %s: %s." % (
                     candidate.get("candidate"), candidate.get("mode"),
                     ", partial: " + ", ".join("@" + n for n in candidate.get("members", [])) if candidate.get("partial") else "",
                     candidate.get("commit") or candidate.get("digest"),
-                    "accepted" if candidate.get("accepted") else "passed, verified by @%s" % candidate["verified_by"]
-                    if candidate.get("verified_by") else "not passed"))
+                    "accepted" if candidate.get("accepted") else
+                    "passed earlier, now stale: %s; verified by @%s" % (stale, candidate["verified_by"]) if stale else
+                    "passed, verified by @%s" % candidate["verified_by"] if passed else "not passed"))
             else:
                 lines.append("No candidate was prepared.")
             lines += ["", "## Transcript", ""]
@@ -1920,7 +2251,7 @@ def main(argv):
                 print(f"Usage: {amount} tokens")
             for name, m in members.items():
                 mine = [p["seq"] for p in posts if p["agent"] == name]
-                extra = " ".join("%s=%s" % kv for kv in m.items() if not kv[0].startswith("last_") and kv[0] not in {"wake_claim", "told", "synced_deps"})
+                extra = " ".join("%s=%s" % kv for kv in m.items() if not kv[0].startswith("last_") and kv[0] not in {"wake_claim", "told", "synced_deps", "start", "tested"})
                 print("  @%-14s last post %-5s unread mentions %d  %s" % (name, "#%d" % mine[-1] if mine else "-", len(unread(name)), extra))
             edges = Counter((p["agent"], n) for p in posts for n in p["to"])
             for (a, b), count in edges.most_common():

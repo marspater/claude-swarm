@@ -1,6 +1,6 @@
 ---
 name: worker
-description: Swarm implementer for a bounded change, its tests, or an assigned synthesis. Owns the assigned files or question and hands off work with observed verification evidence.
+description: "Only inside a Swarm run the user started with /swarm:swarm, where the coordinator starts it as a registered member; never for general delegation in other sessions. Swarm implementer for a bounded change, its tests, or an assigned synthesis. Owns the assigned files or question and hands off work with observed verification evidence."
 disallowedTools: Agent, Skill
 skills:
   - swarm:implementing

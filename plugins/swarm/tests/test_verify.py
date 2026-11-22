@@ -975,7 +975,7 @@ class VerifyRegressions(unittest.TestCase):
             run(*post, "revise", "w", "one more thing")
             run(*post, "post", "v", "@coordinator " + line, ok=False)
             run(*post, "read", "coordinator")
-            assert "passed but was partial: it held only @w" in run(*post, "close")
+            assert "passed earlier, now stale: waiting for READY from @w" in run(*post, "close")
 
     def test_trial_merge_names_conflicting_files_per_peer(self):
         sys.path.insert(0, str(SCRIPTS))
@@ -1012,6 +1012,608 @@ class VerifyRegressions(unittest.TestCase):
                 assert not marker.exists(), "what a finished check left in the background kept running"
         finally:
             sys.path.remove(str(SCRIPTS))
+
+    # The audit of 0.3.47.
+
+    def test_the_commit_after_a_shared_accept_takes_the_verified_files_whatever_was_staged(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g = self._init_git(proj)
+
+            def verified(check):
+                board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Index")
+                post = [sys.executable, SCRIPTS / "board.py", board]
+                gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+                run(*post, "member", "w")
+                run(*post, "member", "v", "role=verifier")
+                run(*post, "ready", "w", text="done")
+                cand = json.loads(run(*gate, "prepare", "shared", "--check", check))["candidate"]
+                run(*post, "post", "v", "@coordinator " + run(*gate, "test", cand, "v").splitlines()[-1])
+                return gate, cand
+
+            def landed(gate, cand):
+                line = next(line for line in run(*gate, "accept", cand).splitlines() if line.startswith("Commit with: "))
+                return subprocess.run(line[len("Commit with: "):].replace("<message>", "land"), shell=True, cwd=proj,
+                                      check=True, capture_output=True, text=True).stdout
+
+            # Staged, then edited (MM): the commit takes the bytes the check saw, not the staged ones.
+            (proj / "file.txt").write_text("staged\n")
+            g("add", "file.txt")
+            (proj / "file.txt").write_text("checked\n")
+            landed(*verified("grep -qx checked file.txt"))
+            assert g("show", "HEAD:file.txt") == "checked" and g("status", "--porcelain") == ""
+
+            # A deletion staged while the file is still there: the file stays, and there is nothing to commit.
+            g("rm", "-q", "--cached", "file.txt")
+            assert "Nothing to commit" in landed(*verified("test -f file.txt"))
+            assert g("status", "--porcelain") == "" and g("ls-tree", "--name-only", "HEAD") == "file.txt"
+
+            # A staged subset, beside a deletion left unstaged: both go into the commit.
+            (proj / "new.txt").write_text("new\n")
+            g("add", "new.txt")
+            (proj / "file.txt").unlink()
+            landed(*verified("test -f new.txt && test ! -e file.txt"))
+            assert g("ls-tree", "--name-only", "HEAD") == "new.txt" and g("status", "--porcelain") == ""
+
+            # A file a line-ending rule converts one way only: a fresh checkout would not bring back what the check read.
+            g("config", "core.autocrlf", "input")
+            (proj / "new.txt").write_bytes(b"dos\r\n")
+            gate, cand = verified("test -s new.txt")
+            line = next(line for line in run(*gate, "accept", cand).splitlines() if line.startswith("Commit with: "))
+            turned = subprocess.run(line[len("Commit with: "):].replace("<message>", "land"), shell=True, cwd=proj,
+                                    capture_output=True, text=True)
+            assert turned.returncode and "a fresh checkout of the commit would not bring back new.txt" in turned.stderr, turned.stderr
+            assert g("diff", "--cached", "--name-only") == "", "a refused commit leaves the index as it was"
+            g("config", "--unset", "core.autocrlf")
+            (proj / "new.txt").write_text("new\n")
+
+            # Run data staged between the acceptance and the commit never reaches the commit.
+            (proj / "new.txt").write_text("unix\n")
+            gate, cand = verified("grep -qx unix new.txt")
+            line = next(line for line in run(*gate, "accept", cand).splitlines() if line.startswith("Commit with: "))
+            (proj / ".swarm" / "notes").write_text("mine")
+            g("add", "-f", ".swarm/notes")
+            late = subprocess.run(line[len("Commit with: "):].replace("<message>", "land"), shell=True, cwd=proj,
+                                  capture_output=True, text=True)
+            assert late.returncode and ".swarm/notes" in late.stderr, late.stderr
+            g("reset", "-q", "--", ".swarm/notes")
+            (proj / ".swarm" / "notes").unlink()
+            landed(gate, cand)
+            assert g("show", "--name-only", "--format=", "HEAD") == "new.txt"
+
+            # A commit hook that changes what is committed: the commit is made, and the command says it is not what passed.
+            hook = proj / ".git" / "hooks" / "pre-commit"
+            hook.write_text("#!/bin/sh\necho hooked > new.txt\ngit add new.txt\n")
+            hook.chmod(0o755)
+            (proj / "new.txt").write_text("newer\n")
+            gate, cand = verified("grep -qx newer new.txt")
+            line = next(line for line in run(*gate, "accept", cand).splitlines() if line.startswith("Commit with: "))
+            changed = subprocess.run(line[len("Commit with: "):].replace("<message>", "land"), shell=True, cwd=proj,
+                                     capture_output=True, text=True)
+            assert changed.returncode and "its files differ from the verified ones" in changed.stderr, changed.stderr
+            assert g("show", "HEAD:new.txt") == "hooked"
+
+    def test_the_printed_staging_command_stages_exactly_what_was_verified(self):
+        import re
+        for sub in ("", "package"):
+            with tempfile.TemporaryDirectory() as t:
+                repo = Path(t).resolve()
+                g = self._init_git(repo)
+                proj = repo / sub
+                (proj / ".swarm").mkdir(parents=True)
+                (proj / ".swarm" / ".gitignore").write_text("integration-*\n")  # the project's own: run data shows in git status
+                # a linked worktree inside the repository, under a name the shell must have quoted
+                g("worktree", "add", "-q", "-b", "agent-x", str(repo / "agent work"))
+                (repo / "agent work" / "scratch").write_text("work")
+                post = gate = None
+
+                def verified(check):
+                    nonlocal post, gate
+                    board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Stage")
+                    post = [sys.executable, SCRIPTS / "board.py", board]
+                    gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+                    run(*post, "member", "w")
+                    run(*post, "member", "v", "role=verifier")
+                    run(*post, "ready", "w", text="done")
+                    cand = json.loads(run(*gate, "prepare", "shared", "--check", check))["candidate"]
+                    run(*post, "post", "v", "@coordinator " + run(*gate, "test", cand, "v").splitlines()[-1])
+                    return cand
+
+                def accepted(cand):
+                    line = next(line for line in run(*gate, "accept", cand).splitlines() if line.startswith("Commit with: "))
+                    assert line.endswith(" commit %s -m '<message>'" % cand), line
+                    return line[len("Commit with: "):].replace("<message>", "land")
+
+                def refused(cand):
+                    result = subprocess.run([*gate, "accept", cand], capture_output=True, text=True)
+                    assert result.returncode, result.stdout
+                    return result.stderr
+
+                def staged():
+                    return g("diff", "--cached", "--name-only").splitlines()
+
+                # the verified change, outside the project's folder when the project is a subfolder
+                (repo / "file.txt").write_text("v2")
+                command = accepted(verified("grep -qx v2 %s/file.txt" % shlex.quote(str(repo))))
+                swarm = (sub + "/" if sub else "") + ".swarm"
+                assert any(name.startswith(swarm + "/") for name in g("status", "--porcelain", "--untracked-files=all").split())
+                # the commit action stages exactly the verified file and commits it, from the project's folder
+                subprocess.run(command, shell=True, cwd=proj, check=True, capture_output=True)
+                assert g("show", "--name-only", "--format=", "HEAD").splitlines() == ["file.txt"]
+                assert staged() == [], staged()
+                (repo / "file.txt").write_text("v3")
+                # run data or a linked worktree staged already is refused, naming the paths and how to unstage them
+                g("reset", "-q")
+                for extra in (swarm, "agent work"):
+                    g("add", "-f", "--", extra)
+                    cand = verified("grep -qx v3 %s/file.txt" % shlex.quote(str(repo)))
+                    why = refused(cand)
+                    assert "Swarm's run data or a linked worktree" in why and extra in why, why
+                    remedy = re.search(r"Run `(git reset -q -- [^`]+)`", why)
+                    subprocess.run(remedy[1], shell=True, cwd=proj, check=True, capture_output=True)
+                    assert staged() == [], staged()
+                    accepted(cand)
+
+    # The review of the 0.3.47 audit fixes.
+
+    def _verified(self, proj, check):
+        """A new run in PROJ whose one worker is ready and whose shared candidate passed CHECK: (gate, candidate, run)."""
+        board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Review")
+        post = [sys.executable, SCRIPTS / "board.py", board]
+        gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+        run(*post, "member", "w")
+        run(*post, "member", "v", "role=verifier")
+        run(*post, "ready", "w", text="done")
+        cand = json.loads(run(*gate, "prepare", "shared", "--check", check))["candidate"]
+        run(*post, "post", "v", "@coordinator " + run(*gate, "test", cand, "v").splitlines()[-1])
+        return gate, cand, Path(board)
+
+    def test_shared_accept_refuses_changes_inside_a_submodule(self):
+        with tempfile.TemporaryDirectory() as t_sub, tempfile.TemporaryDirectory() as t:
+            library, proj = Path(t_sub).resolve(), Path(t).resolve()
+            self._init_git(library)
+            g = self._init_git(proj)
+            g("-c", "protocol.file.allow=always", "submodule", "add", str(library), "vendor/lib")
+            g("commit", "-m", "add the library")
+            lib = proj / "vendor" / "lib"
+            for setting in (("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")):
+                g("config", *setting, cwd=lib)
+            # an untracked file, then a tracked edit, inside the submodule: the verified bytes the commit cannot hold
+            for inner in ("stray.txt", "file.txt"):
+                (lib / inner).write_text("inner")
+                gate, cand, _ = self._verified(proj, "test -s vendor/lib/%s" % inner)
+                result = subprocess.run([*gate, "accept", cand], capture_output=True, text=True)
+                assert result.returncode and "submodule vendor/lib holds changes of its own" in result.stderr, (inner, result.stderr)
+            # committed inside the submodule, its new commit is accepted, and the printed command stages it
+            g("add", "-A", cwd=lib)
+            g("commit", "-m", "inner", cwd=lib)
+            gate, cand, _ = self._verified(proj, "test -s vendor/lib/stray.txt")
+            g("add", "vendor/lib")  # its pointer staged before acceptance: no source changed, so the fingerprint holds
+            line = next(line for line in run(*gate, "accept", cand).splitlines() if line.startswith("Commit with: "))
+            subprocess.run(line[len("Commit with: "):].replace("<message>", "land"), shell=True, cwd=proj, check=True, capture_output=True)
+            assert g("show", "--name-only", "--format=", "HEAD") == "vendor/lib"
+
+    def test_shared_accept_refuses_a_repository_of_its_own_that_is_no_submodule(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g = self._init_git(proj)
+            inner = proj / "vendor" / "tool"
+            inner.mkdir(parents=True)
+            self._init_git(inner)  # cloned or started inside the tree, never registered
+            (inner / "edit.txt").write_text("uncommitted")
+            gate, cand, _ = self._verified(proj, "test -s vendor/tool/edit.txt")
+            result = subprocess.run([*gate, "accept", cand], capture_output=True, text=True)
+            assert result.returncode and "vendor/tool/ is a Git repository of its own" in result.stderr, result.stderr
+            # staged as a bare pointer, clean inside: still a repository no .gitmodules entry names
+            subprocess.run(["git", "-C", str(inner), "add", "-A"], check=True)
+            subprocess.run(["git", "-C", str(inner), "commit", "-qm", "inner"], check=True)
+            subprocess.run(["git", "-C", str(proj), "add", "vendor/tool"], check=True, capture_output=True)
+            gate, cand, _ = self._verified(proj, "test -s vendor/tool/edit.txt")
+            result = subprocess.run([*gate, "accept", cand], capture_output=True, text=True)
+            assert result.returncode and "vendor/tool is a Git repository of its own that no .gitmodules entry names" in result.stderr, result.stderr
+            g("reset", "-q", "--", "vendor/tool")
+            # ignored, it is no source and nothing stages it: a new candidate is accepted
+            (proj / ".gitignore").write_text("vendor/\n")
+            gate, cand, _ = self._verified(proj, "true")
+            assert "ACCEPTED" in run(*gate, "accept", cand)
+
+    def test_shared_accept_refuses_what_staging_leaves_out_of_a_submodule(self):
+        import re
+        with tempfile.TemporaryDirectory() as t_sub, tempfile.TemporaryDirectory() as t:
+            library, proj = Path(t_sub).resolve(), Path(t).resolve()
+            self._init_git(library)
+            g = self._init_git(proj)
+            g("-c", "protocol.file.allow=always", "submodule", "add", str(library), "vendor/lib")
+            g("config", "-f", ".gitmodules", "submodule.vendor/lib.ignore", "all")
+            g("add", ".gitmodules")
+            g("commit", "-m", "add the library, its changes hidden from status")
+            lib = proj / "vendor" / "lib"
+            for setting in (("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")):
+                g("config", *setting, cwd=lib)
+
+            def refused(check):
+                gate, cand, _ = self._verified(proj, check)
+                result = subprocess.run([*gate, "accept", cand], capture_output=True, text=True)
+                assert result.returncode, result.stdout
+                return gate, cand, result.stderr
+
+            # ignore = all hides even a dirty submodule from the parent's status: it is still refused
+            (lib / "file.txt").write_text("edited")
+            assert "holds changes of its own" in refused("grep -qx edited vendor/lib/file.txt")[2]
+            # committed inside, its new commit is what the checks read, and `git add -A` would keep the old pointer
+            g("commit", "-qam", "inner", cwd=lib)
+            gate, cand, why = refused("grep -qx edited vendor/lib/file.txt")
+            assert "leaves unstaged" in why and "vendor/lib" in why, why
+            subprocess.run(re.search(r"Run `(git add -f -- [^`]+)`", why)[1], shell=True, cwd=proj, check=True, capture_output=True)
+            assert "ACCEPTED" in run(*gate, "accept", cand)
+            g("commit", "-m", "the new library")
+            assert g("ls-tree", "HEAD", "vendor/lib").split()[2] == g("rev-parse", "HEAD", cwd=lib)
+            # not checked out, a submodule's folder holds nothing the commit can take: files put there are refused
+            g("submodule", "deinit", "-q", "-f", "vendor/lib")
+            (lib / "dropped.txt").write_text("dropped")
+            _, _, why = refused("test -s vendor/lib/dropped.txt")
+            assert "vendor/lib is not checked out, yet files sit in its folder" in why, why
+            (lib / "dropped.txt").unlink()
+            gate, cand, _ = self._verified(proj, "true")
+            assert "ACCEPTED" in run(*gate, "accept", cand)
+
+    def test_shared_accept_refuses_a_committed_loose_pointer_once_it_moves_and_quotes_odd_paths(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g = self._init_git(proj)
+            inner = proj / "tool"
+            inner.mkdir()
+            gi = self._init_git(inner)
+            g("add", "tool")
+            g("commit", "-m", "a pointer no .gitmodules entry backs")
+            # committed and left alone, the commit after `accept` changes nothing about it
+            gate, cand, _ = self._verified(proj, "true")
+            assert "ACCEPTED" in run(*gate, "accept", cand)
+            # moved, the commit would record the new pointer, which nobody else can resolve
+            (inner / "more.txt").write_text("more")
+            gi("add", "more.txt")
+            gi("commit", "-m", "more")
+            gate, cand, _ = self._verified(proj, "test -s tool/more.txt")
+            result = subprocess.run([*gate, "accept", cand], capture_output=True, text=True)
+            assert result.returncode and "tool is a Git repository of its own that no .gitmodules entry names" in result.stderr
+            gi("reset", "-q", "--hard", "HEAD~1")
+            # a path with a newline in it is quoted in a message, so it cannot break it or forge a line
+            odd = proj / "odd\nACCEPTED x"
+            odd.mkdir()
+            self._init_git(odd)
+            gate, cand, _ = self._verified(proj, "true")
+            result = subprocess.run([*gate, "accept", cand], capture_output=True, text=True)
+            assert result.returncode and '"odd\\nACCEPTED x/" is a Git repository of its own' in result.stderr, result.stderr
+            assert "\nACCEPTED" not in result.stderr
+
+    def test_verify_refuses_malformed_input_naming_what_to_do(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            self._init_git(proj)
+            board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Base")
+            result = subprocess.run([sys.executable, SCRIPTS / "verify.py", board, proj, "prepare", "isolated", "--check", "true",
+                                     "--base=--output=x"], capture_output=True, text=True)
+            assert result.returncode and "--base takes a ref" in result.stderr, result.stderr
+            # a candidate file cut short names what to do, not the field it lacks
+            Path(board, "verification.json").write_text("{}")
+            result = subprocess.run([sys.executable, SCRIPTS / "verify.py", board, proj, "accept", "c" * 16],
+                                    capture_output=True, text=True)
+            assert result.returncode and "superseded" in result.stderr, result.stderr
+
+    def test_a_replacement_between_file_and_folder_fingerprints_alike_staged_or_not(self):
+        sys.path.insert(0, str(SCRIPTS))
+        import verify  # noqa: E402
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g = self._init_git(proj)
+            (proj / "config").write_text("c")
+            g("add", "config")
+            g("commit", "-m", "config")
+            # a tracked file replaced by a folder: staging it changes no byte, so no fingerprint either
+            (proj / "config").unlink()
+            (proj / "config").mkdir()
+            (proj / "config" / "app.yml").write_text("a")
+            unstaged = verify.source_digest(proj)
+            g("add", "-A")
+            assert verify.source_digest(proj) == unstaged
+            g("commit", "-m", "folder")
+            # and the mirror, a tracked folder replaced by a file
+            (proj / "config" / "app.yml").unlink()
+            (proj / "config").rmdir()
+            (proj / "config").write_text("c")
+            unstaged = verify.source_digest(proj)
+            g("add", "-A")
+            assert verify.source_digest(proj) == unstaged
+
+    def test_shared_accept_sees_a_staged_rename_out_of_run_data(self):
+        import re
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g = self._init_git(proj)
+            (proj / ".swarm").mkdir()
+            (proj / ".swarm" / "note.txt").write_text("note\n")
+            g("add", "-f", ".swarm/note.txt")
+            g("commit", "-m", "note")
+            # a rename wholly within the source passes
+            g("mv", "file.txt", "moved.txt")
+            gate, cand, _ = self._verified(proj, "test -f moved.txt")
+            run(*gate, "accept", cand)
+            g("commit", "-m", "move")
+            # a rename out of run data stages the deletion of run data, which rename detection would hide
+            g("mv", ".swarm/note.txt", "notes.txt")
+            gate, cand, _ = self._verified(proj, "test -f notes.txt")
+            result = subprocess.run([*gate, "accept", cand], capture_output=True, text=True)
+            assert result.returncode and ".swarm/note.txt" in result.stderr, result.stderr
+            remedy = re.search(r"Run `(git reset -q -- [^`]+)`", result.stderr)
+            subprocess.run(remedy[1], shell=True, cwd=proj, check=True, capture_output=True)
+            assert g("diff", "--cached", "--name-only", "--no-renames") == "notes.txt"
+            run(*gate, "accept", cand)
+
+    def test_shared_accept_prints_the_staging_command_without_asking_git_again(self):
+        import contextlib
+        import io
+        sys.path.insert(0, str(SCRIPTS))
+        import verify  # noqa: E402
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            self._init_git(proj)
+            (proj / "file.txt").write_text("v2")
+            gate, cand, board = self._verified(proj, "grep -qx v2 file.txt")
+            real_git, real_save = verify.git, verify.save_candidate
+
+            def save(directory, candidate):
+                real_save(directory, candidate)
+                if candidate.get("accepted"):  # Git fails from here on
+                    verify.git = lambda *a, **k: (_ for _ in ()).throw(ValueError("git broke"))
+            out = io.StringIO()
+            try:
+                verify.save_candidate = save
+                with contextlib.redirect_stdout(out):
+                    verify.accept(board, proj, cand)
+            finally:
+                verify.git, verify.save_candidate = real_git, real_save
+            assert "Commit with: python3 " in out.getvalue(), out.getvalue()
+            # a retry takes the already-accepted path, and names the command again
+            assert " commit %s -m " % cand in run(*gate, "accept", cand)
+
+    def test_a_late_verdict_answers_the_candidate_it_was_about(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            self._init_git(proj)
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Late"))
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier", "id=agent-v")
+            run(*post, "member", "v2", "role=verifier")
+
+            def table():
+                return json.loads((board / "verification.json").read_text())
+
+            def last():
+                return json.loads(run(*post, "tail").splitlines()[-1])
+
+            run(*post, "ready", "w", text="done")
+            a = json.loads(run(*gate, "prepare", "shared", "--check", "true"))["candidate"]
+            run(*gate, "test", a, "v")  # tested, and no verdict posted on it yet
+            run(*post, "ready", "w", text="fixed the tabs")  # the fix B is built on
+            b = json.loads(run(*gate, "prepare", "shared", "--check", "true"))["candidate"]
+            run(*post, "post", "coordinator", "@v please test candidate %s" % b)
+            run(*post, "read", "v")  # it has read B's request
+            run(*post, "post", "v2", "@coordinator " + run(*gate, "test", b, "v2").splitlines()[-1])
+            # v's verdict on A, the candidate it tested, arrives after B replaced it
+            out = run(*post, "post", "v", "@coordinator @w NOT PASSED: tabs are dropped")
+            assert "answering candidate %s" % a in out, out
+            late = last()
+            assert late["candidate"] == a and late["rejects"] == [], late  # w's newer READY, the one B holds, stands
+            assert table()["verified_by"] == "v2"  # B's pass is untouched
+            # nor is B's review finished: a resumed run wakes v for it
+            run(*post, "pause", "decision")
+            run(*post, "resume")
+            assert "@v " in last()["text"] and "v" in last()["to"], last()
+            # a verdict on the candidate on the table still ends its review and withdraws its pass
+            run(*post, "read", "v")
+            run(*post, "post", "v", "@coordinator NOT VERIFIED: the check skips the tab case")
+            assert last()["candidate"] == b and "verified_by" not in table()
+            run(*gate, "accept", b, ok=False)
+            run(*post, "post", "v2", "@coordinator " + run(*gate, "test", b, "v2").splitlines()[-1])
+            # one naming a superseded candidate leaves the table alone, and so does acceptance
+            run(*post, "post", "v", "@coordinator NOT VERIFIED %s: never mind" % a)
+            assert last()["candidate"] == a and table()["verified_by"] == "v2"
+            assert "ACCEPTED" in run(*gate, "accept", b)
+
+    def test_a_piece_verdict_withdraws_the_report_its_verifier_read(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            self._init_git(proj)
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Piece"))
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+
+            def last():
+                return json.loads(run(*post, "tail").splitlines()[-1])
+
+            run(*post, "ready", "w", text="done")
+            a = json.loads(run(*gate, "prepare", "shared", "--check", "true"))["candidate"]
+            run(*post, "post", "coordinator", "@v please test candidate %s" % a)
+            run(*post, "read", "v")
+            run(*post, "post", "v", "@coordinator NOT VERIFIED %s: the check cannot run" % a)
+            run(*post, "ready", "w", text="fixed")
+            run(*post, "read", "v")  # v has read w's new READY
+            json.loads(run(*gate, "prepare", "shared", "--check", "true"))
+            run(*post, "post", "coordinator", "@v please test the next candidate")  # not read yet
+            # the request v read last names A, yet the NOT PASSED answers the READY it reviewed, which B holds
+            run(*post, "post", "v", "@w NOT PASSED: still drops tabs")
+            assert last()["candidate"] == a and last()["rejects"] == ["w"], last()
+            run(*gate, "prepare", "shared", "--check", "true", ok=False)  # w is no longer ready
+            # a READY v has not read is no work its verdict saw
+            run(*post, "ready", "w", text="fixed again")
+            json.loads(run(*gate, "prepare", "shared", "--check", "true"))
+            run(*post, "post", "v", "@w NOT PASSED: the old build also leaked")
+            assert last()["candidate"] == a and last()["rejects"] == [], last()
+            json.loads(run(*gate, "prepare", "shared", "--check", "true"))  # w is still ready
+
+    def test_a_verdict_naming_no_candidate_answers_the_one_its_verifier_tested_or_was_asked_to(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            self._init_git(proj)
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Bound"))
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            for verifier in ("v", "v2"):
+                run(*post, "member", verifier, "role=verifier")
+
+            def last():
+                return json.loads(run(*post, "tail").splitlines()[-1])
+
+            def tested(name):
+                return json.loads((board / "members.json").read_text())["members"][name].get("tested")
+
+            run(*post, "ready", "w", text="done")
+            a = json.loads(run(*gate, "prepare", "shared", "--check", "true"))["candidate"]
+            # a post that only mentions a candidate asks for no test: a later verdict is not bound to it
+            run(*post, "post", "coordinator", "@v candidate %s is on the table, more soon" % a)
+            run(*post, "read", "v")
+            run(*post, "ready", "w", text="again")
+            b = json.loads(run(*gate, "prepare", "shared", "--check", "true"))["candidate"]
+            run(*post, "post", "v", "@coordinator NOT VERIFIED: the suite cannot start")
+            assert last()["candidate"] == b, last()
+            # v tests B; C replaces it; v2 passes C. v's rejection that names C leaves v's own test of B open
+            run(*gate, "test", b, "v")
+            assert tested("v") == b
+            run(*post, "ready", "w", text="third")
+            c = json.loads(run(*gate, "prepare", "shared", "--check", "true"))["candidate"]
+            run(*post, "post", "v", "@coordinator NOT VERIFIED %s: named on purpose" % c)
+            assert last()["candidate"] == c and tested("v") == b, (last(), tested("v"))
+            run(*post, "post", "v2", "@coordinator " + run(*gate, "test", c, "v2").splitlines()[-1])
+            # the verdict that names none answers B, the one v tested, and v2's pass of C stands
+            run(*post, "post", "v", "@coordinator NOT VERIFIED: what I tested never built")
+            assert last()["candidate"] == b and tested("v") is None, (last(), tested("v"))
+            assert "ACCEPTED" in run(*gate, "accept", c)
+            # once C is accepted, a verdict on B still answers B, and withdraws nothing C was made of
+            run(*post, "post", "v", "@w NOT PASSED %s: the old build leaked" % b)
+            assert last()["candidate"] == b and last()["rejects"] == [], last()
+            assert "Already accepted" in run(*gate, "accept", c)
+
+    def test_shared_accept_counts_only_a_registration_the_commit_will_hold(self):
+        with tempfile.TemporaryDirectory() as t_sub, tempfile.TemporaryDirectory() as t:
+            library, proj = Path(t_sub).resolve(), Path(t).resolve()
+            self._init_git(library)
+            g = self._init_git(proj)
+            g("-c", "protocol.file.allow=always", "submodule", "add", str(library), "vendor/lib")
+            # the pointer is staged, its registration is not: .gitmodules is untracked and ignored
+            g("rm", "-q", "--cached", ".gitmodules")
+            (proj / ".git" / "info" / "exclude").write_text(".gitmodules\n")
+            gate, cand, _ = self._verified(proj, "true")
+            result = subprocess.run([*gate, "accept", cand], capture_output=True, text=True)
+            assert result.returncode and "vendor/lib is a Git repository of its own that no .gitmodules entry names" in result.stderr, result.stderr
+
+    def test_checks_that_fill_in_a_submodule_of_an_isolated_candidate_do_not_pass(self):
+        with tempfile.TemporaryDirectory() as t_sub, tempfile.TemporaryDirectory() as t:
+            library, proj = Path(t_sub).resolve(), Path(t).resolve()
+            self._init_git(library)
+            g = self._init_git(proj)
+            g("-c", "protocol.file.allow=always", "submodule", "add", str(library), "vendor/lib")
+            g("commit", "-q", "-m", "add the library")
+            board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Filled")
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            g("switch", "-q", "-c", "work")
+            (proj / "file.txt").write_text("v2")
+            g("commit", "-q", "-am", "work")
+            commit = g("rev-parse", "HEAD")
+            g("switch", "-q", "main")
+            run(*post, "ready", "w", commit, text="done")
+            # the candidate's checkout has the submodule empty; a check fills it in and reads a file the landed commit will not bring
+            check = "git -c protocol.file.allow=always submodule update --init -q vendor/lib && test -s vendor/lib/file.txt"
+            cand = json.loads(run(*gate, "prepare", "isolated", "--check", check))["candidate"]
+            result = subprocess.run([*gate, "test", cand, "v"], capture_output=True, text=True)
+            assert result.returncode and "the checks changed files in the candidate's checkout" in result.stderr, (result.stdout, result.stderr)
+            assert "VERIFIED" not in result.stdout
+            # filled in by hand between prepare and test, the checkout is no longer the one prepared
+            made = json.loads(run(*gate, "prepare", "isolated", "--check", "true"))
+            subprocess.run(["git", "-c", "protocol.file.allow=always", "submodule", "update", "--init", "-q", "vendor/lib"],
+                           cwd=made["path"], check=True, capture_output=True)
+            result = subprocess.run([*gate, "test", made["candidate"], "v"], capture_output=True, text=True)
+            assert result.returncode and "changed since it was prepared" in result.stderr, (result.stdout, result.stderr)
+
+    def test_a_deinitialised_submodule_voids_a_shared_pass_that_read_it(self):
+        sys.path.insert(0, str(SCRIPTS))
+        import verify  # noqa: E402
+        with tempfile.TemporaryDirectory() as t_inner, tempfile.TemporaryDirectory() as t_sub, tempfile.TemporaryDirectory() as t:
+            inner, library, proj = Path(t_inner).resolve(), Path(t_sub).resolve(), Path(t).resolve()
+            self._init_git(inner)
+            gl = self._init_git(library)
+            gl("-c", "protocol.file.allow=always", "submodule", "add", str(inner), "deps/inner")
+            gl("commit", "-m", "add inner")
+            g = self._init_git(proj)
+            g("-c", "protocol.file.allow=always", "submodule", "add", str(library), "vendor/lib")
+            g("commit", "-m", "add the library")
+            g("-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+            checked = verify.source_digest(proj)
+            # the inner submodule of a clean checked-out one, deinitialised: its files are gone from the checks too
+            g("-C", "vendor/lib", "submodule", "deinit", "-q", "-f", "deps/inner")
+            assert verify.source_digest(proj) != checked
+            # files dropped into it then are read by the checks, shown by no status, and held by no commit
+            (proj / "vendor" / "lib" / "deps" / "inner" / "dropped.txt").write_text("dropped")
+            gate, cand, _ = self._verified(proj, "test -s vendor/lib/deps/inner/dropped.txt")
+            result = subprocess.run([*gate, "accept", cand], capture_output=True, text=True)
+            assert result.returncode and "vendor/lib/deps/inner is not checked out" in result.stderr, result.stderr
+            (proj / "vendor" / "lib" / "deps" / "inner" / "dropped.txt").unlink()
+            g("-C", "vendor/lib", "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init")
+            assert verify.source_digest(proj) == checked
+            gate, cand, _ = self._verified(proj, "test -s vendor/lib/file.txt")
+            g("submodule", "deinit", "-q", "-f", "vendor/lib")  # the file the check read is gone
+            result = subprocess.run([*gate, "accept", cand], capture_output=True, text=True)
+            assert result.returncode and "source files changed" in result.stderr, (result.stdout, result.stderr)
+            # the isolated view is unchanged: an empty submodule and a clean checked-out one stand for one commit
+            empty = verify.source_digest(proj, pointers=True)
+            g("-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init")
+            assert verify.source_digest(proj, pointers=True) == empty
+
+    def test_an_accept_retry_runs_the_index_guards_again(self):
+        import re
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g = self._init_git(proj)
+            (proj / "file.txt").write_text("v2")
+            (proj / "new.txt").write_text("new")
+            gate, cand, _ = self._verified(proj, "grep -qx v2 file.txt && test -s new.txt")
+            assert "ACCEPTED" in run(*gate, "accept", cand)
+
+            def refused():
+                result = subprocess.run([*gate, "accept", cand], capture_output=True, text=True)
+                assert result.returncode and "Commit with" not in result.stdout, (result.stdout, result.stderr)
+                return result.stderr
+
+            # run data staged after the first acceptance: the fingerprint leaves it out, so only the guard sees it
+            (proj / ".swarm" / "notes").write_text("mine")
+            g("add", "-f", ".swarm/notes")
+            why = refused()
+            assert ".swarm/notes" in why, why
+            subprocess.run(re.search(r"Run `(git reset -q -- [^`]+)`", why)[1], shell=True, cwd=proj, check=True)
+            g("add", "file.txt")  # a staged subset is no matter: the commit action stages the verified files anew
+            line = next(line for line in run(*gate, "accept", cand).splitlines() if line.startswith("Commit with: "))
+            landing = line[len("Commit with: "):].replace("<message>", "land")
+            # an edit after acceptance is not what passed: the commit action refuses it and commits nothing
+            (proj / "file.txt").write_text("unread")
+            late = subprocess.run(landing, shell=True, cwd=proj, capture_output=True, text=True)
+            assert late.returncode and "source files changed after acceptance" in late.stderr, late.stderr
+            assert g("log", "--format=%s", "-1") != "land"
+            (proj / "file.txt").write_text("v2")
+            # as verified, it commits exactly the verified files, whatever was staged meanwhile
+            out = subprocess.run(landing, shell=True, cwd=proj, check=True, capture_output=True, text=True).stdout
+            assert "COMMITTED " + cand in out, out
+            assert g("show", "--name-only", "--format=", "HEAD").splitlines() == ["file.txt", "new.txt"]
+            assert g("status", "--porcelain") == ""
+            # a member's candidate that was never accepted, and a second commit, are refused
+            again = subprocess.run(landing, shell=True, cwd=proj, capture_output=True, text=True)
+            assert again.returncode, again.stdout
 
 
 if __name__ == "__main__":

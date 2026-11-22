@@ -4,7 +4,7 @@ import type { AgentInfo } from 'claude-code'
 
 import type { AttentionItem, Member, Post, Swarm } from '../types'
 import { edgesOf } from './graph'
-import { clean, unquoted } from './text'
+import { clean, unquoted, verdictOf } from './text'
 
 // ponytail: keeps the newest 300 posts; page through board.jsonl if a swarm outgrows that
 export const KEPT = 300
@@ -27,6 +27,79 @@ export function budgetOf(state: BudgetState): number {
 
 export function tokensUsed(tokens?: Record<string, unknown> | null): number {
   return Object.values(tokens ?? {}).reduce<number>((sum, count) => sum + positive(count), 0)
+}
+
+// What a model step reports it spent, and what that is charged against a budget as it is billed: fresh tokens whole,
+// cached reads at a tenth.
+export type Spent = { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number }
+export const weigh = (spent: Spent | undefined) => spent === undefined ? 0
+  : (spent.input_tokens || 0) + (spent.cache_creation_input_tokens || 0) + (spent.output_tokens || 0) + Math.round((spent.cache_read_input_tokens || 0) * 0.1)
+// `sum` is what the steps reported, `charged` the whole tokens the board took for them; `landing` settles once every
+// step charge sent so far has been answered.
+type Turn = { steps: Set<number>; sum: Spent; charged: number; landing: Promise<unknown>; agentId?: string; last: number }
+/**
+ * What each turn's model steps have been charged so far, so its end charges only what the board did not take. A
+ * running turn keeps its entry however long it runs or waits between steps, or its end would charge its steps a
+ * second time; once the agent it belongs to has ended and `graceMs` passed with no end reported for it, it joins the
+ * newest `kept` turns that ended, so a late or repeated end still finds what was charged.
+ */
+export function ledger(kept = 256, graceMs = 600_000) {
+  const running = new Map<string, Turn>()
+  const ended = new Map<string, Turn>()
+  const of = (turnId: string) => running.get(turnId) ?? ended.get(turnId)
+  const end = (turnId: string, turn: Turn) => {
+    running.delete(turnId)
+    ended.delete(turnId)
+    ended.set(turnId, turn)
+    if (ended.size > kept) ended.delete(ended.keys().next().value!)
+  }
+  return {
+    of,
+    get running() { return running.size },
+    clear() {
+      running.clear()
+      ended.clear()
+    },
+    /**
+     * What this report adds to the turn's charge: a step's own usage, or at the turn's end its whole usage less what the
+     * board took for its steps (`landed`). A step's share is what it adds to the turn's weighed sum, so cached reads
+     * round once over the turn, not once a step.
+     */
+    charge(turnId: string, spent: Spent, index?: number, agentId?: string, now = 0): number {
+      let turn = of(turnId)
+      if (index === undefined) {
+        // Kept as charged in full, a turn with no step too: an end reported twice adds nothing the second time.
+        const total = weigh(spent)
+        const closed: Turn = turn ?? { steps: new Set(), sum: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }, charged: 0, landing: Promise.resolve(), agentId, last: now }
+        const owed = total - closed.charged
+        closed.charged = Math.max(closed.charged, total)
+        end(turnId, closed)
+        return owed
+      }
+      // A step that reports after its turn's end was charged with the end.
+      if (ended.has(turnId)) return 0
+      if (!turn) {
+        turn = { steps: new Set(), sum: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }, charged: 0, landing: Promise.resolve(), agentId, last: now }
+        running.set(turnId, turn)
+      }
+      turn.last = now
+      if (turn.steps.has(index)) return 0
+      turn.steps.add(index)
+      const before = weigh(turn.sum)
+      for (const key of Object.keys(turn.sum) as (keyof Spent)[]) turn.sum[key] += spent[key] || 0
+      return weigh(turn.sum) - before
+    },
+    /** A step charge the board took. One it did not (no run bound yet, a failed command) is left to the turn's end. */
+    landed(turn: Turn, amount: number): void {
+      turn.charged += amount
+    },
+    /** Ends the running turns of agents that are no longer live and stepped last `graceMs` or more ago. */
+    prune(isLive: (agentId: string) => boolean, now: number): void {
+      for (const [turnId, turn] of running) {
+        if (turn.agentId !== undefined && !isLive(turn.agentId) && now - turn.last >= graceMs) end(turnId, turn)
+      }
+    },
+  }
 }
 
 // The same rule as board.py: @name at a word start, never an email or a path.
@@ -150,22 +223,43 @@ export function statusOf(
   return agent.status === 'failed' ? 'failed' : agent.status === 'killed' ? 'stopped' : 'waiting'
 }
 
+const fullCommit = (id: unknown): id is string => typeof id === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(id)
+const names = (list: unknown) => Array.isArray(list) ? list.filter((name): name is string => typeof name === 'string').map(clean) : undefined
+/**
+ * The fields board.py adds to a post, as a board line or `show --json` gives them, each kept only in its own shape.
+ * A READY's commit, its base and the commits it also leaves out go into a git command line when its diff is opened:
+ * only full commit ids, and `except` only beside a base and only when it holds some, all of them full.
+ */
+export function postFields(post: Record<string, unknown>): Pick<Post, 'revision' | 'base' | 'except' | 'partial' | 'members' | 'rejects' | 'candidate'> {
+  const { revision, base, except, partial, members, rejects, candidate } = post
+  const kept: Pick<Post, 'revision' | 'base' | 'except' | 'partial' | 'members' | 'rejects' | 'candidate'> = {}
+  if (fullCommit(revision)) kept.revision = revision
+  if (fullCommit(base)) {
+    kept.base = base
+    if (Array.isArray(except) && except.length > 0 && except.every(fullCommit)) kept.except = except
+  }
+  if (partial === true) kept.partial = true
+  const covered = names(members)
+  if (covered) kept.members = covered
+  const rejected = names(rejects)
+  if (rejected) kept.rejects = rejected
+  if (typeof candidate === 'string') kept.candidate = clean(candidate)
+  return kept
+}
+
 export function parsePosts(board: string, roster: Roster): Post[] {
   const posts: Post[] = []
   for (const line of board.split('\n')) {
     if (line.trim() === '') continue
     try {
-      const post = JSON.parse(line) as Omit<Post, 'to' | 'revision'> & { to?: string[]; revision?: unknown }
+      const post = JSON.parse(line) as Record<string, unknown> & Pick<Post, 'seq' | 'agent' | 'text' | 'time'> & { to?: string[] }
       if (!post || !Number.isSafeInteger(post.seq) || post.seq <= (posts.at(-1)?.seq ?? 0) ||
           typeof post.agent !== 'string' || typeof post.text !== 'string' || typeof post.time !== 'string' ||
           (post.to !== undefined && (!Array.isArray(post.to) || post.to.some(name => typeof name !== 'string')))) continue
       // board.py records the recipients; a board written before it did is read by its mentions
       const to =
         post.to ?? targets(post.text, roster, post.agent).filter(name => name !== post.agent)
-      // A READY's commit goes into a git command line when its diff is opened: only a full commit id is kept.
-      const { revision, ...rest } = post
-      const commit = typeof revision === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(revision) ? { revision } : {}
-      posts.push({ ...rest, ...commit, agent: clean(post.agent), time: clean(post.time), text: clean(post.text), to: to.map(clean) })
+      posts.push({ seq: post.seq, ...postFields(post), agent: clean(post.agent), time: clean(post.time), text: clean(post.text), to: to.map(clean) })
     } catch {
       // a line still being written; the next poll reads it whole
     }
@@ -203,9 +297,16 @@ export function parse(
   // The last post each member made, and the last one addressed to it.
   const said = new Map<string, number>()
   const heard = new Map<string, number>()
+  // The last report each member made, for a closed run's roster.
+  const reported = new Map<string, string>()
   for (const post of posts) {
     counts(post.agent).sent++
     said.set(post.agent, post.seq)
+    const kind = verdictOf(post)
+    if (kind && kind.label !== 'BRIEF') {
+      const covered = kind.covered?.length ? ` of ${kind.covered.map(name => `@${name}`).join(', ')}` : ''
+      reported.set(post.agent, `Last report: ${kind.label}${covered} (#${post.seq})`)
+    }
     for (const name of post.to) {
       heard.set(name, post.seq)
       if (post.seq > (memberNamed(roster, name)?.last_read_seq ?? Infinity)) counts(name).unread++
@@ -216,7 +317,9 @@ export function parse(
   const zombieAttention: AttentionItem[] = []
   const members: Member[] = Object.entries(roster).map(([name, member]) => {
     const hint = report?.members && Object.hasOwn(report.members, name) ? report.members[name] : undefined
-    const base = member.role === 'coordinator' && coordinating && !member.killed && !isClosed ? 'coordinating' : statusOf(member.role ?? 'worker', member, liveAgents)
+    // A closed run has no live state: a member is retired, or was there at the close.
+    const base = isClosed ? (member.killed ? 'killed' : 'closed')
+      : member.role === 'coordinator' && coordinating && !member.killed ? 'coordinating' : statusOf(member.role ?? 'worker', member, liveAgents)
     const status = !isClosed && hint?.unreachable && base !== 'working' && base !== 'killed' ? 'unreachable' : base
     const zombie = !isClosed && member.killed && member.id ? findAgent(liveAgents, member.id) : undefined
     const isZombie = zombie !== undefined && (zombie.status === 'running' || zombie.status === 'pending' || zombie.status === 'waiting')
@@ -254,7 +357,7 @@ export function parse(
       depends: hint?.depends ?? [],
       owns: clean(typeof hint?.owns === 'string' ? hint.owns : ''),
       status,
-      detail: isClosed ? '' : isZombie ? `still ${zombie.status} (${zombie.id})` : detailOf(status, hint, Boolean(state.paused), Boolean(member.paused) || hint?.paused === true),
+      detail: isClosed ? (status !== 'closed' || member.role === 'coordinator' ? '' : reported.get(name) ?? 'No outcome recorded') : isZombie ? `still ${zombie.status} (${zombie.id})` : detailOf(status, hint, Boolean(state.paused), Boolean(member.paused) || hint?.paused === true),
       unread: counts(name).unread,
       posts: counts(name).sent,
     }
