@@ -149,7 +149,7 @@ ARG_COUNTS = {
     "replace": (2, None), "post": (1, None), "ready": (1, 2), "revise": (1, None),
     "confirm": (2, 2), "read": (1, 4), "show": (0, 2), "wake": (0, 0),
     "claim": (3, 3), "woke": (3, 3), "rearm": (2, None), "bind": (1, 1),
-    "pause": (0, None), "resume": (0, 1), "close": (0, 0), "kill": (0, None), "status": (0, 0), "account": (3, 3), "tail": (0, 1),
+    "pause": (0, None), "resume": (0, 1), "close": (0, 0), "kill": (0, None), "status": (0, 0), "account": (3, 4), "tail": (0, 1),
     "prune": (0, 2), "sync": (1, 2), "export": (0, 1),
 }
 READ_COMMANDS = {"show", "status", "plan", "attention", "wake", "export"}
@@ -1368,8 +1368,16 @@ def progress(state, member):
     return True
 
 
+# What a report spent before weighting, and what started its turn: `<wake>:<fresh input>,<cache writes>,<cache reads>,<output>`.
+USAGE_DETAIL = re.compile(r"([a-z]+(?:\+[a-z]+){0,3}):([0-9]{1,15}),([0-9]{1,15}),([0-9]{1,15}),([0-9]{1,15})")
+DETAIL_COLUMNS = ("Steps", "Fresh input", "Cache writes", "Cache reads", "Output")
+
+
 def account(d, args):
-    turn, actor, count = args
+    turn, actor, count = args[:3]
+    detail = USAGE_DETAIL.fullmatch(args[3]) if len(args) > 3 else None
+    if len(args) > 3 and not detail:
+        sys.exit("invalid usage detail")
     if not BIND_KEY.fullmatch(turn) or (actor != COORDINATOR and not BIND_KEY.fullmatch(actor)):
         sys.exit("invalid usage key")
     if not re.fullmatch(r"[1-9][0-9]{0,15}", count):
@@ -1388,6 +1396,10 @@ def account(d, args):
         tokens[actor] = tokens.get(actor, 0) + turns[turn]
         steps = usage.setdefault("steps", {})
         steps[actor] = steps.get(actor, 0) + 1
+        if detail:
+            # Kept beside the weighted count, never in place of it: budgets and pauses read `tokens` alone.
+            row = usage.setdefault("detail", {}).setdefault(actor, {}).setdefault(detail[1], [0] * len(DETAIL_COLUMNS))
+            row[:] = [had + more for had, more in zip(row, [1, *map(int, detail.groups()[1:])])]
         # Only a retried report repeats a turn, and it does so at once: the oldest entries are never asked about again.
         for old in list(turns)[:-TURNS_KEPT]:
             del turns[old]
@@ -2971,7 +2983,18 @@ def main(argv):
                         "yes" if name in ready else "no", f"{tokens.get(usage_key(member), 0):,}")))
             lines += ["", "Tokens: %s in all%s, %s of them the coordinator's." % (
                 f"{total:,}", " of a %s budget" % f"{budget:,}" if budget else "", f"{tokens.get(COORDINATOR, 0):,}"),
-                "", "## Verification", ""]
+                ""]
+            detail = state.get("usage", {}).get("detail", {})
+            if detail:
+                # Unweighted, by what started the turn: the table that says which wakes are worth avoiding.
+                lines += ["## Usage", "", "| Member | Type | Wake | %s |" % " | ".join(DETAIL_COLUMNS), "| --- " * 8 + "|"]
+                for name, member in members.items():
+                    key = COORDINATOR if name == COORDINATOR else usage_key(member)
+                    for wake, row in sorted(detail.get(key, {}).items()):
+                        lines.append("| %s |" % " | ".join(cell(v) for v in (
+                            "@" + name, "coordinator" if name == COORDINATOR else kind_of(member), wake, *(f"{n:,}" for n in row))))
+                lines.append("")
+            lines += ["## Verification", ""]
             try:
                 with open(os.path.join(d, "verification.json"), encoding="utf-8") as f:
                     candidate = json.load(f)

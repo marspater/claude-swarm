@@ -120,16 +120,18 @@ test('an @all post is counted on its sender, drawn dashed only when expanded, an
   expect(collapsed).toContain('coordinator to parser · 2 mentions')
   expect(collapsed).toMatch(/class="chip on"[^>]*><rect[^>]*\/><text[^>]*>@all 1</)
   expect(collapsed).toContain('class="motion ripple"')
-  // the key is pane text, beside the drawing rather than scaled down inside it
-  expect(collapsed).not.toContain('class="legend"')
+  expect(collapsed).toContain('class="legend"')
+  expect(collapsed).toContain('@all posts, drawn by Expand @all')
   expect(drawGraph(swarm, 3, new Set(), true, true).key).toContain('(1 in all), drawn by Expand @all')
   // a post that names nobody leaves a dashed outline on its sender, as the key says
   expect(collapsed).toMatch(/<title>coordinator · waiting · 1 post with no mention · 1 to @all<\/title>.*?class="pill sender quiet"/)
+  expect(collapsed).toContain('class="pill quiet" x="336"')
   expect(drawGraph(swarm, 3, new Set(), true, true).key).toContain('Dashed outline: posted with no mention')
 
   const expanded = graphSvg(swarm, 3, new Set(), true, true, false, 0, true)
   expect(expanded).toMatch(/class="route via-all[^"]*"[^>]*><title>coordinator to lexer · 1 via @all/)
   expect(expanded).not.toContain('class="motion ripple"')
+  expect(expanded).toContain('@all posts, drawn as dashed arrows')
   expect(drawGraph(swarm, 3, new Set(), true, true, false, 0, true).key).toContain('drawn as dashed arrows')
   // a member named before and reached through @all later gets both lines, side by side
   const later = { ...swarm, posts: [...posts, { seq: 4, agent: 'coordinator', to: ['parser', 'lexer'], text: '@all wrap up', time: '' },
@@ -142,8 +144,9 @@ test('an @all post is counted on its sender, drawn dashed only when expanded, an
   expect(edgesOf(later.posts)['coordinator>@all']).toBe(2)
   // before the @all post the key counts none, and replay does not show what has not happened yet
   const before = graphSvg(swarm, 2, new Set(), false, false, false, 0, true)
+  expect(before).toContain('no @all posts yet')
   expect(drawGraph(swarm, 2, new Set(), false, false, false, 0, true).key).toContain('No @all posts yet')
-  expect(before).not.toContain('via-all" d=')
+  expect(before.split('via-all" d=').length - 1).toBe(1)
   expect(before).not.toContain('coordinator to lexer')
   // posts the pane no longer keeps still count
   const kept = graphSvg({ ...swarm, posts: [], earlierEdges: edgesOf(posts) }, 0, new Set(), false, true, false, 0, true)
@@ -682,7 +685,7 @@ test('a route left out for size takes every quieter one with it', () => {
     if (graph.svg === undefined) break
     expect(graph.svg.length).toBeLessThanOrEqual(limit)
     if (!graph.svg.includes(named)) namedLeftOut++
-    expect({ limit, quieterKept: graph.svg.includes('class="edge via-all"') && !graph.svg.includes(named) })
+    expect({ limit, quieterKept: graph.svg.includes('class="history-edge"><path class="edge via-all"') && !graph.svg.includes(named) })
       .toEqual({ limit, quieterKept: false })
   }
   expect(namedLeftOut).toBeGreaterThan(0)

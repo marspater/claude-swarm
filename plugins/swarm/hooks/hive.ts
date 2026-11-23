@@ -58,6 +58,44 @@ const scenes: Record<Mood, [string, [number, number], [number, number]]> = {
   relay: ['M0 0h7v5H0z', [3, -2], [-4, 2]],
   forage: ['M4 3h2v2H4zM2 5h2v2H2z', [3, -3], [-2, 2]],
 }
+const memberHues: Record<string, readonly [string, string, string, string]> = {
+  claude: ['#ba5b3d', 'color(display-p3 .682353 .376471 .266667)', '#df7b5c', 'color(display-p3 .8222 .5021 .3877)'],
+  suggestion: ['#235fc4', 'color(display-p3 .2033 .3675 .7427)', '#8fb8ff', 'color(display-p3 .5935 .7170 .9777)'],
+  planMode: ['#2b8278', 'color(display-p3 .24 .50 .47)', '#5cc4b8', 'color(display-p3 .43 .75 .71)'],
+  ide: ['#c27622', 'color(display-p3 .71 .47 .19)', '#f0a64c', 'color(display-p3 .90 .66 .35)'],
+  merged: ['#7b63c4', 'color(display-p3 .48 .39 .77)', '#b69eff', 'color(display-p3 .71 .62 1)'],
+  permission: ['#b8497e', 'color(display-p3 .67 .32 .49)', '#eb7fb0', 'color(display-p3 .87 .52 .68)'],
+  remember: ['#4d6fc4', 'color(display-p3 .34 .44 .74)', '#93b0ff', 'color(display-p3 .60 .69 .98)'],
+  autoAccept: ['#5c8a36', 'color(display-p3 .39 .53 .25)', '#88c458', 'color(display-p3 .57 .76 .39)'],
+  subtle: ['#85878c', 'color(display-p3 .52 .53 .55)', '#9ea2a9', 'color(display-p3 .6224 .6348 .6601)'],
+}
+
+/** Pixel-art bee colored to match a member card's hue; animated only while the member is active. */
+export function memberBee(hue: string, status: string, elapsed = 0): string {
+  const [l, lp3, d, dp3] = memberHues[hue] ?? memberHues.subtle!
+  const active = status === 'working' || status === 'coordinating'
+  const sleeping = status === 'waiting' || status === 'not started' || status === 'closed' || status === 'killed'
+  const ms = Number.isFinite(elapsed) && elapsed > 0 ? Math.floor(elapsed) : 0
+  const style =
+    `svg{--honey:${l};--wing:#4b8f91;--ink:#3b271e}` +
+    `@media(prefers-color-scheme:dark){svg{--honey:${d};--wing:#99c8c8;--ink:#231610}}` +
+    `@supports(color:color(display-p3 1 0 0)){svg{--honey:${lp3};--wing:color(display-p3 .3602 .5544 .5647);--ink:color(display-p3 .23 .16 .12)}` +
+    `@media(prefers-color-scheme:dark){svg{--honey:${dp3};--wing:color(display-p3 .6379 .7791 .7816);--ink:color(display-p3 .14 .09 .06)}}}` +
+    (active
+      ? `@media(prefers-reduced-motion:no-preference){` +
+        `.bee{animation:bob 2.2s cubic-bezier(.42,0,.58,1) -${ms % 2200}ms infinite}` +
+        `.wing{transform-box:fill-box;transform-origin:bottom center;animation:flutter 220ms ease-in-out -${ms % 220}ms infinite}}` +
+        `@keyframes bob{0%,100%{transform:translate(0,0)}50%{transform:translate(-.8px,-1.2px)}}` +
+        `@keyframes flutter{0%,100%{transform:translateY(0) scaleY(1)}50%{transform:translateY(.7px) scaleY(.72)}}`
+      : '')
+  const body =
+    `<path class="wing" fill="var(--wing)" fill-opacity=".88" d="M2 0h2v2H2zM5 0h2v2H5z"/>` +
+    `<path fill="var(--honey)" d="M1 2h6v1h1v2H7v1H2V5H0V3h1z"/>` +
+    `<path fill="var(--ink)" d="M3 2h1v4H3z${sleeping ? 'M5 4h2v1H5z' : 'M6 3h1v1H6z'}"/>`
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 8" shape-rendering="crispEdges"><style>${style}</style>` +
+    `<g class="bee"><g transform="translate(10 1) scale(-1 1)">${body}</g></g></svg>`
+}
+
 export function hiveArt(shown: Mood, elapsed = 0): string {
   // The mood comes from stored state and the time from a clock: one this version does not know, or a time that is
   // no count of milliseconds, must not break the drawing.

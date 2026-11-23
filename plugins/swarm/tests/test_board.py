@@ -255,6 +255,23 @@ def scenario():
         assert "awaiting a decision" in run(budget_run, "attention")
         run(budget_run, "resume", ok=False)
         run(budget_run, "account", "bad key", actor, "1", ok=False)
+        # The unweighted detail is kept by actor and wake, once per report, and never changes what is charged.
+        run(budget_run, "limit", "budget=1000")
+        run(budget_run, "resume")
+        owner = hashlib.sha256(b"swarm-agent:worker-address").hexdigest()
+        for report in ("5", "5", "6"):
+            run(budget_run, "account", report * 64, owner, "30", "wake:1,2,300,4")
+        run(budget_run, "account", "7" * 64, "coordinator", "9", "relay+unread:5,0,40,1")
+        with open(os.path.join(budget_run, "members.json"), encoding="utf-8") as f:
+            usage = json.load(f)["usage"]
+        assert usage["detail"] == {owner: {"wake": [2, 2, 4, 600, 8]}, "coordinator": {"relay+unread": [1, 5, 0, 40, 1]}}, usage
+        assert usage["tokens"][owner] == 60, usage
+        with open(run(budget_run, "export").strip(), encoding="utf-8") as f:
+            exported = f.read()
+        assert "| @worker | worker | wake | 2 | 2 | 4 | 600 | 8 |" in exported, exported
+        assert "| @coordinator | coordinator | relay+unread | 1 | 5 | 0 | 40 | 1 |" in exported, exported
+        for bad in ("wake:1,2,3", "Wake:1,2,3,4", "wake:1,2,3,-4", "wake:1,2,3,4,5", ":1,2,3,4"):
+            run(budget_run, "account", "8" * 64, actor, "1", bad, ok=False)
         run(budget_run, "account", "4" * 64, "raw-address", "1", ok=False)
 
         finding_run = run(name, "init", "Investigator finding review").strip()

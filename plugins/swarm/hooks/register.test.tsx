@@ -1765,7 +1765,7 @@ test('losing the response to an END charge preserves its amount when a step and 
   on('process.run', (_, e) => {
     if (e.argv[3] !== 'account') return answer(board(e))
     const id = e.argv[4]!
-    const requested = Number(e.argv.at(-1))
+    const requested = Number(e.argv[6])
     attempts.push(requested)
     if (attempts.length >= 3 && !persisted.has(id)) persisted.set(id, requested)
     if (attempts.length <= 3) return { value: { ...answer('').value, exitCode: 1 } }
@@ -1843,7 +1843,9 @@ test('the run is bound from its first planning command, and only a real read of 
   for await (const _ of $.turn.step({ turnId: 'plan', index: 0, model: 'm', messageCount: 1 })) { /* no chunks */ }
   await bash('python3 /p/board.py /project/.swarm/demo init "Demo swarm"')
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'plan', usage: spent })
-  expect(seen.commands.filter(command => command.startsWith('account')).map(command => command.split(' ').at(-1))).toEqual(['250'])
+  expect(seen.commands.filter(command => command.startsWith('account')).map(command => command.split(' ')[3])).toEqual(['250'])
+  // The same charge carries what it spent before weighting and what started the turn: here, the user.
+  expect(seen.commands.filter(command => command.startsWith('account')).map(command => command.split(' ')[4])).toEqual([expect.stringMatching(/^user:\d+,\d+,\d+,\d+$/)])
 
   for (const [index, command] of [
     'python3 /p/board.py /project/.swarm/demo init "Demo swarm"',
@@ -1879,7 +1881,7 @@ test('the run is bound from its first planning command, and only a real read of 
   for (let other = 0; other < 256; other++) await step(`other-${other}`, 0)
   await step('long', 1)
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'long', usage: { ...spent, input_tokens: 200 } })
-  const charged = seen.commands.filter(command => command.startsWith('account')).map(command => Number(command.split(' ').at(-1)))
+  const charged = seen.commands.filter(command => command.startsWith('account')).map(command => Number(command.split(' ')[3]))
   expect(charged.reduce((sum, count) => sum + count, 0)).toBe(100 * 258)
 })
 
@@ -4679,7 +4681,7 @@ test('review: what the coordinator spent under one run is charged to that run, t
       failed.push(String(e.argv[2]))
       return { value: { exitCode: 1, stdout: '', stderr: 'busy', isStdoutTruncated: false, isStderrTruncated: false } }
     }
-    charged.push(`${e.argv[2]} ${e.argv.at(-1)}`)
+    charged.push(`${e.argv[2]} ${e.argv[6]}`)
     return answer(JSON.stringify({ title: 'x', total: 0, budget: 0, paused: false }))
   })
   on('agent.list', () => ({ value: [] }))
@@ -6702,7 +6704,7 @@ test('CR-3: replaying a turn from a closed/released run after a new run starts d
   })
   on('process.run', (_, e) => {
     if (e.argv[3] === 'account') {
-      charged.push(`${e.argv[2]}:${e.argv.at(-1)}`)
+      charged.push(`${e.argv[2]}:${e.argv[6]}`)
       return answer(JSON.stringify({ title: 'x', total: 100, budget: 0, paused: false }))
     }
     return answer(board(e))
@@ -6812,7 +6814,7 @@ test('CR3-4 & CR3-5: replay without usage retries failed END charge, and cross-s
     if (e.argv[3] === 'account') {
       if (holdAccount) await new Promise<void>(resolve => { releaseAccount = resolve })
       if (failAccount) return { value: { exitCode: 1, stdout: '', stderr: 'busy', isStdoutTruncated: false, isStderrTruncated: false } }
-      charged.push(`${e.argv[2]}:${e.argv.at(-1)}`)
+      charged.push(`${e.argv[2]}:${e.argv[6]}`)
       return answer(JSON.stringify({ title: 'Accounting swarm', total: 200, budget: 0, paused: false }))
     }
     return answer(board(e))
@@ -6956,7 +6958,7 @@ test('P1 delayed member turn.complete across session restart cannot bill new run
   on('process.run', (_, e) => {
     if (e.argv[3] === 'agent-run') return answer(activeRun)
     if (e.argv[3] === 'account') {
-      charged.push(`${e.argv[2]}:${e.argv.at(-1)}`)
+      charged.push(`${e.argv[2]}:${e.argv[6]}`)
       return answer(JSON.stringify({ title: 'Run', total: 500, budget: 500, paused: true }))
     }
     return answer(board(e))
@@ -7041,7 +7043,7 @@ test('P1 same-session run switch cannot bill new run for uncached member, and st
       return answer(found)
     }
     if (e.argv[3] === 'account') {
-      charged.push(`${e.argv[2]}:${e.argv.at(-1)}`)
+      charged.push(`${e.argv[2]}:${e.argv[6]}`)
       return answer(JSON.stringify({ title: 'Run', total: 400, budget: 0, paused: false }))
     }
     if (e.argv[3] === 'rearm') rearmed.push(e.argv[2]!)

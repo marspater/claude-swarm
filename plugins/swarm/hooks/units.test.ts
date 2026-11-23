@@ -3,7 +3,7 @@ import type { Post } from '../types'
 import { BOARD_CALL, CASE_PATTERN, COORDINATOR_READ, RUN, boardCalls, closesAfter, launches, makesCommit, runsNamed, scanShell, scriptsRun, shellLaunch, shellWords, splitShellSegments, substitutions, unwrap, wakeMessage, wakeSequence } from './command'
 import { edgesOf, graphSvg, isBroadcast } from './graph'
 import { actsAsAnother, commitsInSharedCheckout } from './guard'
-import { BOARD_ACTIONS, hiveArt, toolMood, toolSummary } from './hive'
+import { BOARD_ACTIONS, hiveArt, memberBee, toolMood, toolSummary } from './hive'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, SWARM_AGENTS, familyOf, latestOf } from './models'
 import { progressBar, semanticIcon, statusCss, statusDot, statusKey, swarmEmblem } from './palette'
 import { END, budgetOf, detailOf, findAgent, ledger, mentions, parse, parsePosts, postFields, statusOf, targets, tokensUsed } from './roster'
@@ -761,6 +761,26 @@ test('an ended turn the board still owes an answer for outlasts settled ones', (
   expect(book.owed().map(([turnId]) => turnId)).toEqual(['a'])
 })
 
+test('the usage detail follows each charge: each step for itself, and at the end what the board does not hold yet', () => {
+  const book = ledger()
+  const step = { input_tokens: 3, output_tokens: 4, cache_creation_input_tokens: 5, cache_read_input_tokens: 100 }
+  book.charge('t', step, 0)
+  book.charge('t', step, 1)
+  const turn = book.of('t')!
+  expect(book.detail(turn, 0)).toBe('3,5,100,4')
+  // the first lands, the second was never sent: the end carries the second step's and what no step reported
+  book.landed(turn, 22, 0)
+  book.landed(turn, 0, 1)
+  const owed = book.charge('t', { input_tokens: 7, output_tokens: 8, cache_creation_input_tokens: 10, cache_read_input_tokens: 200 })
+  book.held(turn, owed)
+  expect([book.detail(turn, 0), book.detail(turn, END)]).toEqual(['', '4,5,100,4'])
+  // a step still pending keeps its own detail, and the end leaves it out
+  const late = ledger()
+  late.charge('u', step, 0)
+  late.charge('u', undefined)
+  expect([late.detail(late.of('u')!, 0), late.detail(late.of('u')!, END)]).toEqual(['3,5,100,4', '0,0,0,0'])
+})
+
 test('a turn\'s end the board did not take stays owed under the turn\'s own report', () => {
   const book = ledger()
   const ten = { input_tokens: 10, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
@@ -1067,10 +1087,31 @@ test('visual polish: animated emblems, progress bars, semantic icons, status dot
   expect(liveGraph).toContain('packet-tail')
   expect(liveGraph).toContain('p-ping')
   expect(liveGraph).toContain('filter id="sh"')
+  expect(liveGraph).not.toContain('id="hub"')
+  expect(liveGraph).not.toContain('url(#hub)')
   expect(liveGraph).not.toContain('pattern')
   expect(liveGraph).not.toContain('class="surface"')
   const replayGraph = graphSvg(sample, 1, new Set(), true, false, false, 0)
   expect(replayGraph).toContain('packet-tail')
   expect(replayGraph).not.toContain('indefinite')
   expect(replayGraph).not.toContain('p-ping')
+
+  // Graph SVG legend reflects @all post counts and Expand @all toggle state
+  expect(graphSvg(sample, 1, new Set(), false, true, false, 0, false)).toContain('no @all posts yet')
+  const withAll = { ...sample, posts: [...sample.posts, { seq: 2, agent: 'coordinator', to: ['parser', 'verifier'], text: '@all sync', time: 't' }] }
+  expect(graphSvg(withAll, 2, new Set(), false, true, false, 0, false)).toContain('>@all 1<')
+  expect(graphSvg(withAll, 2, new Set(), false, true, false, 0, false)).toContain('@all posts, drawn by Expand @all')
+  expect(graphSvg(withAll, 2, new Set(), false, true, false, 0, true)).toContain('@all posts, drawn as dashed arrows')
+  expect(graphSvg(withAll, 1, new Set(), false, false, false, 0, false)).toContain('no @all posts yet')
+
+  // Member pixel-art bees match card hues, animate when active, and stay static when idle
+  for (const hue of ['claude', 'suggestion', 'planMode', 'ide', 'merged', 'permission', 'remember', 'autoAccept', 'subtle']) {
+    const activeBee = memberBee(hue, 'working', 300)
+    expect(activeBee).toContain('shape-rendering="crispEdges"')
+    expect(activeBee).toContain('@keyframes flutter')
+    expect(activeBee).not.toContain('NaN')
+    const idleBee = memberBee(hue, 'waiting', 300)
+    expect(idleBee).not.toContain('@keyframes flutter')
+    expect(idleBee).not.toContain('@keyframes bob')
+  }
 })

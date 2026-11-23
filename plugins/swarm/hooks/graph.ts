@@ -40,6 +40,7 @@ export function pairOf(edge: string): [string, string] | undefined {
 }
 
 const PILL_HEIGHT = 38
+const LEGEND = 50
 // The host refuses an Svg source longer than this, and the whole pane with it.
 export const SVG_LIMIT = 131_072
 // The name font is 14px in the drawing's own units; drawn smaller than this on screen, the graph gives way to a list.
@@ -185,15 +186,15 @@ const COLUMN_WIDTH = 8.77
 export function graphHeight(columns: number, members: Swarm['members']): number {
   // The desktop clamps the frame width to the actual slot. Columns estimate its height only, so a change in font
   // metrics cannot narrow the frame. The height follows the drawing's shape: a frame taller than the drawing
-  // leaves the difference empty above and below the graph.
+  // leaves the difference empty above the graph and below its legend.
   const { width, height } = stageOf(members)
-  return Math.max(200, Math.min(members.length > 22 ? 780 : 620, Math.round(columns * COLUMN_WIDTH * height / width)))
+  return Math.max(200, Math.min(members.length > 22 ? 780 : 620, Math.round(columns * COLUMN_WIDTH * (height + LEGEND) / width)))
 }
 
 /** The on-screen size of a member's name, in CSS pixels, in a pane `columns` wide: an estimate, at 8.77 px a column. */
 export function labelPx(columns: number, members: Swarm['members']): number {
   const { width, height } = stageOf(members)
-  return 14 * Math.min(columns * COLUMN_WIDTH / width, graphHeight(columns, members) / height)
+  return 14 * Math.min(columns * COLUMN_WIDTH / width, graphHeight(columns, members) / (height + LEGEND))
 }
 
 /** Each member's name as its pill shows it: a long one keeps its start and its end, and two never read the same. */
@@ -649,24 +650,31 @@ export function drawGraph(
     )
   })
 
-  // The key is pane text beside the drawing, where it keeps its size however small the drawing is scaled.
+  // The key under the diagram is drawn with the diagram's own classes, so it cannot say one thing and the lines another.
+  const row = height + 16
+  const lcw = Math.max(44, 30 + String(allPosts).length * 6.5)
+  const legend =
+    `<g class="legend"><g opacity=".72"><path class="edge" d="M16 ${row}H40" stroke-width="2.4"/><path class="tip" d="M48 ${row}l-9 -4.2v8.4z"/></g>` +
+    `<text x="56" y="${row}" dy=".35em">@mention, width = count</text>` +
+    `<g opacity=".72"><path class="edge via-all" d="M224 ${row}H248" stroke-width="1.6"/><path class="tip" d="M256 ${row}l-9 -4.2v8.4z"/></g>` +
+    `<text x="264" y="${row}" dy=".35em">via @all</text>` +
+    `<rect class="pill quiet" x="336" y="${row - 7}" width="26" height="14" rx="6"/>` +
+    `<text x="370" y="${row}" dy=".35em">posted with no mention</text>` +
+    `<g class="chip" transform="translate(${n1(16 + lcw / 2)} ${row + 22})"><rect x="${n1(-lcw / 2)}" y="-8" width="${n1(lcw)}" height="16" rx="8"/><text dy=".35em">@all ${allPosts}</text></g>` +
+    `<text x="${n1(16 + lcw + 8)}" y="${row + 22}" dy=".35em">${allPosts === 0 ? 'no @all posts yet' : expandAll ? '@all posts, drawn as dashed arrows' : '@all posts, drawn by Expand @all'}</text></g>`
   const key = 'Arrow: @mention, thicker for more · Dashed arrow: reached via @all · Dashed outline: posted with no mention · ' +
     (allPosts === 0 ? 'No @all posts yet' : `“@all N” on a member: its @all posts (${allPosts} in all), ${expandAll ? 'drawn as dashed arrows' : 'drawn by Expand @all'}`)
 
-  const hubGlow = coordinator
-    ? `<circle cx="${n1(width / 2)}" cy="${n1(height / 2)}" r="${n1(Math.min(width, height) * 0.34)}" fill="url(#hub)"/>`
-    : ''
   const pingCss = repeat
     ? `.p-ping{fill:none;stroke-width:1.4;transform-box:fill-box;transform-origin:center;animation:pp 2.6s cubic-bezier(.16,1,.3,1) -${phase % 2600}ms infinite}` +
       `.p-ping.working{stroke:var(--status-working)}.p-ping.coordinating{stroke:var(--status-coordinating)}` +
       `@keyframes pp{0%{transform:scale(1);opacity:.6}78%,100%{transform:scale(2.35);opacity:0}}`
     : ''
   const open =
-    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="100%" height="100%" font-family="system-ui, sans-serif">` +
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height + LEGEND}" width="100%" height="100%" font-family="system-ui, sans-serif">` +
     `<defs><clipPath id="stage"><rect width="${width}" height="${height}"/></clipPath>` +
     `<filter id="sh" x="-15%" y="-25%" width="130%" height="160%"><feDropShadow dx="0" dy="1.5" stdDeviation="2" flood-opacity=".11"/></filter>` +
-    `<linearGradient id="sg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--tint)"/><stop offset="100%" stop-color="var(--pill)"/></linearGradient>` +
-    `<radialGradient id="hub"><stop offset="0%" stop-color="var(--accent)" stop-opacity=".1"/><stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/></radialGradient></defs>` +
+    `<linearGradient id="sg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--tint)"/><stop offset="100%" stop-color="var(--pill)"/></linearGradient></defs>` +
     `<style>
       svg{--edge:#596375;--pill:#f8f8f7;--border:#87909d;--ink:#252628;--accent:#235fc4;--tint:#eaf2ff;--packet:#fff}
       @media (prefers-color-scheme: dark){svg{--edge:#9399a5;--pill:#242424;--border:#737982;--ink:#f1f1ef;--accent:#8fb8ff;--tint:#243750;--packet:#fff}}
@@ -690,6 +698,7 @@ export function drawGraph(
       .badge{fill:var(--tint);stroke:var(--accent);filter:url(#sh)}
       .chip rect{fill:var(--pill);stroke:var(--border)}.chip text{fill:var(--ink);opacity:.82;font-size:10.5px;font-weight:600;text-anchor:middle}
       .chip.on rect{fill:var(--tint);stroke:var(--accent)}
+      .legend>text{fill:var(--ink);opacity:.72;font-size:12px}
       ${statusCss}${pingCss}
       .presence{fill:none;stroke:var(--status-inactive);stroke-width:1.2}
       .presence-ring{fill:none;stroke:var(--status-waiting);stroke-width:1.2}
@@ -699,8 +708,10 @@ export function drawGraph(
       @media (prefers-reduced-motion: reduce){.motion,.motion-route{display:none}.reduced-route{display:inline}}
     </style>
     ` +
-    `<g clip-path="url(#stage)">${hubGlow}${ripples.join('')}</g>`
-  const close = active.join('') + nodes.join('') + badges.join('') + '</svg>'
+    `<g clip-path="url(#stage)">${ripples.join('')}</g>`
+  const close = active.join('') + nodes.join('') + badges.join('') +
+    `<line x1="16" y1="${height}" x2="${width - 16}" y2="${height}" stroke="var(--border)" opacity=".35"/>` +
+    legend + '</svg>'
   // Measured whole: the history goes in, busiest first, until the first route that would take the drawing past the
   // limit. A shorter, quieter one after it stays out too, so what is left out is always the quietest; and no route
   // after that one is routed at all, since none could be drawn.

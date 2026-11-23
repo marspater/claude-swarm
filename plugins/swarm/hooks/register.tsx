@@ -9,7 +9,7 @@ import { DEFAULT_EFFORT, DEFAULT_MODEL, LATEST, SPECIALISTS, SWARM_AGENTS, famil
 import { END, KEPT, budgetOf, findAgent, ledger, memberNamed, mentions, parse, parsePosts, postFields, targets, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
 import { CLIP, bodyOf, chipped, clean, clip, compact, fenceAfter, hasQuestion, head, kindOf, openedText, verdictOf, type Fence } from './text'
 import { progressBar, semanticIcon, statusDot, statusInk, swarmEmblem, type BarTone, type EmblemState } from './palette'
-import { hiveArt, toolMood, toolSummary, type Mood } from './hive'
+import { hiveArt, memberBee, toolMood, toolSummary, type Mood } from './hive'
 import { MIN_LABEL_PX, SVG_LIMIT, drawGraph, edgesOf, graphHeight, isBroadcast, labelPx, pairOf, visibleMembers } from './graph'
 
 const PANE = 'swarm'
@@ -316,6 +316,12 @@ const stepped = ledger()
 // turn's end so a replay cannot be attributed to a replacement run.
 type TurnOwner = string | number
 const turnRuns = new Map<string, TurnOwner>()
+// What started each turn, for the usage detail: a notice the monitor submitted (named by `wakeNext` until the turn it
+// starts), else the user; a member's first turn here, else a wake.
+// ponytail: a member turn after the hooks reload counts as `start` once; record starts on the board if that skews a comparison.
+const turnWakes = new Map<string, string>()
+const wokenAgents = new Set<string>()
+let wakeNext = ''
 function rememberTurnRun(turnId: string, owner: TurnOwner): void {
   turnRuns.set(turnId, owner)
   if (turnRuns.size > TURNS_KEPT) turnRuns.delete(turnRuns.keys().next().value!)
@@ -1516,12 +1522,14 @@ async function refresh($: EngineInterface): Promise<void> {
         pauseOwed = ''
         memberPausesOwed = []
         noticeHold = (await $.clock.now()) + NOTICE_HOLD_MS
+        wakeNext = 'pause'
         void $.prompt.submit({ text }).then(result => {
           if (epoch !== generation) return
-          if (result.drop) { noticeHold = 0; unheard() }
+          if (result.drop) { noticeHold = 0; wakeNext = ''; unheard() }
         }).catch(() => {
           if (epoch !== generation) return
           noticeHold = 0
+          wakeNext = ''
           unheard()
         })
       }
@@ -1570,6 +1578,7 @@ async function refresh($: EngineInterface): Promise<void> {
       if (askRelay) relayHinted = keyToRelay
       if (answerThrough) hinted = Math.max(hinted, answerThrough)
       noticeHold = (await $.clock.now()) + NOTICE_HOLD_MS
+      wakeNext = [askRelay && 'relay', answerThrough && 'unread', askStall && 'stall'].filter(Boolean).join('+')
       void $.prompt.submit({ text: `Swarm: ${heading}\nRun: ${full.title.replace(/\s+/g, ' ')}\n${notices.join('\n\n')}` })
         .then(result => {
           if (epoch !== generation) return
@@ -1577,6 +1586,7 @@ async function refresh($: EngineInterface): Promise<void> {
           // An explicit drop can mean the user stopped the session. Leave the notice on the board.
           if (result.drop) {
             noticeHold = 0
+            wakeNext = ''
             if (askRelay && relayHinted === keyToRelay) relayHinted = told.relayHinted
             if (answerThrough && hinted === answerThrough) hinted = told.hinted
             $.ui.toast('Swarm was unable to notify the coordinator. Check the board for pending work.')
@@ -1584,6 +1594,7 @@ async function refresh($: EngineInterface): Promise<void> {
         }).catch(() => {
           if (epoch !== generation) return
           noticeHold = 0
+          wakeNext = ''
           if (askRelay && relayHinted === keyToRelay) relayHinted = told.relayHinted
           if (answerThrough && hinted === answerThrough) hinted = told.hinted
           if (++noticeFailures >= WAKE_ATTEMPTS) {
@@ -1822,6 +1833,7 @@ async function account(
   amount: number,
   owner: TurnOwner,
   expectedEpoch: number,
+  detail = '',
 ): Promise<number | false | undefined> {
   const at = typeof owner === 'string' ? owner : undefined
   const isCurrent = () => expectedEpoch === sessionEpoch && !isEnding && (at !== undefined || owner === generation)
@@ -1867,7 +1879,8 @@ async function account(
     address ? digest(`swarm-agent:${address}`) : Promise.resolve('coordinator'),
   ])
   if (expectedEpoch !== sessionEpoch || isEnding) return undefined
-  const result = await boardCommand($, dir, ['account', turn, actor, String(amount)])
+  const wake = turnWakes.get(turnId) ?? (agentId ? 'wake' : 'user')
+  const result = await boardCommand($, dir, ['account', turn, actor, String(amount), ...(detail ? [`${wake}:${detail}`] : [])])
   if (result.exitCode !== 0 || result.stdout.trim() === '') return false
   if (expectedEpoch !== sessionEpoch || isEnding) return amount
   const entry = JSON.parse(result.stdout) as { title: string; total: number; budget: number; paused: boolean; member_paused?: unknown; accepted?: number }
@@ -1897,9 +1910,10 @@ async function account(
   const unheard = () => $.ui.toast(`Swarm paused "${entry.title}": its token budget of ${compact(entry.budget)} is spent, and the coordinator could not be told. Raise the budget or close the run.`)
   if (isTold) return accepted
   noticeHold = (await $.clock.now()) + NOTICE_HOLD_MS
+  wakeNext = 'pause'
   void $.prompt.submit({
     text: `Swarm: Run paused at token budget\n${entry.title} spent ${compact(entry.total)} tokens and reached its budget of ${compact(entry.budget)}. Tell the user what is done and ask whether to raise the budget with limit and then resume, or close the run.`,
-  }).then(result => { if (result.drop) { noticeHold = 0; unheard() } }).catch(() => { noticeHold = 0; unheard() })
+  }).then(result => { if (result.drop) { noticeHold = 0; wakeNext = ''; unheard() } }).catch(() => { noticeHold = 0; wakeNext = ''; unheard() })
   return accepted
 }
 
@@ -2579,6 +2593,7 @@ function shortcut($: EngineInterface, e: Parameters<EngineInterface['ui']['resol
   const button = (
     <Button
       key={SHORTCUT}
+      plain={e.surface === 'desktop' ? true : undefined}
       variant={isLive && !shown.isPaused ? 'primary' : 'secondary'}
       label="Swarm: The Board"
       hover={{ scope: 'swarm-shortcut' }}
@@ -2618,7 +2633,8 @@ function shortcut($: EngineInterface, e: Parameters<EngineInterface['ui']['resol
         borderColor={pillBorder}
         borderDimColor
         hover={{ scope: 'swarm-shortcut', borderDimColor: false }}
-        paddingX="xs"
+        paddingX="sm"
+        paddingY="xs"
       >
         <Svg source={swarmEmblem(state)} alt="Swarm" width={16} height={16} />
         {button}
@@ -2662,6 +2678,9 @@ export const register: Register = on => {
     strangers.clear()
     stepped.clear()
     turnRuns.clear()
+    turnWakes.clear()
+    wokenAgents.clear()
+    wakeNext = ''
     retiredRuns.clear()
     strandedFrom = 0
     teammates.clear()
@@ -3270,6 +3289,10 @@ export const register: Register = on => {
       activeCoordinatorTurnId = e.turnId
       noticeHold = 0
     }
+    turnWakes.set(e.turnId, e.agentId === undefined ? wakeNext || 'user' : wokenAgents.has(e.agentId) ? 'wake' : 'start')
+    if (turnWakes.size > TURNS_KEPT) turnWakes.delete(turnWakes.keys().next().value!)
+    if (e.agentId === undefined) wakeNext = ''
+    else wokenAgents.add(e.agentId)
 
     return next(e)
   })
@@ -3303,7 +3326,7 @@ export const register: Register = on => {
         if (at !== undefined && !turnRuns.has(e.turnId)) rememberTurnRun(e.turnId, at)
         // The turn's end waits for this charge. Planning steps that begin before a run is bound fall to that end.
         turn.landing = turn.landing
-          .then(() => at === undefined ? undefined : account($, e.turnId, `${e.turnId}:${e.index}`, e.agentId, delta, at, sEpoch))
+          .then(() => at === undefined ? undefined : account($, e.turnId, `${e.turnId}:${e.index}`, e.agentId, delta, at, sEpoch, stepped.detail(turn, e.index)))
           .catch(() => false as const)
           // One never sent is no longer pending under its own report: its turn's end charges it.
           .then(landed => { if (sEpoch === sessionEpoch && !isEnding && landed !== false) stepped.landed(turn, landed ?? 0, e.index) })
@@ -3357,7 +3380,7 @@ export const register: Register = on => {
             for (const [index, amount] of [...owing.pending]) {
               if (sEpoch !== sessionEpoch || isEnding) break
               const report = index === END ? endReport(turnId, owing) : `${turnId}:${index}`
-              const accepted = await account($, turnId, report, owing.agentId, amount, under, sEpoch).catch(() => false as const)
+              const accepted = await account($, turnId, report, owing.agentId, amount, under, sEpoch, stepped.detail(owing, index)).catch(() => false as const)
               if (accepted) {
                 stepped.landed(owing, accepted, index)
                 isCharged = true
@@ -3373,7 +3396,7 @@ export const register: Register = on => {
         const ended = stepped.of(e.turnId)
         if (ended && owed > 0 && !ended.pending.has(END)) {
           stepped.held(ended, owed)
-          const taken = await account($, e.turnId, endReport(e.turnId, ended), e.agentId, owed, turnRuns.get(e.turnId) ?? at, sEpoch).catch(() => false as const)
+          const taken = await account($, e.turnId, endReport(e.turnId, ended), e.agentId, owed, turnRuns.get(e.turnId) ?? at, sEpoch, stepped.detail(ended, END)).catch(() => false as const)
           // The ledger may have been cleared meanwhile (a new session): nothing is left to mark.
           if (sEpoch !== sessionEpoch || isEnding) return next(e)
           if (taken !== false) stepped.landed(ended, taken ?? 0, END)
@@ -3465,6 +3488,9 @@ export const register: Register = on => {
     strangers.clear()
     stepped.clear()
     turnRuns.clear()
+    turnWakes.clear()
+    wokenAgents.clear()
+    wakeNext = ''
     retiredRuns.clear()
     strandedFrom = 0
     // A teammate's address is kept through /clear and a resume: one that ends afterwards has left the agent
@@ -4428,6 +4454,7 @@ export const register: Register = on => {
         return (
           <Box
             key={member.name}
+            position="relative"
             flexDirection="column"
             gap="xs"
             borderStyle="round"
@@ -4472,6 +4499,11 @@ export const register: Register = on => {
                   <Button key={`feed-${member.name}`} plain dimColor hover={{ dimColor: false }} label="Posts" onPress={() => feedOf(member.name)} />
                 )}
                 {member.role === 'coordinator' && !hasMainTalk && <Text size="caption" dimColor>Its conversation is not available here.</Text>}
+              </Box>
+            )}
+            {HeaderArt && (
+              <Box position="absolute" top={0} right={1}>
+                <HeaderArt source={memberBee(hueOf(member.name), member.status, hiveOffset)} alt=" " width={24} height={16} />
               </Box>
             )}
           </Box>
@@ -4544,7 +4576,7 @@ export const register: Register = on => {
       // A closed, paused or looked-at run moves only while it is replayed.
       const isLiveRun = !browsed && !shown.isClosed && !shown.isPaused
       const animate = playing || (isLiveRun && live && pulse === post.seq)
-      const repeat = isLiveRun && index === shown.posts.length - 1 && !animate
+      const repeat = !playing && index === shown.posts.length - 1 && !animate
       const isExpanded = await read($, expandAll)
       const hasBroadcast = shown.posts.some(isBroadcast) || Object.keys(shown.earlierEdges ?? {}).some(edge => edge.endsWith('>@all'))
       const isLiveVisible = live && isLiveRun
@@ -4765,7 +4797,7 @@ export const register: Register = on => {
         </Box>
         {error && <Text color="warning">{error}</Text>}
         <Box flexDirection="row" gap="sm" flexWrap="wrap" alignItems="center" marginTop="xs">
-          <Text size="caption" weight="semibold" dimColor>Run</Text>
+          <Text dimColor>Run</Text>
           {/* At an end of the history the list showed, the step is text, as a replay step that leads nowhere is. */}
           {runEdge.dir === shown.dir && runEdge.older === false
             ? <Text key="run-prev" dimColor>‹ Prev run</Text>
@@ -4778,12 +4810,14 @@ export const register: Register = on => {
             <Button
               key="run-pause"
               plain
+              dimColor
+              hover={{ scope: 'run-pause', dimColor: false }}
               label={shown.isPaused ? 'Resume run' : 'Pause run'}
               onPress={() => control($, shown.dir, shown.isPaused ? ['resume'] : ['pause', 'paused from the pane'])}
             />
           )}
           {browsed && <Text weight="semibold" color="warning">Not the live run · read-only</Text>}
-          {browsed && <Button key="run-live" plain label="Back to live run" onPress={() => browse($, 0)} />}
+          {browsed && <Button key="run-live" plain dimColor hover={{ scope: 'run-live', dimColor: false }} label="Back to live run" onPress={() => browse($, 0)} />}
         </Box>
         {HeaderArt && (
           <Box marginTop="xs">
