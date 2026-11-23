@@ -2423,6 +2423,10 @@ class BoardRegressions(unittest.TestCase):
         assert "v" in unstarted(d)  # @b's READY still stands, and all of them are its to review
         run(d, "member", "v", "reviews=")
         assert "reviews" not in saved(d)["members"]["v"] and "v" not in unstarted(d)
+        run(d, "member", "v", "reviews=b")
+        run(d, "replace", "b", "b2")  # its successor's READY is reviewed early in its place
+        assert saved(d)["members"]["v"]["reviews"] == "b2"
+        run(d, "replace", "c", "c2", "reviews=b2", ok=False)  # checked on a replacement as on a member
 
     def test_a_read_only_report_is_kept_as_a_file_for_briefs_to_name(self):
         d = self.init_run()

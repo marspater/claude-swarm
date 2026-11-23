@@ -195,6 +195,19 @@ def save(d, state):
     atomic_write(os.path.join(d, "members.json"), json.dumps(state, indent=1))
 
 
+def set_reviews(member, asked, members):
+    """Set MEMBER's reviews= to ASKED, as `member` and `replace` take it: registered workers or all, on a verifier."""
+    asked = list(dict.fromkeys(n.strip().lstrip("@").lower() for n in asked.split(",") if n.strip()))
+    if asked and member.get("role") != "verifier":
+        sys.exit("reviews= is a verifier's: it names the workers whose READY it reviews as each arrives")
+    unknown = [n for n in asked if n != "all" and (n not in members or members[n].get("role") != "worker")]
+    if unknown:
+        sys.exit("reviews= takes registered workers, or all, and not " + ", ".join("@" + n for n in unknown))
+    member["reviews"] = ",".join(asked)
+    if not asked:
+        member.pop("reviews")
+
+
 def planned(d):
     """The `prepare` arguments the coordinator recorded with `verify.py ... prepare ... --when-ready`, or None."""
     try:
@@ -2164,15 +2177,7 @@ def main(argv):
             member.update(changes)
             merge_after(member, changes, previous.get("after", ""))
             if "reviews" in changes:
-                asked = list(dict.fromkeys(n.strip().lstrip("@").lower() for n in changes["reviews"].split(",") if n.strip()))
-                if asked and member.get("role") != "verifier":
-                    sys.exit("reviews= is a verifier's: it names the workers whose READY it reviews as each arrives")
-                unknown = [n for n in asked if n != "all" and (n not in members or members[n].get("role") != "worker")]
-                if unknown:
-                    sys.exit("reviews= takes registered workers, or all, and not " + ", ".join("@" + n for n in unknown))
-                member["reviews"] = ",".join(asked)
-                if not asked:
-                    member.pop("reviews")
+                set_reviews(member, changes["reviews"], members)
             if member.get("killed"):  # a retired member runs no more turns: nothing is paused
                 member.pop("paused", None)
                 member.setdefault("retired_at", len(posts))
@@ -2405,6 +2410,8 @@ def main(argv):
             if named:
                 given["depends"] = asked
             validate_member(new, entry, given, members)
+            if "reviews" in given:
+                set_reviews(entry, given["reviews"], members)
             if given.get("id"):  # started as it is registered, as in `member`
                 started_as(entry)
             if given.get("group") in {"", "-"}:
@@ -2419,6 +2426,8 @@ def main(argv):
                     member["depends"] = ",".join(dict.fromkeys(new if dep == old else dep for dep in dependencies(member)))
                 if member.get("after"):
                     member["after"] = ",".join(dict.fromkeys(new if dep == old else dep for dep in member["after"].split(",")))
+                if member.get("reviews"):  # and whoever reviewed its READY early reviews the successor's
+                    member["reviews"] = ",".join(dict.fromkeys(new if dep == old else dep for dep in member["reviews"].split(",")))
             stranded(new, members)
             # Only what this command asks for: an inherited wait for a removed member is the blocked
             # state Attention already lists, and replacing the waiter must stay possible.

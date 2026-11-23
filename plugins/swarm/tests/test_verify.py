@@ -1090,10 +1090,16 @@ class VerifyRegressions(unittest.TestCase):
             assert candidate() == first
             # A NOT PASSED against the follow-up worker holds the candidate up: a pass would close its finding unseen.
             run(*post, "post", "v", "@late NOT PASSED: F1 the triage missed a thread")
-            held = subprocess.run(command, shell=True, capture_output=True, text=True, cwd=proj)
-            assert held.returncode and "waiting for READY from @late" in held.stderr, held.stderr
+            def held():
+                done = subprocess.run(command, shell=True, capture_output=True, text=True, cwd=proj)
+                return done.returncode and done.stderr
+            assert "waiting for READY from @late" in held(), held()
+            run(*post, "revise", "late", "looking at the thread")  # withdrawing its report answers nothing
+            assert "waiting for READY from @late" in held(), held()
+            run(*post, "replace", "late", "late2")  # nor does a successor, whose finding it now is
+            assert "waiting for READY from @late2" in held(), held()
             # Retiring the last worker that is not ready completes the team: the plan runs then too.
-            assert first in run(*post, "member", "late", "killed=1")
+            assert first in run(*post, "member", "late2", "killed=1")
             # After a rework the next READY prepares the next one, again with no word from the coordinator.
             run(*post, "post", "v", "@a NOT PASSED: F2 the file is missing a line")
             assert candidate() == first

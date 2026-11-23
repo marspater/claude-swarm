@@ -24,7 +24,7 @@ import time
 import uuid
 
 sys.dont_write_bytecode = True
-from board import REPORT_WORD, atomic_write, latest_reports, load, load_state, private, readiness, save, shown, unfenced, withdrawn_in
+from board import REPORT_WORD, atomic_write, latest_reports, ledger, load, load_state, private, readiness, save, shown, unfenced, withdrawn_in
 
 GIT_ENV_STRIP = {
     "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
@@ -301,11 +301,12 @@ def inputs(run, mode, subset=None, *, allow_closed=False, among=None):
     ready = readiness(members, posts)
     # A consultant advises the coordinator: it contributes nothing to the candidate. A worker registered after the
     # candidate was prepared is not in it either. Seen live: a worker added for follow-up work held up `accept`.
+    # ...unless an open finding is its to answer: a pass would close it and acceptance move the ledger past it. Read
+    # from the ledger, so it holds through a `revise` and for the successor of a replaced worker, until a new READY.
+    owing = {owner for finding in ledger(state, posts).values() if finding["open"] for owner in finding["owners"]}
     workers = [name for name, member in members.items()
                if member.get("role") == "worker" and not member.get("killed") and member.get("consult") != "1"
-               and (among is None or name in among
-                    # ...unless a NOT PASSED stands against it: accepting would move the ledger past its open finding.
-                    or (name not in ready and latest_reports(posts).get(name, {}).get("kind") == "ready"))]
+               and (among is None or name in among or (name not in ready and name in owing))]
     stray = sorted(set(subset or ()) - set(workers))
     if stray:
         raise ValueError("--members takes the active workers a candidate holds, and not " + ", ".join("@" + n for n in stray))
