@@ -25,14 +25,15 @@ Size the team from what is known to be wrong, not from how much code there is. A
 1. **What is known to be wrong?** Count the symptoms, failing checks or requested changes the user named. None means an audit: the first row below.
 2. **Where will files change?** List the places you can already name. Places you cannot name yet are not pieces: they are one triage question.
 3. **Do the places touch?** Pieces that share a file, a type or a contract are one member's, or need a seam. Count the groups that can proceed alone: that count is the most writers the task can use.
-4. **How much must really be read?** Search hits and the recent diff (`git diff --stat`, `git log --since`), not the whole tree. A member reads hits and their callers, so a directory with three hits is not a member.
+4. **How much must really be read?** Search hits and the recent diff (`git diff --stat`, `git log --since`), not the whole tree. A member reads hits and their callers, so a directory with three hits is not a member. When the task is to read all of it (a forensic audit of a core the user named), measure it: `wc -c` over the files, divided by 3.5, is its size in tokens. One member reads about 60,000 tokens of source and still has room to trace and report, so the members are that size divided by 60,000, rounded up. A single file above 60,000 tokens is split by line range between two members before anyone starts. Seen live: a 84,000-token file given to one member came back half read, and a member was added mid-run.
 5. **What proves it done?** One check that already exists means one verifier at most. No change means no verifier.
 
 The writers are the smaller of what the table gives and what step 3 counted. A verifier is added to that count wherever something changes.
 
 | What is known | Team | Size and effort |
 | --- | --- | --- |
-| Nothing is known to be broken: an audit, a sweep, a review "for bugs" | One or two read-only members over the whole area, and no verifier until something is changed | `size=s`, the profile's default effort |
+| Nothing is known to be broken, over a wide area: a sweep, a review "for bugs" | One or two read-only members that triage by search, and no verifier until something is changed | `size=s`, the profile's default effort |
+| Nothing is known to be broken, and the user wants a named core read in full | Read-only members by the measure in question 4, and at most one member with a shell to reproduce the findings rated medium or higher | `size=m`, the profile's default effort |
 | One symptom, cause unknown | One investigator. Writers only after the cause is confirmed | `size=m`; `effort=high` only on a narrow scope |
 | Known changes in separate places | One worker per place that really changes, and one verifier | `size=s` or `size=m` per piece |
 | Known changes across sub-systems, with seams between them | The full shape: workers, a verifier, a specialist where one has a distinct assignment | As each piece needs |
@@ -105,7 +106,8 @@ A member starts with nothing but its brief and the first two lines (`@name BRIEF
 - **Seams:** any contract it shares with another piece. When two or more members share one, post it once, before anyone is started and before the individual briefs: a post whose first line addresses those members and the verifier and ends in BRIEF (`@parser @currency @verifier BRIEF`), then a `Seams:` block. The individual briefs then do not repeat it, and each still writes only its own member's name with `@`. The shared post goes first because a mention wakes a started member; `BOARD replace` copies it into a successor's brief.
 - **Done when:** a check the member can run and see pass. "Works correctly" is not a check.
 - **Repository rules:** the user's standing instructions that apply, such as commit-message rules. State the few rules that apply in the seam post. Do not send every member to read the project's guides (`AGENTS.md`, an architecture document): each member pays for the same files again.
-- **How to report:** `BOARD ready <name>`, or the board tool's `ready` action for a specialist.
+- **How to report:** `BOARD ready <name>`, or the board tool's `ready` action for a specialist. A verifier reports with a post: the board refuses it `ready`.
+- **Only what its tools can do.** An explorer, an investigator and an architect have no shell: they read and search. Do not tell one to run a command (`git diff`, a test, a script); the board refuses such a brief. Run the command yourself, write its output to a file outside the project, and name the file in the brief.
 
 ## Cost
 

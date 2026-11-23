@@ -124,11 +124,25 @@ INTERROGATIVE = re.compile(r"[ \t]*(?![ \t])(?:@[A-Za-z0-9_-]+(?![A-Za-z0-9_-])[
 # A clause ends at a question mark or a line's end, and at `.`, `:`, `;` or `!` only before a blank or a line's end:
 # the dot in src/config.ts ends nothing.
 STOP = re.compile(r"[.:;!](?=[ \t\n])|[?\n]")
+# A question quoted whole on one line is somebody else's, told as part of a report: `the verifier posts "@w does it
+# parse CRLF?"` asks nothing. Seen live: a finding's scenario quoted one, and the coordinator paid a turn to say so.
+# A brief that tells its reader to run a command. After "run" or "execute" any command counts: one in a code span, or a
+# bare one with a flag (`Run ls -la first`). After a looser verb only a known program in a code span does: "Read
+# `src/a.ts`" and "use `parseDate`" order nothing. Neither does "Do not run `x`".
+SHELL_ORDER = re.compile(
+    r"(?<!\bnot )(?<!\bnever )(?<!n't )\b(?:"
+    r"(?:run|execute)[ \t]+(?:the[ \t]+)?(?:`([^`\n]+)`|([\w./-]+(?:[ \t]+[\w./-]+){0,2}[ \t]+--?[A-Za-z][\w-]*))"
+    r"|(?:read|start with|use|call|check with)[ \t]+(?:the[ \t]+)?"
+    r"`((?:git|python3?|bunx?|npm|npx|pnpm|yarn|pytest|make|cargo|go|xcodebuild|swift|sh|bash|zsh|\./)\b[^`\n]*)`)", re.I)
+# A question quoted whole on one line is somebody else's, told as part of a report: `the verifier posts "@w does it
+# parse CRLF?"` asks nothing. Seen live: a finding's scenario quoted one, and the coordinator paid a turn to say so.
+SPOKEN = re.compile(r'"[^"\n]*"')
 
 
 def asks(text):
     """Whether TEXT asks something. Quotes go first: an optional type inside a code span is already gone."""
-    text = QUOTED.sub(" ", text)
+    # Whole spans are taken in order, so a closing quote never opens the next one.
+    text = SPOKEN.sub(lambda span: " " if "?" in span[0] else span[0], QUOTED.sub(" ", text))
     scanned, start = 0, 0
 
     def optional(m):
@@ -964,8 +978,10 @@ def runnable(name, members, posts, ready):
     # unready never does, even when it names one. @all and a group are news it reads on its first turn anyway:
     # only its name or @verifiers asks it to start.
     briefs = [p["seq"] for p in posts if name in p["to"] and brief(p)]
+    # The request is the coordinator's: a member that names the verifier in an interim note starts no review of half
+    # the work. Seen live: one such mention cost a verifier a round of interim verdicts, one of them wrong.
     return bool(briefs) and any(p["seq"] > briefs[0] and name in p["to"] and not p.get("kind") and not brief(p)
-                                and mentions(p["text"]) & {name, "verifiers"} for p in posts)
+                                and p["agent"] == COORDINATOR and mentions(p["text"]) & {name, "verifiers"} for p in posts)
 
 
 def rework(state, posts):
@@ -2359,6 +2375,17 @@ def main(argv):
                          "Wait for the candidate; report anything else as NOT VERIFIED or as a note. "
                          "A pass a later NOT PASSED or NOT VERIFIED withdrew is restored only by running the test again.")
             recipients = [name for name in targets(text, members, sender=sender) if name != sender]
+            if sender == COORDINATOR and word == "BRIEF" and (order := SHELL_ORDER.search(text)):
+                # Refused, the brief is corrected in the same step. Seen live: three investigators told to read
+                # `git diff` rebuilt it by comparing two copies of a 5,000-line file.
+                # Whom the first line assigns, as `addressed` records: a member the text only refers to runs nothing.
+                without = [name for name in targets(first, members, sender=sender) if name != sender and kind_of(members[name]) in READ_ONLY]
+                if without:
+                    sys.exit("%s no shell (%s read and search only), so the brief cannot have %s run `%s`. Run it yourself and "
+                             "name the file its output is in, or give that step to a member with a shell. Nothing was posted"
+                             % (" and ".join("@" + name for name in without) + (" has" if len(without) == 1 else " have"),
+                                ", ".join(sorted({kind_of(members[name]) + "s" for name in without})),
+                                "it" if len(without) == 1 else "them", next(part for part in order.groups() if part).strip()))
             stuck, verdict = "", {}
             if passed and passed.get("partial"):  # a pass of some workers' pieces, never the run's
                 verdict = {"partial": True, "members": passed.get("members", [])}

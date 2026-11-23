@@ -374,7 +374,8 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
     if (!INERT.has(name)) {
       if (/^(?:python\d*|perl|node|ruby|osascript|su|tmux)$/.test(name) &&
           (name === 'tmux' || args.some(arg => /^-[A-Za-z]*[ce]/.test(arg))) &&
-          args.some(arg => /\bgit\s+(?:commit|commit-tree|fast-import|quiltimport)\b/.test(arg))) return HIT
+          // Inline code names git and the subcommand any way it likes: `git commit`, or `['git', 'commit']`.
+          args.some(arg => NAMES_COMMIT.test(arg))) return HIT
       if ((unreadWrapper || RUNNERS.has(name)) && NAMES_COMMIT.test(words.slice(at).join(' '))) return HIT
       const runsGit = words.slice(at + 1).some(word => /^git(?:-.+)?$/.test(word.replace(/^.*\//, '')))
       if (runsGit && (fromStdin || NAMES_COMMIT.test(words.slice(at).join(' ')))) return HIT
@@ -702,6 +703,19 @@ export function waitsOnLooseMatch(command: string): boolean {
 // them. Those that name a member name itself.
 const MEMBER_READS = new Set(['show', 'status', 'plan', 'attention', 'tail'])
 const MEMBER_OWN = new Set(['read', 'post', 'ready', 'revise', 'sync'])
+/** Whether WORD's last path part is a glob that FILE's name matches: `board.p?`, `boar*`, `[b]oard.py`. */
+function globNames(word: string, file: string): boolean {
+  const base = word.replace(/^.*\//, '')
+  if (!/[*?[]/.test(base)) return false
+  const pattern = base.replace(/\[!?([^\]]*)\]|[.+^${}()|\\]|[*?]/g, (part, set: string | undefined) =>
+    set !== undefined ? `[${part[1] === '!' ? '^' : ''}${set.replace(/\\/g, '\\\\')}]` : part === '*' ? '.*' : part === '?' ? '.' : `\\${part}`)
+  try {
+    return new RegExp(`^${pattern}$`).test(file)
+  } catch {
+    return true // a pattern this cannot read may name the file
+  }
+}
+
 /**
  * Why a member's Bash command acts as another or as the coordinator, or undefined. Read off every script the command
  * runs (its substitutions, `sh -c`, `eval`), through `cd …&&`, env prefixes and python's flags. A board or verify
@@ -720,11 +734,10 @@ export function actsAsAnother(command: string, name: string, member: Roster[stri
     for (const target of ['board', 'verify']) {
       const file = `${target}.py`
       if (launches(words, file, command)) continue
-      const glob = new RegExp(`(?:^|/)${target}[*?\\[][^/\\s]*$`)
       const expanded = words.flatMap((word, index) => {
         const value = expand(word)
         if (index === atCommand && value !== word && /\s/.test(value)) return shellWords(value)
-        return glob.test(value) ? file : value
+        return globNames(value, file) ? file : value
       })
       if (launches(expanded, file)) return unread(target)
     }

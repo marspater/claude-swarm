@@ -1761,6 +1761,9 @@ function senderOf(e: { text: string; origin: { kind: string } }): string | undef
  */
 const HANDBACK_MIN = 400
 const HANDBACK_PART = 11_000
+// The share of a closing report's words its board report must hold for the closing words to count as a repeat.
+const HANDBACK_REPEATS = 0.8
+const HANDBACK_FRAME = /^The text below is the final report of a subagent[\s\S]*?The report follows:[ \t]*\n?/
 async function mirrorHandback($: EngineInterface, e: { text: string; origin: { kind: string } }): Promise<string | undefined> {
   const roster = ownedRoster
   if (e.origin.kind !== 'peer' || !roster || roster.closed) return undefined
@@ -1779,30 +1782,45 @@ async function mirrorHandback($: EngineInterface, e: { text: string; origin: { k
   const entry = Object.entries(fresh.members).find(([name, m]) => name !== 'coordinator' && m.id && m.killed !== '1' && (m.id === from || m.id === address))
   if (!entry) return undefined
   const [name, member] = entry
+  // The host frames every hand-back with a note of its own, longer than the least report worth a post: measured
+  // and posted without it. Seen live: a one-line status was mirrored because its frame alone passed the minimum.
+  const report = body.replace(HANDBACK_FRAME, '').trim()
   const newest = parsePosts(board, fresh.members).findLast(post => post.agent === name)
   if (newest && newest.seq > Number(member.last_nudged_seq ?? 0)) {
-    const compactBody = body.replace(/\s+/g, ' ').trim()
-    if (compactBody && body.length >= HANDBACK_MIN && newest.text.replace(/\s+/g, ' ').includes(compactBody)) {
-      return e.text.replace(body, `@${name} reported on the board in post #${newest.seq}.`)
+    const compactBody = report.replace(/\s+/g, ' ').trim()
+    if (compactBody && report.length >= HANDBACK_MIN && newest.text.replace(/\s+/g, ' ').includes(compactBody)) {
+      return e.text.replace(body, () => `@${name} reported on the board in post #${newest.seq}.`)
+    }
+    // A turn that ended on its own report has said it, even once the member read that post back: closing words that
+    // repeat the report are not posted again. Seen live: a READY read back after an UNREAD note went up a second time
+    // as a hand-back. Words the report does not hold are news (work done after it), and are posted as before.
+    if (report.length >= HANDBACK_MIN && ['READY', 'FINDING', 'VERIFIED', 'NOT PASSED'].includes(kindOf(newest.text)?.label ?? '')) {
+      const wordsOf = (text: string) => new Set(text.toLowerCase().match(/[a-z0-9_]{4,}/g) ?? [])
+      const said = wordsOf(newest.text)
+      const closing = [...wordsOf(report)]
+      // A replacer function: the report's own `$&` or `$'` must reach the notice as typed.
+      if (closing.length > 0 && closing.filter(word => said.has(word)).length >= closing.length * HANDBACK_REPEATS) {
+        return e.text.replace(body, () => `@${name} reported on the board in post #${newest.seq}. Its closing words began: ${clip(compactBody, 300)}`)
+      }
     }
     if (newest.seq > member.last_read_seq) return undefined
   }
-  if (body.length < HANDBACK_MIN) return undefined
+  if (report.length < HANDBACK_MIN) return undefined
   // A post holds 12,000 characters: a longer report goes up in parts, and the pointer replaces it only once every
   // part is saved. A part the board did not take leaves the coordinator the report itself.
-  const parts = Math.ceil(body.length / HANDBACK_PART)
+  const parts = Math.ceil(report.length / HANDBACK_PART)
   const seqs: string[] = []
   for (let part = 0; part < parts; part++) {
     if (owner !== generation || isEnding) return undefined
     const posted = await boardCommand($, roster.dir, ['post', name],
-      `@coordinator HAND-BACK${parts > 1 ? ` (part ${part + 1} of ${parts})` : ''}: @${name}'s turn ended with this report in no board post, so Swarm put it here.\n${fenced(body.slice(part * HANDBACK_PART, (part + 1) * HANDBACK_PART))}`)
+      `@coordinator HAND-BACK${parts > 1 ? ` (part ${part + 1} of ${parts})` : ''}: @${name}'s turn ended with this report in no board post, so Swarm put it here.\n${fenced(report.slice(part * HANDBACK_PART, (part + 1) * HANDBACK_PART))}`)
     const seq = /posted #(\d+)/.exec(posted.stdout)?.[1]
     if (posted.exitCode !== 0 || !seq) return undefined
     seqs.push(seq)
   }
   $.clock.after(0, () => void refresh($))
   const where = seqs.map(seq => `#${seq}`).join(', ')
-  return e.text.replace(body, `@${name}'s final report is on the board, whole, in post${seqs.length > 1 ? 's' : ''} ${where}: read it there with the board's show action. It is not repeated here.`)
+  return e.text.replace(body, () => `@${name}'s final report is on the board, whole, in post${seqs.length > 1 ? 's' : ''} ${where}: read it there with the board's show action. It is not repeated here.`)
 }
 
 // Per member of a run, the newest post that let one of its turn ends be dropped, and the kinds of wake dropped for it:

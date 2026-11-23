@@ -2325,6 +2325,32 @@ class BoardRegressions(unittest.TestCase):
         qs = [i["seq"] for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]
         assert qs == [1, 2, 4], qs
 
+    def test_a_brief_orders_no_command_from_a_member_without_a_shell(self):
+        d = self.init_run()
+        run(d, "member", "probe", "profile=investigator", "writes=0")
+        run(d, "member", "w")
+        for brief in ("@probe BRIEF\nRead `git diff` for your files first.", "@probe @w BRIEF\nSeams: start with `git diff hooks/a.ts`."):
+            refused = subprocess.run([sys.executable, BOARD, d, "post", "coordinator"], input=brief, capture_output=True, text=True).stderr
+            assert "@probe has no shell" in refused and "git diff" in refused and "Nothing was posted" in refused, refused
+        for brief in ("@probe BRIEF\nRun ls -la first.", "@probe BRIEF\nExecute `wc -c` on each file."):  # any command after "run"
+            refused = subprocess.run([sys.executable, BOARD, d, "post", "coordinator"], input=brief, capture_output=True, text=True)
+            assert refused.returncode != 0 and "@probe has no shell" in refused.stderr, (brief, refused.stderr)
+        run(d, "post", "coordinator", stdin="@w BRIEF\nRun `git diff` first.")  # a worker has a shell
+        run(d, "post", "coordinator", stdin="@w BRIEF\nRun `git diff` first. Ask @probe about the parser.")  # named, not assigned
+        run(d, "post", "coordinator", stdin="@probe BRIEF\nRead `src/a.ts`, use `parseDate` as the entry, and run through its callers.")
+        run(d, "post", "coordinator", stdin="@probe BRIEF\nDo not run `git commit`. The diff is in /tmp/d.patch: Read it.")
+        run(d, "post", "coordinator", stdin="@probe the bug shows when you run `git status`")  # no brief, no order
+
+    def test_a_question_quoted_whole_asks_nothing(self):
+        d = self.init_run()
+        run(d, "member", "w")
+        run(d, "post", "w", stdin='@coordinator interim. Scenario: the verifier posts "@w does parse() handle CRLF?" and gets no answer.')
+        assert not [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]
+        run(d, "post", "w", stdin='@coordinator Should I use "strict"? The alternative is "loose".')  # the mark stands outside both spans
+        assert len([i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]) == 1
+        run(d, "post", "w", stdin='@coordinator should I use "strict" or "loose"?')
+        assert [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]
+
     def test_only_a_request_wakes_a_verifier_early(self):
         def unstarted(d):
             return [i["member"] for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "unstarted"]
@@ -2346,6 +2372,8 @@ class BoardRegressions(unittest.TestCase):
             run(d, "post", "coordinator", "@all the API moved to v2")
             run(d, "post", "coordinator", "@pool the API moved to v2")
             assert "v" not in unstarted(d)  # a broadcast is news, not a request
+            run(d, "post", "a", request.replace("please test", "you could already look at"))
+            assert "v" not in unstarted(d)  # a member's mention is an interim note: only the coordinator asks for a review
             run(d, "post", "coordinator", request)
             assert "v" in unstarted(d), request
 

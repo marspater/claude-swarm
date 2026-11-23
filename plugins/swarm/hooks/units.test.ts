@@ -1235,3 +1235,18 @@ test('guard handles ambiguous commands, parent repositories and arithmetic shift
   expect(await commitsInSharedCheckout(roots, 'git -C ../sandbox commit', '/repo/app')).toBe(false)
   expect(await commitsInSharedCheckout(roots, 'git -C ../sibling commit', '/repo/app')).toBe(true)
 })
+
+test('a glob that names the board script and inline code that names a commit are read as what they run', async () => {
+  const $ = mockGuardEngine()
+  const worker = { role: 'worker', last_read_seq: 0 }
+  for (const hidden of ['python3 /p/board.p? DIR close', 'python3 /p/boar* DIR close', 'python3 /p/[b]oard.py DIR close', 'python3 /p/verify.p[xy] DIR app accept c1']) {
+    expect([hidden, actsAsAnother(hidden, 'parser', worker) !== undefined]).toEqual([hidden, true])
+  }
+  for (const plain of ['python3 /p/board.py DIR read parser', 'ls /p/*.md', 'python3 /p/bored.p? DIR close']) {
+    expect([plain, actsAsAnother(plain, 'parser', worker)]).toEqual([plain, undefined])
+  }
+  for (const commits of [`python3 -c "import subprocess; subprocess.run(['git','commit','-am','x'])"`, `node -e "require('child_process').execFileSync('git', ['commit', '-am', 'x'])"`]) {
+    expect([commits, await commitsInSharedCheckout($, commits, '/project')]).toEqual([commits, true])
+  }
+  expect(await commitsInSharedCheckout($, 'python3 -c "print(1)"', '/project')).toBe(false)
+})

@@ -20,7 +20,9 @@ const OPTIONAL = /(?<![@A-Za-z0-9_])[A-Z][A-Z0-9_]*[a-z][A-Za-z0-9_]*\?(?=[ \t]+
 // separator run ends where its class does, so a failed word backtracks into nothing: `@xmay` is one mention.
 const INTERROGATIVE = /[ \t]*(?![ \t])(?:@[A-Za-z0-9_-]+(?![A-Za-z0-9_-])[ \t,:]*(?![ \t,:]))*(?:may|can|could|should|shall|will|would|do|does|did|is|are|was|were|has|have|had|which|what|who|whom|whose|where|when|why|how)(?![A-Za-z0-9_])/iy
 export const hasQuestion = (text: string) => {
-  const plain = unquoted(text)
+  // A question quoted whole on one line is somebody else's, told as part of a report: it asks nothing (board.py SPOKEN).
+  // Whole spans are taken in order, so a closing quote never opens the next one.
+  const plain = unquoted(text).replace(/"[^"\n]*"/g, span => span.includes('?') ? ' ' : span)
   // The clause starts after the last stop before the type. Each stretch is searched once, and a
   // type's own mark is a stop, so no clause is read twice: many types in a long text stay linear.
   let scanned = 0

@@ -1311,6 +1311,26 @@
   {
    "text": "The return value is Config? or nil",
    "expect": false
+  },
+  {
+   "text": "Scenario: the verifier posts \"@w does parse() handle CRLF?\" and waits.",
+   "expect": false
+  },
+  {
+   "text": "should I use \"strict\" or \"loose\"?",
+   "expect": true
+  },
+  {
+   "text": "He said \"what?\" and is that right?",
+   "expect": true
+  },
+  {
+   "text": "Should I use \"strict\"? The alternative is \"loose\".",
+   "expect": true
+  },
+  {
+   "text": "\"unclosed quote? yes\nnext line",
+   "expect": true
   }
  ],
  "kind": [
