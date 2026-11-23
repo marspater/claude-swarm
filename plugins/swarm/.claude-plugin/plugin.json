@@ -1,6 +1,6 @@
 {
   "name": "swarm",
-  "version": "0.3.58",
+  "version": "0.3.59",
   "description": "/swarm:swarm runs a team of named worker agents that split a task, work in parallel, and coordinate on one shared message board, with a verifier that reviews diffs and runs tests. Open the live board, roster and @mention graph with Swarm: The Board on Desktop or /swarm-board in the terminal.",
   "types": "./types/index.d.ts",
   "keywords": [
