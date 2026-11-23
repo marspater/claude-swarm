@@ -576,6 +576,8 @@ def validate_member(name, member, changes, members):
         raise ValueError("size is s, m or l: how large this member's piece of the task is")
     if "effort" in changes and changes["effort"] not in {"", "low", "medium", "high", "xhigh", "max"}:
         raise ValueError("effort must be low, medium, high, xhigh, or max")
+    if "effort" in changes:  # named now, whatever it started on
+        member.pop("sized", None)
     if member.get("profile") in READ_ONLY:
         if "profile" in changes and "writes" not in changes:
             member["writes"] = "0"
@@ -615,8 +617,29 @@ def model_of(member):
     return member.get("model") or DEFAULTS.get(kind_of(member), ("", ""))[0]
 
 
+# The effort a piece runs at when none is named follows its size: a small piece one step under its type's default, a
+# large one a step over, never past high. An estimate, like the sizes: tune it against the Usage table.
+EFFORT_STEPS = ("low", "medium", "high")
+
+
+def sized_effort(kind, size):
+    base = DEFAULTS.get(kind, ("", ""))[1]
+    if base not in EFFORT_STEPS or size not in ("s", "l"):
+        return base
+    return EFFORT_STEPS[max(0, min(len(EFFORT_STEPS) - 1, EFFORT_STEPS.index(base) + (1 if size == "l" else -1)))]
+
+
 def effort_of(member):
-    return member.get("effort") or DEFAULTS.get(kind_of(member), ("", ""))[1]
+    return member.get("effort") or sized_effort(kind_of(member), member.get("size"))
+
+
+def started_as(member):
+    """Records what MEMBER starts on. A default changed later, or a size, then moves no member already running, and a
+    report of the run says what it really ran on."""
+    if not member.get("effort"):  # taken from its size, which the allocation has already counted
+        member["effort"], member["sized"] = effort_of(member), "1"
+    if not member.get("model"):
+        member["model"] = family(model_of(member))
 
 
 def family(model):
@@ -1260,6 +1283,13 @@ def attention(state, posts):
                 items.append({"kind": "spend", "member": name, "seq": 0,
                               "text": "@%s has used %s of %s (%d%%)" % (name, f"{used:,}", of % f"{whole:,}", used * 100 // whole)})
     for name, member in team.items():
+        if heavy(name, member, posts):
+            report = max(p["seq"] for p in posts if p["agent"] == name)
+            items.append({"kind": "heavy", "member": name, "seq": report,
+                          "text": "@%s holds %s tokens of context and is not woken any more: each wake would read all of it "
+                                  "again, at full price once its cache is cold. Its report is #%d. For more work on its piece, "
+                                  "replace it: replace %s %s-2" % (name, f"{int(member['held']):,}", report, name, name)})
+    for name, member in team.items():
         if member.get("paused"):
             items.append({"kind": "member_paused", "member": name, "seq": 0,
                           "text": "@%s is paused: %s. Raise it with member %s budget=<tokens>, then resume %s"
@@ -1332,7 +1362,7 @@ def attention(state, posts):
                    "ready": name in ready,
                    "blocked_on": [] if closed or name in ready or member.get("killed") else unmet(member, members, ready),
                    "asked": asked.get(name, 0), "unreachable": not closed and name in awake and unreachable(name, members, posts),
-                   "paused": bool(member.get("paused"))}
+                   "paused": bool(member.get("paused")), "heavy": not closed and heavy(name, member, posts)}
             for name, member in members.items() if name != COORDINATOR}
     return {"items": items, "members": view}
 
@@ -1365,8 +1395,13 @@ def member_budget(state, member):
 def allocation(state):
     """Each active member's share of an allocated budget, the coordinator's, and the reserve."""
     team = {name: m for name, m in team_of(state["members"]).items() if not m.get("killed")}
-    shares = {name: int(ALLOWANCE.get(kind_of(m), ALLOWANCE["worker"]) * SIZES.get(m.get("size") or "m", 1)
-                        * EFFORT_COST.get(effort_of(m), 1)) for name, m in team.items()}
+    # Size sets the effort when none is named, so it is counted once: only an effort named for the member, against
+    # its type's default, moves the share again.
+    def named(m):
+        base = DEFAULTS.get(kind_of(m), ("", ""))[1]
+        return EFFORT_COST.get(m.get("effort"), 1) / EFFORT_COST.get(base, 1) if m.get("effort") and not m.get("sized") else 1
+    shares = {name: round(ALLOWANCE.get(kind_of(m), ALLOWANCE["worker"]) * SIZES.get(m.get("size") or "m", 1) * named(m))
+              for name, m in team.items()}
     return shares, COORDINATOR_BASE + COORDINATOR_PER_MEMBER * len(team), int(sum(shares.values()) * RESERVE)
 
 
@@ -1422,7 +1457,21 @@ def progress(state, member):
 
 
 # What a report spent before weighting, and what started its turn: `<wake>:<fresh input>,<cache writes>,<cache reads>,<output>`.
-USAGE_DETAIL = re.compile(r"([a-z]+(?:\+[a-z]+){0,3}):([0-9]{1,15}),([0-9]{1,15}),([0-9]{1,15}),([0-9]{1,15})")
+# A step's report ends with the context that step read (`,<held>`): a turn's end sums several steps and says none.
+USAGE_DETAIL = re.compile(r"([a-z]+(?:\+[a-z]+){0,3}):([0-9]{1,15}),([0-9]{1,15}),([0-9]{1,15}),([0-9]{1,15})(?:,([0-9]{1,15}))?")
+# A read-only member's context past this is read again whole at every wake, and written again whole, at full price,
+# once its cache has gone cold. Seen live: three investigators resumed at 290k cost about 0.9M before one tool call.
+# The hooks hold the same figure (CONTEXT_STOP) and stop such a member's tools there.
+CONTEXT_STOP = 200_000
+# How the hooks head a member's final report when they put it on the board for it (its turn ended with none there).
+HANDBACK = "HAND-BACK"
+
+
+def heavy(name, member, posts):
+    """Whether waking NAME would only pay for its context again: a read-only member past the ceiling whose report is
+    on the board. With no report it is woken once more, to write one: its tools are stopped, its work is not lost."""
+    return (kind_of(member) in READ_ONLY and not member.get("killed") and int(member.get("held", 0)) >= CONTEXT_STOP
+            and (name in latest_reports(posts) or any(p["agent"] == name and HANDBACK in p["text"][:80] for p in posts)))
 DETAIL_COLUMNS = ("Steps", "Fresh input", "Cache writes", "Cache reads", "Output")
 
 
@@ -1452,7 +1501,11 @@ def account(d, args):
         if detail:
             # Kept beside the weighted count, never in place of it: budgets and pauses read `tokens` alone.
             row = usage.setdefault("detail", {}).setdefault(actor, {}).setdefault(detail[1], [0] * len(DETAIL_COLUMNS))
-            row[:] = [had + more for had, more in zip(row, [1, *map(int, detail.groups()[1:])])]
+            row[:] = [had + more for had, more in zip(row, [1, *map(int, detail.groups()[1:5])])]
+            if detail[6]:  # kept on the roster, so it outlasts the hooks' own memory of it across a restart
+                for member in state["members"].values():
+                    if member.get("id") and usage_key(member) == actor:
+                        member["held"] = int(detail[6])
         # Only a retried report repeats a turn, and it does so at once: the oldest entries are never asked about again.
         for old in list(turns)[:-TURNS_KEPT]:
             del turns[old]
@@ -1887,8 +1940,10 @@ def main(argv):
             return candidate, stale
 
         def waiting(member):
+            """Whether MEMBER may be woken. One that is `heavy` is not: every path that wakes goes through here."""
             return (not state.get("closed") and not state.get("paused") and not over_budget and not member.get("killed")
-                    and not member.get("paused"))
+                    and not member.get("paused")
+                    and not heavy(next(n for n, m in members.items() if m is member), member, posts))
 
         def checkout_head(why, tail):
             """This checkout's HEAD commit, refused while it has edits HEAD does not hold: WHY says what they would spoil."""
@@ -1957,6 +2012,7 @@ def main(argv):
             for key in AGENT_STATE:
                 member.pop(key, None)
             member["id"] = address
+            started_as(member)
             if isolated is not None:
                 member["isolated"] = isolated
             else:
@@ -1990,6 +2046,8 @@ def main(argv):
             if member.get("profile") in READ_ONLY and "profile" in changes and changes["profile"] not in READ_ONLY and "writes" not in changes:
                 member.pop("writes", None)  # a specialist turned worker or designer writes again unless told otherwise
             member.update(changes)
+            if changes.get("id"):
+                started_as(member)
             merge_after(member, changes, previous.get("after", ""))
             if member.get("killed"):  # a retired member runs no more turns: nothing is paused
                 member.pop("paused", None)
@@ -2162,6 +2220,8 @@ def main(argv):
                 sys.exit("@%s was already replaced by @%s; replace @%s instead" % (old, members[old]["replaced_by"], members[old]["replaced_by"]))
             before_counts, before_family = roster_counts(state), set(family_limit_errors(state))
             entry = {key: value for key, value in members[old].items() if key in INHERITED}
+            if members[old].get("sized"):  # an effort its size gave it: the successor takes its own from the size
+                entry.pop("effort", None)
             given = assignments(args[2:], MEMBER_FIELDS - {"killed", "backend"})
             entry.update(given)
             if members[old].get("profile") in READ_ONLY and "profile" in given and given["profile"] not in READ_ONLY and "writes" not in given:

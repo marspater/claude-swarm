@@ -33,6 +33,8 @@ export function tokensUsed(tokens?: Record<string, unknown> | null): number {
 // length. Seen live: three investigators grew from 23k to 290k tokens in 34 steps and spent a 3M budget with nothing
 // posted. Past NOTE a member is told once; past STOP a read-only member may only report.
 // ponytail: fixed thresholds; make them a run limit (`context=`) if a run needs a longer-lived specialist.
+// A read-only member is told at EARLY to post its findings as it goes.
+export const CONTEXT_EARLY = 90_000
 export const CONTEXT_NOTE = 150_000
 export const CONTEXT_STOP = 200_000
 /** What one model step read to answer: the context its member holds now. */
@@ -179,6 +181,8 @@ export type Roster = Record<
     consult?: string
     model?: string
     effort?: string
+    /** How large its piece is (s, m, l): sets its effort when none is named. */
+    size?: string
     paths?: string
     isolated?: string
     id?: string
@@ -189,6 +193,8 @@ export type Roster = Record<
     /** Its own token budget, and why it was paused once that was spent: its tool calls are refused until `resume NAME`. */
     budget?: string
     paused?: string
+    /** The context its last model step read, as the board keeps it across a restart of the hooks. */
+    held?: number
     replaced_by?: string
     last_read_seq: number
     last_nudged_seq?: number
@@ -214,6 +220,8 @@ export type Report = {
     unreachable: boolean
     /** It spent its own token budget. */
     paused?: boolean
+    /** Read-only, past the context ceiling, its report on the board: the board wakes it no more. */
+    heavy?: boolean
   }>
 }
 

@@ -4,7 +4,7 @@ import { BOARD_CALL, CASE_PATTERN, COORDINATOR_READ, RUN, boardCalls, closesAfte
 import { edgesOf, graphSvg, isBroadcast } from './graph'
 import { actsAsAnother, commitsInSharedCheckout } from './guard'
 import { BOARD_ACTIONS, hiveArt, memberBee, toolMood, toolSummary } from './hive'
-import { DEFAULT_EFFORT, DEFAULT_MODEL, SWARM_AGENTS, familyOf, latestOf } from './models'
+import { DEFAULT_EFFORT, DEFAULT_MODEL, SWARM_AGENTS, familyOf, latestOf, sizedEffort } from './models'
 import { progressBar, semanticIcon, statusCss, statusDot, statusKey, swarmEmblem } from './palette'
 import { END, budgetOf, contextState, detailOf, heldAt, isWindingDown, findAgent, ledger, mentions, parse, parsePosts, postFields, statusOf, targets, tokensUsed } from './roster'
 import { bodyOf, chipped, clean, clip, compact, fenceAfter, hasQuestion, head, kindOf, openedText, stripKind, unquoted, verdictOf } from './text'
@@ -535,6 +535,7 @@ test('the hooks read targets, quoting, questions, kinds, board subcommands and t
     kind?: { text: string; expect: string }[]
     actions?: string[]
     defaults?: Record<string, [string, string]>
+    effort?: [string, string, string][]
   }
   const bun = (globalThis as { Bun?: { file: (path: string) => { exists: () => Promise<boolean>; json: () => Promise<unknown> } } }).Bun
   if (bun === undefined) return
@@ -542,7 +543,8 @@ test('the hooks read targets, quoting, questions, kinds, board subcommands and t
   if (!(await file.exists())) return
   const parity = await file.json() as Parity
   // A kind of case this test does not read would pass unchecked: it fails instead.
-  expect(Object.keys(parity).filter(kind => !['targets', 'quoted', 'question', 'kind', 'actions', 'defaults'].includes(kind))).toEqual([])
+  expect(Object.keys(parity).filter(kind => !['targets', 'quoted', 'question', 'kind', 'actions', 'defaults', 'effort'].includes(kind))).toEqual([])
+  for (const [kind, size, expected] of parity.effort ?? []) expect([kind, size, sizedEffort(kind, size || undefined)]).toEqual([kind, size, expected])
   if (parity.actions) expect([...BOARD_ACTIONS].sort()).toEqual(parity.actions)
   for (const [type, [family, effort]] of Object.entries(parity.defaults ?? {})) {
     expect([type, familyOf(DEFAULT_MODEL[type]!), DEFAULT_EFFORT[type]]).toEqual([type, family, effort])
@@ -1145,5 +1147,12 @@ test('member bees keep their wings, antennae, and striped body in place across s
     const resting = memberBee(accent, status, 300)
     expect(outline(resting)).toEqual(outline(active))
     expect(resting).not.toContain('@keyframes flutter')
+    // only a member that never started or was retired is faded, whole, as its grey status dot says
+    expect(resting.includes('svg{opacity:.5}')).toBe(status === 'not started' || status === 'killed')
   }
+  // one family with the hive bees: the same wing and honey in both themes
+  for (const shared of ['--wing-back:#4b8f91', '--wing-back:#99c8c8', '--honey:#e9ac55']) expect(active).toContain(shared)
+  expect(hiveArt('sleep')).toContain('--wing:#4b8f91;--honey:#e9ac55')
+  // a paused run is the waiting tone in its icon as in its emblem, not a colour of its own
+  expect(semanticIcon('paused')).toContain(semanticIcon('warn').match(/--ic:#[0-9a-f]{6}/)![0])
 })

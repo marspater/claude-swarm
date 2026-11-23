@@ -144,20 +144,26 @@ test('the pane draws the board, the members and the graph', async ($, on) => {
         expect(identity?.props).toMatchObject({ flexDirection: 'column', flexShrink: 1, minWidth: 0 })
         expect(identity?.children?.[0]?.type).toBe('Text')
         expect(identity?.children?.at(-1)?.props.flexDirection).toBe('row')
-        expect(art?.props.flexShrink).toBe(0)
+        expect(art?.props).toMatchObject({ flexShrink: 0 })
+        if (surface === 'desktop') expect(art?.props).toMatchObject({ paddingTop: 'md', paddingRight: 'sm' })
         expect(art?.children?.[0]?.type).toBe('Svg')
-        expect(art?.children?.[0]?.props).toMatchObject({ width: 64, height: 40 })
+        expect(art?.children?.[0]?.props).toMatchObject({ alt: `Bee for ${card.key}`, width: 48, height: 30 })
         expect(String(art?.children?.[0]?.props.source)).toContain(`class="bee-body" fill="${card.props.borderColor}"`)
       }
     }
     if (surface === 'desktop') {
+      // Desktop discards SVG elements whose alt text is blank after trimming.
+      expect((await ui.findAll({ type: 'Svg' })).map(svg => String(svg.props.alt ?? '').trim())).not.toContain('')
       const parserBee = async () => (await ui.find({ key: 'bee-parser' }))?.children?.[0] as { props: Record<string, unknown> } | undefined
       const wideBee = await parserBee()
       expect(String(wideBee?.props.source)).toContain('@keyframes flutter')
       await clock.advance(180)
-      for (const [bodyColumns, width, height] of [[42, 48, 30], [27, 32, 20]] as const) {
+      for (const bodyColumns of [42, 27, 20]) {
         await ui.redraw({ ...PANE.props, bodyColumns })
-        expect((await parserBee())?.props).toMatchObject({ width, height, source: wideBee?.props.source })
+        const bees = (await ui.findAll({ type: 'Svg' })).filter(svg => String(svg.props.alt).startsWith('Bee for '))
+        expect(bees).toHaveLength(cards.length)
+        expect(bees.every(bee => bee.props.width === 48 && bee.props.height === 30)).toBe(true)
+        expect((await parserBee())?.props.source).toBe(wideBee?.props.source)
         expect(await ui.find({ key: 'feed-parser' })).toBeDefined()
       }
       await ui.redraw(PANE.props)
@@ -1808,6 +1814,15 @@ test('each model step is charged once, a spent budget stops members mid-turn and
   // its final report is asked for and never refused: a refused one is demanded again, each time at the member's full context
   expect(refused.deny).toContain('everything you have found so far')
   expect((await toolCall($, { tool: 'SubagentHandback', message: 'stopped at step 3', agentId: 'a1' } as unknown as ToolInput)).deny).toBeUndefined()
+  // so is the board's ready action, the one call a pause leaves open: on the board a report needs no later wake to recover
+  expect(refused.deny).toContain('which is taken while the run is paused')
+  expect((await toolCall($, { tool: 'mcp__swarm__board', action: 'ready', text: 'found the cause in src/a.ts:3', agentId: 'a1' })).deny ?? '').not.toContain('paused')
+  // a partial report goes up as a post, which marks nothing ready
+  expect(refused.deny).toContain('begins "@coordinator HAND-BACK:"')
+  expect((await toolCall($, { tool: 'mcp__swarm__board', action: 'post', text: '@coordinator HAND-BACK: half done', agentId: 'a1' })).deny ?? '').not.toContain('paused')
+  // the same report through Bash is let through too, but only a command that is nothing else
+  expect((await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" ready a "found it"`, agentId: 'a1' })).deny ?? '').not.toContain('paused')
+  expect((await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" ready a "found it" && make`, agentId: 'a1' })).deny).toContain('run is paused')
   expect((await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" status` })).deny).toBeUndefined()
   expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts', agentId: 'outsider' })).deny).toBeUndefined()
   // a resume with a raised budget lets it through again
@@ -1974,6 +1989,12 @@ test('the run is bound from its first planning command, and only a real read of 
   expect(seen.commands.filter(command => command.startsWith('account')).map(command => command.split(' ')[3])).toEqual(['250'])
   // The same charge carries what it spent before weighting and what started the turn: here, the user.
   expect(seen.commands.filter(command => command.startsWith('account')).map(command => command.split(' ')[4])).toEqual([expect.stringMatching(/^user:\d+,\d+,\d+,\d+$/)])
+  // A turn that a member's report starts is the member's wake, not the user's.
+  await $.prompt.submit({ text: 'Another Claude session sent a message:\n<agent-message from="a1">\nthe build broke in src/shared</agent-message>', origin: { kind: 'peer' }, wait: false })
+  await $.turn.start({ turnId: 'woken', prompt: '' } as never)
+  for await (const _ of $.turn.step({ turnId: 'woken', index: 0, model: 'm', messageCount: 1 })) { /* no chunks */ }
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'woken', usage: spent })
+  expect(seen.commands.filter(command => command.startsWith('account')).map(command => command.split(' ')[4]?.split(':')[0])).toEqual(['user', 'member'])
 
   for (const [index, command] of [
     'python3 /p/board.py /project/.swarm/demo init "Demo swarm"',
@@ -6512,13 +6533,24 @@ test('spend guards: a read-only member past the context ceiling may only report,
       coordinator: { role: 'coordinator', last_read_seq: 1 },
       scout: { role: 'worker', profile: 'investigator', writes: '0', id: 'scout-1', last_read_seq: 1 },
       builder: { role: 'worker', id: 'builder-1', paths: 'src', isolated: '0', last_read_seq: 1 },
+      // resumed after a restart: the hooks never saw a step of it, the board kept what its last one read
+      old: { role: 'worker', profile: 'investigator', writes: '0', id: 'old-1', held: 250_000, last_read_seq: 1 },
     },
   }
-  const { answer, board } = owning(on, {
+  const mirrored: (string | undefined)[] = []
+  let postFails = false
+  const { seen, answer, board } = owning(on, {
     board: () => posts({ agent: 'coordinator', to: ['scout', 'builder'], text: '@scout @builder BRIEF' }),
     roster: () => JSON.stringify(state),
   })
-  on('process.run', (_, e) => answer(e.argv[3] === 'account' ? JSON.stringify({ title: 'Sweep', total: 0, budget: 1000000, paused: false }) : board(e)))
+  on('process.run', (_, e) => {
+    if (e.argv[3] === 'post') {
+      if (postFails) return { value: { exitCode: 1, stdout: '', stderr: 'board unreadable', isStdoutTruncated: false, isStderrTruncated: false } }
+      mirrored.push(e.init?.stdin)
+      return answer('posted #7 -> @coordinator\n')
+    }
+    return answer(e.argv[3] === 'account' ? JSON.stringify({ title: 'Sweep', total: 0, budget: 1000000, paused: false }) : board(e))
+  })
   on('agent.list', () => ({ value: [
     { id: 'scout-1', description: '@scout: sweep', type: 'swarm:investigator', status: 'running' },
     { id: 'builder-1', description: '@builder: build', type: 'swarm:worker', status: 'running' },
@@ -6541,8 +6573,11 @@ test('spend guards: a read-only member past the context ceiling may only report,
   await clock.advance(2000)
   const grep = (agentId: string) => toolCall($, { tool: 'Read', file_path: '/project/src/a.ts', agentId })
 
-  // under 150k nothing is said; past it the member is told once
+  // under 90k nothing is said; from there a read-only member is told once to post as it goes, and past 150k of its context
+  await step('scout-1', 's', 0, 80_000)
+  expect((await grep('scout-1')).context ?? []).toEqual([])
   await step('scout-1', 's', 0, 100_000)
+  expect(String((await grep('scout-1')).context)).toContain('post each finding to the board as soon as its evidence stands')
   expect((await grep('scout-1')).context ?? []).toEqual([])
   await step('scout-1', 's', 1, 160_000)
   expect(String((await grep('scout-1')).context)).toContain('every step reads all of it again')
@@ -6555,6 +6590,25 @@ test('spend guards: a read-only member past the context ceiling may only report,
   await step('builder-1', 'b', 0, 210_000)
   const told = await grep('builder-1')
   expect([told.deny, String(told.context)]).toEqual([undefined, expect.stringContaining('every step reads all of it again')])
+  expect((await grep('old-1')).deny).toMatch(/holds about 250k tokens, past the ceiling of 200k/)
+  // a final report that is in no board post is put there in the member's name, and the coordinator gets its number
+  const findings = `Three findings. ${'ST1 restoreBackup loses the edition when the tension write throws. '.repeat(8)}`
+  await $.prompt.submit({ text: `Another Claude session sent a message:\n<agent-message from="scout-1">\n[Subagent hand-back] ${findings}</agent-message>`, origin: { kind: 'peer' }, wait: false })
+  expect(mirrored).toEqual([expect.stringMatching(/^@coordinator HAND-BACK: @scout's turn ended with this report in no board post[\s\S]*ST1 restoreBackup/)])
+  expect([seen.prompts.at(-1)?.includes("@scout's final report is on the board, whole, in post #7"), seen.prompts.at(-1)?.includes('ST1 restoreBackup')]).toEqual([true, false])
+  // a short one, as after a READY, is passed on as it is
+  await $.prompt.submit({ text: 'Another Claude session sent a message:\n<agent-message from="scout-1">\n[Subagent hand-back] done</agent-message>', origin: { kind: 'peer' }, wait: false })
+  expect(mirrored.length).toBe(1)
+  // a report the board did not take reaches the coordinator whole
+  postFails = true
+  await $.prompt.submit({ text: `Another Claude session sent a message:\n<agent-message from="scout-1">\n[Subagent hand-back] ${findings}</agent-message>`, origin: { kind: 'peer' }, wait: false })
+  expect(seen.prompts.at(-1)).toContain('ST1 restoreBackup')
+  postFails = false
+  // one longer than a post goes up in parts, every character of it, before the pointer stands in for it
+  const long = `${'A'.repeat(11_000)}TAIL-FINDING ${'B'.repeat(500)}`
+  await $.prompt.submit({ text: `Another Claude session sent a message:\n<agent-message from="scout-1">\n[Subagent hand-back] ${long}</agent-message>`, origin: { kind: 'peer' }, wait: false })
+  expect(mirrored.slice(1).map(text => [text?.includes('part 1 of 2'), text?.includes('part 2 of 2'), text?.includes('TAIL-FINDING')])).toEqual([[true, false, false], [false, true, true]])
+  expect([seen.prompts.at(-1)?.includes('whole, in posts #7, #7'), seen.prompts.at(-1)?.includes('TAIL-FINDING')]).toEqual([true, false])
   // an agent that is no member of the run is measured but told nothing: it has no board to post on
   await step('outsider', 'o', 0, 210_000)
   const stranger = await grep('outsider')
@@ -6566,6 +6620,17 @@ test('spend guards: a read-only member past the context ceiling may only report,
   expect(String((await grep('builder-1')).context)).toContain('spent 80% of its token budget')
   expect((await grep('builder-1')).context ?? []).toEqual([])
   expect(String((await toolCall($, { tool: 'Bash', command: 'true' })).context)).toContain('spent 80% of its token budget of 1.0M')
+  // the coordinator's own reading of the repository: two lookups a turn, the run folder and a new turn aside
+  await $.turn.start({ text: 'check', turnId: 'c1' })
+  const look = (file_path: string) => toolCall($, { tool: 'Read', file_path })
+  expect([(await look('/project/src/a.ts')).deny, (await look(`${OWNED}/summary.md`)).deny, (await look('/project/src/b.ts')).deny]).toEqual([undefined, undefined, undefined])
+  expect((await look('/project/src/c.ts')).deny).toContain('third or later repository lookup in one turn')
+  expect((await toolCall($, { tool: 'Grep', pattern: 'x' } as never)).deny).toContain('ask its author on the board')
+  expect((await look('.swarm/sweep-20261123-120000/members.json')).deny).toBeUndefined()
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'c1' })
+  await $.turn.start({ text: 'again', turnId: 'c2' })
+  expect((await look('/project/src/c.ts')).deny).toBeUndefined()
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'c2' })
 })
 
 test('#7: failed agent.list() does not poison strangers for swarm members', async ($, on) => {
@@ -6814,7 +6879,7 @@ test('token-economy #1 & #2: auto-injects roster model on spawn and registers co
   expect(spawnedModels[0]).toMatch(/^claude-opus-/)
 })
 
-test('token-economy #3: heavy context reminder, independent FINDING coalescing, initNotes suppression, single bgWarning, and no refresh churn', async ($, on) => {
+test('token-economy #3: the coordinating conversation is compacted after deployment and on regrowth, independent FINDING coalescing, initNotes suppression, single bgWarning, and no refresh churn', async ($, on) => {
   let contextTokens = 10_000
   let boardText = posts({ agent: 'coordinator', to: ['inv1', 'inv2'], text: '@inv1 @inv2 BRIEF' })
   let attentionCalls = 0
@@ -6832,6 +6897,11 @@ test('token-economy #3: heavy context reminder, independent FINDING coalescing, 
     roster: () => JSON.stringify(state),
   })
   on('session.usage', () => ({ value: { context: { tokens: contextTokens }, total: { input: 0, output: 0 } } as never }))
+  const compactions: string[] = []
+  on('session.compact', (_, e) => {
+    compactions.push(String(e.instructions))
+    return { messages: [{ role: 'user', text: 'The summary.', toolUses: [] }] as never }
+  })
   on('process.run', (_, e) => {
     if (e.argv[3] === 'attention') {
       attentionCalls++
@@ -6876,13 +6946,27 @@ test('token-economy #3: heavy context reminder, independent FINDING coalescing, 
   await clock.advance(2000)
   expect(attentionCalls).toBe(attentionBefore)
 
-  // HEAVY_CONVERSATION: >= 180k context queues a one-line context reminder delivered on next coordinator tool call
+  // The coordinator's conversation is compacted by the hooks once the team is deployed: at 120k the first time, and
+  // again only when it has grown back to 180k. The summary keeps coordinating the same run.
+  const endTurn = async (turnId: string) => {
+    await $.turn.start({ text: 'coord turn', turnId })
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId })
+    await clock.advance(10)
+  }
+  contextTokens = 110_000
+  await endTurn('ct-light')
+  expect(compactions).toEqual([])
+  contextTokens = 130_000
+  await endTurn('ct-long')
+  expect(compactions.length).toBe(1)
+  expect(compactions[0]).toContain(`coordinates the Swarm run "Economy swarm" at ${OWNED}, and goes on coordinating it`)
+  expect(compactions[0]).toContain('the board is the memory of this run')
+  await endTurn('ct-same')
+  expect(compactions.length).toBe(1)
   contextTokens = 190_000
-  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'ct-heavy' })
-  const afterHeavy1 = await toolCall($, { tool: 'Read', file_path: '/project/a.ts' } as never)
-  const afterHeavy2 = await toolCall($, { tool: 'Read', file_path: '/project/a.ts' } as never)
-  expect((afterHeavy1.context ?? []).some(c => c.includes('Conversation context is heavy'))).toBe(true)
-  expect((afterHeavy2.context ?? []).some(c => c.includes('Conversation context is heavy'))).toBe(false)
+  await endTurn('ct-regrown')
+  expect(compactions.length).toBe(2)
+  contextTokens = 10_000
 
   // Independent FINDING coalescing: inv1 posts FINDING while inv2 works and nobody depends on inv1 -> deferred past 10s
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'ct-idle' })

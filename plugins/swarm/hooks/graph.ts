@@ -728,7 +728,7 @@ export function drawGraph(
     ` +
     `<g clip-path="url(#stage)">${ripples.join('')}</g>`
   const close = active.join('') + nodes.join('') + badges.join('') +
-    `<line x1="16" y1="${height}" x2="${width - 16}" y2="${height}" stroke="var(--border)" opacity=".35"/>` +
+    `<line x1="16" y1="${height + 0.5}" x2="${width - 16}" y2="${height + 0.5}" stroke="var(--border)" opacity=".35"/>` +
     legend + '</svg>'
   // Measured whole: the history goes in, busiest first, until the first route that would take the drawing past the
   // limit. A shorter, quieter one after it stays out too, so what is left out is always the quietest; and no route

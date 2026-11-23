@@ -107,8 +107,13 @@ export function memberBee(accent: `#${string}`, status: string, elapsed = 0): st
   const eyes = sleeping ? 'M6 3.5h1.5v.5H6zM8.5 3.5h1.5v.5H8.5z' : 'M6 3h1v1H6zM9 3h1v1H9z'
   const duration = 320
   const style =
-    'svg{--wing-front:#769aa5;--wing-back:#65899b;--glint:#e5f4f4;--honey:#eab448;--stripe:#483328;--antennae:#78573e;--ink:#251e22}' +
-    '@media(prefers-color-scheme:dark){svg{--wing-front:#afe0e1;--wing-back:#92cbd5;--glint:#edfbf6;--honey:#f3bf62;--antennae:#d4b79c}}' +
+    // The hive bees' wing and honey, so both sprites read as one family in either theme; the back wing is the hive's
+    // own tone and the front one a step lighter.
+    'svg{--wing-front:#6ba6a8;--wing-back:#4b8f91;--glint:#e5f4f4;--honey:#e9ac55;--stripe:#483328;--antennae:#78573e;--ink:#251e22}' +
+    '@media(prefers-color-scheme:dark){svg{--wing-front:#b9dcdc;--wing-back:#99c8c8;--glint:#edfbf6;--honey:#f2bd6a;--antennae:#d4b79c}}' +
+    // A member that never started or was retired is drawn faded, as its status dot is grey. A closed run's members
+    // are not: there the whole team is history, and a faded roster would read as broken.
+    (status === 'killed' || status === 'not started' ? 'svg{opacity:.5}' : '') +
     '.wing-glint{fill:var(--glint);opacity:.54}' +
     (active
       ? `@media(prefers-reduced-motion:no-preference){` +

@@ -18,5 +18,13 @@ export const DEFAULT_MODEL: Record<string, string> = {
   worker: LATEST.sonnet!, verifier: LATEST.sonnet!, explorer: LATEST.haiku!, investigator: LATEST.opus!, architect: LATEST.fable!, designer: LATEST.opus!,
 }
 export const DEFAULT_EFFORT: Record<string, string> = { worker: 'medium', verifier: 'medium', explorer: 'medium', investigator: 'medium', architect: 'high', designer: 'high' }
+// As board.py's sized_effort: with no effort named, a small piece runs a step under its type's default and a large
+// one a step over, never past high.
+const EFFORT_STEPS = ['low', 'medium', 'high']
+export const sizedEffort = (kind: string, size?: string) => {
+  const base = DEFAULT_EFFORT[kind] ?? ''
+  const at = EFFORT_STEPS.indexOf(base)
+  return at < 0 || (size !== 's' && size !== 'l') ? base : EFFORT_STEPS[Math.max(0, Math.min(EFFORT_STEPS.length - 1, at + (size === 'l' ? 1 : -1)))]!
+}
 export const familyOf = (model: string) =>
   Object.keys(LATEST).find(name => model.toLowerCase().includes(name)) ?? model

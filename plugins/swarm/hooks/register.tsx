@@ -3,10 +3,10 @@ import { atom, read, update } from 'claude-code'
 import type { AgentInfo, EngineInterface, Register, SessionMessage, Timer, ToolCallResult } from 'claude-code'
 
 import type { Member, Post, Swarm, Tab } from '../types'
-import { COORDINATOR_READ, RUN, boardCalls, type ParsedBoardCall, runsNamed, scanShell, shellWords, substitutions, unwrap, wakeMessage, wakeSequence } from './command'
+import { COORDINATOR_READ, RUN, boardCalls, type ParsedBoardCall, runsNamed, scanShell, shellWords, splitShellSegments, substitutions, unwrap, wakeMessage, wakeSequence } from './command'
 import { actsAsAnother, commitsInSharedCheckout, normalizePath, resolveRealPath } from './guard'
-import { DEFAULT_EFFORT, DEFAULT_MODEL, LATEST, SPECIALISTS, SWARM_AGENTS, familyOf, latestOf } from './models'
-import { CONTEXT_STOP, END, KEPT, budgetOf, contextState, findAgent, heldAt, isWindingDown, ledger, memberNamed, mentions, parse, parsePosts, postFields, targets, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
+import { DEFAULT_EFFORT, DEFAULT_MODEL, LATEST, SPECIALISTS, SWARM_AGENTS, familyOf, latestOf, sizedEffort } from './models'
+import { CONTEXT_EARLY, CONTEXT_STOP, END, KEPT, budgetOf, contextState, findAgent, heldAt, isWindingDown, ledger, memberNamed, mentions, parse, parsePosts, postFields, targets, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
 import { CLIP, bodyOf, chipped, clean, clip, compact, fenceAfter, hasQuestion, head, kindOf, openedText, verdictOf, type Fence } from './text'
 import { liveIndicator, memberAccents, progressBar, progressUnits, semanticIcon, statusDot, statusInk, swarmEmblem, type BarTone, type EmblemState } from './palette'
 import { MEMBER_BEE_SIZE, hiveArt, memberBee, toolMood, toolSummary, type Mood } from './hive'
@@ -87,7 +87,7 @@ function attentionIconOf(kind: string, tone: string | undefined): 'warn' | 'erro
   return 'info'
 }
 
-const hairlineDivider = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 1" preserveAspectRatio="none"><style>rect{fill:#d8dbe0}@media(prefers-color-scheme:dark){rect{fill:#35383f}}</style><rect width="200" height="1"/></svg>`
+const hairlineDivider = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 1" preserveAspectRatio="none"><style>rect{fill:#d8dbe0}@media(prefers-color-scheme:dark){rect{fill:#35383f}}@supports(color:color(display-p3 1 0 0)){rect{fill:color(display-p3 .85 .86 .88)}@media(prefers-color-scheme:dark){rect{fill:color(display-p3 .21 .22 .25)}}}</style><rect width="200" height="1"/></svg>`
 
 const swarm = atom({ plugin: 'swarm', key: 'swarm' } as const, EMPTY, {
   shape: 'swarm-4',
@@ -309,7 +309,9 @@ const heldBy = new Map<string, number>()
 const contextTold = new Map<string, 'note' | 'stop'>()
 let windingDown = ''
 const windTold = new Set<string>()
+const postTold = new Set<string>()
 function forgetSpend(): void {
+  postTold.clear()
   heldBy.clear()
   contextTold.clear()
   windTold.clear()
@@ -325,10 +327,12 @@ const memberOfAgent = (agentId: string) => {
  * (`spendNotes`), since a refused edit would leave its change half made.
  */
 function contextCeiling(agentId: string, tool: string): string | undefined {
-  const held = heldBy.get(agentId) ?? 0
-  if (contextState(held) !== 'stop' || tool === BOARD_TOOL) return undefined
+  if (tool === BOARD_TOOL) return undefined
   const found = memberOfAgent(agentId)
   if (!found || !SPECIALISTS.includes(found[1].profile ?? '')) return undefined
+  // The hooks' own measure, or after a restart the board's: a resumed member is stopped at its first call, not its second.
+  const held = Math.max(heldBy.get(agentId) ?? 0, Number(found[1].held) || 0)
+  if (contextState(held) !== 'stop') return undefined
   if (contextTold.get(agentId) !== 'stop') {
     contextTold.set(agentId, 'stop')
     notesOwed.push(`@${found[0]} reached the context ceiling (${compact(held)} tokens, re-read at every step) and was told to report. Its report is partial: start a fresh member for what it lists as not covered, on a narrower scope.`)
@@ -342,6 +346,13 @@ function spendNotes(agentId: string): string[] {
   // agent in a conversation with no run has no board to post on.
   if (ownedRoster?.closed !== false || !memberOfAgent(agentId)) return notes
   const held = heldBy.get(agentId) ?? 0
+  // A read-only member is told early to post as it goes: what is on the board outlives a pause and the ceiling, and
+  // costs no wake of its whole context to recover.
+  const member = memberOfAgent(agentId)
+  if (held >= CONTEXT_EARLY && !postTold.has(agentId) && SPECIALISTS.includes(member?.[1].profile ?? '')) {
+    postTold.add(agentId)
+    notes.push('Swarm: post each finding to the board as soon as its evidence stands, and each branch you have ruled out, with the board\'s post action; do not hold them for one final report. What is on the board survives a pause and the context ceiling. Close with ready when your piece is done.')
+  }
   if (contextState(held) !== 'ok' && !contextTold.has(agentId)) {
     contextTold.set(agentId, 'note')
     notes.push(`Swarm: your context holds about ${compact(held)} tokens, and every step reads all of it again. Search and read slices, not whole files. Post what you have on the board as soon as it stands; at ${compact(CONTEXT_STOP)} a read-only member's tools stop and it must report.`)
@@ -351,6 +362,29 @@ function spendNotes(agentId: string): string[] {
     notes.push('Swarm: the run has spent 80% of its token budget and pauses at 100%. Post what you have so far on the board now, saying what is covered and what is not; then go on only with what is cheap to finish.')
   }
   return notes
+}
+// The coordinator's own reading of the repository, per turn of an open, deployed run. Whatever it reads stays in its
+// context and is read again at every later wake. Seen live: a coordinator that re-read the code behind five findings
+// spent 0.78M tokens in one round. Two lookups a turn answer a quick question; more is a member's work.
+// ponytail: counts Read, Grep and Glob only; a `cat` through Bash is not seen. Count Bash reads if that becomes the way round.
+const COORDINATOR_READS = 2
+/** A member's usage detail with the context it last held: every attempt at a report carries it, a retry too. */
+function withHeld(detail: string, agentId: string | undefined): string {
+  const held = agentId === undefined ? undefined : heldBy.get(agentId)
+  return detail && held ? `${detail},${held}` : detail
+}
+let coordinatorReads = 0
+function coordinatorRead(tool: string, target: string, root: string): { deny?: string } {
+  const roster = ownedRoster
+  if (!['Read', 'Grep', 'Glob'].includes(tool) || !roster || roster.closed || halted) return {}
+  if (!Object.entries(roster.members).some(([name, member]) => name !== 'coordinator' && Boolean(member.id) && member.killed !== '1')) return {}
+  // The run's own folder and the plugin's skills are the coordinator's to read.
+  if (/(^|\/)\.swarm\//.test(target) || (root !== '' && target.startsWith(root))) return {}
+  coordinatorReads++
+  if (coordinatorReads > COORDINATOR_READS) {
+    return { deny: `Swarm: this is a third or later repository lookup in one turn, so it was not run. What you read stays in your context and is read again at every wake of the run. Judge a report by the evidence its post cites; for more, ask its author on the board, or give the question to a member (an explorer for "where is it").` }
+  }
+  return {}
 }
 function rememberTurnRun(turnId: string, owner: TurnOwner): void {
   turnRuns.set(turnId, owner)
@@ -484,7 +518,6 @@ const shownPosts = { through: 0, posts: new Set<number>() }
 // The posts `owed` counts, and whether all of them are routine (see ROUTINE_GRACE_MS).
 let owedSeqs: number[] = []
 let isOwedRoutine = false
-let heavyTold = ''
 let bgWarnedRun = ''
 let sawSwarmCommand = false
 let pluginBoardScript = ''
@@ -629,7 +662,7 @@ function resetMonitoring(): void {
   rosterMiss = undefined
   moods.clear()
   generation++
-  seen = seenBoard = seenRoster = activity = stalled = heavyTold = bgWarnedRun = ''
+  seen = seenBoard = seenRoster = activity = stalled = compactedRun = bgWarnedRun = ''
   boardStat = undefined
   snapshot = undefined
   lastReport = undefined
@@ -936,7 +969,7 @@ async function initNotes($: EngineInterface): Promise<string[]> {
     notes.push(`Swarm: This conversation runs in a Git worktree of its own (${cwd}). The app can refuse a member's file edits outside that folder, and a member started with isolation: "worktree" works outside it. Before you start a writer with worktree isolation, tell the user: either the writers share this folder with owners that do not overlap, or the run is started from a conversation on the main checkout.`)
   }
   if (held >= LONG_CONVERSATION) {
-    notes.push(`Swarm: This conversation already holds about ${compact(held)} tokens, and each time you are woken during the run all of them are read again. Before you start any member, tell the user that a fresh conversation, or /compact first, would make this run much cheaper, and ask whether to go on here.`)
+    notes.push(`Swarm: This conversation already holds about ${compact(held)} tokens, and each time you are woken during the run all of them are read again. Swarm compacts it by itself at the first idle point after the team is deployed, so write every brief now, from all you know: put in each one everything its member needs, because after the compaction the board is your memory. Tell the user in one line that this happens.`)
   }
   return notes
 }
@@ -1270,6 +1303,9 @@ async function deliver(
       }
       continue
     }
+    // The board refuses the claim of a read-only member past the context ceiling whose report it holds: asking the
+    // coordinator to relay that wake would cost a turn for nothing. Attention says to replace it.
+    if (report?.members && Object.hasOwn(report.members, name) && report.members[name]!.heavy) continue
     const claim = member.wake_claim
     if (claim && claim.until * 1000 > now) {
       results.pending = true
@@ -1674,6 +1710,44 @@ function senderOf(e: { text: string; origin: { kind: string } }): string | undef
     : e.origin.kind === 'peer-send-message' ? /^Message from ([^\s:]+):/ : undefined
   return envelope?.exec(e.text)?.[1]?.trim() || undefined
 }
+/**
+ * A member's final report that is in no board post is put there in its name, and the coordinator gets a pointer in
+ * its place: on the board a replacement, a dependent and the verifier can read it, and the member need not be woken,
+ * at the price of its whole context, to copy it over. Seen live: three investigators stopped by a pause held their
+ * findings only in a hand-back, and were woken at 290k tokens each to post them. Only a report of some length from a
+ * live member that posted nothing since it was last woken: a turn that ended on its own READY already said it.
+ */
+const HANDBACK_MIN = 400
+const HANDBACK_PART = 11_000
+async function mirrorHandback($: EngineInterface, e: { text: string; origin: { kind: string } }): Promise<string | undefined> {
+  const roster = ownedRoster
+  if (e.origin.kind !== 'peer' || !roster || roster.closed || snapshot?.dir !== roster.dir) return undefined
+  const found = /<agent-message from="([^"]+)">\s*\[Subagent hand-back\]\s*([\s\S]*?)\s*<\/agent-message>/.exec(e.text)
+  const body = found?.[2] ?? ''
+  if (!found || body.length < HANDBACK_MIN) return undefined
+  const from = found[1]!
+  const address = teammates.get(from)
+  const entry = Object.entries(roster.members).find(([name, m]) => name !== 'coordinator' && m.id && m.killed !== '1' && (m.id === from || m.id === address))
+  if (!entry || roster.dir !== await read($, run)) return undefined
+  const [name, member] = entry
+  const newest = snapshot.posts.findLast(post => post.agent === name)?.seq ?? 0
+  if (newest > Number(member.last_nudged_seq ?? 0) && newest > member.last_read_seq) return undefined
+  // A post holds 12,000 characters: a longer report goes up in parts, and the pointer replaces it only once every
+  // part is saved. A part the board did not take leaves the coordinator the report itself.
+  const parts = Math.ceil(body.length / HANDBACK_PART)
+  const seqs: string[] = []
+  for (let part = 0; part < parts; part++) {
+    const posted = await boardCommand($, roster.dir, ['post', name],
+      `@coordinator HAND-BACK${parts > 1 ? ` (part ${part + 1} of ${parts})` : ''}: @${name}'s turn ended with this report in no board post, so Swarm put it here.\n${body.slice(part * HANDBACK_PART, (part + 1) * HANDBACK_PART)}`)
+    const seq = /posted #(\d+)/.exec(posted.stdout)?.[1]
+    if (posted.exitCode !== 0 || !seq) return undefined
+    seqs.push(seq)
+  }
+  $.clock.after(0, () => void refresh($))
+  const where = seqs.map(seq => `#${seq}`).join(', ')
+  return e.text.replace(body, `@${name}'s final report is on the board, whole, in post${seqs.length > 1 ? 's' : ''} ${where}: read it there with the board's show action. It is not repeated here.`)
+}
+
 // Per member of a run, the newest post that let one of its turn ends be dropped, and the kinds of wake dropped for it:
 // a hand-back and a task notification each once.
 const boardDrops = new Map<string, { seq: number; kinds: Set<string> }>()
@@ -1735,6 +1809,21 @@ async function released($: EngineInterface, dir: string): Promise<void> {
   // Its members are still refused by name: a retired one, a commit, an edit outside its paths.
   await syncOwnedState($, dir, undefined, undefined, owner).catch(() => undefined)
 }
+
+/**
+ * The coordinator's own context is read again at every wake of a run. Once the team is deployed the briefs are on
+ * the board, written from the whole conversation, so nothing a member gets can lose by a compaction after that
+ * point; before it, one could. Seen live: a coordinator that started at 132k tokens spent 1.2M of a 6.7M run.
+ */
+const runCompact = (dir: string, title: string, root: string) =>
+  `This conversation coordinates the Swarm run "${title}" at ${dir}, and goes on coordinating it. Summarize it for the ` +
+  'same coordinator. Keep, in the user\'s own words, the task and every later instruction, limit and preference; the ' +
+  'verification checks and commands agreed for the run; decisions made and why; anything a member reported to you ' +
+  'that is in no board post; questions still open with the user; uncommitted or unlanded work. Leave out file contents ' +
+  'you read, tool output, and whatever the board holds (briefs, reports, the roster, usage). End with: the board is ' +
+  `the memory of this run; on every wake read it first (the board tool's read action), and Read ${root}/skills/swarm/SKILL.md ` +
+  'again before the next step whose rules are no longer in view.'
+let compactedRun = ''
 
 const KILL_COMPACT = 'The user ended the Swarm run with /swarm-kill. Summarize this conversation for one assistant that ' +
   'continues the user\'s work alone. Keep the user\'s request and every later instruction in their own words, what was ' +
@@ -1817,7 +1906,7 @@ async function killRun($: EngineInterface, reason: string): Promise<{ text: stri
 
 // The compaction a kill owes, to the session that asked, between its turns only. The host refuses one while a turn
 // runs, so a refused one is asked again twice at most. A new run, bound or started, cancels it.
-let owedCompaction: { epoch: number; tries: number; isAsked: boolean } | undefined
+let owedCompaction: { epoch: number; tries: number; isAsked: boolean; instructions?: string } | undefined
 const COMPACTION_RETRY_MS = 1000
 /** Owes the compaction to this session; it runs once no coordinator turn is running, or at the end of the one that is. */
 function compactAfterKill($: EngineInterface): void {
@@ -1828,10 +1917,11 @@ function compactOwed($: EngineInterface): void {
   const owed = owedCompaction
   if (!owed || owed.isAsked || owed.epoch !== sessionEpoch || isCoordinatorBusy) return
   owed.isAsked = true
-  void $.session.compact({ instructions: KILL_COMPACT }).then(
+  void $.session.compact({ instructions: owed.instructions ?? KILL_COMPACT }).then(
     done => {
       if (owedCompaction === owed) owedCompaction = undefined
-      if (done.skip === undefined && owed.epoch === sessionEpoch) sawSwarmCommand = false
+      // Only a kill's compaction ends the run's hold on the conversation: one made mid-run keeps coordinating.
+      if (done.skip === undefined && owed.epoch === sessionEpoch && owed.instructions === undefined) sawSwarmCommand = false
       // A hook's veto is final.
       if (done.skip !== undefined) $.ui.toast(`Swarm: the compaction was skipped (${done.skip}). Run /compact to drop the run from the context.`)
     },
@@ -1959,22 +2049,23 @@ async function account(
 // spending on. The coordinator is never refused: it has to report, raise the budget and resume.
 // A pause is no retirement: what the member found so far is paid for, so its last report carries it. That report is
 // never refused (see the tool.call guard), or the host asks for it again and again at the member's full context.
-const HAND_BACK = 'Make no other tool call: end your turn now with your final report (SubagentHandback, if you were told to use it), saying where you stopped and everything you have found so far.'
+const HAND_BACK = 'Make no other tool call but one: if your findings are not on the board yet, put them there now, which is taken while the run is paused: use the board\'s post action with a text that begins "@coordinator HAND-BACK:" (everything you have found so far, what you covered, what you did not). Use ready instead only if the whole assignment is done. Then end your turn now with your final report (SubagentHandback, if you were told to use it).'
 const MEMBER_PAUSED = `This Swarm member has spent its own token budget, so this tool call was not run. ${HAND_BACK} The coordinator decides whether you go on.`
 /** The refusal the roster alone settles, with no lookup that can fail: a retired member, or one paused on its own budget. */
-function stoppedMember(agentId: string): string | undefined {
+function stoppedMember(agentId: string, reporting = false): string | undefined {
   const address = teammates.get(agentId)
   const has = (ids: ReadonlySet<string>) => ids.has(agentId) || (address !== undefined && ids.has(address))
   // A member that was replaced or removed may still be mid-turn: it builds and edits beside the team that took over.
   if (has(retired) || has(killConfirmed)) return 'This Swarm member has been retired, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped.'
-  if (has(memberPaused)) return MEMBER_PAUSED
+  // A paused member's report is what the pause must not lose: `reporting` lets that one board action through.
+  if (has(memberPaused) && !reporting) return MEMBER_PAUSED
   return undefined
 }
 
 const OVER = 'This Swarm run is over and its conversation drives another run now, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped.'
-async function refusal($: EngineInterface, agentId: string | undefined): Promise<string | undefined> {
+async function refusal($: EngineInterface, agentId: string | undefined, reporting = false): Promise<string | undefined> {
   if (agentId === undefined) return isKillTurn ? 'The user ended the Swarm run with /swarm-kill. End your turn now, in one line.' : undefined
-  const stopped = stoppedMember(agentId)
+  const stopped = stoppedMember(agentId, reporting)
   if (stopped) return stopped
   const sEpoch = sessionEpoch
   const owner = generation
@@ -2023,7 +2114,7 @@ async function refusal($: EngineInterface, agentId: string | undefined): Promise
       await agentRun($, agentId, (await $.agent.list()).find(one => one.id === agentId), false, sEpoch, owner))
     if (sEpoch !== sessionEpoch || owner !== generation || isEnding) return undefined
     if (dir && active && dir !== active) return OVER
-    if (dir !== halted?.dir) return undefined
+    if (dir !== halted?.dir || reporting) return undefined
     return `This Swarm run is ${halted.why}, so this tool call was not run. ${HAND_BACK} The coordinator decides what happens when the run resumes.`
   } catch {
     return undefined // a check that failed stops nobody's tools
@@ -2451,9 +2542,10 @@ async function memberBoard($: EngineInterface, e: BoardInput & { agentId: string
   if (!closed && (paused || isSpent)) {
     const why = paused ? `paused (${paused})` : 'over its token budget'
     if (dir === await read($, run)) halted = { dir, why }
-    return { deny: `This Swarm run is ${why}, so this tool call was not run. ${HAND_BACK} The coordinator decides what happens when the run resumes.` }
+    // The one action a pause leaves open: the report of what the member found, which nothing else saves.
+    if (e.action !== 'ready' && e.action !== 'post') return { deny: `This Swarm run is ${why}, so this tool call was not run. ${HAND_BACK} The coordinator decides what happens when the run resumes.` }
   }
-  if (!closed && member.paused) return { deny: MEMBER_PAUSED }
+  if (!closed && member.paused && e.action !== 'ready' && e.action !== 'post') return { deny: MEMBER_PAUSED }
   const { action } = e
   const setup = (['title', 'name', 'newName', 'options', 'out'] as const).filter(field => e[field] !== undefined)
   if (setup.length > 0) return { deny: `${setup.join(', ')} ${setup.length === 1 ? 'belongs' : 'belong'} to the coordinator's actions: a member acts as itself, on its own posts.` }
@@ -2625,36 +2717,39 @@ async function exportRun($: EngineInterface, dir: string): Promise<void> {
 }
 
 // The band's button that opens the pane.
-function shortcut($: EngineInterface, e: Parameters<EngineInterface['ui']['resolve']>[0], singleCaption = false, shown?: Swarm) {
+function shortcut($: EngineInterface, e: Parameters<EngineInterface['ui']['resolve']>[0], singleCaption = false, shown?: Swarm, emblemOffset = 0) {
   const { Box, Text, Button } = $.ui.resolve(e)
   const isLive = shown !== undefined && shown.dir !== '' && !shown.isClosed
   const working = isLive ? shown.members.filter(m => m.status === 'working').length : 0
   const coordinating = isLive ? shown.members.filter(m => m.status === 'coordinating').length : 0
   const attentionCount = isLive ? shown.attention.length : 0
+  const isPrimary = isLive && !shown.isPaused && attentionCount === 0
   const button = (
     <Button
       key={SHORTCUT}
-      variant={isLive && !shown.isPaused ? 'primary' : 'secondary'}
+      variant={isPrimary ? 'primary' : 'secondary'}
       label="Swarm: The Board"
-      hover={{ scope: 'swarm-shortcut' }}
       onPress={() => void openBoard($).catch(() => undefined)}
     />
   )
   if (e.surface !== 'desktop') return button
   const { Svg } = $.ui.resolve(e)
   const state = shown ? emblemStateOf(shown) : 'idle'
-  const pillBorder = !isLive ? 'subtle' : shown.isPaused || attentionCount > 0 ? 'warning' : working > 0 ? 'success' : 'claude'
   const badgeText = !isLive ? ''
     : shown.isPaused ? 'paused'
       : attentionCount > 0 ? `${attentionCount} attention`
         : working > 0 ? `${working} working`
           : coordinating > 0 ? `${coordinating} coordinating` : ''
   const badgeColor = shown?.isPaused || attentionCount > 0 ? 'warning' : working > 0 ? 'success' : 'claude'
+  const showBadge = badgeText !== '' && !singleCaption
   // Cover the composer's tinted inset with the same theme surface as the crab.
+  // Keep the honeycomb emblem beside the native Button (not trapped inside a separate outer border)
+  // so the entire button pill highlights uniformly from edge to edge on mouse hover.
   return (
     <Box
       flexDirection="row"
       alignItems="center"
+      columnGap="xs"
       backgroundColor="userMessageBackground"
       marginLeft={-2}
       paddingLeft={2}
@@ -2665,31 +2760,18 @@ function shortcut($: EngineInterface, e: Parameters<EngineInterface['ui']['resol
       marginBottom={-1.16}
       paddingBottom={singleCaption ? 0.16 : 1.16}
     >
-      <Box
-        flexDirection="row"
-        alignItems="center"
-        columnGap="xs"
-        borderStyle="round"
-        borderColor={pillBorder}
-        borderDimColor
-        hover={{ scope: 'swarm-shortcut', borderDimColor: false }}
-        paddingLeft="sm"
-        paddingRight="md"
-        paddingY="xs"
-      >
-        <Svg source={swarmEmblem(state)} alt="Swarm" width={16} height={16} />
+      <Svg source={swarmEmblem(state, emblemOffset)} alt="Swarm" width={16} height={16} />
+      {showBadge ? (
         <Button
           key={SHORTCUT}
-          plain
+          variant={isPrimary ? 'primary' : 'secondary'}
           label="Swarm: The Board"
-          hover={{ scope: 'swarm-shortcut' }}
           onPress={() => void openBoard($).catch(() => undefined)}
-        />
-        {badgeText !== '' && !singleCaption && (
-          <Text size="caption" weight="medium" color={badgeColor} tabular>{`· ${badgeText}`}</Text>
-        )}
-        <Box width={1} />
-      </Box>
+        >
+          Swarm: The Board
+          <Text size="caption" weight="medium" color={isPrimary ? undefined : badgeColor} tabular>{` · ${badgeText}`}</Text>
+        </Button>
+      ) : button}
     </Box>
   )
 }
@@ -2812,7 +2894,7 @@ export const register: Register = on => {
     moods.delete(actor)
     moods.set(actor, BOARD_READS.includes(e.action) ? 'inspect' : 'relay')
     try {
-      const stopped = await refusal($, e.agentId)
+      const stopped = await refusal($, e.agentId, e.agentId !== undefined && (e.action === 'ready' || e.action === 'post'))
       if (stopped) return { deny: stopped }
       return e.agentId === undefined ? await coordinatorBoard($, e) : await memberBoard($, { ...e, agentId: e.agentId })
     } catch (error) {
@@ -2829,10 +2911,19 @@ export const register: Register = on => {
     if (e.agentId === undefined) isCoordinatorBusy = true
     // A member's final report ends its run and spends nothing more: refused, the host demands it again each turn.
     if (e.agentId !== undefined && (e.tool as string) === 'SubagentHandback') return next(e)
-    const stopped = await refusal($, e.agentId)
+    // A member's command that is nothing but the board's `ready` or `post` reports as the board tool does: let through a pause.
+    const said = e.agentId !== undefined && e.tool === 'Bash' ? String(e.command) : ''
+    const reports = boardCalls(said)
+    const reporting = reports.length > 0 && reports.every(c => (c.action === 'ready' || c.action === 'post') && !c.piped) &&
+      splitShellSegments(said).length === reports.length && substitutions(said).length === 0
+    const stopped = await refusal($, e.agentId, reporting)
     if (stopped) return { deny: stopped }
     const ceiling = e.agentId === undefined ? undefined : contextCeiling(e.agentId, e.tool)
     if (ceiling) return { deny: ceiling }
+    const lookup = e.agentId === undefined
+      ? coordinatorRead(e.tool, String((e as { file_path?: unknown; path?: unknown }).file_path ?? (e as { path?: unknown }).path ?? ''), $.plugin.root)
+      : {}
+    if (lookup.deny) return { deny: lookup.deny }
     const actor = e.agentId ?? 'coordinator'
     moods.delete(actor)
     moods.set(actor, toolMood(e.tool, e.tool === 'Bash' ? String(e.command) : ''))
@@ -3293,7 +3384,7 @@ export const register: Register = on => {
             : `Pass model: "${expected}" on the Agent call`
         return { deny: `The roster has @${named} on ${expected}, but this call would start it on ${actual || runsOn}. ${guidance}, or change the roster with the board's member command.` }
       }
-      const effort = member.effort || DEFAULT_EFFORT[kind]
+      const effort = member.effort || sizedEffort(kind, member.size)
       if (spawnEfforts.has(e.tool_use_id) && (spawnEfforts.get(e.tool_use_id) ?? DEFAULT_EFFORT[kind]) !== effort) {
         return { deny: `The roster has @${named} on ${effort} effort. Pass effort: "${effort}" on the Agent call, or change the roster first.` }
       }
@@ -3362,6 +3453,7 @@ export const register: Register = on => {
       isCoordinatorBusy = true
       activeCoordinatorTurnId = e.turnId
       noticeHold = 0
+      coordinatorReads = 0
     }
     turnWakes.set(e.turnId, e.agentId === undefined ? wakeNext || 'user' : wokenAgents.has(e.agentId) ? 'wake' : 'start')
     if (turnWakes.size > TURNS_KEPT) turnWakes.delete(turnWakes.keys().next().value!)
@@ -3401,7 +3493,9 @@ export const register: Register = on => {
         if (at !== undefined && !turnRuns.has(e.turnId)) rememberTurnRun(e.turnId, at)
         // The turn's end waits for this charge. Planning steps that begin before a run is bound fall to that end.
         turn.landing = turn.landing
-          .then(() => at === undefined ? undefined : account($, e.turnId, `${e.turnId}:${e.index}`, e.agentId, delta, at, sEpoch, stepped.detail(turn, e.index)))
+          .then(() => at === undefined ? undefined : account($, e.turnId, `${e.turnId}:${e.index}`, e.agentId, delta, at, sEpoch,
+            // A member's step also says what context it read: the board keeps it, to refuse a wake that would only pay for it again.
+            withHeld(stepped.detail(turn, e.index), e.agentId)))
           .catch(() => false as const)
           // One never sent is no longer pending under its own report: its turn's end charges it.
           .then(landed => { if (sEpoch === sessionEpoch && !isEnding && landed !== false) stepped.landed(turn, landed ?? 0, e.index) })
@@ -3460,7 +3554,7 @@ export const register: Register = on => {
             for (const [index, amount] of [...owing.pending]) {
               if (sEpoch !== sessionEpoch || isEnding) break
               const report = index === END ? endReport(turnId, owing) : `${turnId}:${index}`
-              const accepted = await account($, turnId, report, owing.agentId, amount, under, sEpoch, stepped.detail(owing, index)).catch(() => false as const)
+              const accepted = await account($, turnId, report, owing.agentId, amount, under, sEpoch, withHeld(stepped.detail(owing, index), owing.agentId)).catch(() => false as const)
               if (accepted) {
                 stepped.landed(owing, accepted, index)
                 isCharged = true
@@ -3511,12 +3605,19 @@ export const register: Register = on => {
           }
           quietSince = await $.clock.now()
           const dir = await read($, run)
-          if (sEpoch === sessionEpoch && !isEnding && dir && heavyTold !== dir) {
+          // Compacted by the hooks at an idle point: first once the team is deployed (LONG), then whenever the
+          // conversation has grown back (HEAVY). Never with a mention unread, a wake to relay or a pause to answer:
+          // those are what the next turn is for.
+          const deployed = dir !== '' && ownedRoster?.dir === dir && !ownedRoster.closed &&
+            Object.entries(ownedRoster.members).some(([name, member]) => name !== 'coordinator' && Boolean(member.id))
+          if (sEpoch === sessionEpoch && !isEnding && deployed && !owedCompaction && !halted && owed.count === 0 && specialistWakes.length === 0) {
             const held = await $.session.usage().then(usage => usage.context.tokens ?? 0).catch(() => 0)
-            if (sEpoch === sessionEpoch && !isEnding && held >= HEAVY_CONVERSATION) {
-              heavyTold = dir
-              $.ui.toast(`Swarm: the coordinator's conversation now holds about ${compact(held)} tokens, and every wake re-reads them. /compact while it is idle makes the rest of this run cheaper.`)
-              notesOwed.push(`Conversation context is heavy (~${compact(held)} tokens; every wake re-reads it): avoid redundant turns, batch remaining work, and /compact or checkpoint when idle.`)
+            // The run may have changed hands while the usage was read: its address is no other run's instructions.
+            if (sEpoch === sessionEpoch && !isEnding && !owedCompaction && ownedRoster?.dir === dir && !ownedRoster.closed && !halted &&
+                held >= (compactedRun === dir ? HEAVY_CONVERSATION : LONG_CONVERSATION)) {
+              compactedRun = dir
+              owedCompaction = { epoch: sessionEpoch, tries: 0, isAsked: false, instructions: runCompact(dir, snapshot?.title ?? '', $.plugin.root) }
+              $.ui.toast(`Swarm: compacting the coordinator's conversation (about ${compact(held)} tokens). The team is deployed and the board holds the briefs, so every later wake reads less.`)
             }
           }
         }
@@ -3648,6 +3749,12 @@ export const register: Register = on => {
       if (!isLive) return { drop: KILL_DROP }
     }
     if (await repeatsBoard($, e).catch(() => false)) return { drop: 'Swarm: a member handed back while others still work; the board holds what it left.' }
+    const mirrored = await mirrorHandback($, e).catch(() => undefined)
+    if (mirrored) e = { ...e, text: mirrored }
+    // A member's hand-back or task notification that starts the coordinator's next turn is that turn's wake, not the
+    // user's. Mid-turn it starts none, and a notice the monitor just submitted keeps its own name.
+    const kind = (e as { origin?: { kind?: string } }).origin?.kind
+    if (!isCoordinatorBusy && wakeNext === '' && (kind === 'peer' || kind === 'task-notification')) wakeNext = 'member'
     return next(e)
   })
   on('command.run', async ($, e, next) => {
@@ -3709,7 +3816,9 @@ export const register: Register = on => {
     // to look at when the session began. A project Swarm never ran in shows nothing.
     if (!(await read($, run)) && (e.surface !== 'desktop' || !hadRun)) return next(e)
     if (e.surface === 'desktop' && (await $.ui.panes()).some(p => p.id === PANE && p.isShown && p.isPlaced)) return next(e)
-    return shortcut($, e, false, await read($, swarm))
+    const shown = await read($, swarm)
+    const offset = e.surface === 'desktop' ? phase(`${e.surface}:shortcut`, shown.dir, emblemStateOf(shown), await $.clock.now().catch(() => 0)) : 0
+    return shortcut($, e, false, shown, offset)
   })
 
   // Swarm's own row goes only once the shortcut is really in another settled row.
@@ -3723,8 +3832,9 @@ export const register: Register = on => {
     const { Box } = $.ui.resolve(e)
     const crab = await next({ ...e, props: { ...e.props, rows: peers } })
     const shown = await read($, swarm)
+    const offset = phase(`${e.surface}:shortcut`, shown.dir, emblemStateOf(shown), await $.clock.now().catch(() => 0))
     return <Box flexDirection="row" columnGap={2}>
-      {shortcut($, e, textCount(findKey(peers[0]?.tree, 'crab-text')) === 1, shown)}
+      {shortcut($, e, textCount(findKey(peers[0]?.tree, 'crab-text')) === 1, shown, offset)}
       <Box flexDirection="column" flexGrow={1} flexShrink={1}>{crab}</Box>
     </Box>
   })
@@ -3733,6 +3843,12 @@ export const register: Register = on => {
     if (e.surface !== 'desktop' || e.props.isSummary || !DEPLOYED.test(e.props.text) || !(await read($, run))) return next(e)
     const { Box, Text, Button, Svg } = $.ui.resolve(e)
     const reply = await next(e)
+    const shown = await read($, swarm)
+    const state = emblemStateOf(shown)
+    const working = shown.members.filter(m => m.status === 'working').length
+    const borderColor = shown.dir === '' || shown.isClosed ? 'subtle'
+      : shown.isPaused || shown.attention.length > 0 ? 'warning'
+        : working > 0 ? 'success' : 'claude'
     return (
       <Box flexDirection="column" rowGap="sm">
         {reply}
@@ -3745,16 +3861,16 @@ export const register: Register = on => {
           columnGap="md"
           rowGap="xs"
           borderStyle="round"
-          borderColor="claude"
+          borderColor={borderColor}
           borderDimColor
           hover={{ borderDimColor: false }}
           paddingX="sm"
           paddingY="xs"
         >
           <Box flexDirection="row" alignItems="center" columnGap="sm" flexShrink={1}>
-            <Svg source={swarmEmblem('idle')} alt="Swarm" width={20} height={20} />
+            <Svg source={swarmEmblem(state)} alt="Swarm" width={20} height={20} />
             <Box flexDirection="column" flexShrink={1}>
-              <Text weight="semibold" color="claude">Swarm</Text>
+              <Text weight="semibold" color={shown.isClosed ? undefined : 'claude'}>Swarm</Text>
               <Text size="caption" dimColor>Live multi-agent board &amp; graph</Text>
             </Box>
           </Box>
@@ -3774,7 +3890,7 @@ export const register: Register = on => {
     const { Box, Text } = $.ui.resolve(e)
     const [heading, ...body] = e.props.text.slice('Swarm: '.length).split('\n')
     return (
-      <Box flexDirection="column" borderStyle="round" borderColor="claude" borderDimColor paddingX="sm" gap="xs">
+      <Box flexDirection="column" borderStyle="round" borderColor="claude" borderDimColor paddingX="sm" paddingY="xs" gap="xs">
         <Text dimColor><Text weight="semibold" color="claude">Swarm</Text>{` · ${heading}`}</Text>
         {e.props.isExpanded && body.length > 0 && <Text size="caption" dimColor>{body.join('\n')}</Text>}
       </Box>
@@ -3920,7 +4036,7 @@ export const register: Register = on => {
           paddingX="md"
           paddingY="sm"
         >
-          {HeaderArt && <HeaderArt key="hive" source={hiveArt('sleep', hiveOffset)} alt="Sleeping bees" width={88} height={44} />}
+          {HeaderArt && <HeaderArt key="hive" source={hiveArt('sleep', hiveOffset)} alt="Sleeping bees" width={columns < 48 ? 56 : 88} height={columns < 48 ? 28 : 44} />}
           <Text size="heading" weight="semibold" color={error ? 'warning' : undefined}>{error || 'No swarm in this project'}</Text>
           {!error && <Text dimColor>Start one with /swarm:swarm and a task.</Text>}
         </Box>
@@ -4141,7 +4257,7 @@ export const register: Register = on => {
       )
       // Posting and filtering share one row, and the filter wraps under the post field where the pane is too narrow.
       const bar = (isSearchable: boolean) => (compose || isSearchable) && (
-        <Box flexDirection="row" alignItems="center" columnGap={1} rowGap={1} flexWrap="wrap" marginTop={1}>
+        <Box flexDirection="row" alignItems="center" columnGap="sm" rowGap="xs" flexWrap="wrap" marginTop="sm">
           {compose}
           {isSearchable && search}
         </Box>
@@ -4175,15 +4291,18 @@ export const register: Register = on => {
       const older = matching.length - visible.length
       body =
         visible.length === 0 ? (
-          <Box flexDirection="column">
+          <Box flexDirection="column" gap="sm">
             {bar(shown.posts.length > 0)}
-            <Box marginTop={1}>
-              <Text dimColor>{shown.posts.length > 0 ? 'No posts match the filter.' : browsed?.boardUnavailable ? 'Board data unavailable: its board could not be read.' : 'No posts yet.'}</Text>
+            <Box flexDirection="column" gap="xs" marginTop={compose || shown.posts.length > 0 ? undefined : 'sm'} borderStyle="round" borderColor={browsed?.boardUnavailable ? 'warning' : 'subtle'} borderDimColor paddingX="sm" paddingY="xs">
+              <Box flexDirection="row" alignItems="center" columnGap="xs">
+                {HeaderArt && <HeaderArt source={semanticIcon(browsed?.boardUnavailable ? 'warn' : 'info')} alt={browsed?.boardUnavailable ? 'Unavailable' : 'Info'} width={12} height={12} />}
+                <Text dimColor>{shown.posts.length > 0 ? 'No posts match the filter.' : browsed?.boardUnavailable ? 'Board data unavailable: its board could not be read.' : 'No posts yet.'}</Text>
+              </Box>
+              {browsed?.boardUnavailable && retry}
             </Box>
-            {browsed?.boardUnavailable && retry}
           </Box>
         ) : (
-          <Box flexDirection="column" gap={1}>
+          <Box flexDirection="column" gap="sm">
             {bar(true)}
             {terms.length === 0 && shown.posts.length > 1 && (
               <Button
@@ -4323,7 +4442,7 @@ export const register: Register = on => {
     } else if (current === 'attention') {
       // A kind this version does not know is still shown, uncoloured.
       const tone = (kind: string) =>
-        ['unreachable', 'ignored', 'stale', 'rework', 'dispute', 'retired-running', 'conflict'].includes(kind) ? 'error' : kind === 'paused' || kind === 'member_paused' ? 'suggestion'
+        ['unreachable', 'ignored', 'stale', 'rework', 'dispute', 'retired-running', 'conflict'].includes(kind) ? 'error' : kind === 'paused' || kind === 'member_paused' ? 'warning'
           : ['unread', 'review', 'question', 'unstarted', 'blocked', 'spend', 'silent', 'loop'].includes(kind) ? 'warning' : undefined
       const isSpent = shown.budget > 0 && total >= shown.budget
       const ask = (text: string) => submitHeld($, text, () => $.ui.toast('Swarm could not send that request to the coordinator.'))
@@ -4485,12 +4604,13 @@ export const register: Register = on => {
             borderStyle="round"
             borderColor={hueOf(open.name)}
             borderDimColor
+            hover={{ borderDimColor: false }}
             paddingX="sm"
             paddingY="xs"
           >
             <Button key="talk-back" plain label="‹ Members" onPress={() => closeTalk($)} />
             {HeaderArt && member && member.status !== 'closed' && (
-              <HeaderArt source={statusDot(member.status, memberOffset)} alt=" " width={12} height={12} />
+              <HeaderArt source={statusDot(member.status, memberOffset)} alt={member.status} width={12} height={12} />
             )}
             <Text wrap="truncate-end">
               <Text weight="semibold" color={hueOf(open.name)}>@{open.name}</Text>
@@ -4518,7 +4638,7 @@ export const register: Register = on => {
       )
     } else if (current === 'members') {
       const memberOffset = phase(slot('members'), shown.dir, 'cards', now)
-      const beeScale = columns < 34 ? 2 : columns < 52 ? 3 : 4
+      const beeScale = 3
       const beeWidth = MEMBER_BEE_SIZE.width * beeScale
       const beeHeight = MEMBER_BEE_SIZE.height * beeScale
       const isCompact = HeaderArt !== undefined && columns < 42
@@ -4540,9 +4660,9 @@ export const register: Register = on => {
         const hasActions = canOpenTalk || member.posts > 0 || member.role === 'coordinator'
         const summaryLines = last ? bodyOf(last).split('\n').slice(0, kindOf(last.text) ? 2 : 1).filter(l => l.trim() !== '').join(' · ') : ''
         const meta = [member.role === 'coordinator' ? '' : member.type, `${member.model} ${member.effort}`.trim()].filter(Boolean).join(' · ')
-        // Keep model details on their own line if the name and bee leave little room for them.
+        // Allow for the bee, its right inset, and the header gap when fitting the name and model.
         const identityWidth = visualWidth(member.name) + 3 + .8 * visualWidth(meta)
-        const stackIdentity = HeaderArt !== undefined && (isCompact || identityWidth > columns - Math.ceil(beeWidth / 8) - 2)
+        const stackIdentity = HeaderArt !== undefined && (isCompact || identityWidth > columns - Math.ceil(beeWidth / 8) - 3)
         const memberSpend = spentBy(member)
         const identity = (
           <Text strikethrough={member.status === 'killed'} wrap="truncate-end">
@@ -4554,7 +4674,7 @@ export const register: Register = on => {
           <Box flexDirection="row" alignItems={isCompact ? 'flex-start' : 'center'} columnGap="xs" minWidth={0}>
             {member.status === 'closed' ? null : HeaderArt ? (
               <Box flexShrink={0}>
-                <HeaderArt source={statusDot(member.status, motionOffset)} alt=" " width={12} height={isCompact ? 16 : 12} />
+                <HeaderArt source={statusDot(member.status, motionOffset)} alt={member.status} width={12} height={isCompact ? 16 : 12} />
               </Box>
             ) : <Text color={statusColor}>{isBroken ? '!' : ['killed', 'not started'].includes(member.status) ? '○' : '●'}</Text>}
             <Box flexShrink={1} minWidth={0}>
@@ -4588,10 +4708,10 @@ export const register: Register = on => {
                   {stackIdentity && meta && <Text size="caption" dimColor wrap="truncate-end">{meta}</Text>}
                   {status}
                 </Box>
-                <Box key={`bee-${member.name}`} flexShrink={0}>
+                <Box key={`bee-${member.name}`} flexShrink={0} paddingTop="md" paddingRight="sm">
                   <HeaderArt
                     source={memberBee(accent, member.status, motionOffset)}
-                    alt=" "
+                    alt={`Bee for ${member.name}`}
                     width={beeWidth}
                     height={beeHeight}
                   />
@@ -4646,7 +4766,10 @@ export const register: Register = on => {
         <Box flexDirection="column" marginTop="sm" gap="sm">
           <Box flexDirection="row" justifyContent="flex-end">{inactiveToggle(inactive.size)}</Box>
           {visibleGroups.length === 0 && shown.members.length > 0 ? (
-            <Text dimColor>All members are inactive.</Text>
+            <Box flexDirection="row" alignItems="center" columnGap="xs" borderStyle="round" borderColor="subtle" borderDimColor paddingX="sm" paddingY="xs">
+              {HeaderArt && <HeaderArt source={semanticIcon('info')} alt="Info" width={12} height={12} />}
+              <Text dimColor>All members are inactive.</Text>
+            </Box>
           ) : (
             visibleGroups.map(([title, list]) => (
               <Box key={title} flexDirection="column" gap="sm">
@@ -4659,8 +4782,11 @@ export const register: Register = on => {
       )
     } else if (shown.posts.length === 0) {
       body = (
-        <Box flexDirection="column" marginTop={1}>
-          <Text dimColor>{browsed?.boardUnavailable ? 'Board data unavailable: its board could not be read.' : 'No posts yet.'}</Text>
+        <Box flexDirection="column" gap="xs" marginTop="sm" borderStyle="round" borderColor={browsed?.boardUnavailable ? 'warning' : 'subtle'} borderDimColor paddingX="sm" paddingY="xs">
+          <Box flexDirection="row" alignItems="center" columnGap="xs">
+            {HeaderArt && <HeaderArt source={semanticIcon(browsed?.boardUnavailable ? 'warn' : 'info')} alt={browsed?.boardUnavailable ? 'Unavailable' : 'Info'} width={12} height={12} />}
+            <Text dimColor>{browsed?.boardUnavailable ? 'Board data unavailable: its board could not be read.' : 'No posts yet.'}</Text>
+          </Box>
           {browsed?.boardUnavailable && retry}
         </Box>
       )
@@ -4771,7 +4897,7 @@ export const register: Register = on => {
                 source={progressBar(timelineRatio, isLiveVisible ? 'success' : 'accent', playing, timelineOffset)}
                 alt={`Timeline position ${index + 1} of ${shown.posts.length}`}
                 width={1024}
-                height={5}
+                height={6}
               />
             )}
           </Box>
@@ -4819,16 +4945,17 @@ export const register: Register = on => {
           >
             <Box flexDirection="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" columnGap="sm">
               <Box flexDirection="row" alignItems="center" columnGap="xs" flexWrap="wrap">
-                {postKind !== undefined && (
-                  <Svg source={semanticIcon(verdictIconOf(postKind.label))} alt={postKind.label} width={12} height={12} />
-                )}
+                <Text color={hueOf(post.agent)}>●</Text>
                 <Text wrap="wrap">
                   <Text weight="semibold" color={hueOf(post.agent)}>@{post.agent}</Text>
                   <Text dimColor>{post.to.length ? ` → ${post.to.map(name => `@${name}`).join(' ')}` : ' · no mentions'}</Text>
-                  {postKind !== undefined && (
-                    <Text weight="semibold" color={postKind.color}>{` · ${postKind.covered?.length ? `${postKind.label} of ${postKind.covered.map(name => `@${name}`).join(', ')}` : postKind.label}`}</Text>
-                  )}
                 </Text>
+                {postKind !== undefined && (
+                  <Box flexDirection="row" alignItems="center" columnGap="xs">
+                    <Svg source={semanticIcon(verdictIconOf(postKind.label))} alt={postKind.label} width={12} height={12} />
+                    <Text size="caption" weight="semibold" color={postKind.color}>{` · ${postKind.covered?.length ? `${postKind.label} of ${postKind.covered.map(name => `@${name}`).join(', ')}` : postKind.label}`}</Text>
+                  </Box>
+                )}
               </Box>
               <Text size="caption" dimColor tabular>{`#${post.seq}${time ? ` · ${time}` : ''}`}</Text>
             </Box>
@@ -4852,7 +4979,7 @@ export const register: Register = on => {
       // As in the diagram: the coordinator is never hidden for being idle.
       const hideable = [...inactive].filter(name => memberOf(name)?.role !== 'coordinator')
       body = (
-        <Box flexDirection="column" marginTop={1} gap={1}>
+        <Box flexDirection="column" marginTop="sm" gap="sm">
           <Box flexDirection="row" gap="sm" alignItems="center">
             <Button
               key="expand-all"
@@ -4907,7 +5034,7 @@ export const register: Register = on => {
                   source={progressBar(budgetRatio, budgetTone, isHeaderLive && total > 0, budgetOffset)}
                   alt={`Token budget ${Math.min(100, Math.round(budgetRatio * 100))}%`}
                   width={120}
-                  height={5}
+                  height={6}
                 />
                 <Text size="caption" color={budgetRatio >= 0.9 ? 'error' : budgetRatio >= 0.75 ? 'warning' : undefined} dimColor={budgetRatio < 0.75} tabular>
                   {`${Math.round(budgetRatio * 100)}%`}
@@ -4918,7 +5045,7 @@ export const register: Register = on => {
         </Box>
         {error && <Text color="warning">{error}</Text>}
         <Box flexDirection="row" columnGap="sm" rowGap="xs" flexWrap="wrap" alignItems="center" marginTop="xs">
-          <Text dimColor>Run</Text>
+          <Text weight="medium" dimColor>Run</Text>
           {/* At an end of the history the list showed, the step is text, as a replay step that leads nowhere is. */}
           {runEdge.dir === shown.dir && runEdge.older === false
             ? <Text key="run-prev" dimColor>‹ Prev run</Text>
@@ -4942,7 +5069,7 @@ export const register: Register = on => {
         </Box>
         {HeaderArt && (
           <Box marginTop="xs">
-            <HeaderArt source={hairlineDivider} alt=" " width={1024} height={1} />
+            <HeaderArt source={hairlineDivider} alt="Section divider" width={1024} height={1} />
           </Box>
         )}
         <Box flexDirection="row" gap="xs" flexWrap="wrap" marginTop="sm">

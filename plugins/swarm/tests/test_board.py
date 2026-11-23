@@ -270,7 +270,7 @@ def scenario():
             exported = f.read()
         assert "| @worker | worker | wake | 2 | 2 | 4 | 600 | 8 |" in exported, exported
         assert "| @coordinator | coordinator | relay+unread | 1 | 5 | 0 | 40 | 1 |" in exported, exported
-        for bad in ("wake:1,2,3", "Wake:1,2,3,4", "wake:1,2,3,-4", "wake:1,2,3,4,5", ":1,2,3,4"):
+        for bad in ("wake:1,2,3", "Wake:1,2,3,4", "wake:1,2,3,-4", "wake:1,2,3,4,5,6", ":1,2,3,4"):
             run(budget_run, "account", "8" * 64, actor, "1", bad, ok=False)
         run(budget_run, "account", "4" * 64, "raw-address", "1", ok=False)
 
@@ -2189,6 +2189,83 @@ class BoardRegressions(unittest.TestCase):
         run(other, "member", "w", "size=s")
         assert "over budget" not in run(other, "plan")
 
+    def test_a_read_only_member_past_the_context_ceiling_is_woken_once_more_only_to_report(self):
+        d = self.init_run()
+
+        def saved():
+            with open(os.path.join(d, "members.json"), encoding="utf-8") as f:
+                return json.load(f)
+        run(d, "member", "scout", "profile=investigator", "writes=0", "owns=why the retry fails")
+        run(d, "member", "fixer", "owns=src")
+        run(d, "post", "coordinator", "@scout BRIEF\nOwns: the retry bug")
+        run(d, "post", "coordinator", "@fixer BRIEF\nOwns: src")
+        run(d, "member", "scout", "id=scout-address")
+        run(d, "member", "fixer", "id=fixer-address")
+        scout, fixer = (hashlib.sha256(("swarm-agent:%s-address" % n).encode()).hexdigest() for n in ("scout", "fixer"))
+        # a step says what context it read, a turn's end does not: only the first is kept
+        run(d, "account", "1" * 64, scout, "30", "start:2,1000,291000,50,292002")
+        run(d, "account", "2" * 64, scout, "5", "start:0,0,900000,5")
+        run(d, "account", "3" * 64, fixer, "30", "start:2,1000,291000,50,292002")
+        assert saved()["members"]["scout"]["held"] == 292002 and saved()["members"]["fixer"]["held"] == 292002
+        run(d, "account", "4" * 64, scout, "1", "start:1,2,3,4,x", ok=False)
+        # with no report on the board it is still woken: its tools are stopped, but its findings are not lost
+        run(d, "post", "coordinator", "@scout @fixer where do you stand?")
+        assert "@scout" in run(d, "wake") and "@fixer" in run(d, "wake")
+        assert "heavy" not in run(d, "attention")
+        # once its report is there, no path wakes it again; a writer of the same size is still woken
+        run(d, "ready", "scout", stdin="the retry loop never resets its counter (src/net/retry.ts:40)")
+        run(d, "post", "coordinator", "@scout @fixer one more thing")
+        wake = run(d, "wake")
+        assert "@scout" not in wake and "@fixer" in wake, wake
+        assert not run(d, "claim", "scout", "scout-address", "5").strip()
+        assert re.fullmatch(r"[a-f0-9]{32}", run(d, "claim", "fixer", "fixer-address", "5").strip())
+        report = json.loads(run(d, "attention", "--json"))
+        assert [(i["member"], i["seq"]) for i in report["items"] if i["kind"] == "heavy"] == [("scout", 4)], report["items"]
+        assert report["members"]["scout"]["heavy"] and not report["members"]["fixer"]["heavy"]
+        assert "replace scout scout-2" in run(d, "attention")
+        # its replacement starts light, and is woken
+        run(d, "replace", "scout", "scout-2")
+        assert "held" not in saved()["members"]["scout-2"] and "@scout-2" in run(d, "wake")
+
+    def test_a_final_report_the_hooks_put_on_the_board_counts_as_the_members_report(self):
+        d = self.init_run()
+        run(d, "member", "scout", "profile=investigator", "writes=0", "owns=q", "id=scout-address")
+        key = hashlib.sha256(b"swarm-agent:scout-address").hexdigest()
+        run(d, "account", "1" * 64, key, "30", "start:2,1000,291000,50,292002")
+        run(d, "post", "coordinator", "@scout BRIEF\nOwns: q")
+        run(d, "post", "scout", "@coordinator HAND-BACK: @scout's turn ended with this report in no board post.\nfound X")
+        run(d, "post", "coordinator", "@scout thanks, one more")
+        assert "@scout" not in run(d, "wake") and "heavy" in run(d, "attention")
+
+    def test_effort_follows_the_size_of_the_piece_and_a_start_records_what_ran(self):
+        d = self.init_run()
+
+        def saved():
+            with open(os.path.join(d, "members.json"), encoding="utf-8") as f:
+                return json.load(f)["members"]
+        run(d, "member", "small", "owns=a", "size=s")
+        run(d, "member", "big", "owns=b", "size=l")
+        run(d, "member", "probe", "profile=investigator", "writes=0", "owns=q", "size=l")
+        run(d, "member", "named", "owns=c", "size=l", "effort=low")
+        plan = run(d, "plan")
+        for name, effort in (("small", "low"), ("big", "high"), ("probe", "high"), ("named", "low")):
+            assert re.search(r"@%s\s+\S+\s+\S+\s+%s\s" % (name, effort), plan), (name, plan)
+        # size is counted once: only an effort named for the member moves its share again
+        assert [saved()[n]["alloc"] for n in ("small", "big", "probe", "named")] == [350000, 1400000, 1000000, 980000]
+        assert "effort" not in saved()["big"]
+        # the start records the model and effort it ran on, so a default changed later rewrites no history
+        run(d, "member", "big", "id=big-address")
+        assert (saved()["big"]["effort"], saved()["big"]["model"]) == ("high", "sonnet")
+        # the recorded effort is the size again, not a second charge; one named afterwards is
+        sys.path.insert(0, os.path.dirname(BOARD))
+        import board  # noqa: E402
+        assert saved()["big"]["alloc"] == 1400000 and board.allocation({"members": saved()})[0]["big"] == 1400000
+        named = saved()
+        named["big"].pop("sized")
+        assert board.allocation({"members": named})[0]["big"] == 2100000
+        run(d, "member", "big", "size=s")
+        assert saved()["big"]["effort"] == "high"
+
     def test_export_writes_a_report_and_changes_nothing(self):
         d = self.init_run()
         run(d, "member", "w", "owns=a|b")
@@ -2491,7 +2568,9 @@ class BoardRegressions(unittest.TestCase):
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "parity.json"), encoding="utf-8") as f:
             vectors = json.load(f)
         # A kind of vector added to the file and checked here by nobody would let drift through unseen.
-        assert set(vectors) == {"targets", "quoted", "question", "kind", "actions", "defaults"}, sorted(vectors)
+        assert set(vectors) == {"targets", "quoted", "question", "kind", "actions", "defaults", "effort"}, sorted(vectors)
+        for kind, size, expect in vectors["effort"]:
+            assert board.sized_effort(kind, size or None) == expect, (kind, size)
         # The pane's list of board commands (hooks/hive.ts) and its starting model and effort per type (hooks/models.ts).
         assert vectors["actions"] == sorted(board.ARG_COUNTS)
         assert vectors["defaults"] == {kind: list(pair) for kind, pair in board.DEFAULTS.items()}

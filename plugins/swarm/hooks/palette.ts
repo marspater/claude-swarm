@@ -98,10 +98,10 @@ export function swarmEmblem(state: EmblemState, elapsed = 0): string {
       : state === 'paused' || state === 'attention' ? 'waiting'
         : 'inactive'
   const active = state === 'working' || state === 'coordinating' || state === 'attention'
-  // Three crisp interlocking hexagons centered optically in a 20x20 viewBox.
-  const hexTop = 'M10 3.2L12.8 4.8V8L10 9.6L7.2 8V4.8Z'
-  const hexLeft = 'M7 8.4L9.8 10V13.2L7 14.8L4.2 13.2V10Z'
-  const hexRight = 'M13 8.4L15.8 10V13.2L13 14.8L10.2 13.2V10Z'
+  // Three crisp interlocking hexagons optically centered vertically (y: 4.2..15.8, mid 10.0) in a 20x20 viewBox.
+  const hexTop = 'M10 4.2L12.8 5.8V9L10 10.6L7.2 9V5.8Z'
+  const hexLeft = 'M7 9.4L9.8 11V14.2L7 15.8L4.2 14.2V11Z'
+  const hexRight = 'M13 9.4L15.8 11V14.2L13 15.8L10.2 14.2V11Z'
   const style = `${statusCss}` +
     `svg{--cell-warm:#e9ac55;--cell-stroke:var(--status-${tone})}` +
     `@media(prefers-color-scheme:dark){svg{--cell-warm:#f2bd6a}}` +
@@ -119,9 +119,9 @@ export function swarmEmblem(state: EmblemState, elapsed = 0): string {
   const badge = state === 'attention'
     ? `<circle class="ring" cx="15.8" cy="4.4" r="2.5"/><circle class="dot" cx="15.8" cy="4.4" r="2.2"/>`
     : active
-      ? `<circle class="ring" cx="10" cy="9.4" r="6.8"/><circle class="dot" cx="10" cy="6.4" r="1.25"/>`
+      ? `<circle class="ring" cx="10" cy="10.4" r="6.8"/><circle class="dot" cx="10" cy="7.4" r="1.25"/>`
       : state === 'paused'
-        ? `<rect x="8.65" y="5.1" width="1.05" height="2.7" rx=".4" class="dot"/><rect x="10.3" y="5.1" width="1.05" height="2.7" rx=".4" class="dot"/>`
+        ? `<rect x="8.65" y="6.1" width="1.05" height="2.7" rx=".4" class="dot"/><rect x="10.3" y="6.1" width="1.05" height="2.7" rx=".4" class="dot"/>`
         : ''
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><style>${style}</style>` +
     `<path class="c" d="${hexLeft}"/><path class="c" d="${hexRight}"/><path class="c-hi" d="${hexTop}"/>${badge}</svg>`
@@ -157,17 +157,20 @@ export function progressBar(ratio: number, tone: BarTone = 'accent', animate = f
         `@keyframes sw-shim{0%{transform:translateX(-${shineW}px);opacity:0}16%{opacity:.65}52%{opacity:.5}68%,100%{transform:translateX(${fillW}px);opacity:0}}` +
         `@media(prefers-reduced-motion:reduce){.shimmer{display:none}}`
       : '')
-  const defs = glowing
-    ? `<defs><clipPath id="bf"><rect x="0" y="0" width="${fillW}" height="6" rx="3"/></clipPath>` +
-      `<linearGradient id="sg" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#fff" stop-opacity="0"/><stop offset="50%" stop-color="#fff" stop-opacity=".55"/><stop offset="100%" stop-color="#fff" stop-opacity="0"/></linearGradient></defs>`
-    : ''
+  const defs =
+    `<defs><clipPath id="bt"><rect x="0" y="0" width="200" height="6" rx="3"/></clipPath>` +
+    (glowing
+      ? `<clipPath id="bf"><rect x="0" y="0" width="${fillW}" height="6" rx="3"/></clipPath>` +
+        `<linearGradient id="sg" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#fff" stop-opacity="0"/><stop offset="50%" stop-color="#fff" stop-opacity=".55"/><stop offset="100%" stop-color="#fff" stop-opacity="0"/></linearGradient>`
+      : '') +
+    `</defs>`
   const shimmer = glowing
     ? `<g clip-path="url(#bf)"><rect class="shimmer" x="0" y="0" width="${shineW}" height="6" fill="url(#sg)"/></g>`
     : ''
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 6" preserveAspectRatio="none"><style>${style}</style>${defs}` +
-    `<rect x="0" y="0" width="200" height="6" rx="3" fill="var(--track)"/>` +
+    `<g clip-path="url(#bt)"><rect x="0" y="0" width="200" height="6" rx="3" fill="var(--track)"/>` +
     (fillW > 0 ? `<rect x="0" y="0" width="${fillW}" height="6" rx="3" fill="var(--fill)"/>` : '') +
-    `${shimmer}</svg>`
+    `${shimmer}</g></svg>`
 }
 
 /** Crisp 12x12 semantic icon for post verdicts and attention cards. */
@@ -178,7 +181,8 @@ export function semanticIcon(kind: 'pass' | 'ready' | 'warn' | 'error' | 'info' 
     warn: [colors.waiting[0], colors.waiting[1], darkColors.waiting[0], darkColors.waiting[1]],
     error: [colors.failed[0], colors.failed[1], darkColors.failed[0], darkColors.failed[1]],
     info: ['#235fc4', 'color(display-p3 .2033 .3675 .7427)', '#8fb8ff', 'color(display-p3 .5935 .7170 .9777)'],
-    paused: ['#7b63c4', 'color(display-p3 .48 .39 .77)', '#b69eff', 'color(display-p3 .71 .62 1)'],
+    // The emblem draws a paused run in the waiting tone; its icon and its attention card follow.
+    paused: [colors.waiting[0], colors.waiting[1], darkColors.waiting[0], darkColors.waiting[1]],
   }
   const [l, lp3, d, dp3] = colorMap[kind]
   const style = `svg{--ic:${l}}@media(prefers-color-scheme:dark){svg{--ic:${d}}}@supports(color:color(display-p3 1 0 0)){svg{--ic:${lp3}}@media(prefers-color-scheme:dark){svg{--ic:${dp3}}}}`
