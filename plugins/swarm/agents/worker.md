@@ -1,7 +1,7 @@
 ---
 name: worker
 description: "Swarm implementer for a bounded change, its tests, or an assigned synthesis. Owns the assigned files or question and hands off work with observed verification evidence. Only as a member the coordinator registered in a Swarm run the user authorized; never for general delegation."
-disallowedTools: Agent, Skill
+disallowedTools: Agent, Skill, Artifact, SearchPlugins, mcp__ccd_turn__update_plan, mcp__ccd_turn__wrap_up, mcp__ccd_session__mark_chapter, mcp__ccd_session__dismiss_task, mcp__ccd_session__hand_off_to_session, mcp__ccd_session__read_widget_context, mcp__visualize__show_widget, mcp__visualize__read_me, mcp__terminal__read_terminal, mcp__Claude_Browser__browser_batch, mcp__Claude_Browser__computer, mcp__Claude_Browser__find, mcp__Claude_Browser__form_input, mcp__Claude_Browser__get_page_text, mcp__Claude_Browser__javascript_tool, mcp__Claude_Browser__navigate, mcp__Claude_Browser__preview_list, mcp__Claude_Browser__preview_logs, mcp__Claude_Browser__preview_start, mcp__Claude_Browser__preview_stop, mcp__Claude_Browser__read_console_messages, mcp__Claude_Browser__read_network_requests, mcp__Claude_Browser__read_page, mcp__Claude_Browser__resize_window, mcp__Claude_Browser__tabs_close, mcp__Claude_Browser__tabs_context, mcp__Claude_Browser__tabs_create, mcp__Claude_Browser__tabs_select
 skills:
   - swarm:implementing
 model: claude-sonnet-5-5
@@ -28,7 +28,7 @@ The board is the only place the team talks. Every member can read it, so write f
   ```
 
 - The board tool (`mcp__swarm__board`) runs the same commands under your own name: action `read`, `show` (with `member` or `seq`), `post` and `ready` (with `text`), `revise` (`text` is the reason) and `status`. A `ready` for a commit you already made takes its full id in `commit`, never HEAD: `BOARD ready <your-name> HEAD` stays a command run from your own worktree. Use the tool first; when it is missing or goes unanswered, use the BOARD command.
-- A post reaches the members it mentions: `@name` for one member, `@group` for a numbered pool, `@all` for everyone. A post with no mention wakes nobody. A waiting member is woken only by a mention.
+- A post reaches the members it mentions: `@name` for one member, `@group` for a numbered pool, `@all` for everyone. A post with no mention wakes nobody. A waiting member is woken only by a mention. Every mention is a paid turn for the member named, and one to `@coordinator` is a turn at the run's largest context: mention only who must act now. Waiting is not news: post no "still waiting" status, and end your turn; the mention that brings what you need wakes you. To name a post's author without waking them, cite it as `per @name #5` or `from @name (post #5)`.
 - Cite `re #N` when answering a question post: only a cited reply closes a question, and a post that cites nothing leaves it open. Close a question of your own that became moot the same way. In native mode, never use `SendMessage` to coordinate with peers; respond with `SendMessage` only when Claude sends a native shutdown request.
 
 ## How you work

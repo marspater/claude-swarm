@@ -173,6 +173,9 @@ export function ledger(kept = 256, graceMs = 600_000) {
 
 // The same rule as board.py: @name at a word start, never an email or a path.
 const MENTION = /(?<![\w.@/])@([A-Za-z][\w-]*)/g
+// A post's author named as its source ("per @lead #5", "from @novelty (post #6)") addresses nobody: board.py's CITED.
+const CITE = String.raw`@[A-Za-z][A-Za-z0-9_-]*(?:['’]s)?[ \t]*\(?(?:(?:posts?|in)[ \t]+)?#[0-9]+\)?`
+const CITED = new RegExp(String.raw`(?:\b(?:from|per|see|by|in|of|via|cf\.?)[ \t]+|\()${CITE}(?:[ \t]*(?:,|and|&)[ \t]*${CITE})*`, 'gi')
 
 export type Roster = Record<
   string,
@@ -208,6 +211,10 @@ export type Roster = Record<
   }
 >
 
+const countIn = (counts: Record<string, number>, name: string) => {
+  const count = Object.hasOwn(counts, name) ? counts[name] : 0
+  return Number.isSafeInteger(count) && count! > 0 ? count! : 0
+}
 export const memberNamed = (members: Roster, name?: string) => name && Object.hasOwn(members, name) ? members[name] : undefined
 
 // What `board.py attention --json` answers: the items, and each member as the board sees it.
@@ -228,6 +235,9 @@ export type Report = {
     /** Read-only, past the context ceiling, its report on the board: the board wakes it no more. */
     heavy?: boolean
   }>
+  /** Each name's posts, and each member's unread mentions, over the whole journal. Absent from an older board. */
+  sent?: Record<string, number>
+  unread?: Record<string, number>
 }
 
 // What a member that is not working is waiting for, in words.
@@ -248,7 +258,7 @@ export function detailOf(status: string, hint: Report['members'][string] | undef
 
 /** The names a text mentions, in lower case, code and URLs left out: members, groups and `all` alike. */
 export const mentions = (text: string) => new Set(
-  [...unquoted(text).matchAll(MENTION)].map(m => (m[1] ?? '').toLowerCase())
+  [...unquoted(text).replace(CITED, ' ').matchAll(MENTION)].map(m => (m[1] ?? '').toLowerCase())
     .flatMap(name => [name, name.replace(/[-_]+$/, '')]),
 )
 
@@ -434,8 +444,9 @@ export function parse(
       owns: clean(typeof hint?.owns === 'string' ? hint.owns : ''),
       status,
       detail: isClosed ? (status !== 'closed' || member.role === 'coordinator' ? '' : reported.get(name) ?? 'No outcome recorded') : isZombie ? `still ${zombie.status} (${zombie.id})` : detailOf(status, hint, Boolean(state.paused), Boolean(member.paused) || hint?.paused === true),
-      unread: counts(name).unread,
-      posts: counts(name).sent,
+      // The board counts over its whole journal; the posts read here are only the newest of a long board.
+      unread: report?.unread ? countIn(report.unread, name) : counts(name).unread,
+      posts: report?.sent ? countIn(report.sent, name) : counts(name).sent,
     }
   })
 

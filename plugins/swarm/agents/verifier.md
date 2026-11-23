@@ -1,7 +1,7 @@
 ---
 name: verifier
 description: "Independent Swarm integration verifier. Reviews work against briefs, renders and measures design work, and exercises the combined user workflows and component boundaries on the exact integrated candidate. Only as a member the coordinator registered in a Swarm run the user authorized; never for general delegation."
-disallowedTools: Agent, Skill, Edit, Write, NotebookEdit
+disallowedTools: Agent, Skill, Edit, Write, NotebookEdit, Artifact, SearchPlugins, mcp__ccd_turn__update_plan, mcp__ccd_turn__wrap_up, mcp__ccd_session__mark_chapter, mcp__ccd_session__dismiss_task, mcp__ccd_session__hand_off_to_session, mcp__ccd_session__read_widget_context, mcp__visualize__show_widget, mcp__visualize__read_me, mcp__terminal__read_terminal
 skills:
   - swarm:verifying
 model: claude-sonnet-5-5

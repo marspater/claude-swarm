@@ -7,7 +7,7 @@ import { COORDINATOR_READ, RUN, boardCalls, type ParsedBoardCall, runsNamed, sca
 import { actsAsAnother, commitsInSharedCheckout, normalizePath, resolveRealPath, waitsOnLooseMatch } from './guard'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, LATEST, SPECIALISTS, SWARM_AGENTS, familyOf, latestOf, sizedEffort } from './models'
 import { CONTEXT_EARLY, CONTEXT_STOP, END, KEPT, budgetOf, contextState, findAgent, heldAt, isWindingDown, ledger, memberNamed, mentions, parse, parsePosts, postFields, targets, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
-import { CLIP, bodyOf, chipped, clean, clip, compact, fenceAfter, fenced, hasQuestion, head, kindOf, openedText, repeatsPosts, verdictOf, type Fence } from './text'
+import { CLIP, bodyOf, chipped, clean, clip, compact, fenceAfter, fenced, figuresIn, hasQuestion, head, kindOf, openedText, repeatsPosts, verdictOf, type Fence } from './text'
 import { liveIndicator, memberAccents, progressBar, progressUnits, semanticIcon, statusDot, statusInk, swarmEmblem, type BarTone, type EmblemState } from './palette'
 import { MEMBER_BEE_SIZE, hiveArt, memberBee, toolMood, toolSummary, type Mood } from './hive'
 import { MIN_LABEL_PX, SVG_LIMIT, drawGraph, edgesOf, graphHeight, isBroadcast, labelPx, pairOf, visibleMembers } from './graph'
@@ -61,6 +61,41 @@ const estimateRows = (text: string, columns: number) =>
   text.split('\n').reduce((sum, line) => sum + Math.max(1, Math.ceil(visualWidth(line) / columns)), 0)
 const TABS: Tab[] = ['board', 'attention', 'members', 'graph']
 const REPLAY_FRAME_MS = 1200
+const INACTIVE_STATUSES = ['waiting', 'not started', 'killed', 'closed']
+const inactiveOf = (members: Swarm['members']) =>
+  new Set(members.filter(m => INACTIVE_STATUSES.includes(m.status)).map(m => m.name))
+
+// Every new graph source reloads the host's sandboxed frame, and members report statuses many times a second.
+// The live graph takes new statuses with a new frame (another post, or play turning into the loop), or once
+// STATUS_SETTLE_MS passed since it last took them with no packet in flight; a trailing redraw takes what was held.
+const STATUS_SETTLE_MS = REPLAY_FRAME_MS
+let heldStatuses: { frame: string; at: number; statuses: Map<string, string> } | undefined
+let statusTimer: Timer | undefined
+
+function clearHeldStatuses(): void {
+  statusTimer?.cancel()
+  statusTimer = undefined
+  heldStatuses = undefined
+}
+
+function settledStatuses($: EngineInterface, shown: Swarm, frame: string, isMoving: boolean, now: number): Swarm {
+  const statuses = new Map(shown.members.map(m => [m.name, m.status]))
+  const held = heldStatuses
+  const isSame = held !== undefined && held.statuses.size === statuses.size &&
+    [...statuses].every(([name, status]) => held.statuses.get(name) === status)
+  if (!held || held.frame !== frame || (!isSame && !isMoving && now - held.at >= STATUS_SETTLE_MS)) {
+    heldStatuses = { frame, at: now, statuses }
+    return shown
+  }
+  if (isSame) return shown
+  // A packet's end redraws by itself; the timer is the fallback if it never does.
+  const wait = Math.max(50, isMoving ? STATUS_SETTLE_MS : held.at + STATUS_SETTLE_MS - now)
+  statusTimer ??= $.clock.after(wait, () => {
+    statusTimer = undefined
+    void $.ui.invalidate('ui.render')
+  })
+  return { ...shown, members: shown.members.map(m => held.statuses.has(m.name) ? { ...m, status: held.statuses.get(m.name)! } : m) }
+}
 
 function emblemStateOf(shown: Swarm): EmblemState {
   if (shown.dir === '') return 'idle'
@@ -1621,9 +1656,11 @@ async function refresh($: EngineInterface): Promise<void> {
       name !== 'coordinator' && !m.killed && (m.depends ?? '').split(',').map(d => d.trim()).includes(sender))
     isOwedRoutine = !full.attentionUnavailable && unread.length > 0 && unread.every(post => {
       const label = kindOf(post.text)?.label
-      const isRoutineKind = label === 'READY' || (label === 'FINDING' && !hasActiveDependent(post.agent))
+      // A hand-back Swarm put on the board is a turn's closing words: read with the next wake, as a READY is.
+      const isHandback = post.text.startsWith(HANDBACK_POST)
+      const isRoutineKind = isHandback || label === 'READY' || (label === 'FINDING' && !hasActiveDependent(post.agent))
       return isRoutineKind &&
-        state.members[post.agent]?.consult !== '1' && !hasQuestion(post.text) && !/(?<![\w@.-])@coordinator(?![\w-])/.test(post.text) &&
+        state.members[post.agent]?.consult !== '1' && !hasQuestion(post.text) && (isHandback || !/(?<![\w@.-])@coordinator(?![\w-])/.test(post.text)) &&
         !full.attention.some(item => item.kind === 'question' && item.seq === post.seq)
     }) &&
       (full.members.some(member => member.role !== 'coordinator' && member.status === 'working') ||
@@ -1734,6 +1771,9 @@ async function refresh($: EngineInterface): Promise<void> {
           if (answerThrough && prompted === answerThrough) prompted = 0
           if (askStall && stalled === progress) stalled = ''
         })
+    } else if (!pending && await owesRunCompaction($, dir)) {
+      // No turn is running to end: asked for now.
+      $.clock.after(0, () => compactOwed($))
     }
   } catch {
     try {
@@ -1776,7 +1816,15 @@ const HANDBACK = /<agent-message from="([^"]+)">\s*\[Subagent hand-back\]\s*([\s
 const HANDBACK_FRAME = /^The text below is the final report of a subagent[\s\S]*?The report follows:[ \t]*\n?/
 // The host frames every hand-back with a note of its own: what the member said is measured and compared without it.
 const unframed = (body: string) => body.replace(HANDBACK_FRAME, '').trim()
-async function mirrorHandback($: EngineInterface, e: { text: string; origin: { kind: string } }): Promise<string | undefined> {
+const HANDBACK_POST = '@coordinator HAND-BACK'
+/**
+ * `quiet` when the hand-back need start no turn of the coordinator's: other members still work, the report asks
+ * nothing, and what it says is on the board now, where the next wake reads it. Seen live: in 150 seconds ten
+ * hand-backs and notifications each started a coordinator turn at 180k tokens, and five were answered "nothing new".
+ * A member rewords its report as it hands back, so no comparison of words tells a repeat from news: the board keeps
+ * both, and neither is worth a turn of its own.
+ */
+async function mirrorHandback($: EngineInterface, e: { text: string; origin: { kind: string } }): Promise<{ text: string; quiet: boolean } | undefined> {
   const roster = ownedRoster
   if (e.origin.kind !== 'peer' || !roster || roster.closed) return undefined
   const found = HANDBACK.exec(e.text)
@@ -1797,22 +1845,27 @@ async function mirrorHandback($: EngineInterface, e: { text: string; origin: { k
   // The host frames every hand-back with a note of its own, longer than the least report worth a post: measured
   // and posted without it. Seen live: a one-line status was mirrored because its frame alone passed the minimum.
   const report = unframed(body)
+  const shown = snapshot
+  const quiet = !halted && shown?.dir === roster.dir && member.consult !== '1' && !hasQuestion(report) &&
+    shown.members.some(m => m.role !== 'coordinator' && m.name !== name && m.status === 'working')
   const newest = parsePosts(board, fresh.members).findLast(post => post.agent === name)
   if (newest && newest.seq > Number(member.last_nudged_seq ?? 0)) {
     const compactBody = report.replace(/\s+/g, ' ').trim()
     if (compactBody && report.length >= HANDBACK_MIN && newest.text.replace(/\s+/g, ' ').includes(compactBody)) {
-      return e.text.replace(body, () => `@${name} reported on the board in post #${newest.seq}.`)
+      return { quiet, text: e.text.replace(body, () => `@${name} reported on the board in post #${newest.seq}.`) }
     }
     // A turn that ended on its own report has said it, even once the member read that post back: closing words that
     // repeat the report are not posted again. Seen live: a READY read back after an UNREAD note went up a second time
     // as a hand-back. Words the report does not hold are news (work done after it), and are posted as before.
     // A replacer function: the report's own `$&` or `$'` must reach the notice as typed.
     if (report.length >= HANDBACK_MIN && ['READY', 'FINDING', 'VERIFIED', 'NOT PASSED'].includes(kindOf(newest.text)?.label ?? '') && repeatsPosts([newest.text], report)) {
-      return e.text.replace(body, () => `@${name} reported on the board in post #${newest.seq}. Its closing words began: ${clip(compactBody, 300)}`)
+      return { quiet, text: e.text.replace(body, () => `@${name} reported on the board in post #${newest.seq}. Its closing words began: ${clip(compactBody, 300)}`) }
     }
-    if (newest.seq > member.last_read_seq) return undefined
+    // Said to the coordinator as it is, unless that would start a turn others' work does not need: then it is posted.
+    if (newest.seq > member.last_read_seq && !quiet) return undefined
   }
-  if (report.length < HANDBACK_MIN) return undefined
+  // Held, even a line is posted: dropped unposted it would be lost, and said to the coordinator it costs a turn.
+  if (report.length < (quiet ? 1 : HANDBACK_MIN)) return undefined
   // A post holds 12,000 characters: a longer report goes up in parts, and the pointer replaces it only once every
   // part is saved. A part the board did not take leaves the coordinator the report itself.
   const parts = Math.ceil(report.length / HANDBACK_PART)
@@ -1820,14 +1873,14 @@ async function mirrorHandback($: EngineInterface, e: { text: string; origin: { k
   for (let part = 0; part < parts; part++) {
     if (owner !== generation || isEnding) return undefined
     const posted = await boardCommand($, roster.dir, ['post', name],
-      `@coordinator HAND-BACK${parts > 1 ? ` (part ${part + 1} of ${parts})` : ''}: @${name}'s turn ended with this report in no board post, so Swarm put it here.\n${fenced(report.slice(part * HANDBACK_PART, (part + 1) * HANDBACK_PART))}`)
+      `${HANDBACK_POST}${parts > 1 ? ` (part ${part + 1} of ${parts})` : ''}: @${name}'s turn ended with this report in no board post, so Swarm put it here.\n${fenced(report.slice(part * HANDBACK_PART, (part + 1) * HANDBACK_PART))}`)
     const seq = /posted #(\d+)/.exec(posted.stdout)?.[1]
     if (posted.exitCode !== 0 || !seq) return undefined
     seqs.push(seq)
   }
   $.clock.after(0, () => void refresh($))
   const where = seqs.map(seq => `#${seq}`).join(', ')
-  return e.text.replace(body, () => `@${name}'s final report is on the board, whole, in post${seqs.length > 1 ? 's' : ''} ${where}: read it there with the board's show action. It is not repeated here.`)
+  return { quiet, text: e.text.replace(body, () => `@${name}'s final report is on the board, whole, in post${seqs.length > 1 ? 's' : ''} ${where}: read it there with the board's show action. It is not repeated here.`) }
 }
 
 // Per member of a run, the newest post that let one of its turn ends be dropped, and the kinds of wake dropped for it:
@@ -1915,6 +1968,49 @@ const runCompact = (dir: string, title: string, root: string) =>
   `the memory of this run; on every wake read it first (the board tool's read action), and Read ${root}/skills/swarm/SKILL.md ` +
   'again before the next step whose rules are no longer in view.'
 let compactedRun = ''
+let compactedAt = -1
+// The token figures the user has written in this conversation: the only budgets the coordinator may set above the
+// one that stands. Seen live: a coordinator whose team was estimated past the budget set 3,000,000 by itself.
+const userFigures = new Set<number>()
+const BUDGET_IS_USERS = 'Nothing changed: the budget is the user\'s to set, and no message of theirs names this figure. Tell them what the run has used and what the plan estimates, and ask for the new total as a figure. Once they write one, set it. Lowering the budget needs no word from them.'
+/**
+ * Whether the coordinator may set this budget: one no higher than the one that stands, or the total the user wrote.
+ * "Raise it by 500k" names no total, so the coordinator asks for one: a raise it could apply would apply again.
+ */
+const mayBudget = (asked: number, standing: number) => Number.isSafeInteger(asked) &&
+  ((asked > 0 && standing > 0 && asked <= standing) || userFigures.has(asked))
+/**
+ * Whether a `limit` with these options sets a budget the coordinator may not. Every `budget=` is judged, as the board
+ * keeps the last one; `budget=` with no figure lifts the budget, and a value that is no plain figure (`9_000_000`,
+ * `$B`) is none the user wrote.
+ */
+const breaksBudget = (options: string[], standing: number) => options.some(option => {
+  const asked = /^budget=(.*)$/s.exec(option.trim())?.[1]
+  return asked !== undefined && !mayBudget(asked === '' ? 0 : Number(asked), standing)
+})
+/**
+ * Owes the run's compaction when the coordinator is idle with a long conversation: first once the team is deployed
+ * (LONG), then whenever the conversation has grown back (HEAVY). Never with a mention unread, a wake to relay or a
+ * pause to answer: those are what the next turn is for. Asked at each end of the coordinator's turn and at each poll
+ * while it is idle. Seen live: checked at a turn's end alone, a conversation went from 106k to 180k tokens over two
+ * runs and 43 steps with a team deployed and was never compacted, five idle minutes included.
+ */
+async function owesRunCompaction($: EngineInterface, dir: string): Promise<boolean> {
+  const epoch = sessionEpoch
+  // Read again after the usage: the run may have changed hands meanwhile, and its address is no other run's instructions.
+  const fits = () => epoch === sessionEpoch && !isEnding && !isCoordinatorBusy && !owedCompaction && !halted && dir !== '' &&
+    ownedRoster?.dir === dir && !ownedRoster.closed && owed.count === 0 && specialistWakes.length === 0 &&
+    Object.entries(ownedRoster.members).some(([name, member]) => name !== 'coordinator' && Boolean(member.id))
+  // One compaction per idle stretch: a conversation that stays long after it is not compacted again at every poll.
+  if (!fits() || (compactedRun === dir && compactedAt === coordinatorTurnsEnded)) return false
+  const held = await $.session.usage().then(usage => usage.context.tokens ?? 0).catch(() => 0)
+  if (!fits() || held < (compactedRun === dir ? HEAVY_CONVERSATION : LONG_CONVERSATION)) return false
+  compactedRun = dir
+  compactedAt = coordinatorTurnsEnded
+  owedCompaction = { epoch: sessionEpoch, tries: 0, isAsked: false, instructions: runCompact(dir, snapshot?.title ?? '', $.plugin.root) }
+  $.ui.toast(`Swarm: compacting the coordinator's conversation (about ${compact(held)} tokens). The team is deployed and the board holds the briefs, so every later wake reads less.`)
+  return true
+}
 
 const KILL_COMPACT = 'The user ended the Swarm run with /swarm-kill. Summarize this conversation for one assistant that ' +
   'continues the user\'s work alone. Keep the user\'s request and every later instruction in their own words, what was ' +
@@ -2038,6 +2134,7 @@ function forgetKills(): void {
   boardDrops.clear()
   isKillTurn = false
   owedCompaction = undefined
+  userFigures.clear()  // the budget one conversation's user named is not another's
 }
 
 // Charges `amount` tokens to the actor's run under `report`, a name the board records once: a model step
@@ -2719,6 +2816,7 @@ async function coordinatorBoard($: EngineInterface, e: BoardInput) {
   if (!Array.isArray(options) || options.length > 40 || options.some(option => typeof option !== 'string' || !/^[A-Za-z_]\w*=[^\n]*$/.test(option))) {
     return { deny: 'options are key=value strings, such as "role=verifier" or "paths=src/a,src/b".' }
   }
+  if (action === 'limit' && breaksBudget(options, snapshot?.budget ?? 0)) return { deny: BUDGET_IS_USERS }
   if (e.seq !== undefined && (!Number.isSafeInteger(e.seq) || e.seq < 1)) return { deny: 'seq is a positive post number.' }
   const text = typeof e.text === 'string' ? e.text.trim() : ''
   const oneLine = [e.title, e.out].find(value => typeof value === 'string' && /\n/.test(value))
@@ -2916,6 +3014,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     poller?.cancel()
     clocks.clear()
+    userFigures.clear()
+    clearHeldStatuses()
     sessionEpoch++
     browseGen++
     resetMonitoring()
@@ -3054,6 +3154,8 @@ export const register: Register = on => {
       return { deny: 'Nothing ran: this command waits on a loose process match, which can match unrelated command lines. Match the process name exactly with `pgrep -x NAME`, or wait on the PID of a process you started.' }
     }
     const calls = e.tool === 'Bash' ? boardCalls(command) : []
+    if (e.agentId === undefined && calls.some(call => call.action === 'limit' &&
+        breaksBudget(call.rest.split(/\s+/).map(word => word.replace(/^['"]|['"]$/g, '')), snapshot?.budget ?? 0))) return { deny: BUDGET_IS_USERS }
     const isCoordinatorBg = e.agentId === undefined && (e.tool === 'Monitor' || (e.tool === 'Bash' && e.run_in_background === true))
     const isMemberGuard = e.agentId !== undefined && (e.tool === 'Edit' || e.tool === 'Write' || e.tool === 'NotebookEdit' || e.tool === 'Bash')
     let bgWarning: string | undefined
@@ -3782,22 +3884,7 @@ export const register: Register = on => {
             owedCompaction = { epoch: sessionEpoch, tries: 0, isAsked: false }
           }
           quietSince = await $.clock.now()
-          const dir = await read($, run)
-          // Compacted by the hooks at an idle point: first once the team is deployed (LONG), then whenever the
-          // conversation has grown back (HEAVY). Never with a mention unread, a wake to relay or a pause to answer:
-          // those are what the next turn is for.
-          const deployed = dir !== '' && ownedRoster?.dir === dir && !ownedRoster.closed &&
-            Object.entries(ownedRoster.members).some(([name, member]) => name !== 'coordinator' && Boolean(member.id))
-          if (sEpoch === sessionEpoch && !isEnding && deployed && !owedCompaction && !halted && owed.count === 0 && specialistWakes.length === 0) {
-            const held = await $.session.usage().then(usage => usage.context.tokens ?? 0).catch(() => 0)
-            // The run may have changed hands while the usage was read: its address is no other run's instructions.
-            if (sEpoch === sessionEpoch && !isEnding && !owedCompaction && ownedRoster?.dir === dir && !ownedRoster.closed && !halted &&
-                held >= (compactedRun === dir ? HEAVY_CONVERSATION : LONG_CONVERSATION)) {
-              compactedRun = dir
-              owedCompaction = { epoch: sessionEpoch, tries: 0, isAsked: false, instructions: runCompact(dir, snapshot?.title ?? '', $.plugin.root) }
-              $.ui.toast(`Swarm: compacting the coordinator's conversation (about ${compact(held)} tokens). The team is deployed and the board holds the briefs, so every later wake reads less.`)
-            }
-          }
+          if (sEpoch === sessionEpoch) await owesRunCompaction($, await read($, run))
         }
       }
       const owner = turnRuns.get(e.turnId) ?? pinnedAt
@@ -3918,6 +4005,11 @@ export const register: Register = on => {
     // Seen live: a background member's last words arrive as a peer message framed `<agent-message from="ID">`, and
     // its task notification follows. Settled first, with no file read: a retired agent is dropped while the kill runs.
     const from = senderOf(e)
+    // What the user typed: not a member's words, and not a notice of Swarm's own, which names budgets too.
+    const origin = (e as { origin?: { kind?: string } }).origin?.kind ?? ''
+    if (from === undefined && origin === 'composer' && !/^\s*Swarm:/.test(e.text)) {
+      for (const figure of figuresIn(e.text)) userFigures.add(figure)
+    }
     if (from !== undefined && cancelledSpawns.has(from)) return { drop: KILL_DROP }
     if (from !== undefined && killedIds.has(from)) {
       // A teammate's address can come back in a later run: a live member of the run driven now by that id is heard.
@@ -3929,7 +4021,8 @@ export const register: Register = on => {
     }
     if (await repeatsBoard($, e).catch(() => false)) return { drop: 'Swarm: a member handed back while others still work; the board holds what it left.' }
     const mirrored = await mirrorHandback($, e).catch(() => undefined)
-    if (mirrored) e = { ...e, text: mirrored }
+    if (mirrored?.quiet) return { drop: 'Swarm: a member handed back while others still work; its report is on the board.' }
+    if (mirrored) e = { ...e, text: mirrored.text }
     // A member's hand-back or task notification that starts the coordinator's next turn is that turn's wake, not the
     // user's. Mid-turn it starts none, and a notice the monitor just submitted keeps its own name.
     const kind = (e as { origin?: { kind?: string } }).origin?.kind
@@ -3945,6 +4038,7 @@ export const register: Register = on => {
     }
     // A plan's task sits in the conversation that may become the coordinator's, so it is saved the same way.
     if (/^(?:swarm:)?(?:swarm|plan)$/.test(e.command)) commandArgs = e.args
+    if ((e as { origin?: { kind?: string } }).origin?.kind === 'composer') for (const figure of figuresIn(e.args ?? '')) userFigures.add(figure)
     if (!/^(?:swarm:)?(?:swarm|plan)$/.test(e.command) || e.args.length < TASK_CHARS) return next(e)
     let args = e.args
     try {
@@ -3983,6 +4077,7 @@ export const register: Register = on => {
   on('ui.close', { id: PANE }, async ($, e, next) => {
     isPaneOpen = isWatched = false
     for (const clock of clocks.values()) clock.visible = false
+    clearHeldStatuses()
     const result = await next(e)
     talk = undefined  // nothing reads a conversation behind a closed pane
     await stop($)
@@ -4014,7 +4109,8 @@ export const register: Register = on => {
     const crab = await next({ ...e, props: { ...e.props, rows: peers } })
     const shown = await read($, swarm)
     const offset = phase(`${e.surface}:shortcut`, shown.dir, emblemStateOf(shown), await $.clock.now().catch(() => 0))
-    return <Box flexDirection="row" columnGap={2}>
+    // 1.75 cells sits the caption about 2 px nearer the button than 2 did.
+    return <Box flexDirection="row" columnGap={1.75}>
       {shortcut($, e, textCount(findKey(peers[0]?.tree, 'crab-text')) === 1, shown, offset, true)}
       <Box flexDirection="column" flexGrow={1} flexShrink={1}>{crab}</Box>
     </Box>
@@ -4231,11 +4327,7 @@ export const register: Register = on => {
       )
     }
 
-    const inactive = new Set(
-      shown.members
-        .filter(m => ['waiting', 'not started', 'killed', 'closed'].includes(m.status))
-        .map(m => m.name),
-    )
+    const inactive = inactiveOf(shown.members)
     const memberOrder = new Map(shown.members.map((member, idx) => [member.name, idx]))
     const hueOf = (name: string) => HUES[(memberOrder.get(name) ?? -1) % HUES.length] ?? 'subtle'
     const inactiveToggle = (count: number) =>
@@ -5035,34 +5127,36 @@ export const register: Register = on => {
         ...Object.keys(shown.earlierEdges ?? {}).flatMap(edge => pairOf(edge) ?? [edge.split('>')[0] ?? '']),
         ...shown.posts.slice(0, index + 1).flatMap(entry => [entry.agent, ...entry.to]),
       ])
-      const hideable = [...inactive].filter(name =>
-        memberOf(name)?.role !== 'coordinator' && (participants === undefined || participants.has(name)) &&
-        name !== post.agent && !post.to.includes(name),
-      )
-      const hidden = new Set(hiding ? hideable : [])
       // Incoming posts animate once on the live board. The latest route loops when playback is idle.
       const isLiveRun = !browsed && !shown.isClosed && !shown.isPaused
       const animate = playing || (isLiveRun && live && pulse === post.seq)
       const repeat = !playing && index === shown.posts.length - 1 && !animate
+      const mode = animate ? 'play' : repeat ? 'repeat' : 'still'
+      const isLiveVisible = live && isLiveRun
+      if (!isLiveVisible) clearHeldStatuses()
+      const graphSwarm = isLiveVisible ? settledStatuses($, shown, `${slot('route')}/${shown.dir}/${post.seq}/${mode}`, animate, now) : shown
+      const hideable = [...(graphSwarm === shown ? inactive : inactiveOf(graphSwarm.members))].filter(name =>
+        memberOf(name)?.role !== 'coordinator' && (participants === undefined || participants.has(name)) &&
+        name !== post.agent && !post.to.includes(name),
+      )
+      const hidden = new Set(hiding ? hideable : [])
       const isExpanded = await read($, expandAll)
       const hasBroadcast = shown.posts.some(isBroadcast) || Object.keys(shown.earlierEdges ?? {}).some(edge => edge.endsWith('>@all'))
-      const isLiveVisible = live && isLiveRun
       if (!isLiveVisible) hideMotion(slot('live'))
       const postKind = verdictOf(post)
       const time = postTime(post)
       const strippedGraphBody = chipped(post)
-      const drawnMembers = visibleMembers(shown, post.seq, hidden, live)
+      const drawnMembers = visibleMembers(graphSwarm, post.seq, hidden, live)
       // Names drawn smaller than this are not read, so the routes are listed instead. The pane gives its width in
       // columns only: pixels are estimated from them.
       const isLegible = labelPx(columns, drawnMembers) >= MIN_LABEL_PX
       const routeSlot = slot('route')
-      const mode = animate ? 'play' : repeat ? 'repeat' : 'still'
       const drawing = JSON.stringify([live, isExpanded, [...hidden],
         drawnMembers.map(m => [m.name, m.role, live ? m.status : '', m.depends])])
       const routeOffset = isLegible
         ? phase(routeSlot, `${shown.dir}/${post.seq}`, `${mode}/${drawing}`, now, animate && !clocks.get(routeSlot)?.view.startsWith('play/'))
         : 0
-      const graph = isLegible ? drawGraph(shown, post.seq, hidden, animate, live, repeat, routeOffset, isExpanded) : undefined
+      const graph = isLegible ? drawGraph(graphSwarm, post.seq, hidden, animate, live, repeat, routeOffset, isExpanded) : undefined
       // The host refuses a longer source, and the whole pane with it: such a graph is listed too.
       const source = graph?.svg !== undefined && graph.svg.length <= SVG_LIMIT ? graph.svg : undefined
       if (source === undefined) hideMotion(routeSlot)

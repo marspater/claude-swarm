@@ -7,7 +7,7 @@ import { BOARD_ACTIONS, hiveArt, memberBee, toolMood, toolSummary } from './hive
 import { DEFAULT_EFFORT, DEFAULT_MODEL, SWARM_AGENTS, familyOf, latestOf, sizedEffort } from './models'
 import { progressBar, semanticIcon, statusCss, statusDot, statusKey, swarmEmblem } from './palette'
 import { END, budgetOf, contextState, detailOf, heldAt, isWindingDown, findAgent, ledger, mentions, parse, parsePosts, postFields, statusOf, targets, tokensUsed } from './roster'
-import { bodyOf, chipped, clean, clip, compact, fenceAfter, fenced, hasQuestion, head, kindOf, openedText, repeatsPosts, stripKind, unquoted, verdictOf } from './text'
+import { bodyOf, chipped, clean, clip, compact, fenceAfter, fenced, figuresIn, hasQuestion, head, kindOf, openedText, repeatsPosts, stripKind, unquoted, verdictOf } from './text'
 
 const post = (text: string, to: string[] = []): Post => ({ seq: 1, agent: 'parser', to, text, time: '2026-11-16T14:03:22+0100' })
 
@@ -129,6 +129,16 @@ test('multi-segment board calls, wakeSequence bounds, and roster status/closed-r
     members: { constructor: { type: 'worker', model: 'sonnet', effort: 'medium', depends: [], owns: '', ready: false, blocked_on: ['x'], asked: 0, unreachable: true } },
   })
   expect(closed.total).toBe(500)
+  // a tail of a long board counts only its own posts: the board's whole-journal counts win when it gives them
+  expect(closed.members.find(m => m.name === 'constructor')?.posts).toBe(1)
+  const counted = parse('/project/.swarm/demo-20261116-101010', tailedBoard, closedRoster, agents, 300, {
+    items: [], members: {}, sent: { constructor: 412 }, unread: { constructor: 3 },
+  })
+  expect(counted.members.find(m => m.name === 'constructor')).toMatchObject({ posts: 412, unread: 3 })
+  expect(counted.members.find(m => m.name === 'coordinator')).toMatchObject({ posts: 0, unread: 0 })
+  // a name the counts leave out is none, even one Object.prototype answers to
+  const uncounted = parse('/project/.swarm/demo-20261116-101010', tailedBoard, closedRoster, agents, 300, { items: [], members: {}, sent: {}, unread: {} })
+  expect(uncounted.members.find(m => m.name === 'constructor')).toMatchObject({ posts: 0, unread: 0 })
   // a closed run has no live state: no waiting, no unreachable, nothing waited for; only the last report, or none
   expect(closed.members.find(m => m.name === 'constructor')?.status).toBe('closed')
   expect(closed.members.find(m => m.name === 'constructor')?.detail).toBe('No outcome recorded')
@@ -1393,4 +1403,10 @@ test('a glob that names the board script and inline code that names a commit are
     expect([commits, await commitsInSharedCheckout($, commits, '/project')]).toEqual([commits, true])
   }
   expect(await commitsInSharedCheckout($, 'python3 -c "print(1)"', '/project')).toBe(false)
+})
+
+test('figuresIn reads the token figures a message names, however written', () => {
+  expect(figuresIn('give it 3M, or 2.5 mln; not 500k but 3,000,000 or 1 250 000 or 660000')).toEqual([3_000_000, 2_500_000, 500_000, 3_000_000, 1_250_000, 660_000])
+  expect(figuresIn('0.125M and 2,5 mln')).toEqual([125_000, 2_500_000])
+  expect(figuresIn('wait 5 minutes, use 3 workers on #1361 and 0.7 lambda')).toEqual([])
 })

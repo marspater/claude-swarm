@@ -24,7 +24,7 @@ import time
 import uuid
 
 sys.dont_write_bytecode = True
-from board import REPORT_WORD, atomic_write, latest_reports, load, load_state, readiness, save, shown, unfenced, withdrawn_in
+from board import REPORT_WORD, atomic_write, latest_reports, load, load_state, private, readiness, save, shown, unfenced, withdrawn_in
 
 GIT_ENV_STRIP = {
     "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
@@ -2030,6 +2030,7 @@ def main():
     run = args.run.resolve(strict=True)
     if run.parent != (project / ".swarm").resolve() or not (run / "members.json").is_file():
         raise ValueError("expected an initialized Swarm run in the specified project")
+    private(run)
     git_dir = git(project, "rev-parse", "--absolute-git-dir", optional=True)
     lock_directory = Path(os.fsdecode(git_dir.rstrip(b"\n"))) if git_dir else run.parent
     with verification_lock(lock_directory):

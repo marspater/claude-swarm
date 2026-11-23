@@ -186,3 +186,16 @@ export function repeatsPosts(posts: string[], report: string): boolean {
     return unsaid < NEWS_WORDS || words.length - unsaid >= words.length * REPEATS
   })
 }
+
+/**
+ * The token figures a text names, for telling the user's budget from one the coordinator chose: "3M", "2.5 mln",
+ * "500k", "3,000,000", "3 000 000". Anything under ten thousand is no budget.
+ */
+export function figuresIn(text: string): number[] {
+  return Array.from(text.matchAll(/(\d+(?:[ ,._]\d{3})+|\d+(?:[.,]\d+)?)(?:\s*(k|m|mln|mio|million|thousand)\b)?/gi), found => {
+    const unit = (found[2] ?? '').toLowerCase()
+    // With a unit the figure is a decimal ("0.125M", "2,5 mln"); alone, its separators group thousands.
+    const value = unit === '' ? Number(found[1]!.replace(/[ ,._]/g, '')) : Number(found[1]!.replace(/[ _]/g, '').replace(',', '.'))
+    return Math.round(value * (unit === '' ? 1 : unit === 'k' || unit === 'thousand' ? 1e3 : 1e6))
+  }).filter(value => value >= 10_000)
+}

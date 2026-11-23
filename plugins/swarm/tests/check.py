@@ -28,7 +28,7 @@ PARITY = "tests.test_board.BoardRegressions.test_parity_vectors_match_the_board"
 # commands. Both engine scripts run both modules: verify.py imports board.py, and board.py's sync and stale checks
 # import verify.py.
 RULES = (
-    (r"tests/check\.py$", ()),
+    (r"tests/check\.py$", ("selector",)),
     (r"tests/engine\.py$", ("board", "verify")),
     (r"tests/test_board\.py$", ("board",)),
     (r"tests/test_verify\.py$", ("verify",)),
@@ -39,8 +39,8 @@ RULES = (
     (r"(?:hooks|types)/|tsconfig\.json$|bunfig\.toml$|\.claude-plugin/", ("types", "units", "host", "validate")),
     (r"", ("validate",)),  # skills, agents, the README: text the plugin loads
 )
-ORDER = ("types", "units", "validate", "host", "parity", "board", "verify")
-SIDE = {"types": "ts", "units": "ts", "validate": "ts", "host": "ts", "parity": "py", "board": "py", "verify": "py"}
+ORDER = ("selector", "types", "units", "validate", "host", "parity", "board", "verify")
+SIDE = {"selector": "py", "types": "ts", "units": "ts", "validate": "ts", "host": "ts", "parity": "py", "board": "py", "verify": "py"}
 
 
 def git(*args):
@@ -124,6 +124,28 @@ def python_tests(ids):
     return not failed, "\n".join(output for _, output in failed), time.time() - started, note
 
 
+def selector():
+    """The runner's own check: each kind of path picks the checks it needs, and --all --list names every check."""
+    expected = {
+        "tests/check.py": ("selector",),
+        "tests/engine.py": ("board", "verify"),
+        "tests/test_board.py": ("board",),
+        "skills/swarm/scripts/verify.py": ("board", "verify"),
+        "hooks/graph.test.tsx": ("types", "units"),
+        "hooks/register.test.tsx": ("types", "host"),
+        "hooks/register.tsx": ("types", "units", "host", "validate"),
+        "skills/swarm/SKILL.md": ("validate",),
+    }
+    wrong = ["%s picks %s, not %s" % (path, picked, checks) for path, checks in expected.items()
+             if (picked := next(found for pattern, found in RULES if re.match(pattern, path))) != checks]
+    started = time.time()
+    done = subprocess.run([sys.executable, "-B", os.path.abspath(__file__), "--all", "--list"], cwd=ROOT, capture_output=True, text=True)
+    listed = [line.split(":")[0] for line in done.stdout.split("\n") if line]
+    if done.returncode != 0 or listed != [check for check in ORDER if check != "parity"]:
+        wrong.append("--all --list printed %r%s" % (listed, done.stderr))
+    return not wrong, "\n".join(wrong), time.time() - started
+
+
 def main(argv):
     flags = {"--all", "--list"}
     base = argv[argv.index("--base") + 1] if "--base" in argv and argv.index("--base") + 1 < len(argv) else None
@@ -165,6 +187,8 @@ def main(argv):
         if check == "engine":
             passed, output, took, note = python_tests([name for module in engine for name in ids[module]])
             note = "%s: %s" % (" and ".join(engine), note)
+        elif check == "selector":
+            passed, output, took = selector()
         elif check == "parity":
             passed, output, took = command([sys.executable, "-B", "-m", "unittest", PARITY])
         elif check == "types":

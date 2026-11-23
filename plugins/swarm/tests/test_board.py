@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -889,6 +890,34 @@ class BoardRegressions(unittest.TestCase):
 
     def init_run(self, name="reg"):
         return run(os.path.join(self.swarm, name), "init", "Regression").strip()
+
+    def test_attention_counts_posts_over_the_whole_journal(self):
+        d = self.init_run()
+        run(d, "member", "w")
+        for _ in range(3):
+            run(d, "post", "coordinator", stdin="@w next step")
+        run(d, "read", "w")
+        run(d, "post", "coordinator", stdin="@w one more")
+        run(d, "post", "w", stdin="@coordinator done")
+        report = json.loads(run(d, "attention", "--json"))
+        assert report["sent"] == {"coordinator": 4, "w": 1}, report["sent"]
+        assert report["unread"]["w"] == 1, report["unread"]
+
+    def test_run_folder_is_private_under_a_permissive_umask(self):
+        before = os.umask(0o022)
+        try:
+            d = self.init_run()
+            assert stat.S_IMODE(os.stat(d).st_mode) == 0o700
+            os.chmod(d, 0o755)  # a run made before runs were private
+            run(d, "show")
+            assert stat.S_IMODE(os.stat(d).st_mode) == 0o700
+            elsewhere = os.path.join(self.root, "copy")  # a run folder copied out of .swarm is not chmodded
+            shutil.copytree(d, elsewhere)
+            os.chmod(elsewhere, 0o755)
+            run(elsewhere, "show")
+            assert stat.S_IMODE(os.stat(elsewhere).st_mode) == 0o755
+        finally:
+            os.umask(before)
 
     def test_scope_change_withdraws_reports_and_rechecks_dependents(self):
         d = self.init_run()

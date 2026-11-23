@@ -1019,6 +1019,243 @@
    "expect": [
     "coordinator"
    ]
+  },
+  {
+   "text": "@parser FYI from @api (post #6): snapshots are cumulative, per @docs #5 and @v #4",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "coordinator",
+   "expect": [
+    "parser"
+   ]
+  },
+  {
+   "text": "@parser yes: use the interface in @api's #26",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "coordinator",
+   "expect": [
+    "parser"
+   ]
+  },
+  {
+   "text": "@parser #7 is answered, and @api (who posted #6) should check it",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "coordinator",
+   "expect": [
+    "parser",
+    "api"
+   ]
+  },
+  {
+   "text": "@parser the answer for @api #7: use the key",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "coordinator",
+   "expect": [
+    "parser",
+    "api"
+   ]
+  },
+  {
+   "text": "see @parser for the key fields, then (@api #3) applies",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "coordinator",
+   "expect": [
+    "parser"
+   ]
+  },
+  {
+   "text": "@parser and @api #23 changed, merge it again; (@docs #4, @v #5) said so",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "coordinator",
+   "expect": [
+    "parser",
+    "api"
+   ]
   }
  ],
  "quoted": [

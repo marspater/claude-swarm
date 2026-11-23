@@ -66,6 +66,10 @@ sys.dont_write_bytecode = True
 
 # @name at a word start; an email or a path (a@b.com, pkg/@scope) is not a mention
 MENTION = re.compile(r"(?<![A-Za-z0-9_.@/])@([A-Za-z][A-Za-z0-9_-]*)")
+# A post's author named as its source: a citing word, the name, then the post's number. Mirrored in hooks/roster.ts.
+# "and" or a comma only carries a citation on ("per @a #5 and @b #6"): between two addressees it cites nothing.
+_CITE = r"@[A-Za-z][A-Za-z0-9_-]*(?:['’]s)?[ \t]*\(?(?:(?:posts?|in)[ \t]+)?#[0-9]+\)?"
+CITED = re.compile(r"(?:\b(?:from|per|see|by|in|of|via|cf\.?)[ \t]+|\()%s(?:[ \t]*(?:,|and|&)[ \t]*%s)*" % (_CITE, _CITE), re.IGNORECASE)
 NAME = re.compile(r"[a-z](?:[a-z0-9_-]*[a-z0-9])?")  # ends in a letter or digit: "@name-" in prose is @name
 COORDINATOR = "coordinator"
 WAKE_LEASE_SECONDS = 15
@@ -1381,7 +1385,15 @@ def attention(state, posts):
                    "asked": asked.get(name, 0), "unreachable": not closed and name in awake and unreachable(name, members, posts),
                    "paused": bool(member.get("paused")), "heavy": not closed and heavy(name, member, posts)}
             for name, member in members.items() if name != COORDINATOR}
-    return {"items": items, "members": view}
+    # Counted over the whole journal: the pane reads only the newest posts of a board past its read limit.
+    sent, unread = {}, {}
+    for post in posts:
+        sent[post["agent"]] = sent.get(post["agent"], 0) + 1
+        for name in post.get("to", []):
+            seen = members[name].get("last_read_seq") if isinstance(members.get(name), dict) else None
+            if isinstance(seen, int) and post["seq"] > seen:
+                unread[name] = unread.get(name, 0) + 1
+    return {"items": items, "members": view, "sent": sent, "unread": unread}
 
 
 def attention_text(report):
@@ -1705,8 +1717,9 @@ def prune(root, args):
 
 def mentions(text):
     """The names TEXT mentions outside code. The name as written also reaches a roster made before names had to end
-    in a letter or digit."""
-    return {form for m in MENTION.findall(QUOTED.sub(" ", text)) for form in (m.lower(), m.lower().rstrip("-_"))}
+    in a letter or digit. A name that only says whose post is cited ("per @lead #5", "from @novelty (post #6)")
+    addresses nobody: seen live, a note to one member that named two others as its sources woke both for nothing."""
+    return {form for m in MENTION.findall(CITED.sub(" ", QUOTED.sub(" ", text))) for form in (m.lower(), m.lower().rstrip("-_"))}
 
 
 def targets(text, members, *, include_killed=False, sender=None):
@@ -1723,6 +1736,19 @@ def show(post):
     return head + "\n" + "\n".join("  " + line for line in post["text"].split("\n")) + "\n"
 
 
+def private(d):
+    """Run data holds code, check output and whatever a member printed: only its owner may open the run folder.
+    Everything inside it, the journal and the verification logs among them, is then out of other accounts' reach."""
+    if os.path.basename(os.path.dirname(os.path.abspath(d))) != ".swarm":  # only a run folder, as `init` makes them
+        return
+    try:
+        status = os.stat(d)
+        if status.st_uid == os.getuid() and status.st_mode & 0o077:
+            os.chmod(d, 0o700)
+    except OSError:  # a read-only copy, or a folder another account owns: left as it is
+        pass
+
+
 def init(d, title):
     parent, name = os.path.split(os.path.abspath(d))
     if os.path.basename(parent) != ".swarm":  # never write a "*" .gitignore anywhere else
@@ -1737,7 +1763,7 @@ def init(d, title):
         run = "%s-%s" % (name, time.strftime("%Y%m%d-%H%M%S"))
         while True:  # mkdir is atomic, so two runs started in the same second get two folders
             try:
-                os.mkdir(os.path.join(parent, run))
+                os.mkdir(os.path.join(parent, run), 0o700)
                 break
             except FileExistsError:
                 run += "x"
@@ -1853,6 +1879,8 @@ def main(argv):
         binding_file(os.path.dirname(os.path.abspath(d)), args[0])
         choosing = open(os.path.join(os.path.dirname(os.path.abspath(d)), ".adopt.lock"), "w")
         fcntl.flock(choosing, fcntl.LOCK_EX)
+
+    private(d)  # a run made before runs were private is closed on its next command
 
     if cmd == "tail":
         # For a reader with a size limit (the pane reads at most 4 MiB): whole lines only, newest last. Takes no lock.

@@ -305,6 +305,59 @@ test('the pane draws the board, the members and the graph', async ($, on) => {
   await ui.unmount()
 })
 
+test('the live graph holds a status change while a packet is in flight', async ($, on) => {
+  on('command.register', () => ({ value: { command: 'swarm-board' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('tool.register', (_, spec) => ({ value: { tool: `mcp__swarm__${spec.name}` } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.cwd', () => ({ value: '/project' }))
+  on('fs.exists', () => ({ value: true }))
+  let board = BOARD
+  on('fs.read', (_, e) => ({
+    value: e.path.endsWith('/current') ? 'demo\n' : e.path === '/project/.swarm/demo/board.jsonl' ? board : ROSTER,
+  }))
+  let parserStatus: 'running' | 'idle' = 'running'
+  on('agent.list', () => ({
+    value: [
+      { id: 'a1', description: '@parser', type: 'swarm:worker', status: parserStatus },
+      { id: 'a2', description: '@verifier', type: 'swarm:verifier', status: 'completed' },
+    ] as never,
+  }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await clock.advance(2000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-graph' })
+  const graph = async () => (await ui.findAll({ type: 'Svg' })).find(svg => /^Post /.test(String(svg.props.alt)))
+  board = BOARD.slice(0, BOARD.lastIndexOf('\n') + 1) + [
+    { seq: 4, agent: 'parser', to: ['verifier'], text: 'Fixed line 4.' },
+    { seq: 5, agent: 'verifier', to: ['parser'], text: 'Checked it.' },
+  ].map(post => JSON.stringify({ ...post, time: '2026-11-16T14:03:23+0100' })).join('\n') + '\n'
+  await clock.advance(2000 - clock.now() % 2000)
+  await clock.advance(1200)
+  // Post 5's packet is in flight until the next frame; the poll in between brings a status change.
+  expect(String((await graph())?.props.alt)).toMatch(/^Post 5 · /)
+  const inFlight = String((await graph())?.props.source)
+  expect(inFlight).toContain('parser · working')
+  parserStatus = 'idle'
+  await clock.advance(800)
+  expect(String((await graph())?.props.source)).toBe(inFlight)
+  // The packet's end takes the held status with the frame that changes anyway.
+  await clock.advance(400)
+  expect(String((await graph())?.props.source)).toContain('parser · waiting')
+  // With no packet in flight, a change soon after the last one waits out the settle, then redraws by itself.
+  board += JSON.stringify({ seq: 6, agent: 'parser', to: ['verifier'], text: 'Thanks.', time: '2026-11-16T14:03:24+0100' }) + '\n'
+  await clock.advance(2000 - clock.now() % 2000)
+  await clock.advance(1200)
+  expect(String((await graph())?.props.alt)).toMatch(/^Post 6 · /)
+  parserStatus = 'running'
+  await clock.advance(800)
+  expect(String((await graph())?.props.source)).toContain('parser · waiting')
+  await clock.advance(400)
+  expect(String((await graph())?.props.source)).toContain('parser · working')
+  await ui.unmount()
+})
+
 test('with no swarm the pane says how to start one', async $ => {
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
 
@@ -6793,6 +6846,7 @@ test('spend guards: a read-only member past the context ceiling may only report,
   const mirrored: (string | undefined)[] = []
   let postFails = false
   let ready = ''
+  let builderStatus = 'running'
   const symlinks: Record<string, string> = {
     '/project/.swarm': '/data/runs',
     '/project/.swarm/tasks/brief.md': '/data/runs/tasks/brief.md',
@@ -6814,7 +6868,7 @@ test('spend guards: a read-only member past the context ceiling may only report,
   })
   on('agent.list', () => ({ value: [
     { id: 'scout-1', description: '@scout: sweep', type: 'swarm:investigator', status: 'running' },
-    { id: 'builder-1', description: '@builder: build', type: 'swarm:worker', status: 'running' },
+    { id: 'builder-1', description: '@builder: build', type: 'swarm:worker', status: builderStatus },
   ] as never }))
   on('tool.call', () => ({ result: {} }))
   let read = 0
@@ -6853,6 +6907,9 @@ test('spend guards: a read-only member past the context ceiling may only report,
   expect([told.deny, String(told.context)]).toEqual([undefined, expect.stringContaining('every step reads all of it again')])
   expect((await grep('old-1')).deny).toMatch(/holds about 250k tokens, past the ceiling of 200k/)
   // a final report that is in no board post is put there in the member's name, and the coordinator gets its number
+  // (told at once only when no other member works: see the end of this part)
+  builderStatus = 'completed'
+  await clock.advance(2000)
   const findings = `Three findings. ${'ST1 restoreBackup loses the edition when the tension write throws. '.repeat(8)}`
   await $.prompt.submit({ text: `Another Claude session sent a message:\n<agent-message from="scout-1">\n[Subagent hand-back] ${findings}</agent-message>`, origin: { kind: 'peer' }, wait: false })
   // the report goes up fenced: the board reads no mention inside it, so a member it names is not woken
@@ -6903,6 +6960,23 @@ test('spend guards: a read-only member past the context ceiling may only report,
   expect([mirrored.length, seen.prompts.at(-1)?.includes("Its closing words began: Summary: After the READY I traced $& and $' through")]).toEqual([6, true])
   state.members.scout.last_read_seq = 2
   ready = 'Status update. Still investigating.'
+  // while another member works, a report that asks nothing starts no turn of the coordinator's: it goes on the board,
+  // where it waits to be read as a READY does; one that asks something is still said at once
+  builderStatus = 'running'
+  await clock.advance(2000)
+  const heard = seen.prompts.length
+  const held = await $.prompt.submit({ text: `<agent-message from="scout-1">\n[Subagent hand-back] ${frame}  ${findings}</agent-message>`, origin: { kind: 'peer' }, wait: false })
+  expect([mirrored.length, held.drop, seen.prompts.length]).toEqual([7, expect.stringContaining('its report is on the board'), heard])
+  ready = mirrored.at(-1)!
+  state.members.scout.last_read_seq = 1
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'c-idle' })
+  await clock.advance(2000)
+  await clock.advance(14_000)
+  expect(seen.prompts.filter(text => text.includes('Unread board mentions'))).toEqual([])
+  ready = 'Status update. Still investigating.'
+  state.members.scout.last_read_seq = 2
+  await $.prompt.submit({ text: `<agent-message from="scout-1">\n[Subagent hand-back] ${frame}  ${findings} Which of the two fixes do you want?</agent-message>`, origin: { kind: 'peer' }, wait: false })
+  expect([mirrored.length, seen.prompts.length, seen.prompts.at(-1)?.includes("@scout's final report is on the board")]).toEqual([8, heard + 1, true])
   // an agent that is no member of the run is measured but told nothing: it has no board to post on
   await step('outsider', 'o', 0, 210_000)
   const stranger = await grep('outsider')
@@ -7258,17 +7332,40 @@ test('token-economy #3: the coordinating conversation is compacted after deploym
   contextTokens = 110_000
   await endTurn('ct-light')
   expect(compactions).toEqual([])
+  // An idle coordinator is compacted from the poll as well: no turn has to end at the right moment.
   contextTokens = 130_000
-  await endTurn('ct-long')
+  await clock.advance(2000)
+  await clock.advance(10)
   expect(compactions.length).toBe(1)
   expect(compactions[0]).toContain(`coordinates the Swarm run "Economy swarm" at ${OWNED}, and goes on coordinating it`)
   expect(compactions[0]).toContain('the board is the memory of this run')
+  // one that stays long is not compacted again until a turn of the coordinator's has ended
+  contextTokens = 190_000
+  await clock.advance(4000)
+  expect(compactions.length).toBe(1)
+  contextTokens = 130_000
   await endTurn('ct-same')
   expect(compactions.length).toBe(1)
   contextTokens = 190_000
   await endTurn('ct-regrown')
   expect(compactions.length).toBe(2)
   contextTokens = 10_000
+
+  // The budget is the user's: the coordinator may lower it, and raise it only to a figure the user wrote.
+  const limit = (budget: string) => toolCall($, { tool: 'mcp__swarm__board', action: 'limit', options: [`budget=${budget}`] } as never)
+  expect((await limit('3000000')).deny).toContain('the budget is the user\'s to set')
+  expect((await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" limit budget=3000000` })).deny).toContain('the budget is the user\'s to set')
+  await $.prompt.submit({ text: 'Swarm: Run paused\nRaise it to 3,000,000?', origin: { kind: 'composer' }, wait: false })
+  expect((await limit('3000000')).deny).toContain('the budget is the user\'s to set')
+  await $.prompt.submit({ text: 'ok, give it 3M', origin: { kind: 'composer' }, wait: false })
+  expect([(await limit('3000000')).deny, (await limit('2000000')).deny, (await limit('3_000_000')).deny, (await limit('')).deny].map(deny => deny?.includes('the budget is the user'))).toEqual([undefined, true, true, true])
+  expect((await toolCall($, { tool: 'Bash', command: `B=9000000; python3 /p/board.py "${OWNED}" limit budget=$B` })).deny).toContain('the budget is the user\'s to set')
+  expect((await toolCall($, { tool: 'mcp__swarm__board', action: 'limit', options: ['budget=3000000', 'budget=9000000'] } as never)).deny).toContain('the budget is the user\'s to set')
+  await $.prompt.submit({ text: 'raise it by 500k', origin: { kind: 'composer' }, wait: false })
+  expect((await limit('3500000')).deny).toContain('the budget is the user\'s to set')
+  await $.prompt.submit({ text: 'make it 9M', origin: { kind: 'plugin', name: 'other' }, wait: false })
+  expect((await limit('9000000')).deny).toContain('the budget is the user\'s to set')
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'ct-budget' })
 
   // Independent FINDING coalescing: inv1 posts FINDING while inv2 works and nobody depends on inv1 -> deferred past 10s
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'ct-idle' })
