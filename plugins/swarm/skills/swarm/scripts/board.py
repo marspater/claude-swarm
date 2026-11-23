@@ -73,10 +73,10 @@ WAKE_ATTEMPTS = 3
 REWORK_WARNING, REWORK_PAUSE = 2, 3  # failed verification cycles in a row
 SPEND_FLOOR = 200_000  # a share of less says nothing about the run
 SPEND_SHARE, PAIR_SHARE = 1 / 2, 3 / 4  # of the run's tokens with three or more members using any, of the pair's with two
-# Spent by a worker without posting or reading: it is going round in circles. A step is one model response,
+# Spent by a worker or verifier without posting or reading: it is going round in circles. A step is one model response,
 # so a long stretch of honest edits stays well under it. Each step re-reads the member's conversation, some 14,000
-# charged tokens at 100,000 held, so the token count is set to about as many steps and catches the heavier ones.
-LOOP_STEPS, LOOP_TOKENS = 150, 2_000_000
+# charged tokens at 100,000 held, so the token count catches heavy spinning earlier too.
+LOOP_STEPS, LOOP_TOKENS = 150, 750_000
 AGENT_STATE = ("wake_claim", "last_nudged_seq", "told", "delivered", "clipped", "tested")  # what one agent read and was told: not its successor's
 # No run is without a bound: one made with no budget named pauses here and the user is asked. Seen live: a run nobody
 # had capped spent 7.8M tokens before the user looked. Five members on a task of a few files use about this much.
@@ -350,11 +350,22 @@ def withdrawn_in(repo, names, members, posts, revision, base=None):
     return None
 
 
-def carried(repo, member, members, posts, revision):
+def project_base(d, repo):
+    """The project repository's HEAD commit ID when valid and present in REPO, else None."""
+    import verify  # late: verify.py imports this module
+    project = os.path.dirname(os.path.dirname(os.path.abspath(d)))
+    head = verify.git(project, "rev-parse", "--verify", "HEAD^{commit}", optional=True)
+    if not head:
+        return None
+    commit = head.decode().strip()
+    return commit if verify.git(repo, "cat-file", "-e", commit + "^{commit}", optional=True) is not None else None
+
+
+def carried(repo, member, members, posts, revision, base=None):
     """What `withdrawn_in` finds in MEMBER's commit REVISION among the members it waits for, directly or through
     another. What a retired member left unpassed must not ride into the candidate on the commit of a member that came
     after it, however far down the chain: the report is waived by the retirement, the work is not."""
-    return withdrawn_in(repo, upstream(member, members), members, posts, revision)
+    return withdrawn_in(repo, upstream(member, members), members, posts, revision, base)
 
 
 def merge_after(member, changes, before=""):
@@ -404,9 +415,23 @@ def rejected(post, members):
     if not word or word[1] != "NOT PASSED" or members.get(post["agent"], {}).get("role") != "verifier":
         return []
     reached = post.get("to", [])
-    first = [name for name in targets(post["text"].split("\n", 1)[0], members, include_killed=True, sender=post["agent"])
-             if name in reached and members.get(name, {}).get("role") == "worker"]
-    return first or [name for name in reached if members.get(name, {}).get("role") == "worker"]
+    head = post["text"].split("\n", 1)[0]
+    named = mentions(head)
+
+    def rejectable(name, explicit=False):
+        entry = members.get(name, {})
+        if entry.get("role") != "worker" or entry.get("consult") == "1":
+            return False
+        return explicit or kind_of(entry) != "investigator"
+
+    head_workers = [name for name in targets(head, members, include_killed=True, sender=post["agent"])
+                    if name in reached and members.get(name, {}).get("role") == "worker"]
+    first = [name for name in head_workers
+             if rejectable(
+                 name, explicit=(name in named or ("all" not in named and members.get(name, {}).get("group") in named)))]
+    if head_workers:
+        return first
+    return [name for name in reached if rejectable(name)]
 
 
 def readiness(members, posts):
@@ -963,11 +988,12 @@ def fenced(lines):
     quoted output, and no line of it raises, answers or rules on a finding."""
     opened, found = None, set()
     for index, line in enumerate(lines):
-        mark = re.match(r"[ \t]*(`{3,}|~{3,})(.*)", line)
+        mark = re.match(r" {0,3}(`{3,}|~{3,})(.*)", line)
         if opened is None:
-            if mark:
-                opened = mark[1]
-                found.add(index)
+            if not mark or (mark[1][0] == "`" and "`" in mark[2]):
+                continue
+            opened = mark[1]
+            found.add(index)
             continue
         found.add(index)
         # Only a fence of the opener's own mark, at least as long and with nothing after it, closes the block: a
@@ -1024,11 +1050,14 @@ def tagged(text):
     word = REPORT_WORD.match(lines[0])
     whole = word and re.match(r"[ \t]*\[(F\d+)\]", lines[0][word.end():], re.I | re.A)
     if whole:
-        found.append((whole[1].upper(), re.sub(r"^[ \t.:,-]+", "", lines[0][word.end() + whole.end():]).strip()))
+        summary = re.sub(r"^(?:[ \t.:,;—–-]|@[A-Za-z0-9][A-Za-z0-9_-]*)+", "", lines[0][word.end() + whole.end():]).strip()
+        if not summary:
+            summary = next((line.strip() for line in lines[1:] if line.strip() and not RULING_LINE.fullmatch(line)), "")
+        found.append((whole[1].upper(), summary))
     return found
 
 
-def tag_findings(text, known, number):
+def tag_findings(text, known, number, members=None):
     """(TEXT with an id on each defect a NOT PASSED raises, the ids given), counting on from NUMBER. A defect is a
     bullet at the start of a line; a verdict with none is one defect in prose, unless it only rules on ids in KNOWN.
     A bullet that carries a known id raises that defect again, and an id the board never gave is replaced."""
@@ -1042,9 +1071,9 @@ def tag_findings(text, known, number):
         mark = BULLET.match(line)
         if not mark or index in quoted:
             continue
-        bullets = True
         if RULING_LINE.fullmatch(line):
             continue
+        bullets = True
         tag = ID_TAG.match(line, mark.end())
         if tag and (tag[1] or tag[2]).upper() in known:
             continue
@@ -1058,7 +1087,21 @@ def tag_findings(text, known, number):
             rest = rest[whole.end():]  # an id the board never gave
         # A verdict that only closes known ids says what is wrong in its prose: that is a new defect.
         rulings = rulings_in(text)
-        if not any(rulings.get(name) != "resolved" for name in about):
+        routing = RESERVED | (
+            set(members) | {entry["group"] for entry in members.values() if entry.get("group")}
+            if members else set()
+        )
+        def strip_routing(line):
+            return MENTION.sub(
+                lambda m: "" if m[1].lower() in routing or m[1].lower().rstrip("-_") in routing else m[0],
+                line,
+            ).strip(" \t.:,;—–-")
+
+        has_prose = bool(strip_routing(rest)) or any(
+            index not in quoted and not RULING_LINE.fullmatch(line) and bool(strip_routing(line))
+            for index, line in enumerate(lines[1:], start=1)
+        )
+        if has_prose and not any(rulings.get(name) != "resolved" for name in about):
             lines[0] = "%s [%s]%s" % (lines[0][:word.end()], fresh(), rest)
     return "\n".join(lines), given
 
@@ -1199,7 +1242,7 @@ def attention(state, posts):
             items.append({"kind": "member_paused", "member": name, "seq": 0,
                           "text": "@%s is paused: %s. Raise it with member %s budget=<tokens>, then resume %s"
                                   % (name, member["paused"], name, name)})
-        elif member.get("role") == "worker" and member.get("id"):
+        elif member.get("role") in {"worker", "verifier"} and member.get("id"):
             key = usage_key(member)
             mark = usage.get("marks", {}).get(key, [0, 0])  # steps and tokens when it last posted or read
             turns, used = usage.get("steps", {}).get(key, 0) - mark[0], tokens.get(key, 0) - mark[1]
@@ -1414,20 +1457,45 @@ def prune(root, args):
                     if not isinstance(candidate, dict):
                         candidate = {}
                     kept = None if state.get("closed") or candidate.get("accepted") else "integration-%s" % candidate.get("candidate")
-                    for name in sorted(os.listdir(os.path.join(root, run))):
+                    baselines_path = os.path.join(root, run, verify.BASELINES_FILE)
+                    try:
+                        with open(baselines_path, encoding="utf-8") as f:
+                            raw_baselines = json.load(f)
+                    except (OSError, ValueError):
+                        raw_baselines = []
+                    recorded_baselines = {b for b in raw_baselines if isinstance(b, str)} if isinstance(raw_baselines, list) else set()
+                    remaining_baselines = set(recorded_baselines)
+                    run_entries = set(os.listdir(os.path.join(root, run)))
+                    for name in sorted(run_entries):
                         path = os.path.join(root, run, name)
                         # Only ever a folder of this name directly inside a run folder: never a member's own checkout.
-                        if not name.startswith("integration-") or name == kept or os.path.islink(path) or not os.path.isdir(path):
+                        # Baseline directories are removed only when recorded by verification, never manually created ones.
+                        is_integration = name.startswith("integration-")
+                        is_baseline = name.startswith("baseline-") and name in recorded_baselines
+                        if (not is_integration and not is_baseline) or name == kept or os.path.islink(path) or not os.path.isdir(path):
                             continue
                         # Asked before anything is removed, so a dry run reports exactly what a prune would do.
                         if os.path.realpath(path) not in known:
                             print("kept %s: Git does not know it as a worktree" % path)
-                        elif would or verify.git(project, "worktree", "remove", "--force", path, optional=True) is not None:
+                        elif (wt_status := verify.git(path, "status", "--porcelain", "--untracked-files=all", optional=True)) is None or wt_status.strip():
+                            print("kept %s: worktree has uncommitted changes" % path)
+                        elif would or verify.git(project, "worktree", "remove", path, optional=True) is not None:
                             print("%sremove worktree %s" % (would, path))
                             gone.add(os.path.realpath(path))
+                            remaining_baselines.discard(name)
                             removed += 1
                         else:
                             print("kept %s: Git could not remove it" % path)
+                    if not would and recorded_baselines:
+                        remaining_baselines &= run_entries
+                        if remaining_baselines != recorded_baselines:
+                            if remaining_baselines:
+                                atomic_write(baselines_path, json.dumps(sorted(remaining_baselines)) + "\n")
+                            else:
+                                try:
+                                    os.unlink(baselines_path)
+                                except OSError:
+                                    pass
                 if not would:
                     verify.git(project, "worktree", "prune", optional=True)
         worktrees = [wt for wt in (registered() if git_dir else ()) if not would or wt not in gone]
@@ -1894,11 +1962,11 @@ def main(argv):
                     and latest_reports(posts).get(name, {}).get("kind") in {"ready", "finding"}):
                 recipients = [name] + [n for n, entry in team_of(members).items() if n != name and (
                     name in dependencies(entry) or (entry.get("role") == "verifier" and in_play(d, name, members)))]
-                what = ("Review its scope and report again." if member.get("role") == "worker" else
+                what = ("Review your scope and report again." if member.get("role") == "worker" else
                         "You are a %s now: your earlier report is withdrawn, and a %s posts no READY." % (member["role"], member["role"]))
                 return post_message(COORDINATOR, f"@{name} Your assignment changed. {what}",
                                     recipients, kind="revise", subject=name, save_roster=True)
-            if "killed" in changes:
+            if "killed" in changes and not previous.get("killed"):
                 # Whoever only came after the retired member, and waits for nobody else, starts now: no READY will say so.
                 through = readiness(members, posts)
                 freed = [n for n, entry in team_of(members).items()
@@ -2092,9 +2160,21 @@ def main(argv):
             sender = known(args[0])
             if members[sender].get("killed"):
                 sys.exit(f"@{sender} has been retired")
-            text = (" ".join(args[1:]).strip() or sys.stdin.read()).strip()
+            text = " ".join(args[1:]).strip()
             if not text:
-                sys.exit("empty post")
+                sender_id = members[sender].get("id")
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                text = sys.stdin.read().strip()
+                if not text:
+                    sys.exit("empty post")
+                state, posts = relocked()
+                members = state["members"]
+                if state.get("closed"):
+                    sys.exit("the run is closed")
+                if sender not in members or members[sender].get("killed"):
+                    sys.exit(f"@{sender} has been retired")
+                if sender != COORDINATOR and members[sender].get("id") != sender_id:
+                    sys.exit(f"@{sender}'s agent changed while reading stdin. Nothing was posted")
             # A report typed as a post records no readiness: verification would wait for it forever.
             protocol = REPORT_WORD.match(text)
             word = protocol[1] if protocol else ""
@@ -2157,7 +2237,7 @@ def main(argv):
                 # bullet here is a new defect, which the rejected worker has to answer.
                 owners = {successor(name, members) for name in verdict["rejects"]}
                 text, given = tag_findings(text, {name for name, finding in ledger(state, posts).items()
-                                                  if owners & set(finding["owners"])}, number)
+                                                  if owners & set(finding["owners"])}, number, members=members)
                 if given:
                     verdict["findings"] = given
             if word == "NOT PASSED" and members[sender].get("role") == "verifier" and not state.get("paused"):
@@ -2184,7 +2264,7 @@ def main(argv):
             if still:
                 print("OPEN: %s still open to you; only citing it closes it, and a post of just `re #%d` wakes nobody"
                       % (", ".join("#%d from @%s" % pair for pair in still), still[0][0]))
-            if answer != current:
+            if current is not None and answer != current:
                 print("note: this verdict is recorded as answering candidate %s, %s, so candidate %s, the one being verified "
                       "now, keeps its test and its pass. If it is about %s, post it again with that id in its first line"
                       % (answer, why, current, current))
@@ -2215,11 +2295,30 @@ def main(argv):
                     if not COMMIT.fullmatch(revision):
                         sys.exit("expected a full commit ID, or HEAD from your checkout")
                 conflicts, base, exclude, start = {}, None, [], None
+                deps = {dep: through[dep] for dep in dependencies(member) if dep in through}
+                reported = latest_reports(posts).get(sender, {}).get("seq")
+                scope = (assignment_scope(member), member.get("id"))  # a replaced or restarted agent is another
+
+                def revalidate(when):
+                    if state.get("closed") or member.get("role") != "worker" or member.get("killed"):
+                        sys.exit("only an active worker of an open run can ready, and @%s no longer is one: the board changed "
+                                 "%s. Nothing was posted" % (sender, when))
+                    if revision is not None and (member.get("writes") == "0" or kind_of(member) in READ_ONLY):
+                        sys.exit("a read-only report cannot include a commit, and @%s was made read-only while git checked "
+                                 "it. Nothing was posted" % sender)
+                    if (unmet(member, members, through) or [dep for dep in dependencies(member) if dep in through] != list(deps)
+                            or latest_reports(posts).get(sender, {}).get("seq") != reported
+                            or any(through.get(dep, {}).get("seq") != post["seq"] for dep, post in deps.items())):
+                        sys.exit("a dependency's report, @%s's own or its dependencies changed %s, "
+                                 "so nothing was posted. Read the board, then report again" % (sender, when))
+                    # A first READY has no earlier report a scope change withdraws: the work was done for the old scope.
+                    if (assignment_scope(member), member.get("id")) != scope:
+                        sys.exit("@%s's assignment changed %s, so nothing was posted. Read the "
+                                 "board, check the work against the new assignment, then report again" % (sender, when))
+
                 if revision is not None:
                     import verify  # late: verify.py imports this module
                     repo = home = os.path.dirname(os.path.dirname(os.path.abspath(d)))  # the project, which holds every member's commits
-                    deps = {dep: through[dep] for dep in dependencies(member) if dep in through}
-                    reported = latest_reports(posts).get(sender, {}).get("seq")
                     # Compared with the reports that stay current once this one is posted: a member that depends on the
                     # sender loses its READY to it and will sync this commit anyway.
                     peers = {n: p["revision"] for n, p in readiness(members, [*posts, {"seq": len(posts) + 1, "agent": sender,
@@ -2232,7 +2331,6 @@ def main(argv):
                     starts = [member["start"]] if isinstance(member.get("start"), str) else []
                     starts += [post["base"] for post in posts if post.get("kind") == "ready" and post.get("base")
                                and post.get("subject", post["agent"]) == sender]
-                    scope = (assignment_scope(member), member.get("id"))  # a replaced or restarted agent is another
                     # Git may take long (a large repository, hooks): every other board command runs meanwhile, and
                     # what was checked above is checked again once the lock is back.
                     fcntl.flock(lock, fcntl.LOCK_UN)
@@ -2247,7 +2345,7 @@ def main(argv):
                         sys.exit("%s is no commit in the project's repository. Commit your work in a worktree of the project "
                                  "(or fetch it into the project's repository) and give its full ID, or HEAD from your checkout"
                                  % revision)
-                    held = carried(home, member, members, posts, revision)
+                    held = carried(home, member, members, posts, revision, project_base(d, home))
                     if held:
                         sys.exit("your commit still holds @%s's commit %s, which had not passed when @%s was retired. "
                                  "Rebuild your work without it, then report again. Nothing was posted"
@@ -2271,20 +2369,7 @@ def main(argv):
                     members = state["members"]
                     member = members[sender]
                     through = readiness(members, posts)
-                    if state.get("closed") or member.get("role") != "worker" or member.get("killed"):
-                        sys.exit("only an active worker of an open run can ready, and @%s no longer is one: the board changed "
-                                 "while git checked the commit. Nothing was posted" % sender)
-                    if member.get("writes") == "0" or kind_of(member) in READ_ONLY:
-                        sys.exit("a read-only report cannot include a commit, and @%s was made read-only while git checked "
-                                 "it. Nothing was posted" % sender)
-                    if (unmet(member, members, through) or [dep for dep in dependencies(member) if dep in through] != list(deps) or latest_reports(posts).get(sender, {}).get("seq") != reported
-                            or any(through.get(dep, {}).get("seq") != post["seq"] for dep, post in deps.items())):
-                        sys.exit("a dependency's report, @%s's own or its dependencies changed while git checked the commit, "
-                                 "so nothing was posted. Read the board, then report again" % sender)
-                    # A first READY has no earlier report a scope change withdraws: the work was done for the old scope.
-                    if (assignment_scope(member), member.get("id")) != scope:
-                        sys.exit("@%s's assignment changed while git checked the commit, so nothing was posted. Read the "
-                                 "board, check the work against the new assignment, then report again" % sender)
+                    revalidate("while git checked the commit")
                     stays = readiness(members, [*posts, {"seq": len(posts) + 1, "agent": sender, "text": "READY", "kind": "ready"}])
                     # A peer that reported while git worked, a `ready` running beside this one included, was never
                     # compared: it is now, under the lock, so of two overlapping reports the later one names the clash.
@@ -2302,14 +2387,21 @@ def main(argv):
                     else:
                         start = None
                 else:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
                     report = sys.stdin.read().strip()
-                if not report:
-                    sys.exit("READY needs a report on stdin")
+                    if not report:
+                        sys.exit("READY needs a report on stdin")
+                    state, posts = relocked()
+                    members = state["members"]
+                    member = members[sender]
+                    through = readiness(members, posts)
+                    revalidate("while reading stdin")
                 # A report that passes over an open finding sends the verifier into a review of work nobody claims
                 # to have done: refused here, it is corrected in the same step.
                 # An investigator answers a rejected finding with a new one, which the coordinator reviews whole.
                 owed = {name: finding for name, finding in ledger(state, posts).items()
-                        if finding["open"] and sender in finding["owners"] and kind_of(member) != "investigator"}
+                        if finding["open"] and sender in finding["owners"]
+                        and kind_of(member) != "investigator" and member.get("consult") != "1"}
                 silent = sorted(owed.keys() - answers_in(report, owed.keys()).keys(), key=lambda name: int(name[1:]))
                 if silent:
                     sys.exit("the report leaves open findings unanswered: %s. Give each a line: `%s: fixed — <where, and "
@@ -2388,7 +2480,8 @@ def main(argv):
             if verify.toplevel(here) == verify.toplevel(os.path.dirname(os.path.dirname(os.path.abspath(d)))) and not args[1:]:
                 sys.exit("this is the project's own checkout, not your worktree: run `sync` from the worktree you work in")
             # Said here, before the member builds on it: `ready` would refuse the commit only once the work was done.
-            held = carried(here, member, members, posts, head.decode().strip())
+            base_commit = project_base(d, here)
+            held = carried(here, member, members, posts, head.decode().strip(), base_commit)
             if held:
                 sys.exit("HEAD still holds @%s's commit %s, which had not passed when @%s was retired: `ready` will refuse a "
                          "commit built on it. Rebuild your branch without it before you go on" % (held[0], held[1][:12], held[0]))
@@ -2401,7 +2494,7 @@ def main(argv):
                 print("in sync: HEAD contains every dependency's READY commit")
                 return
             for dep in behind:  # before the first merge: a dependency's commit may hold what HEAD does not
-                held = carried(here, member, members, posts, deps[dep]["revision"])
+                held = carried(here, member, members, posts, deps[dep]["revision"], base_commit)
                 if held:
                     sys.exit("@%s's commit %s holds @%s's commit %s, which had not passed when @%s was retired: `ready` would "
                              "refuse a commit built on it. Nothing was merged; ask @%s to rebuild without it"
@@ -2552,7 +2645,7 @@ def main(argv):
                     summary = " | ".join(lines[:2 if p.get("kind") or (word and word[1] == "BRIEF") else 1])
                     summary = summary[:SUMMARY_CHARS] + "…" if len(summary) > SUMMARY_CHARS else summary
                     p = dict(p, text=summary + (" [full: show --post=%d]" % p["seq"] if routine else ""))
-                whole = ("* " if mine else "") + show(p)
+                whole = ("* " if mine and not routine else "") + show(p)
                 output = fit(whole, p["seq"])
                 if output is None:
                     break
@@ -2567,7 +2660,8 @@ def main(argv):
             if replayed == len(replay):
                 layout = ("one line per post" if headers else "all posts are shown in full" if everything else
                           "posts marked * mention you and are shown in full")
-                say(f"{emitted} new post(s); {layout}" if emitted else "no new posts")
+                say(f"{emitted} new post(s); {layout}" if emitted else
+                    f"{remaining} new post(s) deferred to next page" if remaining else "no new posts")
             if remaining:
                 say(f"{remaining} more post(s) remain. Read again for the next page.")
             sys.stdout.flush()
@@ -2900,7 +2994,7 @@ def main(argv):
                 print(f"Usage: {amount} tokens")
             for name, m in members.items():
                 mine = [p["seq"] for p in posts if p["agent"] == name]
-                extra = " ".join("%s=%s" % kv for kv in m.items() if not kv[0].startswith("last_") and kv[0] not in {"wake_claim", "told", "synced_deps", "start", "tested"})
+                extra = " ".join("%s=%s" % kv for kv in m.items() if not kv[0].startswith("last_") and kv[0] not in {"wake_claim", "told", "synced_deps", "start", "tested", "delivered", "clipped"})
                 print("  @%-14s last post %-5s unread mentions %d  %s" % (name, "#%d" % mine[-1] if mine else "-", len(unread(name)), extra))
             edges = Counter((p["agent"], n) for p in posts for n in p["to"])
             for (a, b), count in edges.most_common():

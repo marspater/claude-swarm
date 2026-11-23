@@ -930,10 +930,10 @@ test('a member starts only on the model the roster and the limits allow', async 
     fork: false,
   }
   const probe = { ...spawn, description: '@probe: trace the retry bug', subagentType: 'swarm:investigator' }
-  // the roster says sonnet; a call that forgets the model would start on the type's default, opus
-  expect((await $.agent.spawn(probe)).deny).toContain('model: "sonnet"')
-  expect((await $.agent.spawn({ ...probe, model: 'sonnet' })).agentId).toBe('started')
-  // a family name on the call starts the newest model of that family
+  // the roster says sonnet; omitting model auto-injects the roster model instead of denying, while an explicit wrong model is denied
+  expect((await $.agent.spawn({ ...probe, model: 'opus' })).deny).toContain('model: "sonnet"')
+  expect((await $.agent.spawn(probe)).agentId).toBe('started')
+  // a family name on the roster or call starts the newest model of that family
   expect(startedOn).toEqual(['claude-sonnet-5-5'])
   // fable is reserved for the architect
   expect((await $.agent.spawn({ ...spawn, description: '@design: storage plan', subagentType: 'swarm:architect' })).agentId).toBe('started')
@@ -1348,15 +1348,15 @@ test('the hive follows roster actions, coordinator turns and sleep', async ($, o
 // The engine beneath a conversation that owns RUN, as the tests below share it.
 const OWNED = '/project/.swarm/demo-20261116-101010'
 type On = Parameters<Extract<Parameters<typeof test>[1], (...args: never[]) => unknown>>[1]
-function owning(on: On, files: { board: () => string; roster: () => string; session?: () => string; read?: (path: string) => string | undefined; hold?: (path: string) => Promise<void> | undefined; end?: () => Promise<void>; exists?: boolean }) {
+function owning(on: On, files: { board: () => string; roster: () => string; session?: () => string; cwd?: () => string; read?: (path: string) => string | undefined; hold?: (path: string) => Promise<void> | undefined; end?: () => Promise<void>; exists?: boolean | ((path: string) => boolean) }) {
   const seen = { commands: [] as string[], prompts: [] as string[], toasts: [] as string[], isDeaf: false, restore: '' }
   on('command.register', () => ({ value: { command: 'swarm-board' } }))
   on('tool.register', (_, spec) => ({ value: { tool: `mcp__swarm__${spec.name}` } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: files.session?.() ?? 'fixture-conversation' }))
-  on('session.cwd', () => ({ value: '/project' }))
-  on('fs.exists', () => ({ value: files.exists ?? false }))
+  on('session.cwd', () => ({ value: files.cwd ? files.cwd() : '/project' }))
+  on('fs.exists', (_, e) => ({ value: typeof files.exists === 'function' ? files.exists(e.path) : (files.exists ?? false) }))
   on('fs.read', async (_, e) => {
     // A read the test holds answers once it lets go, with the file as it is then.
     await files.hold?.(e.path)
@@ -3110,9 +3110,9 @@ test('guard regressions: commit wrappers, worktree paths, ignored claims, case, 
   expect((await bash('git commit -m x', 'bob-1')).deny).toBeUndefined()
 
   // R2: an isolated writer's paths= match inside its own worktree.
-  expect((await edit('/project/.claude/worktrees/bob/src/bob/b.ts', 'bob-1')).deny).toBeUndefined()
-  expect((await edit('/project/.claude/worktrees/bob/src/alice/a.ts', 'bob-1')).deny).toContain('claimed by @alice')
-  expect((await edit('/project/.claude/worktrees/bob/.swarm/x', 'bob-1')).deny).toContain('.swarm/')
+  expect((await edit('/project/.claude/worktrees/agent-bob-1/src/bob/b.ts', 'bob-1')).deny).toBeUndefined()
+  expect((await edit('/project/.claude/worktrees/agent-bob-1/src/alice/a.ts', 'bob-1')).deny).toContain('claimed by @alice')
+  expect((await edit('/project/.claude/worktrees/agent-bob-1/.swarm/x', 'bob-1')).deny).toContain('.swarm/')
 
   // R3: read-only, consult and other ignored members hold no claim.
   expect((await edit('/project/notes/n.md')).deny).toBeUndefined()
@@ -3345,8 +3345,8 @@ test('F4, F25, F28: an isolated member is guarded in its worktree wherever the c
   expect(await edit(`${own}/src/alice/a.ts`, 'bob-1')).toContain('claimed by @alice')
   expect(await edit(`${own}/README.md`, 'bob-1')).toContain('claimed paths')
   expect(await edit(`${own}/src/bob/b.ts`, 'ver-1')).toContain('read-only')
-  // the main checkout itself, and any other folder, is no member's worktree
-  expect(await edit('/main/src/bob/b.ts', 'bob-1')).toBeUndefined()
+  // CR3-3: the main checkout itself is blocked for isolated writers even from a linked worktree; unrelated folders stay outside
+  expect(await edit('/main/src/bob/b.ts', 'bob-1')).toContain('isolated to its own worktree')
   expect(await edit('/elsewhere/.claude/worktrees/agent-bob-1/README.md', 'bob-1')).toBeUndefined()
   // F28: a worker has the board command, a specialist the board tool
   expect(await edit(`${own}/.swarm/x`, 'bob-1')).toBe('Direct edits inside .swarm/ are not allowed. Read and post with the board tool, or the board command (board.py) in Bash.')
@@ -6198,4 +6198,836 @@ test('a process scan that failed with nothing listed is reported as not made', a
   const clock = mock.clock(on)
   await settle(clock, $)
   expect((await killCommand($)).text).toContain('the process list could not be read')
+})
+
+test('#5: isolated writer cannot edit main checkout, empty cwd falls back to activeDir, and isUnrecorded resume preserves isolated', async ($, on) => {
+  let cwdValue = '/project'
+  const state = {
+    title: 'Isolation swarm',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 },
+      alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '0', last_read_seq: 1 },
+      bob: { role: 'worker', id: 'bob-1', paths: 'src/bob', isolated: '1', last_read_seq: 1 },
+      ghost: { role: 'worker', paths: 'src/ghost', isolated: '1', last_read_seq: 0 },
+    },
+  }
+  const startedArgs: string[][] = []
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['bob'], text: '@bob BRIEF' }),
+    roster: () => JSON.stringify(state),
+    cwd: () => cwdValue,
+  })
+  on('process.run', (_, e) => {
+    if (e.argv[3] === 'started') startedArgs.push(e.argv.slice(4))
+    return answer(board(e))
+  })
+  on('agent.list', () => ({
+    value: [
+      { id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' },
+      { id: 'bob-1', description: '@bob', type: 'swarm:worker', status: 'running' },
+      { id: 'ghost-1', description: '@ghost', type: 'swarm:worker', status: 'completed' },
+    ] as never,
+  }))
+  on('agent.spawn', () => ({ model: 'sonnet', agentId: 'ghost-1' }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+
+  // Isolated writer bob cannot edit its own paths= directly in the shared main checkout
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'bob-1' })).deny).toContain('isolated to its own worktree')
+  // Inside its own worktree, bob's edit succeeds; inside another unknown or non-agent-* worktree, it is denied
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/.claude/worktrees/agent-bob-1/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'bob-1' })).deny).toBeUndefined()
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/.claude/worktrees/agent-other-1/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'bob-1' })).deny).toContain("another member's worktree")
+  // CR-4: non-agent-* folder under .claude/worktrees/ (folder === undefined) is also denied for isolated writers
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/.claude/worktrees/scratch/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'bob-1' })).deny).toContain("another member's worktree")
+
+  // Empty session.cwd() falls back to activeDir parent (/project) instead of failing open
+  cwdValue = ''
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'alice-1' })).deny).toContain('claimed by @bob')
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'bob-1' })).deny).toContain('isolated to its own worktree')
+  cwdValue = '/project'
+
+  // Resuming an unrecorded member preserves isolated=1 in the started call
+  await $.agent.spawn({
+    tool_use_id: 'resume-ghost',
+    description: '@ghost: continue',
+    subagentType: 'swarm:worker',
+    prompt: 'Continue.',
+    provider: { plugin: 'swarm', tier: 'core' as const },
+    parentModel: 'sonnet',
+    background: true,
+    fork: false,
+    resume: { agentId: 'ghost-1' },
+  })
+  expect(startedArgs.at(-1)).toEqual(['ghost', 'ghost-1', '', 'isolated=1'])
+})
+
+test('#6: member Bash fails closed on guard error except for safe own-member board.py commands', async ($, on) => {
+  const state = {
+    title: 'Catch guard swarm',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 },
+      alice: { role: 'worker', id: 'alice-1', paths: 'src/alice', isolated: '0', last_read_seq: 1 },
+    },
+  }
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['alice'], text: '@alice BRIEF' }),
+    roster: () => JSON.stringify(state),
+  })
+  let failState = false
+  let B = ''
+  on('state.get', (_, e, next) => failState ? { deny: 'state timeout' } : next(e))
+  on('process.run', (_, e) => {
+    if (!B && e.argv[1]?.endsWith('/board.py')) B = e.argv[1]
+    return answer(board(e))
+  })
+  on('agent.list', () => ({ value: [{ id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+
+  // Force tool.call hook to throw into its outer .catch fallback while alice-1 is a known member in ownedRoster
+  failState = true
+  const bash = (command: string) => toolCall($, { tool: 'Bash', command, agentId: 'alice-1' })
+  expect(B).toContain('/skills/swarm/scripts/board.py')
+
+  // Safe own-member board.py commands targeting the installed script (including heredocs and 2>&1) still pass
+  expect((await bash(`python3 "${B}" "${OWNED}" read alice`)).deny).toBeUndefined()
+  expect((await bash(`python3 "${B}" "${OWNED}" post alice "report > ok"`)).deny).toBeUndefined()
+  expect((await bash(`python3 "${B}" "${OWNED}" status 2>&1`)).deny).toBeUndefined()
+  expect((await bash(`python3 "${B}" "${OWNED}" post alice <<'EOF'\nhello > world\nEOF`)).deny).toBeUndefined()
+  expect((await bash(`python3 "${B}" "${OWNED}" ready alice <<'EOF'\nREADY\nEOF`)).deny).toBeUndefined()
+  // CR3-2: a lookalike board.py outside the installed plugin root is denied fail-closed
+  expect((await bash(`python3 /tmp/evil/board.py "${OWNED}" status`)).deny).toContain('could not check')
+  // CR2-3: file-writing output redirects on board.py are denied fail-closed in the fallback
+  expect((await bash(`python3 "${B}" "${OWNED}" status > "${OWNED}/members.json"`)).deny).toContain('could not check')
+  expect((await bash(`python3 "${B}" "${OWNED}" status>>"${OWNED}/members.json"`)).deny).toContain('could not check')
+  expect((await bash(`python3 "${B}" "${OWNED}" status >| "${OWNED}/members.json"`)).deny).toContain('could not check')
+  expect((await bash(`python3 "${B}" "${OWNED}" status &> "${OWNED}/members.json"`)).deny).toContain('could not check')
+  expect((await bash(`python3 "${B}" "${OWNED}" status <> "${OWNED}/members.json"`)).deny).toContain('could not check')
+  // Coordinator-only board.py commands, verify.py, spoofed member names, and arbitrary Bash are all denied fail-closed
+  expect((await bash(`python3 "${B}" "${OWNED}" close`)).deny).toContain('could not check')
+  expect((await bash(`python3 "${B}" "${OWNED}" kill`)).deny).toContain('could not check')
+  expect((await bash(`python3 "${B}" "${OWNED}" member alice`)).deny).toContain('could not check')
+  expect((await bash(`python3 /p/verify.py "${OWNED}" accept alice`)).deny).toContain('could not check')
+  expect((await bash(`python3 "${B}" "${OWNED}" post bob "spoof"`)).deny).toContain('could not check')
+  expect((await bash('rm -rf /tmp/something')).deny).toContain('could not check')
+})
+
+test('#7: failed agent.list() does not poison strangers for swarm members', async ($, on) => {
+  let listFails = true
+  const state = {
+    title: 'List fail swarm',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 },
+      alice: { role: 'worker', paths: 'src/alice', isolated: '0', last_read_seq: 1 },
+      bob: { role: 'worker', id: 'bob-1', paths: 'src/bob', isolated: '0', last_read_seq: 1 },
+    },
+  }
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['alice'], text: '@alice BRIEF' }),
+    roster: () => JSON.stringify(state),
+  })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => {
+    if (listFails) throw new Error('agent list unavailable')
+    return { value: [{ id: 'alice-unrec', description: '@alice: work', type: 'swarm:worker', status: 'running' }] as never }
+  })
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+
+  // First call while agent.list() throws: must NOT poison strangers with 'alice-unrec'
+  await toolCall($, { tool: 'Edit', file_path: '/project/src/alice/a.ts', old_string: 'a', new_string: 'b', agentId: 'alice-unrec' })
+
+  // Once agent.list() recovers, alice-unrec is still recognized and guarded against editing bob's path
+  listFails = false
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'alice-unrec' })).deny).toContain('claimed by @bob')
+})
+
+test('#8a & #8c: deleted run stops account retries and concurrent turn.complete dedups per turnId', async ($, on) => {
+  let isGone = false
+  let accountCalls = 0
+  let releaseAccount!: () => void
+  let holdAccount = false
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: [], text: 'plan' }),
+    roster: () => {
+      if (isGone) throw new Error('ENOENT')
+      return JSON.stringify({ title: 'Accounting swarm', members: { coordinator: { role: 'coordinator', last_read_seq: 1 } } })
+    },
+    exists: path => !(isGone && path.endsWith('/members.json')),
+  })
+  on('process.run', async (_, e) => {
+    if (e.argv[3] === 'account') {
+      accountCalls++
+      if (holdAccount) await new Promise<void>(resolve => { releaseAccount = resolve })
+      return answer(JSON.stringify({ title: 'Accounting swarm', total: 100, budget: 0, paused: false }))
+    }
+    return answer(board(e))
+  })
+  on('agent.list', () => ({ value: [] }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+
+  const usage = { model: 'm', input_tokens: 100, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+  // #8c: two concurrent turn.complete events for the same turnId only charge once
+  holdAccount = true
+  const first = $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'dup-1', usage })
+  const second = $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'dup-1', usage })
+  await clock.advance(0)
+  holdAccount = false
+  releaseAccount()
+  await Promise.all([first, second])
+  expect(accountCalls).toBe(1)
+
+  // #8a: once the run folder is deleted, turn.complete triggers zero account subprocesses
+  isGone = true
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'after-delete-1', usage })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'after-delete-2', usage })
+  expect(accountCalls).toBe(1)
+})
+
+test('#9: no askStall while all workers unstarted, unmet depends excluded from unaddressed, no duplicate relayNotice', async ($, on) => {
+  const state = {
+    title: 'Stall & relay swarm',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 2 },
+      builder: { role: 'worker', last_read_seq: 0 } as Record<string, unknown>,
+      arch: { role: 'worker', profile: 'architect', depends: 'builder', last_read_seq: 0 },
+      scout: { role: 'worker', profile: 'explorer', last_read_seq: 0 } as Record<string, unknown>,
+    },
+  }
+  let boardText = posts({ agent: 'coordinator', to: ['builder', 'arch'], text: '@builder @arch BRIEF' })
+  let agents: { id: string; description: string; type: string; status: string }[] = []
+  let archBlockedOn: string[] = ['builder']
+  const { seen, answer, board } = owning(on, {
+    board: () => boardText,
+    roster: () => JSON.stringify(state),
+  })
+  on('process.run', (_, e) => {
+    if (e.argv[3] === 'attention') {
+      return answer(JSON.stringify({
+        items: [],
+        members: {
+          arch: { type: 'architect', model: 'fable', effort: 'high', depends: ['builder'], owns: '', ready: false, blocked_on: archBlockedOn, asked: 0, unreachable: false },
+        },
+      }))
+    }
+    return answer(board(e))
+  })
+  on('agent.list', () => ({ value: agents as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'init-t' })
+  await clock.advance(2000)
+
+  // All workers unstarted (plan approval): even past QUIET_MS (60s), askStall must NOT fire
+  await clock.advance(65_000)
+  expect(seen.prompts.filter(p => p.includes('Every member is waiting'))).toEqual([])
+
+  // Start builder + scout and address scout; arch has board-reported blocked_on=['builder'] -> must NOT appear in relayNotice
+  state.members.builder.id = 'builder-1'
+  state.members.scout.id = 'scout-1'
+  agents = [
+    { id: 'builder-1', description: '@builder', type: 'swarm:worker', status: 'completed' },
+    { id: 'scout-1', description: '@scout', type: 'swarm:explorer', status: 'completed' },
+  ]
+  boardText = posts(
+    { agent: 'coordinator', to: ['builder', 'arch'], text: '@builder @arch BRIEF' },
+    { agent: 'coordinator', to: ['scout'], text: '@scout check files' },
+  )
+  await clock.advance(2000)
+  const relayPrompt = seen.prompts.find(p => p.includes('Delivering board mentions'))
+  expect(relayPrompt).toBeDefined()
+  expect(relayPrompt).toContain('@scout')
+  expect(relayPrompt).not.toContain('@arch')
+
+  // Later, when askStall fires while the same relay is still pending (keyToRelay === relayPrompted), relayNotice is NOT duplicated
+  await clock.advance(65_000)
+  const stallPrompt = seen.prompts.find(p => p.includes('Every member is waiting'))
+  expect(stallPrompt).toBeDefined()
+  expect(stallPrompt).not.toContain('Relay these Swarm board wakes')
+
+  // Once the board clears blocked_on (e.g. coordinator-confirmed finding or retired after= prerequisite), @arch IS included in relayNotice
+  archBlockedOn = []
+  boardText = posts(
+    { agent: 'coordinator', to: ['builder', 'arch'], text: '@builder @arch BRIEF' },
+    { agent: 'coordinator', to: ['scout'], text: '@scout check files' },
+    { agent: 'coordinator', to: ['scout', 'arch'], text: '@scout @arch confirmed finding, proceed' },
+  )
+  await clock.advance(12_000)
+  const releasedPrompt = seen.prompts.findLast(p => p.includes('Delivering board mentions'))
+  expect(releasedPrompt).toBeDefined()
+  expect(releasedPrompt).toContain('@arch')
+})
+
+test('#13: retired member (including general-purpose stand-in) of closed run is blocked on Read, Grep, and Glob after restart', async ($, on) => {
+  const closedState = {
+    title: 'Closed swarm',
+    closed: true,
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 },
+      alice: { role: 'worker', id: 'alice-1', killed: '1', last_read_seq: 1 },
+      standin: { role: 'worker', id: 'gp-1', killed: '1', last_read_seq: 1 },
+    },
+  }
+  const { answer, board } = owning(on, {
+    board: () => '',
+    roster: () => JSON.stringify(closedState),
+  })
+  // After restart: restore returns '' (closed run is not owned), agent-run returns the closed run for registered ids
+  on('process.run', (_, e) => answer(e.argv[3] === 'agent-run' ? OWNED : board(e)))
+  on('agent.list', () => ({
+    value: [
+      { id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' },
+      { id: 'gp-1', description: '@standin', type: 'general-purpose', status: 'running' },
+    ] as never,
+  }))
+  on('tool.call', () => ({ result: {} }))
+  mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/src/a.ts', agentId: 'alice-1' } as never)).deny).toContain('retired')
+  expect((await toolCall($, { tool: 'Grep', pattern: 'foo', agentId: 'alice-1' } as never)).deny).toContain('retired')
+  expect((await toolCall($, { tool: 'Glob', pattern: '**/*.ts', agentId: 'alice-1' } as never)).deny).toContain('retired')
+  // A registered general-purpose stand-in marked retired in a killed run is also blocked on Read after restart
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/src/a.ts', agentId: 'gp-1' } as never)).deny).toContain('retired')
+})
+
+test('token-economy #1 & #2: auto-injects roster model on spawn and registers compressed board schema', async ($, on) => {
+  let boardSpec: { description: string; isDeferred?: boolean; inputSchema: { properties: Record<string, { description?: string; enum?: string[] }> } } | undefined
+  on('command.register', (_, spec) => ({ value: { command: spec.name } }))
+  on('tool.register', (_, spec) => {
+    if (spec.name === 'board') boardSpec = spec as unknown as typeof boardSpec
+    return { value: { tool: `mcp__swarm__${spec.name}` } }
+  })
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 'fixture-conversation' }))
+  on('session.cwd', () => ({ value: '/project' }))
+  on('process.run', (_, e) => ({
+    value: { exitCode: 0, stdout: e.argv.includes('restore') ? OWNED : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+  }))
+  on('fs.read', () => ({
+    value: JSON.stringify({
+      title: 'Model swarm',
+      members: { coordinator: {}, builder: { role: 'worker', model: 'opus' } },
+    }),
+  }))
+  const spawnedModels: (string | undefined)[] = []
+  on('agent.spawn', (_, e) => {
+    spawnedModels.push(e.model)
+    return { model: e.model ?? 'sonnet', agentId: 'w-1' }
+  })
+  mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+
+  // #2: compressed board schema preserves isDeferred: false, all 10 properties and 18 actions
+  expect(boardSpec).toBeDefined()
+  expect(boardSpec!.isDeferred).toBe(false)
+  expect(Object.keys(boardSpec!.inputSchema.properties).sort()).toEqual(['action', 'commit', 'member', 'name', 'newName', 'options', 'out', 'seq', 'text', 'title'])
+  expect(boardSpec!.inputSchema.properties.action!.enum!.length).toBe(18)
+  const totalDescLen = boardSpec!.description.length + Object.values(boardSpec!.inputSchema.properties).reduce((n, p) => n + (p.description?.length ?? 0), 0)
+  expect(totalDescLen).toBeLessThan(520)
+
+  // #1: omitting model auto-injects roster's opus model; explicit wrong model is still denied
+  const baseSpawn = {
+    tool_use_id: 'sp-1',
+    description: '@builder: build feature',
+    subagentType: 'swarm:worker',
+    prompt: 'Use the board.',
+    provider: { plugin: 'swarm', tier: 'core' as const },
+    parentModel: 'sonnet',
+    background: true,
+    fork: false,
+  }
+  expect((await $.agent.spawn({ ...baseSpawn, model: 'haiku' })).deny).toContain('model: "opus"')
+  expect((await $.agent.spawn(baseSpawn)).agentId).toBe('w-1')
+  expect(spawnedModels[0]).toMatch(/^claude-opus-/)
+})
+
+test('token-economy #3: heavy context reminder, independent FINDING coalescing, initNotes suppression, single bgWarning, and no refresh churn', async ($, on) => {
+  let contextTokens = 10_000
+  let boardText = posts({ agent: 'coordinator', to: ['inv1', 'inv2'], text: '@inv1 @inv2 BRIEF' })
+  let attentionCalls = 0
+  const state = {
+    title: 'Economy swarm',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 },
+      inv1: { role: 'worker', profile: 'investigator', id: 'inv1-1', last_read_seq: 1 },
+      inv2: { role: 'worker', profile: 'investigator', id: 'inv2-1', last_read_seq: 1 },
+      impl: { role: 'worker', id: 'impl-1', last_read_seq: 0 } as Record<string, unknown>,
+    },
+  }
+  const { seen, answer, board } = owning(on, {
+    board: () => boardText,
+    roster: () => JSON.stringify(state),
+  })
+  on('session.usage', () => ({ value: { context: { tokens: contextTokens }, total: { input: 0, output: 0 } } as never }))
+  on('process.run', (_, e) => {
+    if (e.argv[3] === 'attention') {
+      attentionCalls++
+      return answer(JSON.stringify({ items: [], members: {} }))
+    }
+    return answer(board(e))
+  })
+  on('agent.list', () => ({
+    value: [
+      { id: 'inv1-1', description: '@inv1', type: 'swarm:investigator', status: 'completed' },
+      { id: 'inv2-1', description: '@inv2', type: 'swarm:investigator', status: 'running' },
+      { id: 'impl-1', description: '@impl', type: 'swarm:worker', status: 'completed' },
+    ] as never,
+  }))
+  on('command.run', () => ({ text: '' }))
+  on('tool.call', (_, e) => ({ result: { stdout: e.tool === 'Bash' && String(e.command).includes(' init ') ? `${OWNED}\n` : '' } }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+
+  // Memory-started init (no /swarm:swarm yet) emits base initNotes mentioning 3,000,000 default
+  const memInit = await toolCall($, { tool: 'Bash', command: `python3 /p/board.py /project/.swarm init "Economy swarm"` })
+  expect((memInit.context ?? []).some(c => c.includes('3,000,000'))).toBe(true)
+
+  // After /swarm:swarm ran, base initNotes is suppressed
+  await $.command.run({ command: 'swarm:swarm', args: 'do work', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 80 } })
+  const cmdInit = await toolCall($, { tool: 'Bash', command: `python3 /p/board.py /project/.swarm init "Economy swarm"` })
+  expect((cmdInit.context ?? []).some(c => c.includes('A run was made'))).toBe(false)
+
+  await clock.advance(2000)
+
+  // bgWarning emitted at most once per run
+  const bg1 = await toolCall($, { tool: 'Bash', command: 'echo build1', run_in_background: true } as never)
+  const bg2 = await toolCall($, { tool: 'Bash', command: 'echo build2', run_in_background: true } as never)
+  expect((bg1.context ?? []).some(c => c.includes('background Bash'))).toBe(true)
+  expect((bg2.context ?? []).some(c => c.includes('background Bash'))).toBe(false)
+
+  // refresh() churn: coordinator turn.start / turn.complete does NOT re-run board.py attention --json
+  const attentionBefore = attentionCalls
+  await $.turn.start({ text: 'coord turn', turnId: 'ct-1' })
+  await clock.advance(2000)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'ct-1' })
+  await clock.advance(2000)
+  expect(attentionCalls).toBe(attentionBefore)
+
+  // HEAVY_CONVERSATION: >= 180k context queues a one-line context reminder delivered on next coordinator tool call
+  contextTokens = 190_000
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'ct-heavy' })
+  const afterHeavy1 = await toolCall($, { tool: 'Read', file_path: '/project/a.ts' } as never)
+  const afterHeavy2 = await toolCall($, { tool: 'Read', file_path: '/project/a.ts' } as never)
+  expect((afterHeavy1.context ?? []).some(c => c.includes('Conversation context is heavy'))).toBe(true)
+  expect((afterHeavy2.context ?? []).some(c => c.includes('Conversation context is heavy'))).toBe(false)
+
+  // Independent FINDING coalescing: inv1 posts FINDING while inv2 works and nobody depends on inv1 -> deferred past 10s
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'ct-idle' })
+  boardText = posts(
+    { agent: 'coordinator', to: ['inv1', 'inv2'], text: '@inv1 @inv2 BRIEF' },
+    { agent: 'inv1', to: ['coordinator'], text: 'FINDING root cause in parser' },
+  )
+  await clock.advance(2000)
+  await clock.advance(12_000)
+  expect(seen.prompts.filter(p => p.includes('Unread board mentions'))).toEqual([])
+
+  // When an active member depends on inv1, FINDING wakes coordinator after MENTION_GRACE_MS (10s)
+  state.members.impl.depends = 'inv1'
+  await clock.advance(2000)
+  await clock.advance(12_000)
+  expect(seen.prompts.filter(p => p.includes('Unread board mentions')).length).toBe(1)
+})
+
+test('CR-3: replaying a turn from a closed/released run after a new run starts does not bill the new run', async ($, on) => {
+  const RUN_B = '/project/.swarm/run-b-20261123-100000'
+  let runAClosed = false
+  const charged: string[] = []
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: [], text: 'plan' }),
+    roster: () => JSON.stringify({ title: 'Run A', closed: runAClosed, members: { coordinator: { role: 'coordinator', last_read_seq: 1 } } }),
+    read: path => path === `${RUN_B}/members.json`
+      ? JSON.stringify({ title: 'Run B', closed: false, members: { coordinator: { role: 'coordinator', last_read_seq: 1 } } })
+      : undefined,
+    exists: true,
+  })
+  on('process.run', (_, e) => {
+    if (e.argv[3] === 'account') {
+      charged.push(`${e.argv[2]}:${e.argv.at(-1)}`)
+      return answer(JSON.stringify({ title: 'x', total: 100, budget: 0, paused: false }))
+    }
+    return answer(board(e))
+  })
+  on('agent.list', () => ({ value: [] }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+
+  // Own Run A and charge turn T to Run A
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const usage = { model: 'm', input_tokens: 300, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'turn-T', usage })
+  expect(charged).toEqual([`${OWNED}:300`])
+
+  // Close/release Run A (triggered by accounting check on a closed run), then own Run B
+  runAClosed = true
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'turn-close', usage })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${RUN_B}" read coordinator` })
+  await clock.advance(2000)
+
+  // Replay turn-T after Run B is active: Run B must NOT be billed
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'turn-T', usage })
+  expect(charged).toEqual([`${OWNED}:300`])
+
+  // New turn under Run B still bills Run B normally
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'turn-B1', usage })
+  expect(charged).toEqual([`${OWNED}:300`, `${RUN_B}:300`])
+})
+
+test('CR2-4: isolated writer cannot edit main checkout when coordinator runs inside a worktree', async ($, on) => {
+  const COORD_WT = '/project/.claude/worktrees/coord'
+  const WT_RUN = `${COORD_WT}/.swarm/demo-20261116-101010`
+  const state = {
+    title: 'Coord worktree swarm',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 },
+      bob: { role: 'worker', id: 'bob-1', paths: 'src/bob', isolated: '1', last_read_seq: 1 },
+    },
+  }
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['bob'], text: '@bob BRIEF' }),
+    roster: () => JSON.stringify(state),
+    cwd: () => COORD_WT,
+  })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({ value: [{ id: 'bob-1', description: '@bob', type: 'swarm:worker', status: 'running' }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: COORD_WT, surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${WT_RUN}" read coordinator` })
+  await clock.advance(2000)
+
+  // Main checkout (/project/src/bob/b.ts) must be denied for isolated bob even when coordinator runs in /project/.claude/worktrees/coord
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'bob-1' })).deny).toContain('isolated to its own worktree')
+  // Bob's own worktree under /project/.claude/worktrees/agent-bob-1/ is still allowed
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/.claude/worktrees/agent-bob-1/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'bob-1' })).deny).toBeUndefined()
+})
+
+test('CR3-3: linked worktree outside .claude/worktrees still blocks isolated writer from main checkout', async ($, on) => {
+  const LINKED = '/work/coord'
+  const LINKED_RUN = `${LINKED}/.swarm/demo-20261116-101010`
+  const state = {
+    title: 'Linked worktree swarm',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 },
+      bob: { role: 'worker', id: 'bob-1', paths: 'src/bob', isolated: '1', last_read_seq: 1 },
+    },
+  }
+  let gitdirLine = 'gitdir: /project/.git/worktrees/coord\n'
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['bob'], text: '@bob BRIEF' }),
+    roster: () => JSON.stringify(state),
+    cwd: () => LINKED,
+    read: path => path === `${LINKED}/.git` ? gitdirLine : undefined,
+  })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({ value: [{ id: 'bob-1', description: '@bob', type: 'swarm:worker', status: 'running' }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: LINKED, surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${LINKED_RUN}" read coordinator` })
+  await clock.advance(2000)
+
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'bob-1' })).deny).toContain('isolated to its own worktree')
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/.claude/worktrees/agent-bob-1/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'bob-1' })).deny).toBeUndefined()
+
+  // Relative gitdir link resolves against the coordinator worktree too
+  gitdirLine = 'gitdir: ../../project/.git/worktrees/coord\n'
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'bob-1' })).deny).toContain('isolated to its own worktree')
+  expect((await toolCall($, { tool: 'Edit', file_path: '/project/.claude/worktrees/agent-bob-1/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'bob-1' })).deny).toBeUndefined()
+})
+
+test('CR3-4 & CR3-5: replay without usage retries failed END charge, and cross-session stale turn.complete does not mutate new session', async ($, on) => {
+  let failAccount = true
+  let holdAccount = false
+  let releaseAccount!: () => void
+  const charged: string[] = []
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: [], text: 'plan' }),
+    roster: () => JSON.stringify({ title: 'Accounting swarm', members: { coordinator: { role: 'coordinator', last_read_seq: 1 } } }),
+    exists: true,
+  })
+  on('process.run', async (_, e) => {
+    if (e.argv[3] === 'account') {
+      if (holdAccount) await new Promise<void>(resolve => { releaseAccount = resolve })
+      if (failAccount) return { value: { exitCode: 1, stdout: '', stderr: 'busy', isStdoutTruncated: false, isStderrTruncated: false } }
+      charged.push(`${e.argv[2]}:${e.argv.at(-1)}`)
+      return answer(JSON.stringify({ title: 'Accounting swarm', total: 200, budget: 0, paused: false }))
+    }
+    return answer(board(e))
+  })
+  on('agent.list', () => ({ value: [] }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+
+  const usage = { model: 'm', input_tokens: 200, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+  // CR3-4: first turn.complete fails -> END charge stored; replay without usage retries and lands it
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'retry-end', usage })
+  expect(charged).toEqual([])
+  failAccount = false
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'retry-end' })
+  expect(charged).toEqual([`${OWNED}:200`])
+  // Subsequent replay without usage sends nothing once settled
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'retry-end' })
+  expect(charged).toEqual([`${OWNED}:200`])
+
+  // CR3-5: stale turn.complete finishing after session.end + new session.start must not pollute new session's turnRuns
+  holdAccount = true
+  const stale = $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'stale-t', usage })
+  await clock.advance(0)
+  await $.session.end({ reason: 'clear', sessionId: 'fixture-conversation', resume: { id: 'fixture-conversation' } })
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  holdAccount = false
+  releaseAccount()
+  await stale
+  // In the new session (no owned run), replaying stale-t without usage must not charge the old run
+  const before = charged.length
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'stale-t' })
+  expect(charged.length).toBe(before)
+})
+
+test('CR3-6: /swarm:kill compaction resets sawSwarmCommand so a later memory-started init gets initNotes', async ($, on) => {
+  // CR3-6: /swarm:swarm -> /swarm:kill (compacted) -> memory-started init gets initNotes again
+  killable(on, { alice: { role: 'worker', id: 'alice-1', last_read_seq: 1 } })
+  on('agent.list', () => ({ value: [] as never }))
+  on('command.run', () => ({ text: '' }))
+  const clock = mock.clock(on)
+  await settle(clock, $)
+  await $.command.run({ command: 'swarm:swarm', args: 'task', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 80 } })
+  await killCommand($)
+  await clock.advance(10)
+  const memInit = await toolCall($, { tool: 'Bash', command: `python3 /p/board.py /project/.swarm init "After kill"` })
+  expect((memInit.context ?? []).some(c => c.includes('A run was made'))).toBe(true)
+})
+
+test('CR3-7: tailed board does not filter out unaddressed specialist with depends based on incomplete tail', async ($, on) => {
+  const state = {
+    title: 'Tailed swarm',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 10 },
+      builder: { role: 'worker', id: 'builder-1', last_read_seq: 10 },
+      arch: { role: 'worker', profile: 'architect', depends: 'builder', last_read_seq: 0 },
+      scout: { role: 'worker', profile: 'explorer', id: 'scout-1', last_read_seq: 0 },
+    },
+  }
+  // Tailed board starting at seq 10 (builder's earlier READY at seq 5 was before the tail)
+  let tailedBoard = [
+    JSON.stringify({ seq: 10, agent: 'coordinator', to: ['arch', 'scout'], text: '@arch @scout check', time: '2026-11-16T14:03:22+0100' }),
+  ].join('\n') + '\n'
+  let attentionFailed = true
+  let statSize = 5_000_000
+  const { seen, answer, board } = owning(on, {
+    board: () => tailedBoard,
+    roster: () => JSON.stringify(state),
+  })
+  on('fs.stat', () => ({ value: { size: statSize, mtimeMs: 1 } as never }))
+  on('process.run', (_, e) => {
+    if (e.argv[3] === 'tail') return answer(tailedBoard)
+    if (e.argv[3] === 'attention') {
+      if (attentionFailed) return { value: { exitCode: 1, stdout: '', stderr: 'busy', isStdoutTruncated: false, isStderrTruncated: false } }
+      return answer(JSON.stringify({
+        items: [],
+        members: {
+          arch: { type: 'architect', model: 'fable', effort: 'high', depends: ['builder'], owns: '', ready: false, blocked_on: [], asked: 0, unreachable: false },
+        },
+      }))
+    }
+    return answer(board(e))
+  })
+  on('agent.list', () => ({
+    value: [
+      { id: 'builder-1', description: '@builder', type: 'swarm:worker', status: 'completed' },
+      { id: 'scout-1', description: '@scout', type: 'swarm:explorer', status: 'completed' },
+    ] as never,
+  }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'tail-t' })
+  await clock.advance(2000)
+
+  // While attention --json is unavailable, arch (which has depends='builder') must NOT be prematurely suggested
+  const firstPrompt = seen.prompts.find(p => p.includes('Delivering board mentions'))
+  expect(firstPrompt).toBeDefined()
+  expect(firstPrompt).toContain('@scout')
+  expect(firstPrompt).not.toContain('@arch')
+
+  // Once attention --json recovers on retry with blocked_on: [], arch IS included even on a tailed board
+  attentionFailed = false
+  statSize += 100
+  tailedBoard += JSON.stringify({ seq: 11, agent: 'coordinator', to: ['arch', 'scout'], text: '@arch @scout update', time: '2026-11-16T14:04:00+0100' }) + '\n'
+  await clock.advance(12_000)
+  const recoveredPrompt = seen.prompts.findLast(p => p.includes('Delivering board mentions'))
+  expect(recoveredPrompt).toBeDefined()
+  expect(recoveredPrompt).toContain('@arch')
+})
+
+test('P1 delayed member turn.complete across session restart cannot bill new run, and replayed coordinator turn does not clear active busy state', async ($, on) => {
+  const RUN_B = '/project/.swarm/run-b-20261123-120000'
+  let activeRun = OWNED
+  let holdAgentList = false
+  let releaseAgentList!: () => void
+  const charged: string[] = []
+  let boardText = posts({ agent: 'coordinator', to: ['w'], text: '@w BRIEF' })
+  const { seen, answer, board } = owning(on, {
+    board: () => boardText,
+    roster: () => JSON.stringify({
+      title: 'Run A',
+      members: { coordinator: { role: 'coordinator', last_read_seq: 1 }, w: { role: 'worker', id: 'teammate-addr', last_read_seq: 1 } },
+    }),
+    read: path => path === `${RUN_B}/members.json`
+      ? JSON.stringify({
+        title: 'Run B',
+        members: { coordinator: { role: 'coordinator', last_read_seq: 1 }, w: { role: 'worker', id: 'teammate-addr', last_read_seq: 1 } },
+      })
+      : undefined,
+    exists: true,
+  })
+  on('process.run', (_, e) => {
+    if (e.argv[3] === 'agent-run') return answer(activeRun)
+    if (e.argv[3] === 'account') {
+      charged.push(`${e.argv[2]}:${e.argv.at(-1)}`)
+      return answer(JSON.stringify({ title: 'Run', total: 500, budget: 500, paused: true }))
+    }
+    return answer(board(e))
+  })
+  on('agent.list', async () => {
+    if (holdAgentList) await new Promise<void>(resolve => { releaseAgentList = resolve })
+    return { value: [{ id: 'old-member', teammateId: 'teammate-addr', description: '@w', type: 'swarm:worker', status: 'completed' }] as never }
+  })
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+
+  // Hold old member's turn.complete during $.agent.list(), restart session, and start Run B reusing teammate-addr
+  const usage = { model: 'm', input_tokens: 500, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+  holdAgentList = true
+  const delayed = $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'old-turn', agentId: 'old-member', usage })
+  await clock.advance(0)
+  holdAgentList = false
+  await $.session.end({ reason: 'clear', sessionId: 'fixture-conversation', resume: { id: 'fixture-conversation' } })
+  activeRun = RUN_B
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${RUN_B}" read coordinator` })
+  await clock.advance(2000)
+  releaseAgentList()
+  await delayed
+  // Run B must receive ZERO charges and ZERO budget-pause prompts from the stale session's delayed completion
+  expect(charged).toEqual([])
+  expect(seen.prompts.filter(p => p.includes('paused at token budget'))).toEqual([])
+
+  // Replayed coordinator completion for turn A while turn B is active must NOT clear turn B's busy state
+  await $.turn.start({ text: 'turn A', turnId: 'coord-A' })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'coord-A' })
+  await $.turn.start({ text: 'turn B', turnId: 'coord-B' })
+  boardText = posts(
+    { agent: 'coordinator', to: ['w'], text: '@w BRIEF' },
+    { agent: 'w', to: ['coordinator'], text: '@coordinator question?' },
+  )
+  // Replay turn A while turn B is still running
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'coord-A' })
+  await clock.advance(2000)
+  await clock.advance(12_000)
+  // Coordinator is still busy on turn B, so no idle unread prompt may be submitted
+  expect(seen.prompts.filter(p => p.includes('Unread board mentions'))).toEqual([])
+})
+
+test('P1 same-session run switch cannot bill new run for uncached member, and stale agentRun across restart cannot poison next session Read', async ($, on) => {
+  const RUN_B = '/project/.swarm/run-b-20261123-130000'
+  let runAClosed = false
+  let holdAgentList = false
+  let releaseAgentList!: () => void
+  let holdAgentRun = false
+  let releaseAgentRun!: () => void
+  let agentRunDir = OWNED
+  const charged: string[] = []
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['w'], text: '@w BRIEF' }),
+    roster: () => JSON.stringify({
+      title: 'Run A',
+      closed: runAClosed,
+      members: { coordinator: { role: 'coordinator', last_read_seq: 1 }, w: { role: 'worker', id: 'tm-same', last_read_seq: 1 } },
+    }),
+    read: path => path === `${RUN_B}/members.json`
+      ? JSON.stringify({
+        title: 'Run B',
+        closed: false,
+        members: { coordinator: { role: 'coordinator', last_read_seq: 1 }, w: { role: 'worker', id: 'tm-same', last_read_seq: 1 } },
+      })
+      : undefined,
+    exists: true,
+  })
+  on('process.run', async (_, e) => {
+    if (e.argv[3] === 'agent-run') {
+      if (holdAgentRun) await new Promise<void>(resolve => { releaseAgentRun = resolve })
+      return answer(agentRunDir)
+    }
+    if (e.argv[3] === 'account') {
+      charged.push(`${e.argv[2]}:${e.argv.at(-1)}`)
+      return answer(JSON.stringify({ title: 'Run', total: 400, budget: 0, paused: false }))
+    }
+    return answer(board(e))
+  })
+  on('agent.list', async () => {
+    if (holdAgentList) await new Promise<void>(resolve => { releaseAgentList = resolve })
+    return { value: [{ id: 'uncached-m', teammateId: 'tm-same', description: '@w', type: 'swarm:worker', status: 'completed' }] as never }
+  })
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+
+  // Delay uncached member's turn.complete while closing Run A and opening Run B in the SAME session reusing tm-same
+  const usage = { model: 'm', input_tokens: 400, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+  holdAgentList = true
+  const sameSessionDelayed = $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'same-sess-t', agentId: 'uncached-m', usage })
+  await clock.advance(0)
+  holdAgentList = false
+  runAClosed = true
+  await clock.advance(2000)
+  agentRunDir = RUN_B
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${RUN_B}" read coordinator` })
+  await clock.advance(2000)
+  releaseAgentList()
+  await sameSessionDelayed
+  expect(charged).toEqual([])
+
+  // Stale agent-run lookup held across session restart must not poison next session's agentRuns and refuse member Read
+  agentRunDir = OWNED
+  holdAgentRun = true
+  const staleRead = toolCall($, { tool: 'Read', file_path: '/project/a.ts', agentId: 'reused-id' } as never)
+  await clock.advance(0)
+  holdAgentRun = false
+  await $.session.end({ reason: 'clear', sessionId: 'fixture-conversation', resume: { id: 'fixture-conversation' } })
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  agentRunDir = RUN_B
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${RUN_B}" read coordinator` })
+  await clock.advance(2000)
+  releaseAgentRun()
+  await staleRead
+  // In the new session driving RUN_B, reused-id (whose current agent-run is RUN_B) must NOT be refused with OVER
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts', agentId: 'reused-id' } as never)).deny).toBeUndefined()
 })

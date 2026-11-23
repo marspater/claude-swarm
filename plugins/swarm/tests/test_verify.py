@@ -1948,6 +1948,35 @@ class DiffHygiene(unittest.TestCase):
             # Through a namespace, only the module the symbol left counts.
             assert verify.imports_symbol("c.ts", "import * as api from './m'\napi.sym()\n", "sym", "src/m.ts", True)
             assert not verify.imports_symbol("c.ts", "import * as api from './other'\napi.sym()\n", "sym", "src/m.ts", True)
+            # index.* and __init__.py resolve against their module path when exact=True.
+            for source, expected in (
+                    ('import { login } from "./auth"\nlogin()\n', True),
+                    ('import { login } from "./auth/index"\nlogin()\n', True),
+                    ('import * as auth from "./auth"\nauth.login()\n', True),
+                    ('import { login } from "./other"\nlogin()\n', False)):
+                assert verify.imports_symbol("src/app.ts", source, "login", "src/auth/index.ts", True) is expected, source
+            # Packages sharing a directory name (old/api vs new/api) must not be confused.
+            assert not verify.imports_symbol("new/client.ts", 'import { formatLabel } from "./api"\nformatLabel()\n', "formatLabel", "old/api/index.ts", True)
+            assert not verify.imports_symbol("app/client.ts", 'import { formatLabel } from "../new/api"\nformatLabel()\n', "formatLabel", "old/api/index.ts", True)
+            assert verify.imports_symbol("old/client.ts", 'import { formatLabel } from "./api"\nformatLabel()\n', "formatLabel", "old/api/index.ts", True)
+            assert verify.imports_symbol("app/client.ts", 'import { formatLabel } from "../old/api"\nformatLabel()\n', "formatLabel", "old/api/index.ts", True)
+            # TS aliases and nested Python packages still match when not contradicting sibling paths.
+            assert verify.imports_symbol("app/client.ts", 'import { formatLabel } from "@acme/api"\nformatLabel()\n', "formatLabel", "packages/ui/src/api/index.ts", True)
+            assert verify.imports_symbol("app/client.ts", 'import { formatLabel } from "@/api"\nformatLabel()\n', "formatLabel", "src/api/index.ts", True)
+            assert verify.imports_symbol("app/client.ts", 'import { formatLabel } from "@acme/old/api"\nformatLabel()\n', "formatLabel", "old/api/index.ts", True)
+            assert not verify.imports_symbol("app/client.ts", 'import { formatLabel } from "@acme/new/api"\nformatLabel()\n', "formatLabel", "old/api/index.ts", True)
+            assert not verify.imports_symbol("new/client.py", "from .api import format_label\nformat_label()\n", "format_label", "old/api/__init__.py", True)
+            assert not verify.imports_symbol("app.py", "from new.api import format_label\nformat_label()\n", "format_label", "old/api/__init__.py", True)
+            assert verify.imports_symbol("old/client.py", "from .api import format_label\nformat_label()\n", "format_label", "old/api/__init__.py", True)
+            assert verify.imports_symbol("app.py", "from old.api import format_label\nformat_label()\n", "format_label", "old/api/__init__.py", True)
+            assert verify.imports_symbol("app.py", "from api import format_label\nformat_label()\n", "format_label", "backend/api/__init__.py", True)
+            assert verify.imports_symbol("app.py", "from myproj.old.api import format_label\nformat_label()\n", "format_label", "old/api/__init__.py", True)
+            for source, expected in (
+                    ("from pkg import setup\nsetup()\n", True),
+                    ("from pkg import *\nsetup()\n", True),
+                    ("import pkg\npkg.setup()\n", True),
+                    ("from other import setup\nsetup()\n", False)):
+                assert verify.imports_symbol("app.py", source, "setup", "pkg/__init__.py", True) is expected, source
             # Each module a symbol left is kept; one that defines it again, with another signature, lost nothing.
             two = "--- a/a.ts\n+++ b/a.ts\n-export const h = 1\n%s--- a/b.ts\n+++ b/b.ts\n-export const h = 1\n"
             assert verify.removed_public_symbols(two % "") == {"h": ["a.ts", "b.ts"]}
@@ -1962,8 +1991,67 @@ class DiffHygiene(unittest.TestCase):
                 "src/a.py", "cfg test.txt", "b.py"}
             assert verify.declared("REWRITE: ./a/b.py\n`REFORMAT: c.ts`\nREMOVED: Thing, REWRITE:\nnext") == {
                 "REWRITE": {"a/b.py"}, "REFORMAT": {"c.ts"}, "REMOVED": {"Thing"}, "NEWLINE": set()}
+            assert verify.declared("REMOVED: helper: unused\nREMOVED: `other`: legacy") == {
+                "REWRITE": set(), "REFORMAT": set(), "REMOVED": {"helper", "other"}, "NEWLINE": set()}
         finally:
             sys.path.remove(str(SCRIPTS))
+
+    def test_removed_from_index_or_init_with_namesake_and_colon_reason_declared(self):
+        def prepare_nested(files, changes, report="done"):
+            with tempfile.TemporaryDirectory() as t:
+                proj = Path(t).resolve()
+                g = lambda *a: subprocess.run(["git", "-C", str(proj), *a], check=True, capture_output=True, text=True,
+                                              env=NO_GIT_ENV).stdout.strip()
+                g("init", "-b", "main")
+                for setting in (("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")):
+                    g("config", *setting)
+                for name, content in files.items():
+                    (proj / name).parent.mkdir(parents=True, exist_ok=True)
+                    (proj / name).write_text(content)
+                g("add", ".")
+                g("commit", "-m", "init")
+                board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "hyg", "init", "Nested")
+                post = [sys.executable, SCRIPTS / "board.py", board]
+                run(*post, "member", "w")
+                run(*post, "member", "v", "role=verifier")
+                g("switch", "-q", "-c", "work")
+                for name, content in changes.items():
+                    (proj / name).write_text(content)
+                g("add", "-A", "--", ":/", ":(exclude).swarm")
+                g("commit", "-q", "-m", "work")
+                commit = g("rev-parse", "HEAD")
+                g("switch", "-q", "main")
+                run(*post, "ready", "w", commit, text=report)
+                return subprocess.run([sys.executable, SCRIPTS / "verify.py", board, proj, "prepare", "isolated", "--check", "true"],
+                                      capture_output=True, text=True)
+
+        ts = {
+            "src/auth/index.ts": "export function login() {}\nexport const kept = 1\n",
+            "src/other.ts": "export function login() {}\n",
+            "app.ts": 'import { login } from "./src/auth"\nlogin()\n',
+        }
+        refused = prepare_nested(ts, {"src/auth/index.ts": "export const kept = 1\n"})
+        assert refused.returncode and 'app.ts:1 still refers to "login"' in refused.stderr, refused.stderr
+        assert prepare_nested(ts, {"src/auth/index.ts": "export const kept = 1\n"}, "REMOVED: login: replaced").returncode == 0
+        py = {
+            "pkg/__init__.py": "def setup():\n    return 1\n\ndef kept():\n    return 2\n",
+            "other.py": "def setup():\n    return 3\n",
+            "app.py": "from pkg import setup\nsetup()\n",
+        }
+        refused_py = prepare_nested(py, {"pkg/__init__.py": "def kept():\n    return 2\n"})
+        assert refused_py.returncode and 'app.py:1 still refers to "setup"' in refused_py.stderr, refused_py.stderr
+        assert prepare_nested(py, {"pkg/__init__.py": "def kept():\n    return 2\n"}, "REMOVED: setup: removed").returncode == 0
+        # Removing formatLabel from old/api/index.ts must not flag a client importing from new/api/index.ts.
+        sibling = {
+            "old/api/index.ts": "export function formatLabel() { return 'old' }\nexport const kept = 1\n",
+            "new/api/index.ts": "export function formatLabel() { return 'new' }\n",
+            "client.ts": 'import { formatLabel } from "./new/api"\nformatLabel()\n',
+        }
+        assert prepare_nested(sibling, {"old/api/index.ts": "export const kept = 1\n"}).returncode == 0
+        # Abbreviated flags like --time are rejected (allow_abbrev=False), aligning verify.py with guard.ts.
+        abbrev = subprocess.run([sys.executable, SCRIPTS / "verify.py", "/nonexistent", "/nonexistent", "test", "--time", "60", "abc", "v"],
+                                capture_output=True, text=True)
+        assert abbrev.returncode != 0 and "unrecognized arguments: --time" in abbrev.stderr, abbrev.stderr
 
 
 class BaselineDiff(unittest.TestCase):
@@ -2130,8 +2218,50 @@ class BaselineDiff(unittest.TestCase):
             assert one != verify.normalized_failure(run_output("/tmp/base", "0.31", 9, 1).replace("assert x", "assert y"), ["/tmp/base"])
             assert one != verify.normalized_failure(run_output("/tmp/base", "0.31", 9, 1).replace("2 failed", "3 failed"), ["/tmp/base"])
             assert verify.environment_failure("bash: command not found: pytest") and not verify.environment_failure("TypeError: Failed to fetch")
+            # Parallel pytest output without warnings or short-summary sections still normalizes identically.
+            def bare_pytest(root, seconds, passed, order):
+                blocks = ["_________ test_a _________\nassert 1 == 2\n", "_________ test_b _________\nassert x\n"]
+                return ("=================== FAILURES ===================\n" + "".join(blocks[::order])
+                        + "========= 2 failed, %d passed in %ss =========\n" % (passed, seconds))
+            bare_one = verify.normalized_failure(bare_pytest("/tmp/head", "1.20", 7, 1), ["/tmp/head", "/tmp/base"])
+            assert bare_one == verify.normalized_failure(bare_pytest("/tmp/base", "0.31", 9, -1), ["/tmp/head", "/tmp/base"])
+            assert bare_one != verify.normalized_failure(bare_pytest("/tmp/base", "0.31", 9, -1).replace("assert x", "assert y"), ["/tmp/base"])
         finally:
             sys.path.remove(str(SCRIPTS))
+
+    def test_stale_baseline_dir_does_not_block_baseline_diff_retry(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        proj = Path(temp.name).resolve()
+
+        def g(*args):
+            return subprocess.run(["git", "-C", str(proj), *args], check=True, capture_output=True, text=True,
+                                  env=NO_GIT_ENV).stdout.strip()
+
+        g("init", "-b", "main")
+        for setting in (("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")):
+            g("config", *setting)
+        (proj / "check.sh").write_text(self.OLD)
+        g("add", ".")
+        g("commit", "-m", "init")
+        board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "base", "init", "StaleBaseline"))
+        post = [sys.executable, SCRIPTS / "board.py", board]
+        gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+        run(*post, "member", "w")
+        run(*post, "member", "v", "role=verifier")
+        g("switch", "-q", "-c", "work")
+        (proj / "new.txt").write_text("new\n")
+        g("add", "new.txt")
+        g("commit", "-q", "-m", "work")
+        commit = g("rev-parse", "HEAD")
+        g("switch", "-q", "main")
+        run(*post, "ready", "w", commit, text="done")
+        cand = json.loads(run(*gate, "prepare", "isolated", "--check", "sh check.sh", "--baseline-diff"))["candidate"]
+        (board / f"baseline-{cand}").mkdir()
+        (board / f"baseline-{cand}" / "leftover").write_text("stale\n")
+        result = subprocess.run([*gate, "test", cand, "v"], capture_output=True, text=True)
+        assert result.returncode == 0 and result.stdout.splitlines()[-1].startswith("VERIFIED " + cand), (result.stdout, result.stderr)
+        assert list(board.glob("baseline-*")) == [board / f"baseline-{cand}"]
 
 
 if __name__ == "__main__":

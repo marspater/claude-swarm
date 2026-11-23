@@ -127,6 +127,8 @@ The coordinator can select these profiles when splitting a task. You can also as
 | Skill or reference | For | What it holds |
 | --- | --- | --- |
 | `swarm` | You, to start a swarm (`/swarm:swarm`) | The coordinator's procedure: board commands, start-up, the loop, verification, finishing |
+| `plan` | You, to preview a split (`/swarm:plan`) | Dry-run split: file ownership, dependencies, models, checks, and rough cost estimate without starting a run |
+| `kill` | You, to end a run (`/swarm:kill`) | Retires every member and closes the active run without committing or reverting (`/swarm-kill` does the same mid-turn) |
 | `swarm/references/orchestrating.md` | Coordinator, read when needed | When a swarm fits, how to split work, and the team shapes: parallel pieces, pool, pipeline, design then build, investigate then fix, competing explanations, review fan-out |
 | `swarm/references/agent-types.md` | Coordinator, read when needed | Which agent for which piece: the swarm's six member types, the built-in agents, and other plugins' agents |
 | `swarm/references/team-management.md` | Coordinator, read when needed | The roster, workspaces, permissions, adding, replacing and removing members, shutdown, recovery, closing a run |
@@ -142,7 +144,7 @@ The coordinator can select these profiles when splitting a task. You can also as
 | `investigating` | `swarm:investigator`, preloaded | Trace the real path, test competing explanations, hand over a regression check |
 | `architecting` | `swarm:architect`, preloaded | Turn requirements into architecture, justify its complexity, and plan implementation and verification in stages |
 
-All skills but `swarm` are hidden from the `/` menu. The coordinator reads its five references as it needs them. Each member type gets exactly one role skill, injected when it starts, and can load no other: the worker, designer and verifier deny the Skill tool, and the three specialists have a fixed tool list without it. The designer reads its Apple rules as a file, and the verifier its design method.
+The six role skills (`implementing`, `verifying`, `design-craft`, `exploring`, `investigating`, `architecting`) are hidden from the `/` menu; `/swarm:plan` and `/swarm:kill` are user-invocable alongside `/swarm:swarm`. The coordinator reads its six references as it needs them. Each member type gets exactly one role skill, injected when it starts, and can load no other: the worker, designer and verifier deny the Skill tool, and the three specialists have a fixed tool list without it. The designer reads its Apple rules as a file, and the verifier its design method.
 
 The plugin and its guidance were written for this project. The RLM pattern follows the Recursive Language Models paper (arXiv:2512.24601).
 
@@ -158,7 +160,7 @@ The plugin and its guidance were written for this project. The RLM pattern follo
 | A mention wakes a waiting member | The hooks reconcile every two seconds. An accepted send records delivery through a sequence. The member advances its read cursor when it reads the board |
 | `@monitor` | The hooks notify the coordinator once after 30 seconds without progress on an open, unpaused run |
 | Per-worker working copy | `isolation: "worktree"`; `verify.py` builds the candidate from exact worker commits, runs the requested checks there, and fast-forwards a clean checkout to the verified commit |
-| Models | Defaults: coordinator Opus at medium effort, workers and verifier Sonnet at medium. The coordinator raises the verifier to Opus at high when the change crosses several components, touches security, or includes design work. Name another model or effort in the prompt for any worker, all workers, or the verifier |
+| Models | Defaults: coordinator Opus at medium effort, workers and verifier Sonnet at medium. The coordinator raises the verifier to Opus at medium when the change crosses several components, touches security, or includes design work. Name another model or effort in the prompt for any worker, all workers, or the verifier |
 | Swarm pane | **Swarm: The Board** in Desktop, or `/swarm-board` in the terminal |
 
 The `.swarm` folder ignores itself in git, unless it already holds a `.gitignore` of the project's own, which is left as it is. Verification leaves the project's own `.swarm` folder out of the source fingerprint either way. A folder named `.swarm` anywhere else in the repository is source like any other.

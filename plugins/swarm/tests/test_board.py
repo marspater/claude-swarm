@@ -1623,6 +1623,41 @@ class BoardRegressions(unittest.TestCase):
         real = run(self.swarm, "prune", "--days=0")
         assert "archive " + os.path.basename(d) in real and "kept" not in real, real
 
+    def test_prune_removes_only_clean_recorded_baseline_worktrees(self):
+        git = lambda *a: subprocess.run(["git", "-C", self.root, *a], check=True, capture_output=True)
+        git("init", "-q")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x")
+        d = self.init_run()
+        # A manually created baseline-* worktree with uncommitted edits inside an open run must never be removed.
+        manual = os.path.join(d, "baseline-manual-comparison")
+        git("worktree", "add", "-q", "--detach", manual)
+        with open(os.path.join(manual, "notes.txt"), "w", encoding="utf-8") as f:
+            f.write("wip\n")
+        # A recorded baseline worktree with an untracked file must be preserved even when status.showUntrackedFiles=no.
+        git("config", "status.showUntrackedFiles", "no")
+        dirty = os.path.join(d, "baseline-abc123-dirty")
+        git("worktree", "add", "-q", "--detach", dirty)
+        with open(os.path.join(dirty, "dirty.txt"), "w", encoding="utf-8") as f:
+            f.write("edit\n")
+        # A clean recorded baseline worktree is removed.
+        stale = os.path.join(d, "baseline-abc123-stale")
+        git("worktree", "add", "-q", "--detach", stale)
+        with open(os.path.join(d, ".baselines.json"), "w", encoding="utf-8") as f:
+            json.dump(["baseline-abc123-dirty", "baseline-abc123-stale"], f)
+        self.init_run("shown")
+        plan = run(self.swarm, "prune", "--days=0", "--dry-run")
+        assert "would remove worktree " + stale in plan, plan
+        assert "kept " + dirty + ": worktree has uncommitted changes" in plan, plan
+        assert manual not in plan, plan
+        assert os.path.isdir(stale) and os.path.isdir(manual) and os.path.isdir(dirty)
+        real = run(self.swarm, "prune", "--days=0")
+        assert "remove worktree " + stale in real and not os.path.exists(stale), real
+        assert "kept " + dirty + ": worktree has uncommitted changes" in real and os.path.isdir(dirty), real
+        assert os.path.isdir(manual) and os.path.isfile(os.path.join(manual, "notes.txt")), real
+        # Clean up extra worktrees before tearDown.
+        for wt in (manual, dirty):
+            git("worktree", "remove", "--force", wt)
+
     def test_cli_int_validation_and_trailing_whitespace_truncation(self):
         d = self.init_run()
         run(d, "member", "w", "id=id-w")
@@ -2061,8 +2096,10 @@ class BoardRegressions(unittest.TestCase):
         self.account(d, "agent-a", 50_000)
         assert [item["member"] for item in self.items(d, "spend")] == ["a"]  # 76%
         assert not self.items(d, "loop")  # 190,000 tokens are a dozen honest steps: each one re-reads the conversation
-        self.account(d, "agent-a", 1_900_000)
-        assert [item["member"] for item in self.items(d, "loop")] == ["a"]  # 2,090,000 tokens without a post or a read
+        self.account(d, "agent-a", 560_000)
+        assert not self.items(d, "loop")  # 750,000 is the boundary (not > 750,000)
+        self.account(d, "agent-a", 1)
+        assert [item["member"] for item in self.items(d, "loop")] == ["a"]  # 750,001 tokens without a post or a read
         run(d, "post", "a", "@b still on it")
         assert not self.items(d, "loop")
         for _ in range(148):  # its 149th step since it began
@@ -2071,6 +2108,12 @@ class BoardRegressions(unittest.TestCase):
         self.account(d, "agent-b", 10)
         assert [item["member"] for item in self.items(d, "loop")] == ["b"]
         run(d, "read", "b")
+        assert not self.items(d, "loop")
+        # Verifiers are included in loop detection too.
+        run(d, "member", "v", "role=verifier", "id=agent-v")
+        self.account(d, "agent-v", 760_000)
+        assert [item["member"] for item in self.items(d, "loop")] == ["v"]
+        run(d, "post", "v", "@coordinator checking")
         assert not self.items(d, "loop")
 
     def test_export_writes_a_report_and_changes_nothing(self):
@@ -3104,6 +3147,56 @@ class FindingLedger(unittest.TestCase):
         finally:
             sys.path.remove(os.path.dirname(BOARD))
 
+    def test_prose_defect_alongside_bulleted_ruling_and_empty_rest(self):
+        d = self._run()
+        run(d, "post", "v", "@w NOT PASSED. First defect.")
+        run(d, "ready", "w", stdin="F1: fixed — a.py:1")
+        # Prose defect on line 0 with a bulleted ruling still gets tagged as F2.
+        out = run(d, "post", "v", stdin="@w NOT PASSED: the save now loses data\n- F1: resolved")
+        assert "recorded: F2" in out, out
+        refused = subprocess.run([sys.executable, BOARD, d, "ready", "w"], input="ok", capture_output=True, text=True)
+        assert refused.returncode and "F2 (the save now loses data)" in refused.stderr, refused.stderr
+        run(d, "ready", "w", stdin="F2: fixed — save.py:10")
+        # Closing a finding with a bulleted ruling and no line-0 prose (even with trailing punctuation) creates no empty finding.
+        out = run(d, "post", "v", stdin="@w NOT PASSED\n- F2: resolved")
+        assert "recorded:" not in out and "findings" not in self._post(d, 6), (out, self._post(d, 6))
+        run(d, "ready", "w", stdin="all clear")
+        run(d, "post", "v", "@w NOT PASSED. Another defect.")
+        run(d, "ready", "w", stdin="F3: fixed — save.py:12")
+        out = run(d, "post", "v", stdin="@w NOT PASSED:\n- F3: resolved")
+        assert "recorded:" not in out and "findings" not in self._post(d, int(out.split()[1][1:])), out
+        run(d, "ready", "w", stdin="all clear")
+        # Trailing routing mention after NOT PASSED with no defect prose creates no finding, while defect text after it does.
+        run(d, "post", "v", "@w NOT PASSED. Open defect.")
+        run(d, "ready", "w", stdin="F4: fixed — save.py:15")
+        out = run(d, "post", "v", stdin="NOT PASSED @w\n- F4: resolved")
+        assert "recorded:" not in out and "findings" not in self._post(d, int(out.split()[1][1:])), out
+        run(d, "ready", "w", stdin="clear")
+        run(d, "post", "v", "@w NOT PASSED. Another defect.")
+        run(d, "ready", "w", stdin="F5: fixed — save.py:20")
+        out = run(d, "post", "v", stdin="NOT PASSED @w: the save loses data\n- F5: resolved")
+        assert "recorded: F6" in out, out
+        refused = subprocess.run([sys.executable, BOARD, d, "ready", "w"], input="ok", capture_output=True, text=True)
+        assert refused.returncode and "F6" in refused.stderr and "the save loses data" in refused.stderr, refused.stderr
+        run(d, "ready", "w", stdin="F6: fixed — save.py:25")
+
+    def test_fenced_ignores_single_line_backtick_spans_and_deep_indents(self):
+        sys.path.insert(0, os.path.dirname(BOARD))
+        try:
+            import board
+            assert board.fenced(["```foo()``` failed", "- real defect", "F1: resolved"]) == set()
+            assert board.fenced(["    ```", "four spaces is code block", "    ```"]) == set()
+            assert board.fenced(["\t```", "tab is code block", "\t```"]) == set()
+            assert board.fenced(["   ```", "three spaces is a fence", "   ```"]) == {0, 1, 2}
+        finally:
+            sys.path.remove(os.path.dirname(BOARD))
+        d = self._run()
+        run(d, "post", "v", "@w NOT PASSED. First defect.")
+        run(d, "ready", "w", stdin="F1: fixed — a.py:1")
+        out = run(d, "post", "v", stdin="@w NOT PASSED\n```foo()``` failed\n- real defect\nF1: resolved")
+        assert "recorded: F2" in out, out
+        run(d, "ready", "w", stdin="F2: fixed — b.py:2")
+
 
 class SoftDependencies(unittest.TestCase):
     """after= waits for a member to finish, with a report or without one; depends= needs the report."""
@@ -3310,6 +3403,246 @@ class SoftDependencies(unittest.TestCase):
             assert saved(d)["members"]["late"]["after"] == "y" and saved(d)["members"]["late"]["depends"] == "y"
             run(d, "member", "late", "depends=")
             assert "after" not in saved(d)["members"]["late"]
+
+
+class EngineRegressions(unittest.TestCase):
+    """Regressions for engine correctness and edge-case behavior."""
+
+    def _fresh(self, name="reg"):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        return run(os.path.join(temp.name, ".swarm", name), "init", "Regressions").strip(), temp.name
+
+    def test_all_not_passed_excludes_consultant_and_investigator_and_consultant_ready(self):
+        d, _ = self._fresh()
+        run(d, "member", "w")
+        run(d, "member", "adv", "profile=architect", "writes=0", "consult=1")
+        run(d, "member", "inv", "profile=investigator", "writes=0")
+        run(d, "member", "v", "role=verifier")
+        run(d, "ready", "w", stdin="done")
+        run(d, "ready", "adv", stdin="advice")
+        out = run(d, "post", "v", stdin="@all NOT PASSED\n- broken")
+        assert "recorded: F1" in out, out
+        post = json.loads(run(d, "show", "--post=3", "--json"))
+        assert post["rejects"] == ["w"], post
+        run(d, "ready", "adv", stdin="updated advice")
+        # Even a legacy post recording a consultant in rejects never blocks its ready.
+        board_path = os.path.join(d, "board.jsonl")
+        with open(board_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"seq": 5, "agent": "v", "text": "@adv NOT PASSED [F2]: legacy",
+                                "time": "2026-01-01T00:00:00+0000", "to": ["adv"],
+                                "rejects": ["adv"], "findings": ["F2"]}) + "\n")
+        run(d, "ready", "adv", stdin="still unblocked")
+
+    def test_read_max_bytes_defers_new_posts_and_omits_star_on_routine_ready(self):
+        d, _ = self._fresh()
+        run(d, "member", "w1")
+        run(d, "member", "w2", "depends=w1")
+        run(d, "member", "v", "role=verifier")
+        run(d, "ready", "w1", stdin="done\nchecked\nw1 detail " + "x" * 260)
+        run(d, "read", "w2", "--headers")
+        run(d, "post", "coordinator", "@w2 hello")
+        out = run(d, "read", "w2", "--max-bytes=350")
+        assert "earlier report(s) you work from" in out, out
+        assert "no new posts" not in out, out
+        assert "1 new post(s) deferred to next page" in out, out
+        assert "1 more post(s) remain" in out, out
+        # Routine worker READY summarized for coordinator must not carry '* '.
+        run(d, "post", "w1", "@coordinator non-routine note")
+        coord = run(d, "read", "coordinator")
+        assert "[full: show --post=1]" in coord, coord
+        routine_line = next(line for line in coord.splitlines() if "#1 " in line and "@w1" in line)
+        assert not routine_line.startswith("* "), coord
+        note_header = next(line for line in coord.splitlines() if "#3 " in line and "@w1" in line)
+        assert note_header.startswith("* "), coord
+
+    def test_post_verdict_after_acceptance_prints_no_candidate_none(self):
+        d, _ = self._fresh()
+        run(d, "member", "w")
+        run(d, "member", "v", "role=verifier")
+        run(d, "ready", "w", stdin="done")
+        with open(os.path.join(d, "verification.json"), "w", encoding="utf-8") as f:
+            json.dump({"candidate": "newcand1111111111", "accepted": True, "inputs": {"w": [1, None]},
+                       "superseded": [{"candidate": "oldcand0000000000", "inputs": {"w": [1, None]}}]}, f)
+        out = run(d, "post", "v", "@w NOT VERIFIED oldcand0000000000: late note")
+        assert "candidate None" not in out, out
+
+    def test_carried_matches_prepare_when_project_head_holds_retired_commit(self):
+        d, root = self._fresh()
+        project = os.path.realpath(root)
+        env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+
+        def git(*args, cwd=project):
+            return subprocess.run(["git", "-C", cwd, *args], check=True, capture_output=True, text=True, env=env).stdout.strip()
+
+        def commit(branch, start, name):
+            git("switch", "-q", "-C", branch, start)
+            with open(os.path.join(project, name), "w") as f:
+                f.write(name + "\n")
+            git("add", "--", name)
+            git("commit", "-q", "-m", "add " + name)
+            rev = git("rev-parse", "HEAD")
+            git("switch", "-q", "main")
+            return rev
+
+        git("init", "-q", "-b", "main")
+        for setting in (("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")):
+            git("config", *setting)
+        git("commit", "-q", "--allow-empty", "-m", "init")
+        d = run(os.path.join(project, ".swarm", "car"), "init", "Carried").strip()
+        for who, extra in (("a", []), ("b", ["after=a"]), ("v", ["role=verifier"])):
+            run(d, "member", who, *extra)
+        first = commit("a", "main", "a.txt")
+        run(d, "ready", "a", first, stdin="a done")
+        built = commit("b", "a", "b.txt")
+        run(d, "post", "v", "@a NOT PASSED. a.txt is wrong.")
+        run(d, "member", "a", "killed=1")
+        tree = os.path.join(project, "b-tree")
+        git("worktree", "add", "-q", "--detach", tree, built)
+        # Before project HEAD holds `first`, both ready and sync refuse `built`.
+        refused_ready = subprocess.run([sys.executable, BOARD, d, "ready", "b", built], input="done", capture_output=True, text=True)
+        assert refused_ready.returncode and "still holds @a's commit" in refused_ready.stderr, refused_ready.stderr
+        refused_sync = subprocess.run([sys.executable, BOARD, d, "sync", "b", "--check-only"], capture_output=True, text=True, cwd=tree)
+        assert refused_sync.returncode and "HEAD still holds @a's commit" in refused_sync.stderr, refused_sync.stderr
+        # Once project HEAD includes `first`, both ready and sync succeed, matching verify.py prepare.
+        git("merge", "-q", "--ff-only", first)
+        assert subprocess.run([sys.executable, BOARD, d, "sync", "b", "--check-only"], capture_output=True, text=True, cwd=tree).returncode == 0
+        ok_ready = subprocess.run([sys.executable, BOARD, d, "ready", "b", built], input="done", capture_output=True, text=True)
+        assert ok_ready.returncode == 0, ok_ready.stderr
+        git("worktree", "remove", "--force", tree)
+
+    def test_killed_idempotent_and_status_excludes_delivered_clipped_and_scope_typo(self):
+        d, _ = self._fresh()
+        run(d, "member", "a")
+        run(d, "member", "b", "after=a")
+        out1 = run(d, "member", "a", "killed=1")
+        assert "posted #1" in out1, out1
+        out2 = run(d, "member", "a", "killed=1")
+        assert "posted" not in out2, out2
+        with open(os.path.join(d, "board.jsonl"), encoding="utf-8") as f:
+            assert len(f.readlines()) == 1
+        # Scope change message says "Review your scope", not "Review its scope".
+        run(d, "ready", "b", stdin="done")
+        run(d, "member", "b", "owns=new-part")
+        revise_post = json.loads(run(d, "show", "--post=3", "--json"))["text"]
+        assert "Review your scope and report again." in revise_post and "Review its scope" not in revise_post, revise_post
+        # Status omits internal delivered/clipped lists.
+        run(d, "member", "c", "depends=b")
+        run(d, "read", "c")
+        state = saved(d)
+        state["members"]["c"]["clipped"] = [2]
+        with open(os.path.join(d, "members.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        st = run(d, "status")
+        assert "delivered=" not in st and "clipped=" not in st, st
+
+    def test_post_and_ready_release_lock_while_reading_stdin(self):
+        d, _ = self._fresh()
+        run(d, "member", "w")
+        for cmd in (["post", "w"], ["ready", "w"]):
+            proc = subprocess.Popen([sys.executable, BOARD, d, *cmd], stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                # Give the child a moment to either block on stdin (fixed) or lock `.lock` and block (buggy).
+                time.sleep(0.3)
+                began = time.monotonic()
+                st = subprocess.run([sys.executable, BOARD, d, "status"], capture_output=True, text=True, timeout=5)
+                assert st.returncode == 0, st.stderr
+                ping = subprocess.run([sys.executable, BOARD, d, "post", "coordinator", "ping during " + cmd[0]],
+                                      capture_output=True, text=True, timeout=5)
+                assert ping.returncode == 0, ping.stderr
+                assert time.monotonic() - began < 4, "lock held while waiting on stdin for " + cmd[0]
+                out, err = proc.communicate("from pipe\n", timeout=10)
+                assert proc.returncode == 0 and "posted #" in out, (cmd, out, err)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+
+    def test_post_rejects_sender_id_change_while_reading_stdin(self):
+        d, _ = self._fresh()
+        run(d, "member", "w", "id=agent-1")
+        proc = subprocess.Popen([sys.executable, BOARD, d, "post", "w"], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            time.sleep(0.3)
+            run(d, "started", "w", "agent-2", "agent-1")
+            out, err = proc.communicate("stale agent post\n", timeout=10)
+            assert proc.returncode != 0 and "agent changed while reading stdin" in err, (out, err)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        with open(os.path.join(d, "board.jsonl"), encoding="utf-8") as f:
+            assert f.readlines() == []
+        # Posting still works when sender id is unchanged, and for coordinator.
+        for who in ("w", "coordinator"):
+            ok = subprocess.Popen([sys.executable, BOARD, d, "post", who], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                out, err = ok.communicate("valid post\n", timeout=10)
+                assert ok.returncode == 0 and "posted #" in out, (who, out, err)
+            finally:
+                if ok.poll() is None:
+                    ok.kill()
+                    ok.wait()
+
+    def test_report_only_ready_rejects_stale_dependency_version_after_stdin(self):
+        d, _ = self._fresh()
+        run(d, "member", "a")
+        run(d, "member", "b", "depends=a")
+        run(d, "ready", "a", stdin="a v1")
+        proc = subprocess.Popen([sys.executable, BOARD, d, "ready", "b"], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            time.sleep(0.3)
+            run(d, "ready", "a", stdin="a v2")
+            out, err = proc.communicate("b built on v1\n", timeout=10)
+            assert proc.returncode != 0 and "changed while reading stdin" in err, (out, err)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        assert not json.loads(run(d, "attention", "--json"))["members"]["b"]["ready"]
+        ok = subprocess.Popen([sys.executable, BOARD, d, "ready", "b"], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            out, err = ok.communicate("b built on v2\n", timeout=10)
+            assert ok.returncode == 0 and "posted #" in out, (out, err)
+        finally:
+            if ok.poll() is None:
+                ok.kill()
+                ok.wait()
+
+    def test_multiline_prose_not_passed_creates_finding(self):
+        d, _ = self._fresh()
+        run(d, "member", "w")
+        run(d, "member", "v", "role=verifier")
+        run(d, "ready", "w", stdin="initial work")
+        out = run(d, "post", "v", stdin="@w NOT PASSED\nThe save loses data.")
+        assert "recorded: F1" in out, out
+        blocked = subprocess.run([sys.executable, BOARD, d, "ready", "w"], input="done again", capture_output=True, text=True)
+        assert blocked.returncode != 0 and "F1" in blocked.stderr and "The save loses data." in blocked.stderr, blocked.stderr
+        run(d, "ready", "w", stdin="F1: fixed save — added flush test")
+        # Multiline prose defect alongside a resolved bullet ruling allocates F2 and preserves line-1 summary (not @w).
+        out2 = run(d, "post", "v", stdin="NOT PASSED @w\nThe retry drops headers.\n- F1: resolved")
+        assert "recorded: F2" in out2, out2
+        blocked2 = subprocess.run([sys.executable, BOARD, d, "ready", "w"], input="done again", capture_output=True, text=True)
+        assert blocked2.returncode != 0 and "F2" in blocked2.stderr and "The retry drops headers." in blocked2.stderr and "(@w)" not in blocked2.stderr, blocked2.stderr
+
+    def test_consultant_addressed_verdict_does_not_withdraw_other_worker_ready(self):
+        d, _ = self._fresh()
+        run(d, "member", "w")
+        run(d, "member", "adv", "profile=architect", "writes=0", "consult=1")
+        run(d, "member", "v", "role=verifier")
+        run(d, "ready", "w", stdin="worker ready")
+        assert json.loads(run(d, "attention", "--json"))["members"]["w"]["ready"]
+        # Explicitly addressing consultant @adv on line 1 while mentioning @w in body must not withdraw @w's READY.
+        run(d, "post", "v", stdin="@adv NOT PASSED: revisit design\nSee @w for context")
+        assert json.loads(run(d, "attention", "--json"))["members"]["w"]["ready"]
+        # Addressing @coordinator on line 1 with no worker target still falls back to body worker @w.
+        run(d, "post", "v", stdin="@coordinator NOT PASSED\n@w broke the build")
+        assert not json.loads(run(d, "attention", "--json"))["members"]["w"]["ready"]
 
 
 if __name__ == "__main__":

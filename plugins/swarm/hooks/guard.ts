@@ -2,7 +2,7 @@
 // as the shell runs it. Needs the engine only for the file system and git.
 import type { EngineInterface } from 'claude-code'
 
-import { boardCalls, CASE_PATTERN, closesAfter, COMMITTING, GIT_BUILTINS, launches, makesCommit, NAMES_COMMIT, scanShell, scriptsRun, shellLaunch, SHELLS, shellWords, type Statement, unwrap } from './command'
+import { boardCalls, CASE_PATTERN, closesAfter, COMMITTING, GIT_BUILTINS, launches, makesCommit, NAMES_COMMIT, RUNNERS, scanShell, scriptsRun, shellLaunch, SHELLS, shellWords, type Statement, unwrap, withoutRedirects } from './command'
 import type { Roster } from './roster'
 
 export function normalizePath(p: string): string {
@@ -157,10 +157,11 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
         else if (/^--(?:git-dir|work-tree)(?:=|$)/.test(tok)) {
           isMoved = true
           if (!tok.includes('=')) i++
-        } else if (tok === '-c' || tok.startsWith('--config-env')) {
-          const value = tok === '-c' || tok === '--config-env' ? args[++i] ?? '' : tok.slice('--config-env='.length)
+        } else if (tok.startsWith('-c') || tok.startsWith('--config-env')) {
+          const isC = tok.startsWith('-c')
+          const value = tok === '-c' || tok === '--config-env' ? args[++i] ?? '' : isC ? tok.slice(2) : tok.slice('--config-env='.length)
           const alias = /^alias\.([^=]+)=([\s\S]*)$/i.exec(value)
-          if (alias) given.set(alias[1]!.toLowerCase(), tok === '-c' ? alias[2] : undefined)
+          if (alias) given.set(alias[1]!.toLowerCase(), isC ? alias[2] : undefined)
         } else if (['--namespace', '--super-prefix', '--attr-source', '--exec-path', '--list-cmds'].includes(tok)) i++
         else if (!tok.startsWith('-')) break
       }
@@ -214,6 +215,7 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
     let fromStdin = false
     // Folders a wrapper moves the command to, in order, `undefined` for one this cannot tell.
     const chdirs: Array<string | undefined> = []
+    let unreadWrapper = false
     let at = 0
     // What stands before the command, read off the words: env's options change the folder and split a command line.
     prefixes: for (let word = words[at]; word !== undefined; word = words[at]) {
@@ -241,6 +243,7 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
             ? longs !== undefined && !(longName in longs)
             : flags !== undefined && [...flag.slice(1, index < 0 ? undefined : index + 1)].some(ch => !flags.includes(ch))
           if (isUnread) {
+            unreadWrapper = true
             at = start
             break prefixes
           }
@@ -349,10 +352,24 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
       }
       return NAMES_COMMIT.test(`git ${args.join(' ')}`) ? HIT : end(here)
     }
-    // A command this does not know that runs git after it (a wrapper it does not list, a function from elsewhere) is a
-    // commit when it names one, or when its further words come from its input: it cannot be told from the folder.
-    const runsGit = words.slice(at + 1).some(word => /^git(?:-.+)?$/.test(word.replace(/^.*\//, '')))
-    if (!INERT.has(name) && runsGit && (fromStdin || NAMES_COMMIT.test(words.slice(at).join(' ')))) return HIT
+    // A command this does not know (or a strict wrapper whose flag could not be read) that runs git or a shell after
+    // it is a commit when it names one, when its shell script commits, or when its further words come from its input.
+    if (!INERT.has(name)) {
+      if ((unreadWrapper || RUNNERS.has(name)) && NAMES_COMMIT.test(words.slice(at).join(' '))) return HIT
+      const runsGit = words.slice(at + 1).some(word => /^git(?:-.+)?$/.test(word.replace(/^.*\//, '')))
+      if (runsGit && (fromStdin || NAMES_COMMIT.test(words.slice(at).join(' ')))) return HIT
+      for (let j = at + 1; j < words.length; j++) {
+        if (!SHELLS.test(words[j]!.replace(/^.*\//, ''))) continue
+        const shell = shellLaunch(words.slice(j + 1))
+        if (shell.code !== undefined) {
+          for (const script of [shell.code, ...shell.operands]) if ((await run(script, UNKNOWN, depth + 1)).hit) return HIT
+        } else if (shell.stdin && shell.fed !== undefined) {
+          if ((await run(shell.fed, UNKNOWN, depth + 1)).hit) return HIT
+        } else if ((fromStdin || shell.stdin || shell.file === '_' || /[$`]/.test(shell.file ?? '')) && NAMES_COMMIT.test(command)) {
+          return HIT
+        }
+      }
+    }
     return end(here)
   }
   // The compound commands open at a point of the script: what each restores or joins when it closes.
@@ -601,20 +618,37 @@ export function actsAsAnother(command: string, name: string, member: Roster[stri
       if (call) {
         if (MEMBER_READS.has(call.action)) continue
         const own = MEMBER_OWN.has(call.action) && !(isVerifier && call.action !== 'read' && call.action !== 'post')
-        const named = shellWords(call.rest).slice(1).find(word => !word.startsWith('-'))?.replace(/^@/, '').toLowerCase()
+        const named = withoutRedirects(shellWords(call.rest)).words.slice(1).find(word => !word.startsWith('-'))?.replace(/^@/, '').toLowerCase()
         if (!own) return `the board's ${call.action} is the coordinator's${isVerifier && MEMBER_OWN.has(call.action) ? ', and a verifier reports with post' : ''}`
         if (named !== name) return `the board's ${call.action} names @${named ?? '?'}, and @${name} acts only as itself`
       } else if (launches(words, 'board.py', command)) return unread('board')
       const verify = launches(words, 'verify.py', command)
       if (!verify) continue
-      const at = words.findIndex(word => /(?:^|\/)verify\.py$/.test(word))
+      const cleanWords = withoutRedirects(words).words
+      const at = cleanWords.findIndex(word => /(?:^|\/)verify\.py$/.test(word))
       // Run some other way (python -c, a module, a program from its input), its words are not the ones it gets.
       if (verify === 'other' || at < 0) return unread('verify')
-      const action = words.slice(at + 3).find(word => !word.startsWith('-'))
-      if (action === undefined || !/^[a-z]+$/.test(action)) return unread('verify')
-      if (!['prepare', 'test', 'accept', 'commit'].includes(action)) continue
+      const action = cleanWords.slice(at + 3).find(word => !word.startsWith('-'))
+      if (action === undefined || !['prepare', 'test', 'accept', 'commit'].includes(action)) return unread('verify')
       // A verifier tests a candidate under its own name; preparing, accepting and committing candidates is the coordinator's.
-      const tester = action === 'test' ? words.slice(words.indexOf(action, at + 3) + 1).filter(word => !word.startsWith('-'))[1] : undefined
+      let tester: string | undefined
+      if (action === 'test') {
+        const positionals: string[] = []
+        for (let i = cleanWords.indexOf(action, at + 3) + 1; i < cleanWords.length; i++) {
+          const word = cleanWords[i]!
+          if (word === '--') {
+            positionals.push(...cleanWords.slice(i + 1))
+            break
+          }
+          if (word === '--timeout') {
+            i++
+            continue
+          }
+          if (word.startsWith('-')) continue
+          positionals.push(word)
+        }
+        tester = positionals[1]
+      }
       if (!isVerifier || action !== 'test') return `verify.py ${action} is ${action === 'test' ? "a verifier's" : "the coordinator's"}`
       if (tester?.replace(/^@/, '').toLowerCase() !== name) return `verify.py test names @${tester ?? '?'}, and @${name} tests only as itself`
     }

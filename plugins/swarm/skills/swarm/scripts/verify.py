@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+import posixpath
 import re
 import shlex
 import shutil
@@ -420,7 +421,7 @@ def declared(*texts):
     found = {"REWRITE": set(), "REFORMAT": set(), "REMOVED": set(), "NEWLINE": set()}
 
     def bare(value):
-        return value.strip("`'\"").removeprefix("./").rstrip(",;.)`'\"")
+        return value.strip("`'\"").removeprefix("./").rstrip(",;.:)`'\"")
     for text in texts:
         # A declaration stands at the start of a line of the report itself: one inside a pasted log declares nothing.
         for kind, value in DECLARED.findall(unfenced(text)):
@@ -465,23 +466,58 @@ def gives(clause, symbol):
     return any(part.split()[-1:] == [symbol] for part in re.sub(r"[()\\]", " ", clause).split(","))
 
 
-def ts_imports(source, symbol, stem=None):
-    """Does a TypeScript or JavaScript file pull SYMBOL in from some module? The module path is not resolved; with
-    STEM, only an import whose path ends in that file name counts."""
+def alt_stems(definition, stem):
+    """Alternative module names when DEFINITION is a package entry (`index.*` in JS/TS or `__init__.py[i]` in Python)."""
+    parts = definition.rsplit("/", 2)
+    return {stem, parts[-2]} if len(parts) >= 2 and parts[-2] else {stem}
+
+
+def _ts_path_matches(path, stems, importer=None, definition=None):
+    raw = re.sub(r"\.[cm]?[jt]sx?$", "", path.rstrip("/"))
+    if definition is not None:
+        def_mod = re.sub(r"(\.d)?\.[cm]?[jt]sx?$", "", definition)
+        is_pkg = def_mod == "index" or def_mod.endswith("/index")
+        def_dir = def_mod[:-6] if def_mod.endswith("/index") else ("" if def_mod == "index" else None)
+        is_rel = raw in (".", "..") or raw.startswith(("./", "../"))
+        if is_pkg:
+            if is_rel and importer is not None:
+                resolved = posixpath.normpath(posixpath.join(posixpath.dirname(importer), raw))
+                if resolved == ".":
+                    resolved = ""
+                return resolved == def_mod or (def_dir is not None and resolved == def_dir)
+            # Strip tsconfig/bundler alias prefixes (@scope/, @/, ~/, #/, $/, or leading @~#$ on a single segment).
+            bare = re.sub(r"^(?:[@~#$][^/]*/|/)", "", raw)
+            bare = bare.lstrip("@~#$")
+            if "/" in bare:
+                return (bare == def_mod or (def_dir is not None and bare == def_dir)
+                        or def_mod.endswith("/" + bare) or bare.endswith("/" + def_mod)
+                        or (def_dir is not None and (def_dir.endswith("/" + bare) or (def_dir != "" and bare.endswith("/" + def_dir)))))
+            return bare in stems
+        if is_rel and importer is not None:
+            resolved = posixpath.normpath(posixpath.join(posixpath.dirname(importer), raw))
+            if not resolved.startswith("..") and "/" in resolved and "/" in def_mod and resolved != def_mod:
+                return False
+    return raw.rsplit("/", 1)[-1] in stems
+
+
+def ts_imports(source, symbol, stem=None, importer=None, definition=None):
+    """Does a TypeScript or JavaScript file pull SYMBOL in from some module? With STEM, only an import that matches
+    the defining module counts (resolving relative package imports against IMPORTER when given)."""
+    stems = None if stem is None else {stem} if isinstance(stem, str) else set(stem)
     sym = re.escape(symbol)
     # import { a, sym as b } from / import sym from / import type { sym } from / export { sym } from. The clause is
     # anchored to real import shapes, so it cannot span from an unrelated `export const` to a later `from`.
     for clause, path in re.findall(r"\b(?:import|export)\s+(?:type\s+)?((?:%s\s*,\s*)?(?:\{[^}]*\}|\*\s*as\s+%s)|%s)\s*from\s*['\"]([^'\"]*)"
                                    % (NAME, NAME, NAME), source, re.ASCII):
-        if stem not in (None, re.sub(r"\.[cm]?[jt]sx?$", "", path.rsplit("/", 1)[-1])):
+        if stems is not None and not _ts_path_matches(path, stems, importer, definition):
             continue
         if mentions(clause, symbol):
             return True
         space = re.search(r"\*\s*as\s+(%s)" % NAME, clause, re.ASCII)  # `import * as api from './lib'`, then `api.sym`
-        if stem is not None and space and re.search(
+        if stems is not None and space and re.search(
                 r"(?<![\w$.])%s\s*\??\.\s*%s(?![\w$])" % (re.escape(space[1]), sym), source, re.ASCII):
             return True
-    if stem is not None:
+    if stems is not None:
         return False
     # const { sym } = require('x') / const { sym } = await import('x')
     for clause in re.findall(r"(?:const|let|var)\s*\{([^}]*)\}\s*=\s*(?:require|await\s+import)\s*\(", source, re.ASCII):
@@ -497,28 +533,59 @@ def ts_imports(source, symbol, stem=None):
                for space in spaces)
 
 
-def py_imports(source, symbol, definition, exact=False):
+def py_imports(source, symbol, definition, exact=False, importer=None):
     """Does a Python file pull SYMBOL in: `from m import sym`, `from m import *` of the defining module, or `alias.sym`?
     With EXACT, `from m import sym` counts only when m is the defining module."""
-    stem = re.sub(r"\.pyi?$", "", definition.rsplit("/", 1)[-1])
+    def_mod = re.sub(r"\.pyi?$", "", definition)
+    stem = def_mod.rsplit("/", 1)[-1]
+    is_pkg = stem == "__init__"
+    def_dir = def_mod[:-9] if def_mod.endswith("/__init__") else ("" if def_mod == "__init__" else None)
+    stems = alt_stems(definition, stem) if is_pkg else {stem}
+
+    def py_matches(module, child=None):
+        if module.startswith(".") and importer is not None:
+            dots = len(module) - len(module.lstrip("."))
+            base_parts = [p for p in posixpath.dirname(importer).split("/") if p]
+            if dots - 1 > len(base_parts):
+                return False
+            prefix = base_parts[:len(base_parts) - (dots - 1)]
+            tail = [p for p in module[dots:].split(".") if p]
+            if child:
+                tail.append(child)
+            resolved = "/".join(prefix + tail)
+            return resolved == def_mod or (def_dir is not None and resolved == def_dir)
+        parts = [p for p in module.lstrip(".").split(".") if p]
+        if child:
+            parts.append(child)
+        mod_path = "/".join(parts)
+        if is_pkg:
+            if "/" in mod_path:
+                return (mod_path == def_mod or (def_dir is not None and (mod_path == def_dir or def_dir.endswith("/" + mod_path)
+                        or (def_dir != "" and mod_path.endswith("/" + def_dir))))
+                        or def_mod.endswith("/" + mod_path) or mod_path.endswith("/" + def_mod))
+            return mod_path in stems
+        if "/" in mod_path and "/" in def_mod:
+            return mod_path == def_mod or def_mod.endswith("/" + mod_path)
+        return (parts[-1] if parts else "") in stems
+
     bound = []
     for module, clause in PY_FROM.findall(source):
         clause = re.sub(r"[()\\]", " ", clause)
         if clause.strip() == "*":
-            if module.rsplit(".", 1)[-1] == stem:
+            if py_matches(module):
                 return True
             continue
-        if mentions(clause, symbol) and (not exact or module.rsplit(".", 1)[-1] == stem):
+        if mentions(clause, symbol) and (not exact or py_matches(module)):
             return True
         for part in clause.split(","):  # `from pkg import api [as a]`: only the defining module binds `a.sym`
             imported = re.fullmatch(r"\s*(\w+)(?:\s+as\s+(\w+))?\s*", part, re.ASCII)
-            if imported and imported[1] == stem:
+            if imported and py_matches(module, imported[1]):
                 bound.append(imported[2] or imported[1])
     for names in re.findall(r"^[ \t]*import[ \t]+([^\n#]+)", source, re.ASCII | re.M):
         for part in names.split(","):
             alias = re.fullmatch(r"\s*([\w.]+)(?:\s+as\s+(\w+))?\s*", part, re.ASCII)
             # `import requests` does not make `requests.get` a caller of a `get` removed elsewhere.
-            if alias and alias[1].rsplit(".", 1)[-1] == stem:
+            if alias and py_matches(alias[1]):
                 bound.append(alias[2] or alias[1])
     return any(re.search(r"(?<![\w.])%s(?:\.\w+)*\.%s\b" % (re.escape(name), re.escape(symbol)), source, re.ASCII)
                for name in bound)
@@ -529,9 +596,10 @@ def imports_symbol(name, source, symbol, definition, exact=False):
     only an import that names the defining module counts: for a symbol another file defines too."""
     code = "\n".join("" if comment_only(name, line) else line for line in source.split("\n"))
     if is_python(name):
-        return py_imports(code, symbol, definition, exact)
+        return py_imports(code, symbol, definition, exact, importer=name)
     stem = re.sub(r"(\.d)?\.[cm]?[jt]sx?$", "", definition.rsplit("/", 1)[-1])
-    return ts_imports(code, symbol, stem if exact else None)
+    stems = alt_stems(definition, stem) if stem == "index" else {stem}
+    return ts_imports(code, symbol, stems if exact else None, importer=name, definition=definition)
 
 
 def removed_public_symbols(diff, moved=None):
@@ -1061,7 +1129,7 @@ def normalized_failure(output, roots):
         end = len(text) if end is None else found.end() + end.start()
         return text[:found.end()] + split(text[found.end():end]) + text[end:]
 
-    output = ordered(output, r"^={3,} FAILURES ={3,}\n", r"^={3,} (?:warnings summary|short test summary info) ={3,}$",
+    output = ordered(output, r"^={3,} FAILURES ={3,}\n", r"^={3,} .* ={3,}$",
                      lambda body: "".join(sorted(filter(None, re.split(r"(?=^_{8,}.*$)", body, flags=re.M)))))
     return ordered(output, r"^={3,} short test summary info ={3,}\n", r"^={3,} .* ={3,}$",
                    lambda body: "".join(line + "\n" for line in sorted(filter(None, body.split("\n")))))
@@ -1069,6 +1137,31 @@ def normalized_failure(output, roots):
 
 def environment_failure(output):
     return any(pattern.search(output) for pattern in ENVIRONMENT_FAILURE)
+
+
+BASELINES_FILE = ".baselines.json"
+
+
+def record_baseline(run, name, add=True):
+    """Track baseline worktree directory names created by verification so `board.py prune` cleans only ours."""
+    path = Path(run) / BASELINES_FILE
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        names = [entry for entry in raw if isinstance(entry, str)] if isinstance(raw, list) else []
+    except (OSError, ValueError):
+        names = []
+    if add:
+        if name not in names:
+            names.append(name)
+    else:
+        names = [entry for entry in names if entry != name]
+    if names:
+        atomic_write(path, json.dumps(sorted(names)) + "\n")
+    else:
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def same_on_base(run, project, candidate, ran, timeout):
@@ -1097,54 +1190,59 @@ def same_on_base(run, project, candidate, ran, timeout):
     if inputs:
         why = "the candidate changes %s, so the base runs with other dependencies" % ", ".join(inputs)
         return {**verdicts, **dict.fromkeys(asked, (False, why))}
-    baseline, short, diverged = run / ("baseline-" + candidate["candidate"]), candidate["base"][:12], None
-    try:
-        git(project, "worktree", "add", "--detach", str(baseline), candidate["base"])
-        work = baseline / Path(candidate["path"]).relative_to(candidate["worktree"])
-        roots = [str(Path(candidate["worktree"])), str(Path(candidate["worktree"]).resolve()), str(baseline), str(baseline.resolve())]
+    short, diverged = candidate["base"][:12], None
+    with tempfile.TemporaryDirectory(dir=run, prefix=f"baseline-{candidate['candidate']}-") as base_dir:
+        baseline = Path(base_dir)
+        record_baseline(run, baseline.name, add=True)
+        try:
+            git(project, "worktree", "add", "--detach", str(baseline), candidate["base"])
+            work = baseline / Path(candidate["path"]).relative_to(candidate["worktree"])
+            roots = [str(Path(candidate["worktree"])), str(Path(candidate["worktree"]).resolve()), str(baseline), str(baseline.resolve())]
 
-        def printed(path):
-            return None if path.stat().st_size > COMPARED_BYTES else normalized_failure(path.read_bytes().decode(errors="replace"), roots)
-        for index, (command, returncode, log) in enumerate(ran[:asked[-1] + 1]):
-            if diverged is not None:
-                if index in asked:
-                    verdicts[index] = (False, "an earlier check ends or prints otherwise on the base, so the two runs are not "
-                                              "set up alike: " + diverged)
-                continue
-            base_log = log.with_name(log.stem + "-base.log")
-            try:
-                with base_log.open("wb") as output:
-                    on_base = run_check(command, work, timeout, output)
-            except subprocess.TimeoutExpired:
-                on_base = None
-            here, there = printed(log), printed(base_log)
-            if on_base != returncode or here is None or here != there:
-                diverged = command
-            if index not in asked:
-                continue
-            if on_base is None:
-                why = "it timed out on the base"
-            elif on_base == 0:
-                why = "it passes on the base %s" % short
-            elif on_base != returncode:
-                why = "it exits %d on the base %s and %d here" % (on_base, short, returncode)
-            elif there is None:
-                why = "its output on the base is over %d MB, more than is compared" % (COMPARED_BYTES >> 20)
-            elif here != there:
-                why = "it fails on the base %s too, with other output (log: %s)" % (short, base_log)
-            # Nothing, progress marks, counts, a banner: the same count may be another test on each side.
-            elif not any(map(names_failure, here.split("\n"))):
-                why = "it prints nothing that names a failure on either side, so nothing shows the two are one"
-            else:
-                verdicts[index] = (True, "it fails on the base %s with the same output (log: %s)" % (short, base_log))
-                continue
-            verdicts[index] = (False, why)
-    except (OSError, ValueError) as error:  # no such folder on the base, a worktree Git could not make: no comparison
-        for index in asked:
-            verdicts.setdefault(index, (False, "the base could not be checked: %s" % error))
-    finally:
-        if baseline.exists():
-            git(project, "worktree", "remove", "--force", str(baseline), optional=True)
+            def printed(path):
+                return None if path.stat().st_size > COMPARED_BYTES else normalized_failure(path.read_bytes().decode(errors="replace"), roots)
+            for index, (command, returncode, log) in enumerate(ran[:asked[-1] + 1]):
+                if diverged is not None:
+                    if index in asked:
+                        verdicts[index] = (False, "an earlier check ends or prints otherwise on the base, so the two runs are not "
+                                                  "set up alike: " + diverged)
+                    continue
+                base_log = log.with_name(log.stem + "-base.log")
+                try:
+                    with base_log.open("wb") as output:
+                        on_base = run_check(command, work, timeout, output)
+                except subprocess.TimeoutExpired:
+                    on_base = None
+                here, there = printed(log), printed(base_log)
+                if on_base != returncode or here is None or here != there:
+                    diverged = command
+                if index not in asked:
+                    continue
+                if on_base is None:
+                    why = "it timed out on the base"
+                elif on_base == 0:
+                    why = "it passes on the base %s" % short
+                elif on_base != returncode:
+                    why = "it exits %d on the base %s and %d here" % (on_base, short, returncode)
+                elif there is None:
+                    why = "its output on the base is over %d MB, more than is compared" % (COMPARED_BYTES >> 20)
+                elif here != there:
+                    why = "it fails on the base %s too, with other output (log: %s)" % (short, base_log)
+                # Nothing, progress marks, counts, a banner: the same count may be another test on each side.
+                elif not any(map(names_failure, here.split("\n"))):
+                    why = "it prints nothing that names a failure on either side, so nothing shows the two are one"
+                else:
+                    verdicts[index] = (True, "it fails on the base %s with the same output (log: %s)" % (short, base_log))
+                    continue
+                verdicts[index] = (False, why)
+        except (OSError, ValueError) as error:  # no such folder on the base, a worktree Git could not make: no comparison
+            for index in asked:
+                verdicts.setdefault(index, (False, "the base could not be checked: %s" % error))
+        finally:
+            if baseline.exists():
+                git(project, "worktree", "remove", "--force", str(baseline), optional=True)
+            if not baseline.exists():
+                record_baseline(run, baseline.name, add=False)
     return verdicts
 
 
@@ -1519,11 +1617,11 @@ def accept(run, project, identifier):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("run", type=Path)
     parser.add_argument("project", type=Path)
     actions = parser.add_subparsers(dest="action", required=True)
-    prep = actions.add_parser("prepare")
+    prep = actions.add_parser("prepare", allow_abbrev=False)
     prep.add_argument("mode", choices=("shared", "isolated"))
     checks = prep.add_mutually_exclusive_group(required=True)
     checks.add_argument("--check", action="append")
@@ -1534,12 +1632,12 @@ def main():
     prep.add_argument("--baseline-diff", action="store_true",
                       help="waive a check that fails on the candidate's base with the same output (isolated only)")
     prep.add_argument("--members", help="a partial candidate of these workers, comma-separated: tested, never accepted")
-    test = actions.add_parser("test")
+    test = actions.add_parser("test", allow_abbrev=False)
     test.add_argument("candidate")
     test.add_argument("verifier")
     test.add_argument("--timeout", help="per-check timeout in seconds (overrides SWARM_VERIFY_TIMEOUT)")
-    actions.add_parser("accept").add_argument("candidate")
-    landed = actions.add_parser("commit")
+    actions.add_parser("accept", allow_abbrev=False).add_argument("candidate")
+    landed = actions.add_parser("commit", allow_abbrev=False)
     landed.add_argument("candidate")
     landed.add_argument("-m", "--message", required=True)
     args = parser.parse_args()

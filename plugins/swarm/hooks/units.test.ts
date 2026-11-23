@@ -2,9 +2,10 @@ import { expect, test } from 'claude-code/testing'
 import type { Post } from '../types'
 import { BOARD_CALL, CASE_PATTERN, COORDINATOR_READ, RUN, boardCalls, closesAfter, launches, makesCommit, runsNamed, scanShell, scriptsRun, shellLaunch, shellWords, splitShellSegments, substitutions, unwrap, wakeMessage, wakeSequence } from './command'
 import { edgesOf, graphSvg, isBroadcast } from './graph'
+import { actsAsAnother, commitsInSharedCheckout } from './guard'
 import { BOARD_ACTIONS, hiveArt, toolMood, toolSummary } from './hive'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, SWARM_AGENTS, familyOf, latestOf } from './models'
-import { statusCss, statusDot, statusKey } from './palette'
+import { progressBar, semanticIcon, statusCss, statusDot, statusKey, swarmEmblem } from './palette'
 import { END, budgetOf, detailOf, findAgent, ledger, mentions, parse, parsePosts, postFields, statusOf, targets, tokensUsed } from './roster'
 import { bodyOf, chipped, clean, clip, compact, fenceAfter, hasQuestion, head, kindOf, openedText, stripKind, unquoted, verdictOf } from './text'
 
@@ -841,4 +842,215 @@ test('review: redirections are read whole and only where they are redirections, 
   // a compound command after a joined line is still one command, piped onward as a whole
   expect(boardCalls('if true; then \\\n  python3 /p/board.py /project/.swarm/demo-20261116-101010 read coordinator; fi | head').map(call => call.piped)).toEqual([true])
   expect(boardCalls('\\\nif true; then python3 /p/board.py /project/.swarm/demo-20261116-101010 read coordinator; fi | head').map(call => call.piped)).toEqual([true])
+})
+
+const mockGuardEngine = () => ({
+  fs: {
+    stat: async (path: string) => ({ realPath: path }),
+    read: async () => '',
+  },
+  process: {
+    run: async () => ({ exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }),
+  },
+}) as never
+
+test('guard regressions (#1-#4): parameter-expansion quote flip, unclosed quotes, verify redirect shift, env/unlisted-runner sh -c, and attached -c', async () => {
+  const $ = mockGuardEngine()
+
+  // #1: nested quotes inside "${...}" must not flip outer quote state; unclosed quotes mark unread and fail closed
+  expect(splitShellSegments('echo "${x:-"a\'b"}" && git commit -m pwn')).toEqual(['echo "${x:-"a\'b"}"', 'git commit -m pwn'])
+  expect(splitShellSegments('echo "${x:-${y:-"a\'b"}}" && git commit -m pwn')).toEqual(['echo "${x:-${y:-"a\'b"}}"', 'git commit -m pwn'])
+  expect(splitShellSegments('echo "$(echo "${x:-"a)b"}")" && git commit -m pwn')).toEqual(['echo "$(echo "${x:-"a)b"}")"', 'git commit -m pwn'])
+  expect(scanShell('echo "${x:-$(git commit -m pwn)}"')[0]?.inner).toEqual(['git commit -m pwn'])
+  expect(scanShell('echo "unclosed && git commit -m pwn')[0]?.unread).toBe(true)
+  expect(scanShell("echo 'unclosed")[0]?.unread).toBe(true)
+  expect(scanShell('echo "${x:-unclosed')[0]?.unread).toBe(true)
+  expect(shellWords('env X="${a:-"b\'"}" git commit -m pwn')).toEqual(['env', 'X=${a:-"b\'"}', 'git', 'commit', '-m', 'pwn'])
+  for (const cmd of [
+    'echo "${x:-"a\'b"}" && git commit -m pwn',
+    'echo "${x:-\'a}"\'}" && git commit -m pwn',
+    'env X="${a:-"b\'"}" git commit -m pwn',
+    'echo "unclosed && git commit -m pwn',
+  ]) {
+    expect(await commitsInSharedCheckout($, cmd, '/project'), cmd).toBe(true)
+  }
+  expect(await commitsInSharedCheckout($, 'echo "${x:-"a\'b"}" && git status', '/project')).toBe(false)
+
+  // CR-1: single quotes inside double-quoted "${...}" are literal and do not hide $(...) / `...`, while unquoted ${...} single quotes stay literal
+  expect(scanShell('printf \'%s\\n\' "${missing:-\'$(git commit -am mixed)\'}"')[0]?.inner).toEqual(['git commit -am mixed'])
+  expect(scanShell('printf \'%s\\n\' "${missing:-\'`git commit -am mixed`\'}"')[0]?.inner).toEqual(['git commit -am mixed'])
+  expect(scanShell('printf \'%s\\n\' ${missing:-\'$(git commit -am mixed)\'}')[0]?.inner).toBeUndefined()
+  expect(await commitsInSharedCheckout($, 'printf \'%s\\n\' "${missing:-\'$(git commit -am mixed)\'}"', '/project')).toBe(true)
+  expect(await commitsInSharedCheckout($, 'printf \'%s\\n\' ${missing:-\'$(git commit -am mixed)\'}', '/project')).toBe(false)
+
+  // CR-2: process substitution inside unquoted ${...} runs and is detected, while double-quoted "<(...)" / "${v/x/<(...)}" stays literal
+  expect(scanShell('v=x; printf \'%s\\n\' ${v/x/<(git commit -am mixed)}')[1]?.inner).toEqual(['git commit -am mixed'])
+  expect(scanShell('printf \'%s\\n\' <(git commit -am mixed)')[0]?.inner).toEqual(['git commit -am mixed'])
+  expect(scanShell('printf \'%s\\n\' "<(git commit -am mixed)"')[0]?.inner).toBeUndefined()
+  expect(scanShell('v=x; printf \'%s\\n\' "${v/x/<(git commit -am mixed)}"')[1]?.inner).toBeUndefined()
+  expect(await commitsInSharedCheckout($, 'v=x; printf \'%s\\n\' ${v/x/<(git commit -am mixed)}', '/project')).toBe(true)
+  expect(await commitsInSharedCheckout($, 'printf \'%s\\n\' "<(git commit -am mixed)"', '/project')).toBe(false)
+  expect(await commitsInSharedCheckout($, 'v=x; printf \'%s\\n\' "${v/x/<(git commit -am mixed)}"', '/project')).toBe(false)
+
+  // CR2-1: closesAfter respects $'...' escapes so escaped apostrophes do not corrupt subshell close counts
+  expect(closesAfter("echo $'a\\')'")).toEqual({ text: "echo $'a\\')'", closes: 0 })
+  expect(closesAfter("echo $'a\\')')")).toEqual({ text: "echo $'a\\')'", closes: 1 })
+
+  // CR2-2: shellWords inside double-quoted "${...}" passes inDouble=true so apostrophes stay literal
+  expect(shellWords('printf "%s" "${label:-it\'s fine}" extra')).toEqual(['printf', '%s', "${label:-it's fine}", 'extra'])
+
+  // CR3-1: escaped \$' inside ${...} or $(...) is not treated as an ANSI-C quote opener
+  expect(shellWords("echo ${x:-\\$'a\\'} python board.py")).toEqual(['echo', "${x:-\\$'a\\'}", 'python', 'board.py'])
+  expect(splitShellSegments("echo $(echo \\$'a\\') && git commit -m pwn")).toEqual(["echo $(echo \\$'a\\')", 'git commit -m pwn'])
+
+  // #2: verify.py redirections before operands cannot shift action index; invalid actions fail closed
+  expect(actsAsAnother('python3 /p/verify.py >a 2> b .swarm/r-20260101-000000 app accept cand-1', 'parser', { role: 'worker', last_read_seq: 0 })).toContain("the coordinator's")
+  expect(actsAsAnother('python3 /p/verify.py >a 2> b .swarm/r-20260101-000000 app accept cand-1', 'vera', { role: 'verifier', last_read_seq: 0 })).toContain("the coordinator's")
+  expect(actsAsAnother('python3 /p/verify.py .swarm/r-20260101-000000 app unknown cand-1', 'parser', { role: 'worker', last_read_seq: 0 })).toContain('checked only when')
+  expect(actsAsAnother('python3 /p/verify.py --help', 'parser', { role: 'worker', last_read_seq: 0 })).toContain('checked only when')
+
+  // #3: unknown env flags and unlisted runners wrapping sh/bash -c commit are blocked, while safe sh -c and prose pass
+  for (const cmd of [
+    'env --default-signal bash -c "git commit -m pwn"',
+    'flock /tmp/lk sh -c "git commit -m pwn"',
+    'doas sh -c "git commit -m pwn"',
+    'setsid sh -c "git commit -m pwn"',
+    'ionice -c3 sh -c "git commit -m pwn"',
+    'taskset -c 0 bash -c "git commit -m pwn"',
+  ]) {
+    expect(await commitsInSharedCheckout($, cmd, '/project'), cmd).toBe(true)
+  }
+  for (const cmd of [
+    'flock /tmp/lk sh -c "git status"',
+    'env --default-signal bash -c "git status"',
+    'python3 /p/board.py DIR post alice "See git log for commit details"',
+  ]) {
+    expect(await commitsInSharedCheckout($, cmd, '/project'), cmd).toBe(false)
+  }
+
+  // #4: attached git -calias.x=... is inspected like -c alias.x=...
+  expect(await commitsInSharedCheckout($, 'git -calias.x=commit x -m pwn', '/project')).toBe(true)
+  expect(await commitsInSharedCheckout($, 'git -calias.x=cherry-pick x abc', '/project')).toBe(true)
+  expect(await commitsInSharedCheckout($, 'git -calias.x=status x', '/project')).toBe(false)
+})
+
+test('guard and roster regressions (#5-#8): BOARD_CALL/actsAsAnother false positives, silent read-only exclusion, and duplicate landed accounting', () => {
+  // #5: python without 3, --check-hash-based-pycs, and quoted case patterns in WRAPPER
+  expect(boardCalls('python /p/board.py /r/.swarm/x-20260101-000000 show').map(c => c.action)).toEqual(['show'])
+  expect(boardCalls('python3 --check-hash-based-pycs always /p/board.py /r/.swarm/x-20260101-000000 show').map(c => c.action)).toEqual(['show'])
+  expect(boardCalls('python3 --check-hash-based-pycs=never /p/board.py /r/.swarm/x-20260101-000000 read parser').map(c => [c.action, c.subarg])).toEqual([['read', 'parser']])
+  expect(actsAsAnother('python /p/board.py DIR read parser', 'parser', { role: 'worker', last_read_seq: 0 })).toBeUndefined()
+  expect(actsAsAnother('python3 --check-hash-based-pycs always /p/board.py DIR show', 'parser', { role: 'worker', last_read_seq: 0 })).toBeUndefined()
+  expect(actsAsAnother('case "$x" in "a b") python3 /p/board.py DIR read parser ;; esac', 'parser', { role: 'worker', last_read_seq: 0 })).toBeUndefined()
+  expect(actsAsAnother('case "$x" in ("a|b") python3 /p/board.py DIR show ;; esac', 'parser', { role: 'worker', last_read_seq: 0 })).toBeUndefined()
+
+  // #6: < file before member name in board.py and --timeout 60 before operands in verify.py
+  expect(actsAsAnother('python3 /p/board.py DIR ready < report.txt parser', 'parser', { role: 'worker', last_read_seq: 0 })).toBeUndefined()
+  expect(actsAsAnother('python3 /p/board.py DIR ready < report.txt other', 'parser', { role: 'worker', last_read_seq: 0 })).toContain('acts only as itself')
+  expect(actsAsAnother('python3 /p/verify.py DIR proj test --timeout 60 cand-1 v', 'v', { role: 'verifier', last_read_seq: 0 })).toBeUndefined()
+  expect(actsAsAnother('python3 /p/verify.py DIR proj test --timeout=60 cand-1 v', 'v', { role: 'verifier', last_read_seq: 0 })).toBeUndefined()
+  expect(actsAsAnother('python3 /p/verify.py DIR proj test --timeout 60 cand-1 other', 'v', { role: 'verifier', last_read_seq: 0 })).toContain('tests only as itself')
+
+  // #7: read-only profiles (explorer, architect) and consultants (consult=1) are excluded from silent checks
+  const rosterJson = JSON.stringify({
+    title: 'Demo',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 },
+      scout: { role: 'worker', profile: 'explorer', id: 's1', last_read_seq: 1 },
+      arch: { role: 'worker', profile: 'architect', id: 'a1', last_read_seq: 1 },
+      cons: { role: 'worker', consult: '1', id: 'c1', last_read_seq: 1 },
+      dev: { role: 'worker', id: 'd1', last_read_seq: 1 },
+    },
+  })
+  const boardJsonl = JSON.stringify({ seq: 1, agent: 'coordinator', text: '@all check in', time: 't' })
+  const agents = ['s1', 'a1', 'c1', 'd1'].map(id => ({ id, description: '', type: 'swarm:worker', status: 'idle' })) as never
+  const idleHint = { type: 'worker', model: 'sonnet', effort: 'medium', depends: [], owns: '', ready: false, blocked_on: [], asked: 0, unreachable: false }
+  const parsed = parse('/r/.swarm/x-20260101-000000', boardJsonl, rosterJson, agents, 300, {
+    items: [],
+    members: { scout: idleHint, arch: idleHint, cons: idleHint, dev: idleHint },
+  })
+  expect(parsed.attention.filter(item => item.kind === 'silent').map(item => item.member)).toEqual(['dev'])
+
+  // #8: duplicate/concurrent turn.complete charge/landed calls do not double-count in-memory turn.charged
+  const book = ledger()
+  const whole = { input_tokens: 100, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+  const part = { input_tokens: 40, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+  const owed1 = book.charge('dup', whole)
+  const owed2 = book.charge('dup', whole)
+  expect([owed1, owed2]).toEqual([100, 100])
+  book.landed(book.of('dup')!, owed1)
+  book.landed(book.of('dup')!, owed2)
+  expect(book.of('dup')!.charged).toBe(100)
+  expect(book.charge('dup', whole)).toBe(0)
+
+  expect(book.charge('dup2', part, 0)).toBe(40)
+  const rem1 = book.charge('dup2', whole)
+  const rem2 = book.charge('dup2', whole)
+  expect([rem1, rem2]).toEqual([60, 60])
+  book.landed(book.of('dup2')!, rem1)
+  book.landed(book.of('dup2')!, rem2)
+  expect(book.of('dup2')!.charged).toBe(60)
+  book.landed(book.of('dup2')!, 40, 0)
+  expect(book.of('dup2')!.charged).toBe(100)
+})
+
+test('visual polish: animated emblems, progress bars, semantic icons, status dots, and graph animations', () => {
+  // Swarm emblems for every state: active states animate and respect reduced motion; bad elapsed never produces NaN
+  for (const state of ['working', 'coordinating', 'paused', 'attention', 'idle', 'closed'] as const) {
+    for (const elapsed of [0, 350, -10, NaN]) {
+      const svg = swarmEmblem(state, elapsed)
+      expect(svg).toContain('viewBox="0 0 20 20"')
+      expect(svg).not.toContain('NaN')
+    }
+  }
+  expect(swarmEmblem('working', 200)).toContain('emb-ring')
+  expect(swarmEmblem('working', 200)).toContain('prefers-reduced-motion:reduce')
+  expect(swarmEmblem('closed')).not.toContain('emb-ring')
+  expect(swarmEmblem('paused')).toContain('<rect ')
+
+  // Progress bar clamps ratios safely, animates shimmer only when requested and wide enough
+  expect(progressBar(0, 'accent', true)).not.toContain('shimmer')
+  expect(progressBar(-5, 'accent')).toContain('viewBox="0 0 200 6"')
+  expect(progressBar(NaN, 'warning')).not.toContain('NaN')
+  expect(progressBar(0.65, 'success', true, 120)).toContain('class="shimmer"')
+  expect(progressBar(1.8, 'error', false)).toContain('width="200"')
+
+  // Semantic icons render distinct shapes across light/dark Display P3 themes
+  for (const kind of ['pass', 'ready', 'warn', 'error', 'info', 'paused'] as const) {
+    const icon = semanticIcon(kind)
+    expect(icon).toContain('viewBox="0 0 12 12"')
+    expect(icon).toContain('prefers-color-scheme:dark')
+  }
+
+  // Animated statusDot keeps safe elapsed handling and reduced-motion guards
+  expect(statusDot('working', NaN)).not.toContain('NaN')
+  expect(statusDot('working', 500)).toContain('sw-pulse')
+  expect(statusDot('working', 500)).toContain('prefers-reduced-motion:reduce')
+  expect(statusDot('coordinating', 500)).toContain('sw-aura')
+
+  // Hive art uses smooth animations + soft radial aura when active, none when sleeping
+  expect(hiveArt('build', 400)).toContain('radialGradient id="hg"')
+  expect(hiveArt('sleep', 400)).not.toContain('radialGradient')
+  expect(hiveArt('verify', 400)).toContain('var(--ok)')
+
+  // Graph SVG emits live presence pulse & comet tail only in live repeat mode, never indefinite in replay
+  const sample = {
+    title: 'T', dir: '/r', isClosed: false, attention: [], budget: 0, tokens: {},
+    posts: [post('@verifier READY', ['verifier'])],
+    members: [
+      { name: 'coordinator', role: 'coordinator', type: 'coordinator', model: 'opus', effort: 'high', status: 'coordinating', detail: '', owns: '', depends: [], posts: 0, unread: 0 },
+      { name: 'parser', role: 'worker', type: 'worker', model: 'sonnet', effort: 'medium', status: 'working', detail: '', owns: '', depends: [], posts: 1, unread: 0 },
+      { name: 'verifier', role: 'verifier', type: 'verifier', model: 'sonnet', effort: 'medium', status: 'waiting', detail: '', owns: '', depends: [], posts: 0, unread: 0 },
+    ],
+  }
+  const liveGraph = graphSvg(sample, 1, new Set(), false, true, true, 250)
+  expect(liveGraph).toContain('packet-tail')
+  expect(liveGraph).toContain('p-ping')
+  expect(liveGraph).toContain('filter id="sh"')
+  expect(liveGraph).not.toContain('pattern')
+  expect(liveGraph).not.toContain('class="surface"')
+  const replayGraph = graphSvg(sample, 1, new Set(), true, false, false, 0)
+  expect(replayGraph).toContain('packet-tail')
+  expect(replayGraph).not.toContain('indefinite')
+  expect(replayGraph).not.toContain('p-ping')
 })

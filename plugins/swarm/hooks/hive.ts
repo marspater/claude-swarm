@@ -65,13 +65,20 @@ export function hiveArt(shown: Mood, elapsed = 0): string {
   elapsed = Number.isFinite(elapsed) && elapsed > 0 ? Math.floor(elapsed) : 0
   const [prop, left, right] = scenes[mood]
   const sleeping = mood === 'sleep'
-  const gesture = {
-    sleep: 'translate(1px,-2px)', forage: 'translate(2px,-1px)', inspect: 'translate(1px,0px)',
-    build: 'translate(0px,-1px)', verify: 'translate(0px,-1px)', relay: 'translate(10px,0px)',
-  }[mood]
-  const steps = ([x, y]: [number, number]) => {
-    const midX = Math.round(x / 2), midY = Math.round(y / 2)
-    return `0%,100%{transform:translate(0,0)}24%,80%{transform:translate(${midX}px,${midY}px)}48%,64%{transform:translate(${x}px,${y}px)}`
+  const smoothOrbit = ([x, y]: [number, number], flip = 1) => {
+    const midX = (x * 0.55).toFixed(1)
+    const midY = (y * 0.55 - 0.6 * flip).toFixed(1)
+    const altX = (x * 0.35).toFixed(1)
+    const altY = (y * 0.8 + 0.5 * flip).toFixed(1)
+    return `0%,100%{transform:translate(0,0)}28%{transform:translate(${midX}px,${midY}px)}54%{transform:translate(${x}px,${y}px)}78%{transform:translate(${altX}px,${altY}px)}`
+  }
+  const propKeyframes: Record<Mood, string> = {
+    sleep: '0%{opacity:0;transform:translate(0,1.5px) scale(.85)}25%{opacity:.85}75%{opacity:.75;transform:translate(1.8px,-2.6px) scale(1)}100%{opacity:0;transform:translate(2.5px,-3.6px) scale(1.05)}',
+    inspect: '0%,100%{opacity:.75;transform:translate(-1.5px,0)}45%{opacity:1;transform:translate(3.2px,-1px)}70%{opacity:.95;transform:translate(1.2px,1px)}',
+    build: '0%,100%{opacity:.8;transform:rotate(-16deg) translate(0,0)}35%{opacity:1;transform:rotate(14deg) translate(1px,1px)}55%{opacity:1;transform:rotate(-8deg) translate(0,-.5px)}',
+    verify: '0%,100%{opacity:.78;transform:scale(.92) translate(0,0)}40%,60%{opacity:1;transform:scale(1.1) translate(0,-1.2px)}',
+    relay: '0%{opacity:0;transform:translate(-1px,1px)}15%{opacity:1}80%{opacity:1;transform:translate(13px,-.5px)}100%{opacity:0;transform:translate(15px,1px)}',
+    forage: '0%,100%{opacity:.55;transform:translate(0,0)}50%{opacity:1;transform:translate(2.6px,-1.6px)}',
   }
   const beeBody = `<path class="wing" fill="var(--wing)" d="M2 0h2v2H2zM5 0h2v2H5z"/>
     <path fill="var(--honey)" d="M1 2h6v1h1v2H7v1H2V5H0V3h1z"/>
@@ -80,20 +87,51 @@ export function hiveArt(shown: Mood, elapsed = 0): string {
     `<g transform="translate(${x} ${y})"><g class="${kind}">${
       kind === 'right' ? `<g transform="translate(8 0) scale(-1 1)">${beeBody}</g>` : beeBody
     }</g></g>`
+  const propFill = mood === 'verify' ? 'var(--ok)' : 'var(--wing)'
   const propMarkup = mood === 'relay'
     ? `<g class="prop"><path fill="var(--wing)" d="${prop}"/><path fill="var(--ink)" d="M0 0h1v1H0zM6 0h1v1H6zM1 1h1v1H1zM5 1h1v1H5zM2 2h3v1H2z"/></g>`
-    : `<path class="prop" fill="var(--wing)" d="${prop}"/>`
+    : mood === 'build'
+      ? `<g class="prop"><path fill="var(--wing)" d="${prop}"/></g><path class="spark" fill="var(--spark)" d="M1 2h1v1H1zM10 1h1v1h-1zM3 0h1v1H3z"/>`
+      : mood === 'sleep'
+        ? `<path class="prop" fill="var(--wing)" d="${prop}"/><path class="prop-echo" fill="var(--wing)" d="M4 0h3v1H4zM5 1h1v1H5zM4 2h3v1H4z"/>`
+        : mood === 'forage'
+          ? `<path class="prop" fill="var(--wing)" d="${prop}"/><path class="spark" fill="var(--spark)" d="M0 2h1v1H0zM7 4h1v1H7zM5 0h1v1H5z"/>`
+          : `<path class="prop" fill="${propFill}" d="${prop}"/>`
+  const lDur = sleeping ? 4600 : 3200
+  const rDur = sleeping ? 5200 : 4000
+  const pDur = mood === 'relay' ? 2800 : mood === 'build' ? 1800 : 3400
+  const aura = sleeping
+    ? ''
+    : '<defs><radialGradient id="hg"><stop offset="0%" stop-color="var(--honey)" stop-opacity=".42"/><stop offset="70%" stop-color="var(--honey)" stop-opacity=".14"/><stop offset="100%" stop-color="var(--honey)" stop-opacity="0"/></radialGradient></defs>' +
+      '<ellipse class="aura" cx="21" cy="14" rx="13" ry="7.5" fill="url(#hg)" shape-rendering="auto"/>'
+  const doorwayGlow = sleeping
+    ? ''
+    : '<rect class="door-glow" x="19" y="15" width="4" height="4" fill="var(--spark)"/>'
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 44 22" shape-rendering="crispEdges">
-    <style>svg{--wing:#4b8f91;--honey:#e9ac55;--ink:#664437;--wax:#b46b46}
-    @media(prefers-color-scheme:dark){svg{--wing:#99c8c8}}
-    @supports(color:color(display-p3 1 0 0)){svg{--wing:color(display-p3 .3602 .5544 .5647);--honey:color(display-p3 .8774 .6843 .3908);--ink:color(display-p3 .3804 .2724 .2245);--wax:color(display-p3 .6663 .4331 .3019)}@media(prefers-color-scheme:dark){svg{--wing:color(display-p3 .6379 .7791 .7816)}}}
-    @media(prefers-reduced-motion:no-preference){.left{animation:l ${sleeping ? '5' : '3.4'}s steps(1,end) infinite;animation-delay:-${elapsed % (sleeping ? 5000 : 3400)}ms}.right{animation:r ${sleeping ? '5.6' : '4.8'}s steps(1,end) infinite;animation-delay:-${elapsed % (sleeping ? 5600 : 4800)}ms}.prop{transform-box:fill-box;transform-origin:center;animation:signal 4s steps(1,end) infinite;animation-delay:-${elapsed % 4000}ms}${sleeping ? '' : `.wing{animation:flutter .28s steps(1,end) infinite;animation-delay:-${elapsed % 280}ms}`}}
-    @keyframes l{${steps(left)}}
-    @keyframes r{${steps(right)}}
-    @keyframes flutter{50%{transform:translateY(1px)}}@keyframes signal{0%,100%{opacity:.5}55%{opacity:1;transform:${gesture}}}
-    </style><path fill="var(--wax)" d="M17 7h8v2h2v3h2v7H13v-7h2V9h2z"/>
+    <style>svg{--wing:#4b8f91;--honey:#e9ac55;--ink:#664437;--wax:#b46b46;--ok:#349962;--spark:#f6cf6e}
+    @media(prefers-color-scheme:dark){svg{--wing:#99c8c8;--ok:#4cc480;--spark:#ffe08a}}
+    @supports(color:color(display-p3 1 0 0)){svg{--wing:color(display-p3 .3602 .5544 .5647);--honey:color(display-p3 .8774 .6843 .3908);--ink:color(display-p3 .3804 .2724 .2245);--wax:color(display-p3 .6663 .4331 .3019);--ok:color(display-p3 .3224 .5918 .4028);--spark:color(display-p3 .96 .82 .45)}@media(prefers-color-scheme:dark){svg{--wing:color(display-p3 .6379 .7791 .7816);--ok:color(display-p3 .4333 .7586 .5248);--spark:color(display-p3 1 .88 .55)}}}
+    .aura{opacity:.65}.door-glow{opacity:.2}.spark{opacity:0}.prop-echo{opacity:0}
+    @media(prefers-reduced-motion:no-preference){
+      .left{animation:l ${lDur}ms cubic-bezier(.42,0,.58,1) -${elapsed % lDur}ms infinite}
+      .right{animation:r ${rDur}ms cubic-bezier(.42,0,.58,1) -${elapsed % rDur}ms infinite}
+      .prop{transform-box:fill-box;transform-origin:center;animation:signal ${pDur}ms cubic-bezier(.4,0,.2,1) -${elapsed % pDur}ms infinite}
+      .prop-echo{transform-box:fill-box;transform-origin:center;animation:signal ${pDur}ms cubic-bezier(.4,0,.2,1) -${(elapsed + Math.floor(pDur / 2)) % pDur}ms infinite}
+      .spark{transform-box:fill-box;transform-origin:center;animation:sp ${pDur}ms ease-out -${elapsed % pDur}ms infinite}
+      .aura{transform-box:fill-box;transform-origin:center;animation:glow 3.6s ease-in-out -${elapsed % 3600}ms infinite}
+      .door-glow{animation:dg 2.6s ease-in-out -${elapsed % 2600}ms infinite}
+      ${sleeping ? '' : `.wing{transform-box:fill-box;transform-origin:bottom center;animation:flutter 220ms ease-in-out -${elapsed % 220}ms infinite}`}
+    }
+    @keyframes l{${smoothOrbit(left, 1)}}
+    @keyframes r{${smoothOrbit(right, -1)}}
+    @keyframes flutter{0%,100%{transform:translateY(0) scaleY(1)}50%{transform:translateY(.7px) scaleY(.72)}}
+    @keyframes signal{${propKeyframes[mood]}}
+    @keyframes sp{0%,28%{opacity:0;transform:translateY(1px)}42%{opacity:1;transform:translateY(-1px)}80%,100%{opacity:0;transform:translateY(-3px)}}
+    @keyframes glow{0%,100%{opacity:.45;transform:scale(.94)}50%{opacity:.95;transform:scale(1.06)}}
+    @keyframes dg{0%,100%{opacity:.12}50%{opacity:.42}}
+    </style>${aura}<path fill="var(--wax)" d="M17 7h8v2h2v3h2v7H13v-7h2V9h2z"/>
     <path fill="var(--honey)" d="M17 8h8v2h-8zM15 11h12v2H15zM14 14h14v2H14z"/>
-    <path fill="var(--ink)" d="M19 15h4v4h-4z"/>
+    <path fill="var(--ink)" d="M19 15h4v4h-4z"/>${doorwayGlow}
     ${bee(sleeping ? 3 : 1, sleeping ? 14 : 12, 'left')}${bee(sleeping ? 31 : 33, sleeping ? 14 : 6, 'right')}
     <g transform="translate(${sleeping ? 27 : 9} 1)">${propMarkup}</g></svg>`
 }

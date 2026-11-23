@@ -1,10 +1,10 @@
 // The text forms this module recognises: a board command in a Bash call, a run folder, a wake message.
 
-// python3 with any flags (-B, -X utf8, -Xutf8; never -c or -m, which run something else) or the script run by its
-// shebang, the script, the run folder (a trailing slash allowed), the subcommand. A backslash is only ever half of
-// an escape, so no input can be matched two ways. An assignment's value holds no `(`: `R=$(board.py … init …)` is a
-// call inside a substitution, whose output the shell keeps, not one this pattern reads.
-export const BOARD_CALL = /^(?:[A-Za-z_]\w*=(?:"[^"\n]*"|'[^'\n]*'|[^\s"'<>;()`]*)\s+)*(?:(?:\S*\/)?python3(?:\.\d+)?\s+(?:-(?:[XW]\s+\S+|(?![cm](?:\s|$))[^\s"'<>;|&]+)\s+)*)?(?:"(?:[^"\n]*\/)?board\.py"|'(?:[^'\n]*\/)?board\.py'|(?:(?:\\.|[^\s"'<>;\\])*\/)?board\.py)\s+(?:"([^"\n]+)"|'([^'\n]+)'|((?:\\.|[^\s"'<>;\\])+))\s+([a-z]+(?:-[a-z]+)*)(?=$|[\s<>;|&)])/
+// python with any flags (-B, -X utf8, -Xutf8, --check-hash-based-pycs always; never -c or -m, which run something else)
+// or the script run by its shebang, the script, the run folder (a trailing slash allowed), the subcommand. A backslash
+// is only ever half of an escape, so no input can be matched two ways. An assignment's value holds no `(`:
+// `R=$(board.py … init …)` is a call inside a substitution, whose output the shell keeps, not one this pattern reads.
+export const BOARD_CALL = /^(?:[A-Za-z_]\w*=(?:"[^"\n]*"|'[^'\n]*'|[^\s"'<>;()`]*)\s+)*(?:(?:\S*\/)?python(?:\d+(?:\.\d+)*)?\s+(?:-(?:(?:[XWQ]|-check-hash-based-pycs)\s+\S+|(?![cm](?:\s|$))[^\s"'<>;|&]+)\s+)*)?(?:"(?:[^"\n]*\/)?board\.py"|'(?:[^'\n]*\/)?board\.py'|(?:(?:\\.|[^\s"'<>;\\])*\/)?board\.py)\s+(?:"([^"\n]+)"|'([^'\n]+)'|((?:\\.|[^\s"'<>;\\])+))\s+([a-z]+(?:-[a-z]+)*)(?=$|[\s<>;|&)])/
 export const RUN = /(?:^|\/)\.swarm\/[\w.-]+-\d{8}-\d{6}x*$/
 // `read coordinator`, with the read's flags on either side of the name, which the board also takes as `@coordinator`.
 // Only read off a BOARD_CALL whose subcommand is `read`: alone it also matches a commit message.
@@ -52,15 +52,67 @@ const tickEnd = (command: string, i: number) => {
   return -1
 }
 
-/** Index of the quote closing the double quote at `i`, or -1: an escape and a substitution inside it are stepped over. */
+/** Index of the `'` closing `$'…'` at `i`, or -1. */
+const ansiQuoteEnd = (command: string, i: number): number => {
+  for (let j = i + 1; j < command.length; j++) {
+    if (command[j] === '\\') j++
+    else if (command[j] === "'") return j
+  }
+  return -1
+}
+
+/** Index of the end of a `${…}`, `$((…))`, `$(…)` or backtick expansion at `i`, -1 if unclosed, or undefined if none. */
+const expansionEnd = (command: string, i: number, inDouble = false): number | undefined => {
+  const ch = command[i]
+  if (ch === '`') return tickEnd(command, i)
+  if (ch !== '$') return undefined
+  if (command[i + 1] === '{') return braceEnd(command, i + 2, inDouble)
+  if (command[i + 1] === '(') {
+    const arith = command[i + 2] === '(' ? arithEnd(command, i + 1) : -1
+    return arith > 0 ? arith : parenEnd(command, i + 2)
+  }
+  return undefined
+}
+
+/** Index of the quote closing the double quote at `i`, or -1: escapes, `${…}`, substitutions and arithmetic inside it are stepped over. */
 const quoteEnd = (command: string, i: number): number => {
   for (let j = i + 1; j < command.length; j++) {
     const ch = command[j]
     if (ch === '\\') j++
     else if (ch === '"') return j
-    else if (ch === '`' || (ch === '$' && command[j + 1] === '(')) {
-      j = ch === '`' ? tickEnd(command, j) : parenEnd(command, j + 2)
+    else {
+      const end = expansionEnd(command, j, true)
+      if (end !== undefined) {
+        if (end < 0) return -1
+        j = end
+      }
+    }
+  }
+  return -1
+}
+
+/** Index of the `}` closing a `${` whose body starts at `from`, or -1: nested `${…}`, quotes and substitutions are stepped over. */
+const braceEnd = (command: string, from: number, inDouble = false): number => {
+  let depth = 0
+  for (let j = from; j < command.length; j++) {
+    const ch = command[j]!
+    if (ch === '\\') j++
+    else if (ch === '$' && command[j + 1] === '{') {
+      depth++
+      j++
+    } else if (ch === '"') {
+      j = quoteEnd(command, j)
       if (j < 0) return -1
+    } else if (ch === "'" && !inDouble) {
+      j = command[j - 1] === '$' && !escaped(command, j - 1, from) ? ansiQuoteEnd(command, j) : command.indexOf("'", j + 1)
+      if (j < 0) return -1
+    } else if (ch === '}' && depth-- === 0) return j
+    else {
+      const end = expansionEnd(command, j, inDouble)
+      if (end !== undefined) {
+        if (end < 0) return -1
+        j = end
+      }
     }
   }
   return -1
@@ -205,13 +257,11 @@ const parenEnd = (command: string, from: number): number => {
       j += command[j + 1] === ';' && command[j + 2] === '&' ? 2 : 1
     } else if (ch === "'") {
       // $'…' takes escapes; a plain single quote takes none.
-      if (command[j - 1] === '$') {
-        for (j++; j < command.length && command[j] !== "'"; j++) if (command[j] === '\\') j++
-        if (j >= command.length) return -1
-      } else {
-        j = command.indexOf("'", j + 1)
-        if (j < 0) return -1
-      }
+      j = command[j - 1] === '$' && !escaped(command, j - 1, from) ? ansiQuoteEnd(command, j) : command.indexOf("'", j + 1)
+      if (j < 0) return -1
+    } else if (ch === '$' && command[j + 1] === '{') {
+      j = braceEnd(command, j + 2)
+      if (j < 0) return -1
     } else if (ch === '"' || ch === '`') {
       j = ch === '"' ? quoteEnd(command, j) : tickEnd(command, j)
       if (j < 0) return -1
@@ -241,6 +291,8 @@ export function scanShell(command: string): Statement[] {
   const segments: Statement[] = []
   const pendingHeredocs: Heredoc[] = []
   let quote: "'" | '"' | undefined
+  // Saved outer quote state for each open `${…}` so nested quotes inside `"${…}"` cannot flip the outer quote.
+  const braceQuotes: Array<'"' | undefined> = []
   let start = 0
   let textEnd = -1
   let redirected = false
@@ -320,7 +372,8 @@ export function scanShell(command: string): Statement[] {
         continue
       }
     }
-    if ((ch === '$' || (!quote && (ch === '<' || ch === '>'))) && command[i + 1] === '(') {
+    const inDouble = quote === '"' || braceQuotes.includes('"')
+    if ((ch === '$' || (!inDouble && (ch === '<' || ch === '>'))) && command[i + 1] === '(') {
       const end = parenEnd(command, i + 2)
       if (end > 0) {
         i = skip(i, end, command.slice(i + 2, end))
@@ -336,8 +389,29 @@ export function scanShell(command: string): Statement[] {
       }
       unread = true
     }
+    if (ch === '$' && command[i + 1] === '{') {
+      braceQuotes.push(quote)
+      quote = undefined
+      i++
+      continue
+    }
     if (quote) {
       if (ch === quote) quote = undefined
+      continue
+    }
+    if (braceQuotes.length > 0) {
+      if (ch === '}') quote = braceQuotes.pop()
+      else if (ch === '$') dollar = i
+      else if (ch === '"') quote = ch
+      else if (ch === "'" && !braceQuotes.includes('"')) {
+        if (dollar === i - 1) {
+          const end = ansiQuoteEnd(command, i)
+          if (end < 0) {
+            unread = true
+            i = command.length
+          } else i = end
+        } else quote = ch
+      }
       continue
     }
     if (ch === '$') {
@@ -347,6 +421,7 @@ export function scanShell(command: string): Statement[] {
     if (ch === "'" && dollar === i - 1) {
       // $'…' takes escapes, so \' does not end it.
       for (i++; i < command.length && command[i] !== "'"; i++) if (command[i] === '\\') i++
+      if (i >= command.length) unread = true
       continue
     }
     if (ch === "'" || ch === '"') {
@@ -455,14 +530,20 @@ export function scanShell(command: string): Statement[] {
       }
     }
   }
+  if (quote !== undefined || braceQuotes.length > 0) unread = true
   push(command.length, false, '')
   return segments.map(s => ({ ...s, text: s.text.trim(), ...(s.plain === undefined ? {} : { plain: s.plain.trim() }) })).filter(s => s.text)
 }
 
+// One word of a case pattern, and a pattern with its optional `(`, its alternatives and its `)`: what a case arm's command follows.
+const PATTERN_WORD = `(?:"[^"]*"|'[^']*'|\\\\.|[^\\s()|;&"'\\\\\`])+`
+const CASE_ARMS = `\\(?\\s*${PATTERN_WORD}(?:\\s*\\|\\s*${PATTERN_WORD})*\\s*\\)`
+export const CASE_PATTERN = new RegExp(`^${CASE_ARMS}\\s*`)
+
 // What may stand before the command a statement runs: `(`, `{`, `!`, a shell keyword, an env/time-style prefix with
 // its flags, `case WORD in`, or a case pattern such as `*)` or `a|b)`: a clause after `;;` is a statement of its own.
 // A word and `)` before a redirect is a subshell's last command, `(a; b) > out`, not a pattern.
-const WRAPPER = /^(?:[({!]|(?:if|elif|while|until|then|do|else|time|command|exec|nohup|env)(?=\s|$)(?:\s+(?:-u\s+\S+|-\S+))*|case\s+(?:"[^"]*"|'[^']*'|\S+)\s+in(?=\s|$)|[^\s()|;&"'`]+(?:\s*\|\s*[^\s()|;&"'`]+)*\)(?!\s*\d*[<>]))\s*/
+const WRAPPER = new RegExp(`^(?:[({!]|(?:if|elif|while|until|then|do|else|time|command|exec|nohup|env)(?=\\s|$)(?:\\s+(?:-u\\s+\\S+|-\\S+))*|case\\s+(?:"[^"]*"|'[^']*'|\\S+)\\s+in(?=\\s|$)|${CASE_ARMS}(?!\\s*\\d*[<>]))\\s*`)
 
 /** A statement without the wrappers before its command, and whether an odd number of `!` negates it. */
 export function unwrap(statement: string): { text: string; negated: boolean } {
@@ -501,10 +582,22 @@ export function shellWords(text: string): string[] {
       push()
     } else if (ch === '\\') {
       word = (word ?? '') + (text[++i] ?? '')
+    } else if (ch === '$' && text[i + 1] === '{') {
+      const end = braceEnd(text, i + 2)
+      const stop = end < 0 ? text.length : end + 1
+      word = (word ?? '') + text.slice(i, stop)
+      i = stop - 1
     } else if (ch === "'" || ch === '"') {
       const isAnsi = ch === "'" && word?.endsWith('$') === true
       word = isAnsi ? word!.slice(0, -1) : word ?? ''
       for (i++; i < text.length && text[i] !== ch; i++) {
+        const end = ch === '"' ? expansionEnd(text, i, true) : undefined
+        if (end !== undefined) {
+          const stop = end < 0 ? text.length : end + 1
+          word += text.slice(i, stop)
+          i = stop - 1
+          continue
+        }
         if (text[i] === '\\' && (ch === '"' || isAnsi) && i + 1 < text.length) i++
         word += text[i]
       }
@@ -641,10 +734,6 @@ export const GIT_BUILTINS = new Set(['add', 'annotate', 'apply', 'archive', 'bis
   'show-ref', 'sparse-checkout', 'stash', 'status', 'submodule', 'switch', 'symbolic-ref', 'tag', 'update-index', 'update-ref',
   'var', 'verify-commit', 'verify-tag', 'version', 'whatchanged', 'worktree', 'write-tree'])
 
-// One word of a case pattern, and a pattern with its `(`, its alternatives and its `)`: what a case arm's command follows.
-const PATTERN_WORD = `(?:"[^"]*"|'[^']*'|\\\\.|[^\\s()|;&"'\\\\])+`
-export const CASE_PATTERN = new RegExp(`^\\(?\\s*${PATTERN_WORD}(?:\\s*\\|\\s*${PATTERN_WORD})*\\s*\\)\\s*`)
-
 /**
  * A command's text without the `)`s that close a subshell opened before it, and how many there are: `git commit)` is
  * `git commit` and one close. Quoted and escaped parentheses, and pairs such as `a=(1 2)`, stay.
@@ -658,11 +747,21 @@ export function closesAfter(text: string): { text: string; closes: number } {
     if (ch === '\\') {
       kept += text.slice(i, i + 2)
       i++
-    } else if (ch === "'" || ch === '"') {
-      let end = i + 1
-      while (end < text.length && text[end] !== ch) end += ch === '"' && text[end] === '\\' ? 2 : 1
-      kept += text.slice(i, end + 1)
-      i = end
+    } else if (ch === '$' && text[i + 1] === '{') {
+      const end = braceEnd(text, i + 2)
+      const stop = end < 0 ? text.length : end + 1
+      kept += text.slice(i, stop)
+      i = stop - 1
+    } else if (ch === "'") {
+      const end = text[i - 1] === '$' && !escaped(text, i - 1) ? ansiQuoteEnd(text, i) : text.indexOf("'", i + 1)
+      const stop = end < 0 ? text.length : end + 1
+      kept += text.slice(i, stop)
+      i = stop - 1
+    } else if (ch === '"') {
+      const end = quoteEnd(text, i)
+      const stop = end < 0 ? text.length : end + 1
+      kept += text.slice(i, stop)
+      i = stop - 1
     } else if (ch === '(') {
       depth++
       kept += ch
@@ -677,7 +776,7 @@ export function closesAfter(text: string): { text: string; closes: number } {
 }
 
 /** A command's words without its redirections and their targets; what a here-string (`<<< text`) feeds it is `fed`. */
-function withoutRedirects(words: readonly string[]): { words: string[]; fed?: string } {
+export function withoutRedirects(words: readonly string[]): { words: string[]; fed?: string } {
   const kept: string[] = []
   let fed: string | undefined
   for (let i = 0; i < words.length; i++) {
@@ -767,8 +866,8 @@ export function scriptsRun(command: string, depth = 0): string[] {
 }
 
 // Commands that run the rest of their words as a command: a script named after one of these is run.
-const RUNNERS = new Set(['env', 'nohup', 'time', 'command', 'builtin', 'exec', 'sudo', 'doas', 'timeout', 'nice', 'xargs', 'watch', 'stdbuf',
-  'caffeinate', 'xcrun', 'flock', 'parallel', 'ionice', 'taskset', 'chronic', 'unbuffer'])
+export const RUNNERS = new Set(['env', 'nohup', 'time', 'command', 'builtin', 'exec', 'sudo', 'doas', 'timeout', 'nice', 'xargs', 'watch', 'stdbuf',
+  'caffeinate', 'xcrun', 'flock', 'parallel', 'ionice', 'taskset', 'setsid', 'chronic', 'unbuffer'])
 // The runners that take the program as their first word when no option or operand of their own comes before it.
 const DIRECT = new Set(['env', 'nohup', 'time', 'command', 'builtin', 'exec', 'sudo', 'doas', 'nice', 'stdbuf', 'caffeinate', 'xcrun', 'chronic', 'unbuffer', 'ionice'])
 const PYTHON = /^(?:python|pypy)(?:\d+(?:\.\d+)*)?$/

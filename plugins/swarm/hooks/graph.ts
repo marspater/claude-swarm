@@ -549,15 +549,21 @@ export function drawGraph(
       : `<path class="tip-current" d="${tip}"/>`)
     if (animate || repeat) {
       const route = `M${n1(x1)} ${n1(y1)} Q${n1(cx)} ${n1(cy)} ${n1(x2)} ${n1(y2)}`
+      const tailPhase = (phase + 3530) % 3600
       const motion = repeat
         ? `<animateMotion begin="-${phase}ms" dur="3.6s" path="${route}" calcMode="spline" keyPoints="0;1;1" keyTimes="0;.24;1" keySplines=".22 .61 .36 1;0 0 1 1" repeatCount="indefinite"/>`
         : `<animateMotion dur="0.86s" path="${route}" calcMode="spline" keyPoints="0;1" keyTimes="0;1" keySplines=".22 .61 .36 1" fill="freeze"/>`
-      const opacity = (peak: string) => repeat
-        ? `<animate attributeName="opacity" values="0;${peak};${peak};0;0" keyTimes="0;.025;.19;.265;1" begin="-${phase}ms" dur="3.6s" repeatCount="indefinite"/>`
+      const tailMotion = repeat
+        ? `<animateMotion begin="-${tailPhase}ms" dur="3.6s" path="${route}" calcMode="spline" keyPoints="0;1;1" keyTimes="0;.24;1" keySplines=".22 .61 .36 1;0 0 1 1" repeatCount="indefinite"/>`
+        : `<animateMotion begin="0.06s" dur="0.86s" path="${route}" calcMode="spline" keyPoints="0;1" keyTimes="0;1" keySplines=".22 .61 .36 1" fill="freeze"/>`
+      const opacity = (peak: string, offsetMs = phase) => repeat
+        ? `<animate attributeName="opacity" values="0;${peak};${peak};0;0" keyTimes="0;.025;.19;.265;1" begin="-${offsetMs}ms" dur="3.6s" repeatCount="indefinite"/>`
         : `<animate attributeName="opacity" values="0;${peak};${peak};0" keyTimes="0;.1;.8;1" dur="0.95s"/>`
       active.push(
-        '<circle class="motion packet-halo" r="7" opacity="0">' +
-        motion + opacity('.35') + '</circle>' +
+        '<circle class="motion packet-tail" r="2.2" opacity="0">' +
+        tailMotion + opacity('.5', tailPhase) + '</circle>' +
+        '<circle class="motion packet-halo" r="7.5" opacity="0">' +
+        motion + opacity('.38') + '</circle>' +
         '<circle class="motion packet" r="3.5" opacity="0">' +
         motion + opacity('1') + '</circle>',
       )
@@ -607,13 +613,13 @@ export function drawGraph(
     if (moving && sender && isCurrentBroadcast && !expandAll) {
       ripples.push(
         `<g transform="translate(${p.x.toFixed(1)} ${p.y.toFixed(1)})">` +
-        [0, 0.22].map(delay =>
+        [0, 0.18, 0.36].map(delay =>
           `<circle class="motion ripple" r="24" opacity="0">` +
           (repeat
-            ? `<animate attributeName="r" values="24;150;150" keyTimes="0;.3;1" calcMode="spline" keySplines=".22 .61 .36 1;0 0 1 1" begin="${Math.round(delay * 1000) - phase}ms" dur="3.6s" repeatCount="indefinite"/>` +
-              `<animate attributeName="opacity" values=".5;0;0" keyTimes="0;.3;1" begin="${Math.round(delay * 1000) - phase}ms" dur="3.6s" repeatCount="indefinite"/>`
-            : `<animate attributeName="r" from="24" to="150" begin="${delay}s" dur="0.9s" calcMode="spline" keyTimes="0;1" keySplines=".22 .61 .36 1"/>` +
-              `<animate attributeName="opacity" from=".5" to="0" begin="${delay}s" dur="0.9s"/>`) +
+            ? `<animate attributeName="r" values="24;154;154" keyTimes="0;.32;1" calcMode="spline" keySplines=".22 .61 .36 1;0 0 1 1" begin="${Math.round(delay * 1000) - phase}ms" dur="3.6s" repeatCount="indefinite"/>` +
+              `<animate attributeName="opacity" values=".48;0;0" keyTimes="0;.32;1" begin="${Math.round(delay * 1000) - phase}ms" dur="3.6s" repeatCount="indefinite"/>`
+            : `<animate attributeName="r" from="24" to="154" begin="${delay}s" dur="0.92s" calcMode="spline" keyTimes="0;1" keySplines=".22 .61 .36 1"/>` +
+              `<animate attributeName="opacity" from=".48" to="0" begin="${delay}s" dur="0.92s"/>`) +
           '</circle>').join('') +
         '</g>',
       )
@@ -626,10 +632,13 @@ export function drawGraph(
     const px = -p.half + 14
     const skey = statusKey(status)
     const scls = esc(status.replace(/\s+/g, '-'))
+    const pulseRing = repeat && (skey === 'working' || skey === 'coordinating')
+      ? `<circle class="motion p-ping ${skey}" cx="${px}" r="3.6"/>`
+      : ''
     const dot = status === '' ? ''
-      : skey === 'working' ? `<circle class="presence working" cx="${px}" r="3.7"/>`
+      : skey === 'working' ? `${pulseRing}<circle class="presence working" cx="${px}" r="3.7"/>`
       : skey === 'waiting' ? `<circle class="presence-ring waiting" cx="${px}" r="3.1"/><circle class="presence waiting" cx="${px}" r="1.4"/>`
-      : skey === 'coordinating' ? `<path class="presence coordinating" d="M${px} -4L${px + 4} 0 ${px} 4 ${px - 4} 0z"/>`
+      : skey === 'coordinating' ? `${pulseRing}<path class="presence coordinating" d="M${px} -4L${px + 4} 0 ${px} 4 ${px - 4} 0z"/>`
       : skey === 'failed' ? `<path class="presence-x ${scls}" d="M${px - 2.6} -2.6L${px + 2.6} 2.6M${px + 2.6} -2.6L${px - 2.6} 2.6"/>`
       : `<circle class="presence ${scls}" cx="${px}" r="3.1"/>`
     return (
@@ -644,9 +653,20 @@ export function drawGraph(
   const key = 'Arrow: @mention, thicker for more · Dashed arrow: reached via @all · Dashed outline: posted with no mention · ' +
     (allPosts === 0 ? 'No @all posts yet' : `“@all N” on a member: its @all posts (${allPosts} in all), ${expandAll ? 'drawn as dashed arrows' : 'drawn by Expand @all'}`)
 
+  const hubGlow = coordinator
+    ? `<circle cx="${n1(width / 2)}" cy="${n1(height / 2)}" r="${n1(Math.min(width, height) * 0.34)}" fill="url(#hub)"/>`
+    : ''
+  const pingCss = repeat
+    ? `.p-ping{fill:none;stroke-width:1.4;transform-box:fill-box;transform-origin:center;animation:pp 2.6s cubic-bezier(.16,1,.3,1) -${phase % 2600}ms infinite}` +
+      `.p-ping.working{stroke:var(--status-working)}.p-ping.coordinating{stroke:var(--status-coordinating)}` +
+      `@keyframes pp{0%{transform:scale(1);opacity:.6}78%,100%{transform:scale(2.35);opacity:0}}`
+    : ''
   const open =
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="100%" height="100%" font-family="system-ui, sans-serif">` +
-    `<defs><clipPath id="stage"><rect width="${width}" height="${height}"/></clipPath></defs>` +
+    `<defs><clipPath id="stage"><rect width="${width}" height="${height}"/></clipPath>` +
+    `<filter id="sh" x="-15%" y="-25%" width="130%" height="160%"><feDropShadow dx="0" dy="1.5" stdDeviation="2" flood-opacity=".11"/></filter>` +
+    `<linearGradient id="sg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--tint)"/><stop offset="100%" stop-color="var(--pill)"/></linearGradient>` +
+    `<radialGradient id="hub"><stop offset="0%" stop-color="var(--accent)" stop-opacity=".1"/><stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/></radialGradient></defs>` +
     `<style>
       svg{--edge:#596375;--pill:#f8f8f7;--border:#87909d;--ink:#252628;--accent:#235fc4;--tint:#eaf2ff;--packet:#fff}
       @media (prefers-color-scheme: dark){svg{--edge:#9399a5;--pill:#242424;--border:#737982;--ink:#f1f1ef;--accent:#8fb8ff;--tint:#243750;--packet:#fff}}
@@ -655,19 +675,22 @@ export function drawGraph(
         @media(prefers-color-scheme:dark){svg{--edge:color(display-p3 .58 .60 .64);--pill:color(display-p3 .14 .14 .14);--border:color(display-p3 .45 .47 .51);--ink:color(display-p3 .95 .95 .94);--accent:color(display-p3 .5935 .7170 .9777);--tint:color(display-p3 .15 .22 .31)}}
       }
       .edge,.route,.route-base{fill:none;stroke-linecap:round}
-      .history-edge{opacity:.72}.edge{stroke:var(--edge)}.tip{fill:var(--edge)}
+      .history-edge{opacity:.64;transition:opacity .18s ease}.history-edge:hover{opacity:1}.history-edge:hover .edge{stroke:var(--accent)}.history-edge:hover .tip{fill:var(--accent)}
+      .edge{stroke:var(--edge);transition:stroke .18s ease}.tip{fill:var(--edge);transition:fill .18s ease}
       .via-all{stroke-dasharray:6 5;stroke-linecap:butt}
-      .route-base{stroke:var(--accent);opacity:.13}
+      .route-base{stroke:var(--accent);opacity:.15}
       .route{stroke:var(--accent)}.motion-route{stroke-dasharray:102 102}.tip-current{fill:var(--accent)}
-      .packet-halo{fill:var(--accent)}.packet{fill:var(--packet);stroke:var(--accent);stroke-width:1.5}
-      .pill{fill:var(--pill);stroke:var(--border)}.sender{fill:var(--tint);stroke:var(--accent);stroke-width:1.8}.recipient{stroke:var(--accent);stroke-width:1.5}
+      .packet-tail{fill:var(--accent)}.packet-halo{fill:var(--accent)}.packet{fill:var(--packet);stroke:var(--accent);stroke-width:1.6}
+      .pill{fill:var(--pill);stroke:var(--border);filter:url(#sh);transition:stroke .16s ease,fill .16s ease}
+      g:hover>.pill{stroke:var(--accent)}
+      .sender{fill:url(#sg);stroke:var(--accent);stroke-width:1.8}.recipient{stroke:var(--accent);stroke-width:1.5}
       .quiet{stroke-dasharray:5 4}.killed .pill{stroke-dasharray:2 3}.killed .name{opacity:.68;text-decoration:line-through}
-      .arrival,.ripple{fill:none;stroke:var(--accent)}.arrival{stroke-width:4}.ripple{stroke-width:2}
+      .arrival,.ripple{fill:none;stroke:var(--accent)}.arrival{stroke-width:4}.ripple{stroke-width:1.8}
       .name,.count{fill:var(--ink);text-anchor:middle;font-weight:600}.name{font-size:14px}.count{font-size:12px}
-      .badge{fill:var(--tint);stroke:var(--accent)}
+      .badge{fill:var(--tint);stroke:var(--accent);filter:url(#sh)}
       .chip rect{fill:var(--pill);stroke:var(--border)}.chip text{fill:var(--ink);opacity:.82;font-size:10.5px;font-weight:600;text-anchor:middle}
       .chip.on rect{fill:var(--tint);stroke:var(--accent)}
-      ${statusCss}
+      ${statusCss}${pingCss}
       .presence{fill:none;stroke:var(--status-inactive);stroke-width:1.2}
       .presence-ring{fill:none;stroke:var(--status-waiting);stroke-width:1.2}
       .presence-x{fill:none;stroke:var(--status-failed);stroke-width:1.6;stroke-linecap:round}
@@ -676,7 +699,7 @@ export function drawGraph(
       @media (prefers-reduced-motion: reduce){.motion,.motion-route{display:none}.reduced-route{display:inline}}
     </style>
     ` +
-    `<g clip-path="url(#stage)">${ripples.join('')}</g>`
+    `<g clip-path="url(#stage)">${hubGlow}${ripples.join('')}</g>`
   const close = active.join('') + nodes.join('') + badges.join('') + '</svg>'
   // Measured whole: the history goes in, busiest first, until the first route that would take the drawing past the
   // limit. A shorter, quieter one after it stays out too, so what is left out is always the quietest; and no route
