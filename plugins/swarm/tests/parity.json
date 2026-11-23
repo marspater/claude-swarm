@@ -980,6 +980,45 @@
    },
    "sender": "v",
    "expect": []
+  },
+  {
+   "text": "@coordinator HAND-BACK: the report follows.\n~~~~~~\n  @parser has no findings\n~~~\n@docs closed F1\n~~~~~\n@parser again\n~~~~~~",
+   "members": {
+    "coordinator": {
+     "role": "coordinator"
+    },
+    "parser": {
+     "role": "worker",
+     "group": "fix"
+    },
+    "api": {
+     "role": "worker",
+     "group": "fix",
+     "depends": "parser"
+    },
+    "docs": {
+     "role": "worker",
+     "depends": "parser,api"
+    },
+    "v": {
+     "role": "verifier"
+    },
+    "v2": {
+     "role": "verifier"
+    },
+    "gone": {
+     "role": "verifier",
+     "killed": "1"
+    },
+    "old_": {
+     "role": "worker",
+     "depends": "parser"
+    }
+   },
+   "sender": "api",
+   "expect": [
+    "coordinator"
+   ]
   }
  ],
  "quoted": [

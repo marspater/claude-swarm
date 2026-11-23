@@ -596,6 +596,48 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
   return (await run(command, new Set([cwd]))).hit
 }
 
+// pgrep's options that take a value of their own: the word after one is no pattern and no flag.
+const PGREP_VALUED = /^-[A-Za-z]*[dFgGPstuU]$/
+/**
+ * Whether a command waits (a loop or a sleep) on a `pgrep -f` that is not exact (`-x`). Such a pattern matches any
+ * command line that contains it, so a wait for `xcodebuild` never ends while an `xcodebuildmcp` server runs.
+ * Read off the words of every script the command runs. A wait is a `sleep` run as a command or a statement that
+ * opens a loop, not the word in an argument. `-f` counts wherever it stands; `-x` only before the pattern, so one in
+ * the pattern, in a comment or in a later command excuses nothing. A pgrep the words do not show (a variable, an
+ * alias) is read off the raw text: over-refusing costs one retry, a missed wait costs minutes.
+ */
+export function waitsOnLooseMatch(command: string): boolean {
+  if (!/\b(?:sleep|while|until)\b/.test(command)) return false
+  let waits = false
+  let loose = false
+  let parsed = 0
+  for (const script of scriptsRun(command)) {
+    for (const { text } of scanShell(script)) {
+      const words = withoutRedirects(shellWords(unwrap(text).text)).words
+      if (words[0] === 'sleep' || /^\s*(?:while|until)\b/.test(text)) waits = true
+      for (let at = words.indexOf('pgrep'); at >= 0; at = words.indexOf('pgrep', at + 1)) {
+        parsed++
+        let full = false
+        let exact = false
+        let isPatternSeen = false
+        for (let i = at + 1; i < words.length && !words[i]!.startsWith('#'); i++) {
+          const word = words[i]!
+          if (!/^-./.test(word)) {
+            isPatternSeen = true
+            continue
+          }
+          const flags = word === '--full' ? 'f' : word === '--exact' ? 'x' : word.startsWith('--') ? '' : word.slice(1)
+          if (flags.includes('f')) full = true
+          if (flags.includes('x') && !isPatternSeen) exact = true
+          if (PGREP_VALUED.test(word)) i++
+        }
+        if (full && !exact) loose = true
+      }
+    }
+  }
+  return parsed === 0 ? /\bpgrep\b[^;|&)\n]*\s-[A-Za-z]*f/.test(command) : waits && loose
+}
+
 // The board commands a member may type in Bash: reading, and its own posts and reports, as the board tool takes
 // them. Those that name a member name itself.
 const MEMBER_READS = new Set(['show', 'status', 'plan', 'attention', 'tail'])

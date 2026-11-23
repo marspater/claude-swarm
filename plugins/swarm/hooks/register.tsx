@@ -4,10 +4,10 @@ import type { AgentInfo, EngineInterface, Register, SessionMessage, Timer, ToolC
 
 import type { Member, Post, Swarm, Tab } from '../types'
 import { COORDINATOR_READ, RUN, boardCalls, type ParsedBoardCall, runsNamed, scanShell, shellWords, splitShellSegments, substitutions, unwrap, wakeMessage, wakeSequence } from './command'
-import { actsAsAnother, commitsInSharedCheckout, normalizePath, resolveRealPath } from './guard'
+import { actsAsAnother, commitsInSharedCheckout, normalizePath, resolveRealPath, waitsOnLooseMatch } from './guard'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, LATEST, SPECIALISTS, SWARM_AGENTS, familyOf, latestOf, sizedEffort } from './models'
 import { CONTEXT_EARLY, CONTEXT_STOP, END, KEPT, budgetOf, contextState, findAgent, heldAt, isWindingDown, ledger, memberNamed, mentions, parse, parsePosts, postFields, targets, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
-import { CLIP, bodyOf, chipped, clean, clip, compact, fenceAfter, hasQuestion, head, kindOf, openedText, verdictOf, type Fence } from './text'
+import { CLIP, bodyOf, chipped, clean, clip, compact, fenceAfter, fenced, hasQuestion, head, kindOf, openedText, verdictOf, type Fence } from './text'
 import { liveIndicator, memberAccents, progressBar, progressUnits, semanticIcon, statusDot, statusInk, swarmEmblem, type BarTone, type EmblemState } from './palette'
 import { MEMBER_BEE_SIZE, hiveArt, memberBee, toolMood, toolSummary, type Mood } from './hive'
 import { MIN_LABEL_PX, SVG_LIMIT, drawGraph, edgesOf, graphHeight, isBroadcast, labelPx, pairOf, visibleMembers } from './graph'
@@ -1126,6 +1126,9 @@ async function memberCall($: EngineInterface, call: MemberCall, activeDir: strin
     if (spoof) {
       return { deny: `The board refused this command: ${spoof}. Nothing in it ran, whatever was chained before the board command included: run that part again on its own. Use the board tool, which acts as you, or the board command under your own name.` }
     }
+    if (waitsOnLooseMatch(command)) {
+      return { deny: 'Nothing ran: this command waits on `pgrep -f`, which matches every command line that contains the pattern (a server named xcodebuildmcp matches `xcodebuild`), so the wait may never end. Match the process name exactly with `pgrep -x NAME`, or wait on the PID of a process you started.' }
+    }
     if (isShared && await commitsInSharedCheckout($, command, checkout)) {
       return { deny: `Shared-checkout writers must not run \`git commit\`: leave your edits in the working tree and report via \`BOARD ready ${memberName}\`.` }
     }
@@ -1738,7 +1741,7 @@ async function mirrorHandback($: EngineInterface, e: { text: string; origin: { k
   const seqs: string[] = []
   for (let part = 0; part < parts; part++) {
     const posted = await boardCommand($, roster.dir, ['post', name],
-      `@coordinator HAND-BACK${parts > 1 ? ` (part ${part + 1} of ${parts})` : ''}: @${name}'s turn ended with this report in no board post, so Swarm put it here.\n${body.slice(part * HANDBACK_PART, (part + 1) * HANDBACK_PART)}`)
+      `@coordinator HAND-BACK${parts > 1 ? ` (part ${part + 1} of ${parts})` : ''}: @${name}'s turn ended with this report in no board post, so Swarm put it here.\n${fenced(body.slice(part * HANDBACK_PART, (part + 1) * HANDBACK_PART))}`)
     const seq = /posted #(\d+)/.exec(posted.stdout)?.[1]
     if (posted.exitCode !== 0 || !seq) return undefined
     seqs.push(seq)

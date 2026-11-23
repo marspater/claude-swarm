@@ -3217,6 +3217,10 @@ test('hardening: runtime file edit guards, shared git commit guard, coordinator 
   expect((await toolCall($, { tool: 'Write', file_path: '/tmp/design.html', content: '<html/>', agentId: 'ver-1' })).deny).toBeUndefined()
   expect((await toolCall($, { tool: 'Edit', file_path: '/worktrees/wt1/src/bob/b.ts', old_string: 'a', new_string: 'b', agentId: 'bob-1' })).deny).toBeUndefined()
 
+  // A wait on a substring process match is refused; an exact one runs
+  expect((await toolCall($, { tool: 'Bash', command: 'while pgrep -f xcodebuild >/dev/null; do sleep 10; done', agentId: 'alice-1' })).deny).toContain('pgrep -x NAME')
+  expect((await toolCall($, { tool: 'Bash', command: 'while pgrep -x xcodebuild >/dev/null; do sleep 10; done', agentId: 'alice-1' })).deny).toBeUndefined()
+
   // Shared git commit guard
   for (const command of ['git -C . commit', 'cd . && git commit', 'cd /tmp/wt && git -C /project commit']) {
     expect((await toolCall($, { tool: 'Bash', command, agentId: 'alice-1' })).deny).toContain('Shared-checkout writers')
@@ -6594,7 +6598,8 @@ test('spend guards: a read-only member past the context ceiling may only report,
   // a final report that is in no board post is put there in the member's name, and the coordinator gets its number
   const findings = `Three findings. ${'ST1 restoreBackup loses the edition when the tension write throws. '.repeat(8)}`
   await $.prompt.submit({ text: `Another Claude session sent a message:\n<agent-message from="scout-1">\n[Subagent hand-back] ${findings}</agent-message>`, origin: { kind: 'peer' }, wait: false })
-  expect(mirrored).toEqual([expect.stringMatching(/^@coordinator HAND-BACK: @scout's turn ended with this report in no board post[\s\S]*ST1 restoreBackup/)])
+  // the report goes up fenced: the board reads no mention inside it, so a member it names is not woken
+  expect(mirrored).toEqual([expect.stringMatching(/^@coordinator HAND-BACK: @scout's turn ended with this report in no board post[^\n]*\n~~~\nThree findings\.[\s\S]*ST1 restoreBackup[\s\S]*\n~~~$/)])
   expect([seen.prompts.at(-1)?.includes("@scout's final report is on the board, whole, in post #7"), seen.prompts.at(-1)?.includes('ST1 restoreBackup')]).toEqual([true, false])
   // a short one, as after a READY, is passed on as it is
   await $.prompt.submit({ text: 'Another Claude session sent a message:\n<agent-message from="scout-1">\n[Subagent hand-back] done</agent-message>', origin: { kind: 'peer' }, wait: false })

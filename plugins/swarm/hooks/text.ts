@@ -149,3 +149,12 @@ export function clip(text: string, length = CLIP): string {
   const fence = openFence(trimmed)
   return fence ? `${trimmed}\n${fence}\n…` : `${trimmed} …`
 }
+
+/**
+ * TEXT inside a fence its own tildes cannot close. The board reads no mention inside one, so a report that quotes
+ * `@name` wakes nobody. Seen live: a mirrored hand-back named two finished members, and each paid a turn to say so.
+ */
+export function fenced(text: string): string {
+  const fence = '~'.repeat(Math.max(3, ...Array.from(text.matchAll(/~+/g), run => run[0].length + 1)))
+  return `${fence}\n${text}\n${fence}`
+}

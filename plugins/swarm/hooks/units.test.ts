@@ -2,12 +2,12 @@ import { expect, test } from 'claude-code/testing'
 import type { Post } from '../types'
 import { BOARD_CALL, CASE_PATTERN, COORDINATOR_READ, RUN, boardCalls, closesAfter, launches, makesCommit, runsNamed, scanShell, scriptsRun, shellLaunch, shellWords, splitShellSegments, substitutions, unwrap, wakeMessage, wakeSequence } from './command'
 import { edgesOf, graphSvg, isBroadcast } from './graph'
-import { actsAsAnother, commitsInSharedCheckout } from './guard'
+import { actsAsAnother, commitsInSharedCheckout, waitsOnLooseMatch } from './guard'
 import { BOARD_ACTIONS, hiveArt, memberBee, toolMood, toolSummary } from './hive'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, SWARM_AGENTS, familyOf, latestOf, sizedEffort } from './models'
 import { progressBar, semanticIcon, statusCss, statusDot, statusKey, swarmEmblem } from './palette'
 import { END, budgetOf, contextState, detailOf, heldAt, isWindingDown, findAgent, ledger, mentions, parse, parsePosts, postFields, statusOf, targets, tokensUsed } from './roster'
-import { bodyOf, chipped, clean, clip, compact, fenceAfter, hasQuestion, head, kindOf, openedText, stripKind, unquoted, verdictOf } from './text'
+import { bodyOf, chipped, clean, clip, compact, fenceAfter, fenced, hasQuestion, head, kindOf, openedText, stripKind, unquoted, verdictOf } from './text'
 
 const post = (text: string, to: string[] = []): Post => ({ seq: 1, agent: 'parser', to, text, time: '2026-11-16T14:03:22+0100' })
 
@@ -1155,4 +1155,43 @@ test('member bees keep their wings, antennae, and striped body in place across s
   expect(hiveArt('sleep')).toContain('--wing:#4b8f91;--honey:#e9ac55')
   // a paused run is the waiting tone in its icon as in its emblem, not a colour of its own
   expect(semanticIcon('paused')).toContain(semanticIcon('warn').match(/--ic:#[0-9a-f]{6}/)![0])
+})
+
+test('a wait on a substring process match is caught; an exact match or a single look is not', () => {
+  // the stall this guards: `xcodebuild` also matches a running `xcodebuildmcp` server, so the loop never breaks
+  for (const stuck of [
+    'for i in $(seq 1 55); do pgrep -f "[x]codebuild" >/dev/null || break; sleep 10; done; ls build.sh',
+    'while pgrep -f xcodebuild >/dev/null; do sleep 10; done',
+    'until ! pgrep -lf xcodebuild; do :; done',
+    'sleep 30; pgrep -u me -f xcodebuild',
+    // an -x in a comment, in the pattern or in a later command excuses nothing
+    "while pgrep -f '[x]codebuild' # use -x later\ndo sleep 10; done",
+    'while pgrep -f "xcodebuild -exportArchive"; do sleep 5; done',
+    'while pgrep -f xcodebuild; do sleep 5; done; tar -xf a.tar',
+    'while pgrep --full xcodebuild; do sleep 5; done',
+    // a long option's value is no pattern: the -f after it still counts
+    'sleep 1; pgrep --uid 1000 -f xcodebuild',
+    'P=pgrep; while $P -f xcodebuild; do sleep 5; done; echo pgrep -f done',
+    `sh -c 'while pgrep -f xcodebuild; do sleep 5; done'`,
+  ]) expect(waitsOnLooseMatch(stuck)).toBe(true)
+  for (const fine of [
+    'while pgrep -x xcodebuild >/dev/null; do sleep 10; done',
+    'while pgrep -fx "xcodebuild -quiet" >/dev/null; do sleep 10; done',
+    'pgrep -fl "xcodebuild -" | head -2; ./build.sh',
+    'while kill -0 "$pid" 2>/dev/null; do sleep 5; done',
+    'sleep 1; pgrep xcodebuild',
+    // `sleep` as the pattern looked for is no wait
+    'pgrep -fl sleep',
+    'pgrep -f "while true" | head -1',
+    'while pgrep -u me -x xcodebuild; do sleep 5; done',
+    'while pgrep --full --exact "xcodebuild -quiet"; do sleep 5; done',
+  ]) expect(waitsOnLooseMatch(fine)).toBe(false)
+})
+
+test('a fenced report wakes nobody it names, whatever tildes it holds', () => {
+  const members = { coordinator: { role: 'coordinator', last_read_seq: 0 }, parser: { role: 'worker', last_read_seq: 0 }, api: { role: 'worker', last_read_seq: 0 } }
+  const report = '  @parser has no findings\n~~~\n@api closed F1\n~~~~~\n@parser again'
+  expect(targets(`@coordinator HAND-BACK: put here.\n${report}`, members, 'api')).toEqual(['coordinator', 'parser'])
+  expect(targets(`@coordinator HAND-BACK: put here.\n${fenced(report)}`, members, 'api')).toEqual(['coordinator'])
+  expect(fenced('plain')).toBe('~~~\nplain\n~~~')
 })

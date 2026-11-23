@@ -60,7 +60,7 @@ Experimental: to use Claude's native shared task list, launch `/swarm:swarm --na
 
 ## Seeing and limiting the cost
 
-**The plan comes first.** Before any member starts, the coordinator shows the team as a table: each member's type, model, effort, what it owns and what it waits for. It starts straight away for a small team on the default models, and asks first when the plan has more than five members, when a member would run on a stronger model than its type's default, when a member would run on Fable that you did not ask for, or when you asked to approve the plan.
+**The plan comes first.** Before any member starts, the coordinator shows the team as a table: each member's type, model, effort, what it owns and what it waits for. It sizes the team from what is known to be wrong, not from how much code there is, and says why. It starts straight away for a team of three or fewer on the default models and effort. It asks how many to deploy, with its recommendation and the next smaller team, when the plan has more than three members, when a member would run on a stronger model or a higher effort than its type's default, when a member would run on Fable that you did not ask for, or when you asked to approve the plan.
 
 **Limits go in the task.** Write them in plain words; the coordinator records them and the board enforces them (passing an empty value like `budget=`, `max_workers=`, `max_members=`, or `fable=` clears a limit):
 

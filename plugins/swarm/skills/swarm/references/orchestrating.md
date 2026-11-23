@@ -16,6 +16,32 @@ Each rule has one home. Commands and the order of steps are in the `swarm` skill
 
 Every member is its own agent with its own context. Three members cost roughly three conversations. Add a member only when it has a piece of its own.
 
+## How big a team
+
+Size the team from what is known to be wrong, not from how much code there is. A large codebase with no known defect is a small task.
+
+**Assess before you split.** Measure the task in one step of cheap commands, before `init`, and write the answers down: they are the reason for the team you propose.
+
+1. **What is known to be wrong?** Count the symptoms, failing checks or requested changes the user named. None means an audit: the first row below.
+2. **Where will files change?** List the places you can already name. Places you cannot name yet are not pieces: they are one triage question.
+3. **Do the places touch?** Pieces that share a file, a type or a contract are one member's, or need a seam. Count the groups that can proceed alone: that count is the most writers the task can use.
+4. **How much must really be read?** Search hits and the recent diff (`git diff --stat`, `git log --since`), not the whole tree. A member reads hits and their callers, so a directory with three hits is not a member.
+5. **What proves it done?** One check that already exists means one verifier at most. No change means no verifier.
+
+The writers are the smaller of what the table gives and what step 3 counted. A verifier is added to that count wherever something changes.
+
+| What is known | Team | Size and effort |
+| --- | --- | --- |
+| Nothing is known to be broken: an audit, a sweep, a review "for bugs" | One or two read-only members over the whole area, and no verifier until something is changed | `size=s`, the profile's default effort |
+| One symptom, cause unknown | One investigator. Writers only after the cause is confirmed | `size=m`; `effort=high` only on a narrow scope |
+| Known changes in separate places | One worker per place that really changes, and one verifier | `size=s` or `size=m` per piece |
+| Known changes across sub-systems, with seams between them | The full shape: workers, a verifier, a specialist where one has a distinct assignment | As each piece needs |
+
+- **Grow, do not start big.** Members are added while a run is open; tokens spent on a member that finds nothing are not returned. Start with the smallest row that fits and add a member only where a report names a place that needs one.
+- **Count clean slices as cost.** Seen live: a whole-app audit split into seven workers at medium effort found two small defects. Five workers changed nothing and spent 1.2M tokens between them; the one `size=s` member at low effort found a defect in 11 steps.
+- **Read-only work gets read-only members.** An audit slice goes to an explorer or an investigator, not to a worker: a worker loads the tools and the rules for editing, and most slices edit nothing. Register a worker for the slices where a finding is confirmed.
+- **Propose a size and ask.** Give the user your assessment in three or four lines (what is known, where changes land, how many groups proceed alone) and the team it leads to. Ask how many to deploy whenever the team is more than three members, any member runs above its profile's default model or effort, or your assessment could not settle between two sizes. Offer your recommendation first, then the next smaller team, each with its allocated tokens and what the smaller one gives up. Start a team of three or fewer at default models and effort without asking.
+
 ## Splitting
 
 1. **Split by ownership, not by activity.** A piece is a set of paths or one question. "Write the code" and "write its tests" for the same module are one piece: the same worker owns both files.
@@ -36,6 +62,10 @@ Independent pieces, one worker each, one verifier over the integrated result. No
 ### Pool
 
 Many similar small jobs: failing tests grouped by package, lint fixes by directory. Register the workers as a numbered group (`fix-1` to `fix-4`, each `group=fix`) and give each a fixed share in its brief. Do not let pool workers pick jobs from a common list: two will pick the same one. `@fix` reaches the whole pool.
+
+### Triage, then fan out
+
+An audit or sweep with no known symptom. One or two read-only members triage the whole area with searches (the risky constructs, the recent diff, the failing or missing tests) and post each suspect place as a `FINDING` with its path. You register a member only for the places that hold up: a worker for a small fix, an investigator for a suspect that needs tracing. Slices that triage reports clean get nobody.
 
 ### Pipeline
 
@@ -74,7 +104,7 @@ A member starts with nothing but its brief and the first two lines (`@name BRIEF
 - **Depends on:** the members whose `READY` it must wait for, or `nothing`.
 - **Seams:** any contract it shares with another piece. When two or more members share one, post it once, before anyone is started and before the individual briefs: a post whose first line addresses those members and the verifier and ends in BRIEF (`@parser @currency @verifier BRIEF`), then a `Seams:` block. The individual briefs then do not repeat it, and each still writes only its own member's name with `@`. The shared post goes first because a mention wakes a started member; `BOARD replace` copies it into a successor's brief.
 - **Done when:** a check the member can run and see pass. "Works correctly" is not a check.
-- **Repository rules:** the user's standing instructions that apply, such as commit-message rules.
+- **Repository rules:** the user's standing instructions that apply, such as commit-message rules. State the few rules that apply in the seam post. Do not send every member to read the project's guides (`AGENTS.md`, an architecture document): each member pays for the same files again.
 - **How to report:** `BOARD ready <name>`, or the board tool's `ready` action for a specialist.
 
 ## Cost
