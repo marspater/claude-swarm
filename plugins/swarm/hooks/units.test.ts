@@ -1026,6 +1026,13 @@ test('guard regressions (#1-#4): parameter-expansion quote flip, unclosed quotes
   expect(shellWords("echo ${x:-\\$'a\\'} python board.py")).toEqual(['echo', "${x:-\\$'a\\'}", 'python', 'board.py'])
   expect(splitShellSegments("echo $(echo \\$'a\\') && git commit -m pwn")).toEqual(["echo $(echo \\$'a\\')", 'git commit -m pwn'])
 
+  // a variable inside the word that is run fills in too: `./$S` is the script
+  for (const typed of ['S=board.py; ./$S .swarm/r-20260101-000000 init T', 'S=verify; "./${S}.py" . .swarm/r-20260101-000000 accept c1']) {
+    expect([typed, actsAsAnother(typed, 'parser', { role: 'worker', last_read_seq: 0 }) !== undefined]).toEqual([typed, true])
+  }
+  // more fillings than are tried one by one: the word is refused, not read from the first few
+  const many = `for S in ${Array.from({ length: 65 }, (_, index) => `n${index}`).join(' ')} oard; do :; done; P=b; "./\${P}\${S}.py" .swarm/r-20260101-000000 init T`
+  expect(actsAsAnother(many, 'parser', { role: 'worker', last_read_seq: 0 })).toBeDefined()
   // #2: verify.py redirections before operands cannot shift action index; invalid actions fail closed
   expect(actsAsAnother('python3 /p/verify.py >a 2> b .swarm/r-20260101-000000 app accept cand-1', 'parser', { role: 'worker', last_read_seq: 0 })).toContain("the coordinator's")
   expect(actsAsAnother('python3 /p/verify.py >a 2> b .swarm/r-20260101-000000 app accept cand-1', 'vera', { role: 'verifier', last_read_seq: 0 })).toContain("the coordinator's")

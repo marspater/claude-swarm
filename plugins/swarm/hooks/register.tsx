@@ -1969,6 +1969,8 @@ const runCompact = (dir: string, title: string, root: string) =>
   'again before the next step whose rules are no longer in view.'
 let compactedRun = ''
 let compactedAt = -1
+let failedCompaction = ''
+let toldFailedCompaction = ''
 // The token figures the user has written in this conversation: the only budgets the coordinator may set above the
 // one that stands. Seen live: a coordinator whose team was estimated past the budget set 3,000,000 by itself.
 const userFigures = new Set<number>()
@@ -1984,6 +1986,13 @@ const mayBudget = (asked: number, standing: number) => Number.isSafeInteger(aske
  * keeps the last one; `budget=` with no figure lifts the budget, and a value that is no plain figure (`9_000_000`,
  * `$B`) is none the user wrote.
  */
+/** The budget that stands for the run driven now: the board's own word when no poll has shown it yet, as right after `init`. */
+async function standingBudget($: EngineInterface): Promise<number> {
+  const dir = await read($, run).catch(() => '')
+  if (snapshot && snapshot.dir === dir) return snapshot.budget
+  if (!dir) return 0
+  return $.fs.read(`${dir}/members.json`).then(text => Number((JSON.parse(text) as { limits?: { budget?: string } }).limits?.budget ?? 0) || 0).catch(() => 0)
+}
 const breaksBudget = (options: string[], standing: number) => options.some(option => {
   const asked = /^budget=(.*)$/s.exec(option.trim())?.[1]
   return asked !== undefined && !mayBudget(asked === '' ? 0 : Number(asked), standing)
@@ -2002,7 +2011,7 @@ async function owesRunCompaction($: EngineInterface, dir: string): Promise<boole
     ownedRoster?.dir === dir && !ownedRoster.closed && owed.count === 0 && specialistWakes.length === 0 &&
     Object.entries(ownedRoster.members).some(([name, member]) => name !== 'coordinator' && Boolean(member.id))
   // One compaction per idle stretch: a conversation that stays long after it is not compacted again at every poll.
-  if (!fits() || (compactedRun === dir && compactedAt === coordinatorTurnsEnded)) return false
+  if (!fits() || compactedAt === coordinatorTurnsEnded) return false
   const held = await $.session.usage().then(usage => usage.context.tokens ?? 0).catch(() => 0)
   if (!fits() || held < (compactedRun === dir ? HEAVY_CONVERSATION : LONG_CONVERSATION)) return false
   compactedRun = dir
@@ -2112,12 +2121,22 @@ function compactOwed($: EngineInterface): void {
       // A hook's veto is final.
       if (done.skip !== undefined) $.ui.toast(`Swarm: the compaction was skipped (${done.skip}). Run /compact to drop the run from the context.`)
     },
-    () => {
+    (error: unknown) => {
       // Cancelled meanwhile, by a new run or another session: nothing is owed.
       if (owedCompaction !== owed) return
       if (++owed.tries > 2) {
         owedCompaction = undefined
-        return $.ui.toast('Swarm: the conversation could not be compacted. Run /compact to drop the run from the context.')
+        const why = error instanceof Error ? error.message : String(error ?? '')
+        // A run's own compaction is tried again at the next idle point after a turn of the coordinator's: said once
+        // per run, with the host's reason, and never as the kill's advice to drop a run that still goes on.
+        if (owed.instructions === undefined) return $.ui.toast('Swarm: the conversation could not be compacted. Run /compact to drop the run from the context.')
+        if (compactedRun !== '') failedCompaction = compactedRun
+        compactedRun = ''
+        if (failedCompaction !== toldFailedCompaction) {
+          toldFailedCompaction = failedCompaction
+          $.ui.toast(`Swarm: the coordinator's conversation could not be compacted${why ? ` (${clip(why, 120)})` : ''}. The run goes on, and Swarm tries again later.`)
+        }
+        return
       }
       // Asked again at the next idle point: a turn's end, or shortly when none runs.
       owed.isAsked = false
@@ -2816,7 +2835,7 @@ async function coordinatorBoard($: EngineInterface, e: BoardInput) {
   if (!Array.isArray(options) || options.length > 40 || options.some(option => typeof option !== 'string' || !/^[A-Za-z_]\w*=[^\n]*$/.test(option))) {
     return { deny: 'options are key=value strings, such as "role=verifier" or "paths=src/a,src/b".' }
   }
-  if (action === 'limit' && breaksBudget(options, snapshot?.budget ?? 0)) return { deny: BUDGET_IS_USERS }
+  if (action === 'limit' && breaksBudget(options, await standingBudget($))) return { deny: BUDGET_IS_USERS }
   if (e.seq !== undefined && (!Number.isSafeInteger(e.seq) || e.seq < 1)) return { deny: 'seq is a positive post number.' }
   const text = typeof e.text === 'string' ? e.text.trim() : ''
   const oneLine = [e.title, e.out].find(value => typeof value === 'string' && /\n/.test(value))
@@ -3154,8 +3173,10 @@ export const register: Register = on => {
       return { deny: 'Nothing ran: this command waits on a loose process match, which can match unrelated command lines. Match the process name exactly with `pgrep -x NAME`, or wait on the PID of a process you started.' }
     }
     const calls = e.tool === 'Bash' ? boardCalls(command) : []
-    if (e.agentId === undefined && calls.some(call => call.action === 'limit' &&
-        breaksBudget(call.rest.split(/\s+/).map(word => word.replace(/^['"]|['"]$/g, '')), snapshot?.budget ?? 0))) return { deny: BUDGET_IS_USERS }
+    if (e.agentId === undefined && calls.some(call => call.action === 'limit')) {
+      const standing = await standingBudget($)
+      if (calls.some(call => call.action === 'limit' && breaksBudget(call.rest.split(/\s+/).map(word => word.replace(/^['"]|['"]$/g, '')), standing))) return { deny: BUDGET_IS_USERS }
+    }
     const isCoordinatorBg = e.agentId === undefined && (e.tool === 'Monitor' || (e.tool === 'Bash' && e.run_in_background === true))
     const isMemberGuard = e.agentId !== undefined && (e.tool === 'Edit' || e.tool === 'Write' || e.tool === 'NotebookEdit' || e.tool === 'Bash')
     let bgWarning: string | undefined
@@ -3835,9 +3856,10 @@ export const register: Register = on => {
               if (sEpoch !== sessionEpoch || isEnding) break
               const report = index === END ? endReport(turnId, owing) : `${turnId}:${index}`
               const accepted = await account($, turnId, report, owing.agentId, amount, under, sEpoch, withHeld(stepped.detail(owing, index), owing.agentId)).catch(() => false as const)
-              if (accepted) {
-                stepped.landed(owing, accepted, index)
-                isCharged = true
+              // Taken already (0) or nothing to charge (undefined) is settled too: left owing, it is sent at every turn's end.
+              if (accepted !== false) {
+                stepped.landed(owing, accepted ?? 0, index)
+                if (accepted) isCharged = true
               }
             }
           } finally {
@@ -4109,8 +4131,8 @@ export const register: Register = on => {
     const crab = await next({ ...e, props: { ...e.props, rows: peers } })
     const shown = await read($, swarm)
     const offset = phase(`${e.surface}:shortcut`, shown.dir, emblemStateOf(shown), await $.clock.now().catch(() => 0))
-    // 1.75 cells sits the caption about 2 px nearer the button than 2 did.
-    return <Box flexDirection="row" columnGap={1.75}>
+    // 1.25 cells sits the caption about 6 px nearer the button than 2 did.
+    return <Box flexDirection="row" columnGap={1.25}>
       {shortcut($, e, textCount(findKey(peers[0]?.tree, 'crab-text')) === 1, shown, offset, true)}
       <Box flexDirection="column" flexGrow={1} flexShrink={1}>{crab}</Box>
     </Box>

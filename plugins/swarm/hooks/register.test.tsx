@@ -1829,10 +1829,16 @@ test('each model step is charged once, a spent budget stops members mid-turn and
   const clock = mock.clock(on)
   const charged = new Set<string>()
   let isSlow = false
+  let heard: 'yes' | 'no' | 'before' = 'yes'
+  const taken = new Set<string>()
   on('process.run', async (_, e) => {
     const stdout = board(e)
     if (e.argv[3] !== 'account') return answer(stdout)
+    if (heard === 'no') return { value: { exitCode: 1, stdout: '', stderr: 'board unreadable', isStdoutTruncated: false, isStderrTruncated: false } }
     const [turn = '', actor = '', count] = e.argv.slice(4)
+    if (heard === 'before') taken.add(turn)
+    // a report the board holds already: nothing more is taken for it, now or later
+    if (taken.has(turn)) return answer(JSON.stringify({ title: state.title, total: 0, budget: 1000, paused: false, accepted: 0 }))
     if (isSlow) await clock.advance(2000)  // a poll falls between the turn's end and its usage reaching the board
     if (!charged.has(turn)) state.usage.tokens[actor] = (state.usage.tokens[actor] ?? 0) + Number(count)
     charged.add(turn)
@@ -1873,6 +1879,19 @@ test('each model step is charged once, a spent budget stops members mid-turn and
   expect([total(), accounts().length]).toEqual([450, 2])
   // the end's first report carries the context the member last held, as its retries do
   expect(accounts()[1]).toMatch(/,1300$/)
+  // a step the board did not answer for is sent again at a turn's end; told then that it was taken before (0), it is
+  // settled, not sent again at every later end
+  heard = 'no'
+  answered = usage(40)
+  for await (const _ of $.turn.step({ turnId: 'r', index: 0, model: 'm', messageCount: 1, agentId: 'a1' })) { /* no chunks */ }
+  await clock.advance(1)
+  heard = 'before'
+  await $.turn.complete({ ...done, turnId: 'r', agentId: 'a1', usage: usage(40) })
+  await $.turn.complete({ ...done, turnId: 'r2', agentId: 'a1' })
+  heard = 'yes'
+  const sent = accounts().length
+  for (const turnId of ['r3', 'r4', 'r5']) await $.turn.complete({ ...done, turnId, agentId: 'a1' })
+  expect([taken.size > 0, accounts().length]).toEqual([true, sent])
   expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts', agentId: 'a1' })).deny).toBeUndefined()
 
   // the coordinator's last step crosses the budget: until that is on the board its turn is not over, so no poll
@@ -7274,7 +7293,9 @@ test('token-economy #3: the coordinating conversation is compacted after deploym
   })
   on('session.usage', () => ({ value: { context: { tokens: contextTokens }, total: { input: 0, output: 0 } } as never }))
   const compactions: string[] = []
+  let isRefused = false
   on('session.compact', (_, e) => {
+    if (isRefused) throw new Error('a turn is running')
     compactions.push(String(e.instructions))
     return { messages: [{ role: 'user', text: 'The summary.', toolUses: [] }] as never }
   })
@@ -7305,6 +7326,10 @@ test('token-economy #3: the coordinating conversation is compacted after deploym
   await $.command.run({ command: 'swarm:swarm', args: 'do work', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 80 } })
   const cmdInit = await toolCall($, { tool: 'Bash', command: `python3 /p/board.py /project/.swarm init "Economy swarm"` })
   expect((cmdInit.context ?? []).some(c => c.includes('A run was made'))).toBe(false)
+  // Right after init no poll has shown the budget yet: the board's own figure stands, so lowering it is allowed.
+  Object.assign(state, { limits: { budget: '3000000' } })
+  expect((await toolCall($, { tool: 'mcp__swarm__board', action: 'limit', options: ['budget=1500000'] } as never)).deny).toBeUndefined()
+  Object.assign(state, { limits: undefined })
 
   await clock.advance(2000)
 
@@ -7349,6 +7374,16 @@ test('token-economy #3: the coordinating conversation is compacted after deploym
   contextTokens = 190_000
   await endTurn('ct-regrown')
   expect(compactions.length).toBe(2)
+  // one the host refuses is said once, with the host's reason and not as a kill's advice, and tried again from the
+  // first threshold at a later idle point
+  isRefused = true
+  await endTurn('ct-refused')
+  for (let tries = 0; tries < 4; tries++) await clock.advance(1000)
+  expect(seen.toasts.filter(text => text.includes('could not be compacted'))).toEqual([expect.stringMatching(/^Swarm: the coordinator's conversation could not be compacted \(.+\)\. The run goes on, and Swarm tries again later\.$/)])
+  isRefused = false
+  contextTokens = 130_000
+  await endTurn('ct-again')
+  expect(compactions.length).toBe(3)
   contextTokens = 10_000
 
   // The budget is the user's: the coordinator may lower it, and raise it only to a figure the user wrote.

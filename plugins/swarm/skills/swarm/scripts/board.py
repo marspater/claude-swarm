@@ -2091,6 +2091,7 @@ def main(argv):
                     member.pop("isolated", None)
             if member.get("profile") in READ_ONLY and "profile" in changes and changes["profile"] not in READ_ONLY and "writes" not in changes:
                 member.pop("writes", None)  # a specialist turned worker or designer writes again unless told otherwise
+            waited = set(dependencies(previous))
             member.update(changes)
             merge_after(member, changes, previous.get("after", ""))
             if member.get("killed"):  # a retired member runs no more turns: nothing is paused
@@ -2115,8 +2116,10 @@ def main(argv):
             if "depends" in changes:
                 deps = dependencies(member)
                 member["depends"] = ",".join(deps)
+                # Only the names this command adds, as `replace` checks them: a wait the member already had for one
+                # retired since stays, or an after= could never be added to it.
                 if any(dep not in members or members[dep].get("role") != "worker"
-                       or members[dep].get("killed") or members[dep].get("consult") == "1" for dep in deps):
+                       or members[dep].get("killed") or members[dep].get("consult") == "1" for dep in deps if dep not in waited):
                     sys.exit("dependencies must be registered, active non-consultant workers")
                 frontier = list(deps)
                 seen = set()

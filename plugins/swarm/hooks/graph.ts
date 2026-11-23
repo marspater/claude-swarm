@@ -215,7 +215,8 @@ function labelsOf(names: string[]): Map<string, string> {
       labels.set(name, name)
       continue
     }
-    const cut = (start: number) => `${clipHead(name, start)}…${name.slice(start - 14)}`
+    // The tail starts on a whole character: half of a pair is no text an SVG may hold.
+    const cut = (start: number) => `${clipHead(name, start)}…${name.slice(start - 14).replace(/^[\uDC00-\uDFFF]/, '')}`
     // Names alike at both ends get a number: of as many numbers as names, one is always free.
     const label = [7, 4, 10, 2, 12].map(cut).find(one => !taken.has(one)) ??
       names.map((_, index) => `${clipHead(name, 11)}…${index + 2}`).find(one => !taken.has(one))!

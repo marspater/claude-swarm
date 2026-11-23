@@ -641,7 +641,18 @@ function possibleCommands(command: string) {
   }
   return { statements, expand: (word: string): string[] => {
     const match = variableWord.exec(word)
-    return match ? variables.get(match[1] ?? match[2]!) ?? [word] : [word]
+    if (match) return variables.get(match[1] ?? match[2]!) ?? [word]
+    // A variable inside a word (`./$S`, `"${S}.py"`) fills in too, every value it was given.
+    let filled = [word]
+    for (const [name, values] of variables) {
+      const use = new RegExp(`\\$(?:${name}(?![A-Za-z0-9_])|\\{${name}\\})`, 'g')
+      if (!use.test(word)) continue
+      filled = filled.flatMap(one => values.map(value => one.replace(use, () => value)))
+      // ponytail: past 64 fillings they are not built; the word is read as either script, which refuses it wherever
+      // a script would run. Cut short instead, the one filling that spells the script could be the one dropped.
+      if (filled.length > 64) return ['board.py', 'verify.py']
+    }
+    return filled
   } }
 }
 

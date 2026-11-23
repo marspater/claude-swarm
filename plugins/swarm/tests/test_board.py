@@ -1822,6 +1822,17 @@ class BoardRegressions(unittest.TestCase):
             run(d, "post", "v", "@inv NOT PASSED: the finding does not hold")
         assert [item["member"] for item in self.items(d, "rework")] == ["inv"]
 
+    def test_an_after_is_added_to_a_member_that_waits_for_one_retired_since(self):
+        d = self.init_run()
+        for name in ("b", "c"):
+            run(d, "member", name)
+        run(d, "member", "a", "depends=b")
+        run(d, "member", "b", "killed=1")
+        run(d, "member", "a", "after=c")  # the wait for @b is inherited, not asked for: only @c is checked
+        assert saved(d)["members"]["a"]["depends"].split(",") == ["b", "c"], saved(d)["members"]["a"]
+        run(d, "member", "c", "killed=1")
+        run(d, "member", "a", "depends=b,c,ghost", ok=False)  # a new name is still checked
+
     def test_f10_retired_members_and_verifier_dependencies_stay_fixed(self):
         d = self.init_run()
         run(d, "member", "base")

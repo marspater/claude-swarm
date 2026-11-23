@@ -590,6 +590,9 @@ test('long names that share a start stay told apart, and a narrow pane is too sm
   expect(labels).toContain('input-n…ization')
   expect(labels).toContain('input-n…malizer')
   expect(new Set(labels).size).toBe(labels.length)
+  // a name cut inside a character outside the basic plane keeps no half of it
+  const bee = graphSvg({ title: 'T', dir: '/r', isClosed: false, attention: [], budget: 0, tokens: {}, posts: [], members: teamOf(['coordinator', 'aaaaaaaa🐝bbbbbb']) }, 0, new Set(), false, true)
+  expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(bee)).toBe(false)
   // eleven members in a 316 px pane draw names near 5 px; at 737 px they are readable
   const eleven = teamOf(['coordinator', ...Array.from({ length: 10 }, (_, i) => `metadata-index-${i}`)])
   expect(labelPx(36, eleven)).toBeLessThan(9)
