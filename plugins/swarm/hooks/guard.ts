@@ -2,7 +2,7 @@
 // as the shell runs it. Needs the engine only for the file system and git.
 import type { EngineInterface } from 'claude-code'
 
-import { boardCalls, CASE_PATTERN, closesAfter, COMMITTING, GIT_BUILTINS, launches, makesCommit, NAMES_COMMIT, RUNNERS, scanShell, scriptsRun, shellLaunch, SHELLS, shellWords, type Statement, unwrap, withoutRedirects } from './command'
+import { boardCalls, CASE_PATTERN, closesAfter, COMMITTING, GIT_BUILTINS, launches, makesCommit, NAMES_COMMIT, RUNNERS, scanShell, scriptsRun, shellLaunch, SHELLS, shellWords, type Statement, UNREAD, unwrap, withoutRedirects } from './command'
 import type { Roster } from './roster'
 
 export function normalizePath(p: string): string {
@@ -132,7 +132,7 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
       }
     }
   }
-  const viaVariable = (text: string) => [...text.matchAll(/\$\{?([A-Za-z_]\w*)/g)].some(([, key]) => (values.get(key!) ?? []).some(value => NAMES_COMMIT.test(`git ${value}`)))
+  const viaVariable = (text: string) => [...text.matchAll(/\$\{?([A-Za-z_]\w*)/g)].some(([, key]) => (values.get(key!) ?? []).some(value => NAMES_COMMIT.test(`git ${value}`) || value.includes(UNREAD)))
   // Words this cannot read (a variable, a substitution, a placeholder) that may stand for a commit: one of the words
   // beside them names one, or a variable among them was given one.
   const mayCommit = (words: readonly string[]) => words.some(word => COMMITTING.includes(word)) || viaVariable(words.join(' '))
@@ -300,6 +300,8 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
       : new Set([...here].map(dir => chdirs.reduce<string | undefined>((current, path) => directoryAfter(current, path), dir)))
     const end = (ok: Dirs, failed: Dirs = here): End => ({ hit: false, ok, failed })
     if (name === undefined) return end(here, here)
+    // A word this cannot read for sure (`$'\U…'`) may be git or a commit, unless the command only prints or reads.
+    if (words.slice(at).some(word => word.includes(UNREAD)) && !INERT.has(name)) return HIT
     // A command named by a variable, a substitution or a placeholder (`$GIT commit`, `{}` under xargs) is any command.
     if (/[$`{}*?]/.test(words[at]!) || words[at] === '_') {
       return mayCommit(words.slice(at)) || (fromStdin && NAMES_COMMIT.test(command)) ||
@@ -312,7 +314,8 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
     }
     if (!isChild && (name === 'exit' || name === 'return')) return end(new Set(), new Set())
     if (name === 'git' || /^git-./.test(name)) {
-      const gitArgs = name === 'git' ? args : [name.slice(4), ...args]
+      // A redirection between git and its command (`git 2>/dev/null status`) is no word git gets.
+      const gitArgs = withoutRedirects(name === 'git' ? args : [name.slice(4), ...args]).words
       return await git(gitArgs, from, isElsewhere, fromStdin, depth) ? HIT : end(here)
     }
     if (SHELLS.test(name)) {
@@ -457,7 +460,8 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
       let framed = false
       const open = (kind: Frame['kind'], extra: Partial<Frame> = {}) => {
         framed = true
-        const isFunction = isFunctionNext && (kind === '(' || kind === '{')
+        // Any compound after a function's header is its body: `f() if …; fi` runs nothing until f is called.
+        const isFunction = isFunctionNext
         frames.push({ kind, entry: here, isApart: s.op === '|' || isFunction, isFunction, pipeStart: s.pipeStart, listStart: s.listStart,
           carryOk: s.carryOk, carryFailed: s.carryFailed, ends: [], ...extra })
         s.carryOk = s.carryFailed = new Set()
@@ -547,16 +551,14 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
           if (frame?.kind !== kind) break
           rest = rest.slice(keyword[0].length)
           const reached = union(s.ok, s.failed)
-          if (kind === 'if') {
+          if (frame.isFunction) shut(frame, frame.entry)
+          else if (kind === 'if') {
             shut(frame, union(...frame.ends, reached, frame.hasElse ? new Set() : frame.condFailed ?? frame.entry))
           } else if (kind === 'case') {
             shut(frame, union(...frame.ends, frame.state === 'body' ? reached : new Set(), frame.fall ?? new Set(), frame.entry))
           } else if (kind === '{') {
-            if (frame.isFunction) shut(frame, frame.entry)
-            else {
-              shut(frame, reached)
-              if (!(frame.isApart || next === '|' || next === '&')) [okNext, failedNext] = [s.ok, s.failed]
-            }
+            shut(frame, reached)
+            if (!(frame.isApart || next === '|' || next === '&')) [okNext, failedNext] = [s.ok, s.failed]
           } else {
             const restart = frame.restart!
             const seen = union(restart.here, reached)
@@ -617,7 +619,7 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
 }
 
 // pgrep's options that take a value of their own: the word after one is no pattern and no flag.
-const PGREP_VALUED = /^-[A-Za-z]*[dFgGPstuU]$/
+const PGREP_VALUED = 'dFgGPstuU'
 const assignment = /^([A-Za-z_]\w*)=([\s\S]*)$/
 const variableWord = /^\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})$/
 
@@ -625,17 +627,21 @@ function possibleCommands(command: string) {
   const statements = scriptsRun(command).flatMap(script => scanShell(script).map(statement => ({
     ...statement, script, words: withoutRedirects(shellWords(unwrap(statement.text).text)).words,
   })))
-  const variables = new Map<string, string>()
+  // Every value the command gives each variable, wherever it gives it: a later one does not undo an earlier use.
+  const variables = new Map<string, string[]>()
+  const give = (key: string, ...values: string[]) => variables.set(key, [...variables.get(key) ?? [], ...values])
   for (const { words } of statements) {
-    for (const word of words[0] === 'export' ? words.slice(1) : words) {
+    if ((words[0] === 'for' || words[0] === 'select') && words[2] === 'in') give(words[1]!, ...words.slice(3))
+    const declares = /^(?:export|declare|typeset|local|readonly)$/.test(words[0] ?? '')
+    for (const word of declares ? words.slice(1) : words) {
       const match = assignment.exec(word)
-      if (!match) break
-      variables.set(match[1]!, match[2]!)
+      if (match) give(match[1]!, match[2]!)
+      else if (!declares) break
     }
   }
-  return { statements, expand: (word: string) => {
+  return { statements, expand: (word: string): string[] => {
     const match = variableWord.exec(word)
-    return match ? variables.get(match[1] ?? match[2]!) ?? word : word
+    return match ? variables.get(match[1] ?? match[2]!) ?? [word] : [word]
   } }
 }
 
@@ -675,9 +681,9 @@ export function waitsOnLooseMatch(command: string): boolean {
   const { statements, expand } = possibleCommands(command)
   for (const { text, words } of statements) {
     const at = executableIndex(words)
-    const name = expand(words[at] ?? '').replace(/^.*\//, '')
-    if (name === 'sleep' || /^\s*(?:while|until)\b/.test(text)) waits = true
-    if (name === 'pgrep' || name === 'pkill') {
+    const names = expand(words[at] ?? '').map(word => word.replace(/^.*\//, ''))
+    if (names.includes('sleep') || /^\s*(?:while|until)\b/.test(text)) waits = true
+    if (names.includes('pgrep') || names.includes('pkill')) {
       let full = false
       let exact = false
       let isPatternSeen = false
@@ -688,10 +694,21 @@ export function waitsOnLooseMatch(command: string): boolean {
           isPatternSeen = true
           continue
         }
-        const flags = word === '--full' ? 'f' : word === '--exact' ? 'x' : word.startsWith('--') ? '' : word.slice(1)
-        if (flags.includes('f')) full = true
-        if (flags.includes('x') && !isPatternSeen) exact = true
-        if (PGREP_VALUED.test(word) || /^--(?:delimiter|pidfile|pgroup|group|session|terminal|euid|uid)$/.test(word)) i++
+        if (word.startsWith('--')) {
+          if (word === '--full') full = true
+          if (word === '--exact') exact = true
+          if (/^--(?:delimiter|pidfile|pgroup|group|session|terminal|euid|uid)$/.test(word)) i++
+          continue
+        }
+        // A cluster read letter by letter: an option that takes a value takes the rest of it (`-ufoo`), or the next word.
+        for (let j = 1; j < word.length; j++) {
+          if (PGREP_VALUED.includes(word[j]!)) {
+            if (j === word.length - 1) i++
+            break
+          }
+          if (word[j] === 'f') full = true
+          if (word[j] === 'x') exact = true
+        }
       }
       if (full && !exact) loose = true
     }
@@ -729,17 +746,28 @@ export function actsAsAnother(command: string, name: string, member: Roster[stri
     // A substitution that never closes runs what this cannot list.
     if (isUnread && /\b(?:board|verify)\.py\b/.test(script)) return unread(/\bboard\.py\b/.test(script) ? 'board' : 'verify')
     const words = shellWords(unwrap(text).text)
+    // A word this cannot read for sure may name either script, or a member.
+    if (words.some(word => word.includes(UNREAD))) return unread('board')
     const call = boardCalls(text)[0]
     const atCommand = executableIndex(words)
-    for (const target of ['board', 'verify']) {
+    targets: for (const target of ['board', 'verify']) {
       const file = `${target}.py`
       if (launches(words, file, command)) continue
-      const expanded = words.flatMap((word, index) => {
-        const value = expand(word)
-        if (index === atCommand && value !== word && /\s/.test(value)) return shellWords(value)
-        return globNames(value, file) ? file : value
-      })
-      if (launches(expanded, file)) return unread(target)
+      // Each way the variables may fill the words in, every value a variable was given tried.
+      let readings: string[][] = [[]]
+      for (const [index, word] of words.entries()) {
+        const values = expand(word).flatMap(value => index === atCommand && value !== word && /\s/.test(value)
+          ? [shellWords(value)] : [[value]]).map(value => value.map(part => globNames(part, file) ? file : part))
+        readings = readings.flatMap(reading => values.map(value => [...reading, ...value]))
+        // ponytail: past 64 readings they are not tried one by one; refused when the command, or any value a word
+        // of it may take, names the script
+        if (readings.length > 64) {
+          if (command.includes(target) || words.some(one => expand(one).some(value =>
+            shellWords(value).some(part => part.includes(target) || globNames(part, file))))) return unread(target)
+          continue targets
+        }
+      }
+      if (readings.some(reading => launches(reading, file))) return unread(target)
     }
     // A board command typed plainly, run so that more may follow it (`python3 -i`), runs what this cannot read.
     if (call && launches(words, 'board.py', command) === 'other') return unread('board')

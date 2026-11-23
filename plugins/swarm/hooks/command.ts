@@ -33,12 +33,29 @@ export const runsNamed = (prompt: string) => {
  */
 export type Statement = { text: string; piped: boolean; next: '&&' | '||' | ';' | ';;' | ';&' | '|' | '&' | ''; inner?: string[]; plain?: string; unread?: true }
 
-/** Index of the `))` closing the `((` that opens at `i`, or -1. */
-const arithEnd = (command: string, i: number) => {
+// The scans below call each other: a `$((` that never closes is read again as `$(`, so each nested one would double
+// the work. Their answers for the command at hand are kept, which holds an unclosed run to polynomial time.
+let scanned = { command: '', ends: new Map<string, number>() }
+const remembered = (command: string, key: string, scan: () => number): number => {
+  if (scanned.command !== command) scanned = { command, ends: new Map() }
+  let end = scanned.ends.get(key)
+  if (end === undefined) scanned.ends.set(key, end = scan())
+  return end
+}
+
+/** Index of the `))` closing the `((` that opens at `i`, or -1: escapes, quotes and expansions inside it are stepped over. */
+const arithEnd = (command: string, i: number): number => remembered(command, `a${i}`, () => arithScan(command, i))
+const arithScan = (command: string, i: number): number => {
   let depth = 0
   for (let j = i + 2; j < command.length; j++) {
-    if (command[j] === '(') depth++
-    else if (command[j] === ')' && --depth < 0) return command[j + 1] === ')' ? j + 1 : -1
+    const ch = command[j]
+    if (ch === '\\') j++
+    else if (ch === '"') j = quoteEnd(command, j)
+    else if (ch === "'") j = command[j - 1] === '$' && !escaped(command, j - 1) ? ansiQuoteEnd(command, j) : command.indexOf("'", j + 1)
+    else if (ch === '$' || ch === '`') j = expansionEnd(command, j) ?? j
+    else if (ch === '(') depth++
+    else if (ch === ')' && --depth < 0) return command[j + 1] === ')' ? j + 1 : -1
+    if (j < 0) return -1
   }
   return -1
 }
@@ -119,8 +136,22 @@ const braceEnd = (command: string, from: number, inDouble = false): number => {
   return -1
 }
 
+/** Stands in a word for a character this cannot read for sure: the guards refuse a command that holds one. */
+export const UNREAD = '\u0002'
+const ANSI_SIMPLE: Record<string, string> = { a: '\x07', b: '\b', e: '\x1b', E: '\x1b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v', '\\': '\\', "'": "'", '"': '"', '?': '?' }
+/**
+ * The body of `$'…'` as bash and zsh both read it. A form they read apart is UNREAD: `\u`, `\U`, `\c`, an unknown
+ * escape, and a NUL (bash ends the word there, zsh keeps it). An octal value keeps its low byte, as both do.
+ */
+const ansiC = (body: string) => body.replace(/\\(?:([abeEfnrtv\\'"?])|([0-7]{1,3})|x([0-9A-Fa-f]{1,2})|[\s\S]?)/g, (_, simple?: string, octal?: string, hex?: string) => {
+  if (simple) return ANSI_SIMPLE[simple]!
+  const code = octal ? parseInt(octal, 8) & 0xff : hex ? parseInt(hex, 16) : 0
+  return code > 0 ? String.fromCharCode(code) : UNREAD
+})
+
 // `quoted`: any quoting in the delimiter word makes the body literal; a bare one leaves its substitutions live.
-type Heredoc = { delim: string; stripTabs: boolean; quoted: boolean }
+// `owner`: the index of the statement whose `<<` opened it, which runs what its body substitutes.
+type Heredoc = { delim: string; stripTabs: boolean; quoted: boolean; owner?: number }
 
 /** The heredoc the `<<` at `i` opens, if its delimiter is a word, and the index after that word. */
 const heredocAt = (command: string, i: number): { heredoc?: Heredoc; end: number } => {
@@ -136,7 +167,16 @@ const heredocAt = (command: string, i: number): { heredoc?: Heredoc; end: number
   let delim = ''
   while (j < command.length && !/[\s;|&<>()]/.test(command[j]!)) {
     const q = command[j]!
-    if (q === "'" || q === '"') {
+    if (q === '$' && command[j + 1] === "'") {
+      // $'…' takes escapes in both shells.
+      const end = ansiQuoteEnd(command, j + 1)
+      delim += ansiC(command.slice(j + 2, end < 0 ? command.length : end))
+      j = end < 0 ? command.length : end + 1
+    } else if (q === '$' && command[j + 1] === '"') {
+      // bash reads $"EOF" as EOF, zsh as $EOF: a delimiter no line matches keeps the rest a body, read as unread.
+      delim += UNREAD
+      j++
+    } else if (q === "'" || q === '"') {
       for (j++; j < command.length && command[j] !== q && command[j] !== '\n'; j++) {
         if (q === '"' && command[j] === '\\' && j + 1 < command.length) j++
         delim += command[j]!
@@ -156,9 +196,13 @@ const heredocAt = (command: string, i: number): { heredoc?: Heredoc; end: number
  * substitution a delimiter line may go on with its `)`, as in `EOF)`: shells differ on it, and reading it as the
  * delimiter then the close keeps the commands after it in view. The index of that `)` is returned.
  */
-const heredocsEnd = (command: string, pos: number, pending: Heredoc[], inParen = false) => {
+const heredocsEnd = (command: string, pos: number, pending: Heredoc[], inParen = false,
+  bodies: Array<{ heredoc: Heredoc; text: string; closed: boolean }> = []) => {
   while (pending.length > 0 && pos < command.length) {
-    const { delim, stripTabs } = pending.shift()!
+    const heredoc = pending.shift()!
+    const { delim, stripTabs } = heredoc
+    const from = pos
+    let closed = false
     while (pos < command.length) {
       const nl = command.indexOf('\n', pos)
       const lineEnd = nl === -1 ? command.length : nl
@@ -166,12 +210,20 @@ const heredocsEnd = (command: string, pos: number, pending: Heredoc[], inParen =
       const candidate = stripTabs ? rawLine.replace(/^\t+/, '') : rawLine
       if (inParen && candidate.startsWith(`${delim})`)) {
         pending.length = 0
+        bodies.push({ heredoc, text: command.slice(from, pos), closed: true })
         return pos + rawLine.length - candidate.length + delim.length
       }
+      const lineStart = pos
       pos = nl === -1 ? command.length : nl + 1
-      if (candidate === delim) break
+      if (candidate === delim) {
+        bodies.push({ heredoc, text: command.slice(from, lineStart), closed: closed = true })
+        break
+      }
     }
+    if (!closed) bodies.push({ heredoc, text: command.slice(from, pos), closed })
   }
+  // A heredoc left with no body line at all never closes either.
+  for (const heredoc of pending) bodies.push({ heredoc, text: '', closed: false })
   pending.length = 0
   return pos
 }
@@ -187,8 +239,9 @@ const heredocSubstitutions = (body: string): string[] => {
       found.push(body.slice(i + 2, end < 0 ? body.length : end))
       i = end < 0 ? body.length : end
     } else if (body[i] === '`') {
-      const end = body.indexOf('`', i + 1)
-      found.push(body.slice(i + 1, end < 0 ? body.length : end))
+      // An escaped backtick inside is a nested substitution, not the close.
+      const end = tickEnd(body, i)
+      found.push(body.slice(i + 1, end < 0 ? body.length : end).replace(/\\([`$\\])/g, '$1'))
       i = end < 0 ? body.length : end
     }
   }
@@ -213,7 +266,8 @@ const startsWord = (command: string, j: number, from = 0, boundary = /[\s;&|(]/)
 }
 
 /** Index of the `)` closing a `(` whose body starts at `from`, or -1: quotes, heredoc bodies, arithmetic, case patterns and nested parentheses are stepped over. */
-const parenEnd = (command: string, from: number): number => {
+const parenEnd = (command: string, from: number): number => remembered(command, `p${from}`, () => parenScan(command, from))
+const parenScan = (command: string, from: number): number => {
   let depth = 0
   const heredocs: Heredoc[] = []
   // The case statements open here, by the depth each opened at: a pattern's `)` closes nothing.
@@ -517,7 +571,7 @@ export function scanShell(command: string): Statement[] {
     }
     if (ch === '<' && command[i + 1] === '<') {
       const { heredoc, end } = heredocAt(command, i)
-      if (heredoc) pendingHeredocs.push(heredoc)
+      if (heredoc) pendingHeredocs.push({ ...heredoc, owner: segments.length })
       i = end - 1
       continue
     }
@@ -530,12 +584,16 @@ export function scanShell(command: string): Statement[] {
       if (isAnd || isOr || (isPipe && command[i + 1] === '&')) i++
       start = i + 1
       if (ch === '\n' && pendingHeredocs.length > 0) {
-        const live = pendingHeredocs.some(heredoc => !heredoc.quoted)
-        const bodies = i + 1
-        i = heredocsEnd(command, bodies, pendingHeredocs) - 1
-        // The shell runs what an unquoted heredoc's body substitutes: it belongs to the statement that reads it.
-        const ran = live ? heredocSubstitutions(command.slice(bodies, i + 1)) : []
-        if (ran.length > 0) (segments.at(-1)!.inner ??= []).push(...ran)
+        const bodies: Parameters<typeof heredocsEnd>[4] = []
+        i = heredocsEnd(command, i + 1, pendingHeredocs, false, bodies) - 1
+        for (const { heredoc, text, closed } of bodies) {
+          const owner = segments[heredoc.owner ?? segments.length - 1]!
+          // A body that never meets its delimiter may hold commands a shell runs after it.
+          if (!closed) owner.unread = true
+          // The shell runs what an unquoted heredoc's body substitutes: it belongs to the statement that reads it.
+          const ran = heredoc.quoted ? [] : heredocSubstitutions(text)
+          if (ran.length > 0) (owner.inner ??= []).push(...ran)
+        }
         start = i + 1
       }
     }
@@ -553,7 +611,13 @@ export const CASE_PATTERN = new RegExp(`^${CASE_ARMS}\\s*`)
 // What may stand before the command a statement runs: `(`, `{`, `!`, a shell keyword, an env/time-style prefix with
 // its flags, `case WORD in`, or a case pattern such as `*)` or `a|b)`: a clause after `;;` is a statement of its own.
 // A word and `)` before a redirect is a subshell's last command, `(a; b) > out`, not a pattern.
-const WRAPPER = new RegExp(`^(?:[({!]|(?:if|elif|while|until|then|do|else|time|command|exec|nohup|env)(?=\\s|$)(?:\\s+(?:-u\\s+\\S+|-\\S+))*|case\\s+(?:"[^"]*"|'[^']*'|\\S+)\\s+in(?=\\s|$)|${CASE_ARMS}(?!\\s*\\d*[<>]))\\s*`)
+// A prefix's options go with it, and so does the value of one that takes a value (`exec -a NAME`, `env -C DIR`),
+// as guard.ts's PREFIXES lists them: the word after them is the command.
+const SHELL_WORD = `(?:"[^"]*"|'[^']*'|\\\\.|[^\\s"'\\\\])+`
+const prefixOptions = (valued: string, long = '') =>
+  `(?:\\s+(?:-[^\\s\\-${valued}]*[${valued}](?=\\s)\\s+${SHELL_WORD}|${long && `--(?:${long})(?=\\s)\\s+${SHELL_WORD}|`}-\\S+))*`
+const WRAPPER = new RegExp(`^(?:[({!]|(?:if|elif|while|until|then|do|else|command|nohup)(?=\\s|$)(?:\\s+-\\S+)*|` +
+  `exec(?=\\s|$)${prefixOptions('a')}|time(?=\\s|$)${prefixOptions('of')}|env(?=\\s|$)${prefixOptions('uCSP', 'chdir|split-string|unset')}|case\\s+(?:"[^"]*"|'[^']*'|\\S+)\\s+in(?=\\s|$)|${CASE_ARMS}(?!\\s*\\d*[<>]))\\s*`)
 
 /** A statement without the wrappers before its command, and whether an odd number of `!` negates it. */
 export function unwrap(statement: string): { text: string; negated: boolean } {
@@ -597,9 +661,12 @@ export function shellWords(text: string): string[] {
       const stop = end < 0 ? text.length : end + 1
       word = (word ?? '') + text.slice(i, stop)
       i = stop - 1
+    } else if (ch === "'" && word?.endsWith('$') && text[i - 1] === '$' && !escaped(text, i - 1)) {
+      const end = ansiQuoteEnd(text, i)
+      word = word.slice(0, -1) + ansiC(text.slice(i + 1, end < 0 ? text.length : end))
+      i = end < 0 ? text.length : end
     } else if (ch === "'" || ch === '"') {
-      const isAnsi = ch === "'" && word?.endsWith('$') === true
-      word = isAnsi ? word!.slice(0, -1) : word ?? ''
+      word ??= ''
       for (i++; i < text.length && text[i] !== ch; i++) {
         const end = ch === '"' ? expansionEnd(text, i, true) : undefined
         if (end !== undefined) {
@@ -608,7 +675,7 @@ export function shellWords(text: string): string[] {
           i = stop - 1
           continue
         }
-        if (text[i] === '\\' && (ch === '"' || isAnsi) && i + 1 < text.length) i++
+        if (text[i] === '\\' && ch === '"' && i + 1 < text.length) i++
         word += text[i]
       }
     } else {
@@ -873,6 +940,8 @@ export function scriptsRun(command: string, depth = 0): string[] {
       for (let j = k + 1; j < raw.length && raw[j]!.startsWith('-'); j++) {
         const split = /^(?:-[^-S]*S|--split-string=?)([\s\S]*)$/.exec(raw[j]!)
         if (split) found.push(...scriptsRun(split[1] || raw[j + 1] || '', depth + 1))
+        // Another option's value is no option: `env -u FOO -S '…'` still splits.
+        else if (/^(?:-[^-uCP]*[uCP]|--(?:unset|chdir))$/.test(raw[j]!)) j++
       }
     })
   }
@@ -903,8 +972,12 @@ const SCRIPTERS = /^(?:perl|ruby|node|nodejs|bun|deno|php|lua|osascript|[gmn]?aw
 function pythonRuns(args: readonly string[], file: string, input: string, includeInteractive = false): 'script' | 'other' | undefined {
   const named = (words: readonly string[]) => words.some(word => word.includes(file))
   let inspects = false
-  const script = (word: string | undefined) =>
-    word?.replace(/^.*\//, '') !== file ? undefined : inspects && !includeInteractive ? 'other' : 'script'
+  const script = (word: string | undefined) => {
+    if (word === undefined) return undefined
+    if (word.replace(/^.*\//, '') === file) return inspects && !includeInteractive ? 'other' : 'script'
+    // A script the shell names later (`"$(echo board.py)"`, `"${B}.py"`, a glob) may be it when the line names it.
+    return /[$`*?[]/.test(word) && `${word}\n${input}`.includes(file.replace(/\.py$/, '')) ? 'other' : undefined
+  }
   for (let i = 0; i < args.length; i++) {
     const word = args[i]!
     if (word === '-') return input.includes(file) || named(args.slice(i + 1)) ? 'other' : undefined
@@ -947,10 +1020,14 @@ export function launches(statementWords: readonly string[], file: string, input 
   // Where a command starts: after assignments, and after a command that runs the rest of its words with its options.
   const isCommand = (k: number) => words.slice(0, k).every((word, j) =>
     /^[A-Za-z_]\w*=/.test(word) || RUNNERS.has(base(word)) || /^[-+\d]/.test(word) || words[j - 1]?.startsWith('-'))
+  // A search that runs nothing it is given: `grep -n python3 board.py`, `git log -S python3 -- board.py`.
+  const command = words.findIndex(word => !/^[A-Za-z_]\w*=/.test(word))
+  const isReader = command >= 0 && (/^[ef]?grep$/.test(words[command]!) ||
+    (words[command] === 'git' && /^(?:log|show|diff|grep|blame)$/.test(words[command + 1] ?? '')))
   for (let k = 0; k < words.length; k++) {
     const name = base(words[k]!)
     const after = words.slice(k + 1)
-    if (PYTHON.test(name)) {
+    if (PYTHON.test(name) && !(isReader && k > command)) {
       const how = pythonRuns(after, file, stdin)
       if (how) return how
     } else if (SHELLS.test(name) && isCommand(k)) {

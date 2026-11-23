@@ -2,11 +2,13 @@
 
 The plugin lives in `plugins/swarm`; run everything below from there.
 
-## Checks (all must pass before a commit)
-- `python3 -B -m unittest discover -s tests -p "test_*.py"` - engine tests (~3 min)
-- `claude plugin test .` - host tests for `hooks/*.test.ts(x)`; 5 s limit per test
-- `claude plugin validate .` - must print no "not type-checked" warning
-- `bunx tsc --noEmit` and `bun test hooks/units.test.ts hooks/graph.test.tsx`
+## Checks
+- `python3 -B tests/check.py` - runs the checks the uncommitted changes need, and only those. It must pass before a commit. `--base origin/main` covers a whole branch; `--list` prints the selection and runs nothing.
+- `python3 -B tests/check.py --all` - everything. It must pass before a version bump; CI runs the same checks on every push.
+- What it selects from: the engine tests (`tests/test_board.py`, `tests/test_verify.py`, one test per process, several at once), `bunx tsc --noEmit`, `bun test hooks/units.test.ts hooks/graph.test.tsx`, `claude plugin test .` (host tests for `hooks/*.test.ts(x)`; 5 s limit per test) and `claude plugin validate .` (must print no "not type-checked" warning).
+- An edit inside one test of `tests/test_*.py` runs that test alone. A change to `board.py` or `verify.py` runs both engine modules. Text-only changes (skills, agents, README) run the validation alone.
+- A new path that needs a check gets a line in `RULES` in `tests/check.py`.
+- The engine tests call `board.py` inside the test process (`tests/engine.py`), not as a process per command. `SWARM_TEST_PROCESSES=1` makes every call a real process, as CI does; a test about two commands at once, or about a process itself, uses `subprocess` directly. `CHECK_JOBS=<n>` sets how many tests run at once.
 
 ## Layout
 - `skills/swarm/scripts/board.py`, `verify.py` - the engine; tests in `tests/`

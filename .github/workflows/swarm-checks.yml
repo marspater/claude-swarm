@@ -21,7 +21,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - run: python3 -B -m unittest discover -s tests -p 'test_*.py'
+      # Every board command as a real process, as a member runs it: local runs call it in-process for speed.
+      - run: SWARM_TEST_PROCESSES=1 python3 -B tests/check.py --all --only py
 
   plugin:
     name: Plugin validation and host tests

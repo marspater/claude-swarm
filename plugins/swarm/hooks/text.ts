@@ -109,7 +109,8 @@ export function head(text: string, length: number): string {
       if (index + segment.length > length) break
       end = index + segment.length
     }
-    if (end > 0) return text.slice(0, end)
+    // A first cluster longer than the cut leaves nothing: half of one is no character.
+    return text.slice(0, end)
   }
   const last = text.charCodeAt(length - 1)
   return text.slice(0, last >= 0xd800 && last <= 0xdbff ? length - 1 : length)
@@ -159,4 +160,29 @@ export function clip(text: string, length = CLIP): string {
 export function fenced(text: string): string {
   const fence = '~'.repeat(Math.max(3, ...Array.from(text.matchAll(/~+/g), run => run[0].length + 1)))
   return `${fence}\n${text}\n${fence}`
+}
+
+// The share of a sentence's words the posts must hold for that sentence to count as said already, and the fewest
+// words the posts lack that make a sentence news: a heading or a sign-off ("Summary", "Done.") is none.
+const REPEATS = 0.8
+const NEWS_WORDS = 2
+const wordsOf = (text: string) => text.toLowerCase().match(/[a-z0-9_]{4,}/g) ?? []
+const statusOf = (text: string) => text.toLowerCase().match(/\b(?:not|no|never|\w+n['’]t|fail(?:s|ed|ing|ure)?|broke|broken|errors?|pass(?:es|ed|ing)?)\b/g) ?? []
+/**
+ * Whether REPORT says nothing the POSTS do not: each of its lines and sentences has its words, nearly all, in them.
+ * Judged a sentence at a time, so a long recap that ends on one new failure is news. Seen live: a hand-back that
+ * carried a new build failure after a READY was dropped as a repeat because the READY existed.
+ * ponytail: words of four letters or more, so a one-word sentence ("Blocked.") is no news; only the negations and
+ * status words in statusOf count however short; compare phrases if a short report that differs otherwise is dropped.
+ */
+export function repeatsPosts(posts: string[], report: string): boolean {
+  const said = new Set(posts.flatMap(wordsOf))
+  const statusSaid = new Set(posts.flatMap(statusOf))
+  return report.split(/\n|(?<=[.!?;])\s+/).every(sentence => {
+    // A negation or a status word the posts never used flips what they said: "Build failed" after "Build passed".
+    if (statusOf(sentence).some(word => !statusSaid.has(word))) return false
+    const words = [...new Set(wordsOf(sentence))]
+    const unsaid = words.filter(word => !said.has(word)).length
+    return unsaid < NEWS_WORDS || words.length - unsaid >= words.length * REPEATS
+  })
 }

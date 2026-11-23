@@ -1,13 +1,13 @@
 import { expect, test } from 'claude-code/testing'
 import type { Post } from '../types'
-import { BOARD_CALL, CASE_PATTERN, COORDINATOR_READ, RUN, boardCalls, closesAfter, launches, makesCommit, runsNamed, scanShell, scriptsRun, shellLaunch, shellWords, splitShellSegments, substitutions, unwrap, wakeMessage, wakeSequence } from './command'
+import { BOARD_CALL, CASE_PATTERN, COORDINATOR_READ, RUN, boardCalls, closesAfter, launches, makesCommit, runsNamed, scanShell, scriptsRun, shellLaunch, shellWords, splitShellSegments, substitutions, UNREAD, unwrap, wakeMessage, wakeSequence } from './command'
 import { edgesOf, graphSvg, isBroadcast } from './graph'
 import { actsAsAnother, commitsInSharedCheckout, waitsOnLooseMatch } from './guard'
 import { BOARD_ACTIONS, hiveArt, memberBee, toolMood, toolSummary } from './hive'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, SWARM_AGENTS, familyOf, latestOf, sizedEffort } from './models'
 import { progressBar, semanticIcon, statusCss, statusDot, statusKey, swarmEmblem } from './palette'
 import { END, budgetOf, contextState, detailOf, heldAt, isWindingDown, findAgent, ledger, mentions, parse, parsePosts, postFields, statusOf, targets, tokensUsed } from './roster'
-import { bodyOf, chipped, clean, clip, compact, fenceAfter, fenced, hasQuestion, head, kindOf, openedText, stripKind, unquoted, verdictOf } from './text'
+import { bodyOf, chipped, clean, clip, compact, fenceAfter, fenced, hasQuestion, head, kindOf, openedText, repeatsPosts, stripKind, unquoted, verdictOf } from './text'
 
 const post = (text: string, to: string[] = []): Post => ({ seq: 1, agent: 'parser', to, text, time: '2026-11-16T14:03:22+0100' })
 
@@ -164,6 +164,19 @@ test('wave 1/2 design, text, hive and palette helpers', async () => {
   expect(stripKind('NOT PASSED: line 4')).toBe('line 4')
 
   expect(head('a👍🏽b', 3)).toBe('a')
+  // a first cluster longer than the cut leaves nothing, never half of it
+  expect(head('👨‍👩‍👧‍👦abc', 3)).toBe('')
+
+  // a report repeats the posts only when each of its sentences does: one new line among old ones is news
+  const said = ['READY\nThree findings: ST1 restoreBackup loses the edition when the tension write throws.']
+  expect(repeatsPosts(said, `Three findings. ${'ST1 restoreBackup loses the edition when the tension write throws. '.repeat(8)}`)).toBe(true)
+  expect(repeatsPosts(said, `Three findings. ${'ST1 restoreBackup loses the edition when the tension write throws. '.repeat(8)}\nThe build now fails: TypeError in src/lexer.ts`)).toBe(false)
+  expect([repeatsPosts(['READY\nparser done'], 'done'), repeatsPosts(['READY\nparser done'], 'ok.'), repeatsPosts(['READY\nparser done'], 'Build broke.')]).toEqual([true, true, false])
+  // a sentence that flips the status the posts gave is news, short as it is
+  const passed = ['READY\nBuild passed and the migration is safe to run.']
+  expect([repeatsPosts(passed, 'Build passed.'), repeatsPosts(passed, 'Build failed.'), repeatsPosts(passed, 'The migration is not safe to run.'), repeatsPosts(passed, "The migration isn't safe.")]).toEqual([true, false, false, false])
+  // a heading, a sign-off or a pointer to the post adds no news
+  expect([repeatsPosts(said, `Summary\n${said[0]!.slice(6)}\nDone.`), repeatsPosts(said, 'Done. READY is on the board as #2.')]).toEqual([true, true])
   expect(clean('hi\u001b]0;title\u0007\u202e\u2066there\u2069')).toBe('hithere')
 
   const fenced = clip(`\`\`\`ts\n${'x'.repeat(480)}\n\`\`\``)
@@ -312,6 +325,9 @@ test('F1: a board command of repeated escapes is refused in linear time', () => 
     expect(BOARD_CALL.exec('python3 board.py ' + '\\a'.repeat(n))).toBeNull()
     expect(BOARD_CALL.exec('python3 ' + '\\a'.repeat(n) + ' x y')).toBeNull()
     expect(boardCalls('python3 -c ' + '\\a'.repeat(n))).toEqual([])
+    // a wrapper's options, valued or not, are read in linear time
+    expect(unwrap('env' + ' -u -u'.repeat(n) + ' "x').text.length).toBeGreaterThan(0)
+    expect(unwrap('exec' + ' -a'.repeat(n) + ' \'x').text.length).toBeGreaterThan(0)
   }
   expect(Date.now() - started).toBeLessThan(500)
 })
@@ -337,6 +353,39 @@ test('F2: the shell scanner reads arithmetic, $\'…\' quoting, substitutions an
   for (const opener of ["<<'EO'F", "<<E'O'F", '<<""EOF', '<<\\EOF', '<<-EOF']) {
     expect(splitShellSegments(`cat ${opener}\nx && git commit -m wip\nEOF\necho after`), opener).toEqual([`cat ${opener}`, 'echo after'])
   }
+  // a $'…' delimiter takes its escapes; $"…" bash and zsh read apart, and a body that never closes, are unread
+  expect(splitShellSegments("cat <<$'E\\x4fF'\nx\nEOF\ngit commit -m wip")).toEqual(["cat <<$'E\\x4fF'", 'git commit -m wip'])
+  expect(scanShell('cat <<$"EOF"\nx\nEOF\ngit commit -m wip')[0]?.unread).toBe(true)
+  expect(scanShell('cat <<EOF\nx\nEOX\ngit commit -m wip')[0]?.unread).toBe(true)
+  expect(scanShell('cat <<EOF\nx\nEOF\ngit commit -m wip')[0]?.unread).toBeUndefined()
+  // a quote or an expansion inside arithmetic holds no close
+  expect(splitShellSegments('echo $(( ${x:-"))"} )) ; python3 board.py DIR show')).toEqual(['echo $(( ${x:-"))"} ))', 'python3 board.py DIR show'])
+  expect(boardCalls('echo $(( ${x:-"))"} )) ; python3 board.py DIR show').map(call => call.action)).toEqual(['show'])
+  expect(splitShellSegments('(( x = $(echo "))") )) && git commit -m wip')).toEqual(['(( x = $(echo "))") ))', 'git commit -m wip'])
+  // nested arithmetic that never closes is read again as a substitution: that must not double the work at each level
+  const started = performance.now()
+  for (const unit of ['$(( ', '(( $(( ', '$(( $( ', '"$(( ', '$(( `']) expect(scanShell(`echo ${unit.repeat(300)}`).length).toBeGreaterThan(0)
+  expect(performance.now() - started).toBeLessThan(2000)
+  // $'…' escapes read as bash and zsh both read them; a form they read apart is unread
+  expect(shellWords("git $'\\x63ommit' $'\\143\\x41' $'a\\tb\\e' $'\\777'")).toEqual(['git', 'commit', 'cA', 'a\tb\x1b', '\xff'])
+  for (const form of ["$'\\u0063'", "$'\\U00000063'", "$'\\cA'", "$'\\z'", "$'\\x'", "$'a\\0b'", "$'\\400'"]) {
+    expect([form, shellWords(form)[0]!.includes(UNREAD)]).toEqual([form, true])
+  }
+  expect(shellWords(`"$"'\\x63' \\$'\\x63'`)).toEqual(['$\\x63', '$\\x63'])
+  // a wrapper's option takes its value with it: the word after is the command
+  for (const [wrapped, command] of [
+    ['exec -a foo ./board.py DIR post bob hi', './board.py DIR post bob hi'],
+    ['exec -la foo git commit', 'git commit'],
+    ['exec -al foo git commit', 'foo git commit'],
+    ['env -C /p -u X ./board.py DIR show', './board.py DIR show'],
+    ['env -iu X git commit', 'git commit'],
+    ["env -S 'a b' --chdir /p git commit", 'git commit'],
+    ['env -uX git commit', 'git commit'],
+    ['time -o out -f "%e s" git commit', 'git commit'],
+  ]) expect([wrapped, unwrap(wrapped!).text]).toEqual([wrapped, command])
+  // env's other options take their values before -S: what -S splits still runs
+  expect(scriptsRun("env -u FOO -S 'python3 board.py DIR post bob hi'")).toContain('python3 board.py DIR post bob hi')
+  expect(scriptsRun("env --unset FOO -C /p -S 'git commit'")).toContain('git commit')
   // what stands before a command, and the words of it as the shell runs them
   expect(unwrap('if ! env -u X git commit')).toEqual({ text: 'git commit', negated: true })
   expect(shellWords(`"git" \\commit -m 'a b' $'c\\'d' e\\ f`)).toEqual(['git', 'commit', '-m', 'a b', "c'd", 'e f'])
@@ -425,6 +474,10 @@ test('F19: a malformed roster, token count or report draws what it can, and no l
   expect(none.members.map(m => m.name)).toEqual(['coordinator', 'art'])
   expect(none.tokens).toEqual({ a: 7, b: 0 })
   expect(parse('/p/.swarm/x-20261116-101010', board, roster, [], 2).posts.map(p => p.seq)).toEqual([2, 3])
+  // members or token counts that are no plain object make no members and no actors
+  const shapeless = parse('/p/.swarm/x-20261116-101010', '', JSON.stringify({ title: 'T', usage: { tokens: 'abc' }, members: [{ role: 'worker', last_read_seq: 0 }] }), [])
+  expect([shapeless.members, shapeless.tokens]).toEqual([[], {}])
+  expect([tokensUsed('abc' as never), tokensUsed([5] as never)]).toEqual([0, 0])
   expect(detailOf('waiting', { type: 'worker' } as never, false)).toBe('')
 })
 
@@ -629,6 +682,12 @@ test('an unquoted heredoc body runs its substitutions; a quoted one is text', ()
   expect(scanShell('cat <<EOF\n$(git commit -m x) and `git push`\nEOF\necho done')[0]?.inner).toEqual(['git commit -m x', 'git push'])
   expect(scanShell("cat <<'EOF'\n$(git commit -m x)\nEOF")[0]?.inner).toBeUndefined()
   expect(scanShell('cat <<EOF\n\\$(git commit -m x)\nEOF')[0]?.inner).toBeUndefined()
+  // an escaped backtick inside a backtick substitution nests one: the inner command is listed whole
+  expect(substitutions('cat <<EOF\n`echo \\`git commit -m x\\``\nEOF')).toEqual(['echo `git commit -m x`', 'git commit -m x'])
+  // what a body substitutes belongs to the statement that opened it, and each body is read as its own heredoc
+  expect(scanShell('cat <<EOF; cd /tmp || exit; echo hi\n$(git commit -m x)\nEOF').map(s => s.inner)).toEqual([['git commit -m x'], undefined, undefined, undefined])
+  expect(scanShell("cat <<'A' <<B\n$(git commit -m x)\nA\n$(git push)\nB")[0]?.inner).toEqual(['git push'])
+  expect(scanShell("cat <<A <<'B'\n$(git commit -m x)\nA\n$(git push)\nB")[0]?.inner).toEqual(['git commit -m x'])
 })
 
 test('a case is read as patterns and arms: a pattern\'s | and ) split and close nothing, and ;; ends an arm', () => {
@@ -806,6 +865,12 @@ test('a turn\'s end the board did not take stays owed under the turn\'s own repo
   expect([book.owed().map(([turnId]) => turnId), book.charge('t', ten)]).toEqual([['t'], 0])
   book.landed(book.of('t')!, 10, END)
   expect([book.owed().length, book.charge('t', ten)]).toEqual([0, 0])
+  // a repeated end that carries no usage leaves the pending end's detail as it was
+  const twice = ledger()
+  twice.charge('d', ten)
+  twice.held(twice.of('d')!, 10)
+  twice.charge('d', undefined)
+  expect(twice.detail(twice.of('d')!, END)).toBe('10,0,0,0')
 })
 
 test('a turn\'s end charges its whole usage less what the board took and what its steps still owe, cached reads rounded once over the turn', () => {
@@ -981,6 +1046,29 @@ test('guard regressions (#1-#4): parameter-expansion quote flip, unclosed quotes
   expect(await commitsInSharedCheckout($, 'git -calias.x=status x', '/project')).toBe(false)
   expect(await commitsInSharedCheckout($, 'git -ccolor.ui=never commit -m example', '/project')).toBe(false)
   expect(await commitsInSharedCheckout($, 'git --config-env=alias.x=GIT_ACTION x', '/project')).toBe(true)
+
+  // heredoc delimiters, nested backticks, $'…' escapes, a body's owner and a function's body hide no commit
+  for (const cmd of [
+    "cat <<$'EOF'\nhello\nEOF\ngit commit -m x",
+    'cat <<$"EOF"\nhello\nEOF\ngit commit -m x',
+    'cat <<EOF\n`echo \\`git commit -m x\\``\nEOF',
+    "git $'\\x63ommit' -m hi",
+    "git $'\\U00000063'ommit -m hi",
+    "$'\\U00000067'it status",
+    "X=git; Y=$'\\U00000063'ommit; $X $Y",
+    'cat <<EOF; cd /tmp || exit; echo hi\n$(git commit -m x)\nEOF',
+    'f() if true; then cd /tmp || exit; else cd /tmp || exit; fi; git commit -m x',
+    'f() while cd /tmp; do exit; done; git commit -m x',
+    'f() case a in *) cd /tmp || exit;; esac; git commit -m x',
+    // a redirection between git and its command is read past, and the command is still a commit
+    'git >/tmp/out commit -m x',
+    'git 2>/dev/null commit -m x',
+    'git 2> /dev/null -C . commit -m x',
+    "git '>x' status",
+  ]) expect([cmd, await commitsInSharedCheckout($, cmd, '/project')]).toEqual([cmd, true])
+  for (const cmd of ['git 2>/dev/null status', 'git >/tmp/out diff', 'git 2> /dev/null log', "echo $'\\cA'"]) {
+    expect([cmd, await commitsInSharedCheckout($, cmd, '/project')]).toEqual([cmd, false])
+  }
 })
 
 test('guard and roster regressions (#5-#8): BOARD_CALL/actsAsAnother false positives, silent read-only exclusion, and duplicate landed accounting', () => {
@@ -992,6 +1080,47 @@ test('guard and roster regressions (#5-#8): BOARD_CALL/actsAsAnother false posit
   expect(actsAsAnother('python3 --check-hash-based-pycs always /p/board.py DIR show', 'parser', { role: 'worker', last_read_seq: 0 })).toBeUndefined()
   expect(actsAsAnother('case "$x" in "a b") python3 /p/board.py DIR read parser ;; esac', 'parser', { role: 'worker', last_read_seq: 0 })).toBeUndefined()
   expect(actsAsAnother('case "$x" in ("a|b") python3 /p/board.py DIR show ;; esac', 'parser', { role: 'worker', last_read_seq: 0 })).toBeUndefined()
+
+  // a board or verify command hidden behind a heredoc, an escape, a wrapper's value, a dynamic script or a variable is refused
+  const worker = { role: 'worker' as const, last_read_seq: 0 }
+  for (const cmd of [
+    "cat <<$'EOF'\nhello\nEOF\npython3 board.py .swarm/run post bob hi",
+    'cat <<EOF\n`echo \\`python3 board.py .swarm/run post bob hi\\``\nEOF',
+    "python3 $'\\x62oard.py' .swarm/run post bob hi",
+    "python3 board.py .swarm/run post $'\\x62ob' hi",
+    "python3 $'\\U00000062'oard.py .swarm/run post bob hi",
+    "B=$'\\U00000062'oard.py; python3 \"$B\" .swarm/run post bob hi",
+    'exec -a foo ./board.py .swarm/run post bob hi',
+    'exec -a foo ./verify.py .swarm/run . accept cand1',
+    'env -C /path ./board.py .swarm/run post bob hi',
+    "env -u FOO -S 'python3 board.py .swarm/run post bob hi'",
+    'python3 "$(echo board.py)" .swarm/run post bob hi',
+    'python3 $(echo board.py) .swarm/run post bob hi',
+    'B=board; python3 "${B}.py" .swarm/run post bob hi',
+    'B=board.py; python3 "$B" .swarm/run post bob hi; B=harmless.py',
+    'declare B=board.py; python3 "$B" .swarm/run post bob hi',
+    'local -r B=board.py; python3 "$B" .swarm/run post bob hi',
+    'export -- B=board.py; python3 "$B" .swarm/run post bob hi',
+    'for B in harmless.py board.py; do python3 "$B" .swarm/run post bob hi; done',
+    'P=python3; S=board.py; $P "$S" .swarm/run post bob hi; S=x',
+    // a python launched by a search that runs what it finds, or by a wrapper this does not list, is still read
+    'find . -exec python3 board.py .swarm/run post bob hi \\;',
+    'f() { python3 board.py .swarm/run post bob hi; }; f',
+    'coproc python3 board.py .swarm/run post bob hi',
+    "flock /tmp/lk python3 -c 'exec(open(\"board.py\").read())'",
+    'git bisect run python3 board.py .swarm/run post bob hi',
+    '/usr/bin/grep x; python3 board.py .swarm/run post bob hi',
+    'grep -n x board.py && python3 board.py .swarm/run post bob hi',
+  ]) expect([cmd, actsAsAnother(cmd, 'parser', worker) !== undefined]).toEqual([cmd, true])
+  for (const cmd of [
+    'grep -n python3 scripts/board.py',
+    'git log -S python3 -- board.py',
+    'git grep -e python3 board.py',
+    'python3 "${CLAUDE_PLUGIN_ROOT}/skills/swarm/scripts/board.py" DIR post parser hi',
+    'python3 "$R/board.py" DIR post parser hi',
+    "python3 board.py DIR post $'\\x70arser' hi",
+    'exec -a foo ./board.py DIR read parser',
+  ]) expect([cmd, actsAsAnother(cmd, 'parser', worker)]).toEqual([cmd, undefined])
 
   // #6: < file before member name in board.py and --timeout 60 before operands in verify.py
   expect(actsAsAnother('python3 /p/board.py DIR ready < report.txt parser', 'parser', { role: 'worker', last_read_seq: 0 })).toBeUndefined()
@@ -1019,6 +1148,9 @@ test('guard and roster regressions (#5-#8): BOARD_CALL/actsAsAnother false posit
     members: { scout: idleHint, arch: idleHint, cons: idleHint, dev: idleHint },
   })
   expect(parsed.attention.filter(item => item.kind === 'silent').map(item => item.member)).toEqual(['dev'])
+  // a worker the attention report says is paused on its own budget is not silent, whatever the roster says yet
+  const paused = parse('/r/.swarm/x-20260101-000000', boardJsonl, rosterJson, agents, 300, { items: [], members: { dev: { ...idleHint, paused: true } } })
+  expect(paused.attention.filter(item => item.kind === 'silent')).toEqual([])
 
   // #8: duplicate/concurrent turn.complete charge/landed calls do not double-count in-memory turn.charged
   const book = ledger()
@@ -1181,7 +1313,13 @@ test('a wait on a substring process match is caught; an exact match or a single 
     'sleep 1; pgrep --uid 1000 -f xcodebuild',
     'P=pgrep; while $P -f xcodebuild; do sleep 5; done; echo pgrep -f done',
     `sh -c 'while pgrep -f xcodebuild; do sleep 5; done'`,
-  ]) expect(waitsOnLooseMatch(stuck)).toBe(true)
+    // a later value does not undo an earlier one, and a wrapper's own value is no command
+    'P=pgrep; while $P -f xcodebuild; do sleep 1; done; P=true',
+    'while true; do exec -a foo pgrep -f xcodebuild; sleep 1; done',
+    // an -x inside a valued option's attached value is no -x
+    'while pgrep -ux -f xcodebuild; do sleep 1; done',
+    'while pgrep -Gx -f xcodebuild; do sleep 1; done',
+  ]) expect([stuck, waitsOnLooseMatch(stuck)]).toEqual([stuck, true])
   for (const fine of [
     'while pgrep -x xcodebuild >/dev/null; do sleep 10; done',
     'while pgrep -fx "xcodebuild -quiet" >/dev/null; do sleep 10; done',
@@ -1193,7 +1331,10 @@ test('a wait on a substring process match is caught; an exact match or a single 
     'pgrep -f "while true" | head -1',
     'while pgrep -u me -x xcodebuild; do sleep 5; done',
     'while pgrep --full --exact "xcodebuild -quiet"; do sleep 5; done',
-  ]) expect(waitsOnLooseMatch(fine)).toBe(false)
+    // an f inside a valued option's attached value is no -f
+    'while pgrep -ufoo xcodebuild; do sleep 1; done',
+    'while pgrep -xu foo -f xcodebuild; do sleep 1; done',
+  ]) expect([fine, waitsOnLooseMatch(fine)]).toEqual([fine, false])
 })
 
 test('a fenced report wakes nobody it names, whatever tildes it holds', () => {
@@ -1239,10 +1380,13 @@ test('guard handles ambiguous commands, parent repositories and arithmetic shift
 test('a glob that names the board script and inline code that names a commit are read as what they run', async () => {
   const $ = mockGuardEngine()
   const worker = { role: 'worker', last_read_seq: 0 }
-  for (const hidden of ['python3 /p/board.p? DIR close', 'python3 /p/boar* DIR close', 'python3 /p/[b]oard.py DIR close', 'python3 /p/verify.p[xy] DIR app accept c1']) {
+  for (const hidden of ['python3 /p/board.p? DIR close', 'python3 /p/boar* DIR close', 'python3 /p/[b]oard.py DIR close', 'python3 /p/verify.p[xy] DIR app accept c1',
+    // a variable that holds the command and the glob, and too many ways to fill the words in to try one by one
+    "for P in 'python3 /p/boar*'; do $P DIR close; done", "for P in 'env /p/[b]oard.p?'; do $P DIR close; done",
+    'for X in a b c d e; do python3 /p/boar* DIR close $X $X $X; done', "for X in a b c d e; do python3 /p/bo''ard.py DIR close $X $X $X; done"]) {
     expect([hidden, actsAsAnother(hidden, 'parser', worker) !== undefined]).toEqual([hidden, true])
   }
-  for (const plain of ['python3 /p/board.py DIR read parser', 'ls /p/*.md', 'python3 /p/bored.p? DIR close']) {
+  for (const plain of ['python3 /p/board.py DIR read parser', 'ls /p/*.md', 'python3 /p/bored.p? DIR close', "for P in 'python3 /p/boar*'; do echo $P; done", 'for X in a b c d e; do ls *.md $X $X $X; done']) {
     expect([plain, actsAsAnother(plain, 'parser', worker)]).toEqual([plain, undefined])
   }
   for (const commits of [`python3 -c "import subprocess; subprocess.run(['git','commit','-am','x'])"`, `node -e "require('child_process').execFileSync('git', ['commit', '-am', 'x'])"`]) {

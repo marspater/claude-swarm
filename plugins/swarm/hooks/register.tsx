@@ -7,7 +7,7 @@ import { COORDINATOR_READ, RUN, boardCalls, type ParsedBoardCall, runsNamed, sca
 import { actsAsAnother, commitsInSharedCheckout, normalizePath, resolveRealPath, waitsOnLooseMatch } from './guard'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, LATEST, SPECIALISTS, SWARM_AGENTS, familyOf, latestOf, sizedEffort } from './models'
 import { CONTEXT_EARLY, CONTEXT_STOP, END, KEPT, budgetOf, contextState, findAgent, heldAt, isWindingDown, ledger, memberNamed, mentions, parse, parsePosts, postFields, targets, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
-import { CLIP, bodyOf, chipped, clean, clip, compact, fenceAfter, fenced, hasQuestion, head, kindOf, openedText, verdictOf, type Fence } from './text'
+import { CLIP, bodyOf, chipped, clean, clip, compact, fenceAfter, fenced, hasQuestion, head, kindOf, openedText, repeatsPosts, verdictOf, type Fence } from './text'
 import { liveIndicator, memberAccents, progressBar, progressUnits, semanticIcon, statusDot, statusInk, swarmEmblem, type BarTone, type EmblemState } from './palette'
 import { MEMBER_BEE_SIZE, hiveArt, memberBee, toolMood, toolSummary, type Mood } from './hive'
 import { MIN_LABEL_PX, SVG_LIMIT, drawGraph, edgesOf, graphHeight, isBroadcast, labelPx, pairOf, visibleMembers } from './graph'
@@ -311,6 +311,8 @@ let wakeNext = ''
 const heldBy = new Map<string, number>()
 const contextTold = new Map<string, 'note' | 'stop'>()
 let windingDown = ''
+// The budget the wind-down was told at: a raised one ends it, so 80% of the new budget is told again.
+let windBudget = 0
 const windTold = new Set<string>()
 const postTold = new Set<string>()
 function forgetSpend(): void {
@@ -319,6 +321,12 @@ function forgetSpend(): void {
   contextTold.clear()
   windTold.clear()
   windingDown = ''
+}
+/** A run whose budget was changed and is no longer near it is no longer winding down. */
+function windUp(dir: string, used: number, budget: number): void {
+  if (windingDown !== dir || budget === windBudget || isWindingDown(used, budget)) return
+  windingDown = ''
+  windTold.clear()
 }
 const memberOfAgent = (agentId: string) => {
   const address = teammates.get(agentId)
@@ -710,6 +718,8 @@ function resetMonitoring(): void {
   specialistWakes = []
   startupReads.clear()
   relayRun = relayHinted = relayPrompted = ''
+  windingDown = ''
+  windTold.clear()
 }
 
 function boardCommand($: EngineInterface, directory: string, args: string[], stdin?: string) {
@@ -1512,6 +1522,7 @@ async function refresh($: EngineInterface): Promise<void> {
     halted = owned && !state.closed && (state.paused || isSpent)
       ? { dir, why: state.paused ? `paused (${state.paused})` : 'over its token budget' }
       : undefined
+    windUp(dir, tokensUsed(state.usage?.tokens), budgetOf(state))
     if (drove) ownedRoster = { dir, closed: state.closed === true, members: state.members }
     else ownedRoster = undefined
     const agentStates = JSON.stringify(agents.map(a => [a.id, a.teammateId, a.status]))
@@ -1761,13 +1772,14 @@ function senderOf(e: { text: string; origin: { kind: string } }): string | undef
  */
 const HANDBACK_MIN = 400
 const HANDBACK_PART = 11_000
-// The share of a closing report's words its board report must hold for the closing words to count as a repeat.
-const HANDBACK_REPEATS = 0.8
+const HANDBACK = /<agent-message from="([^"]+)">\s*\[Subagent hand-back\]\s*([\s\S]*?)\s*<\/agent-message>/
 const HANDBACK_FRAME = /^The text below is the final report of a subagent[\s\S]*?The report follows:[ \t]*\n?/
+// The host frames every hand-back with a note of its own: what the member said is measured and compared without it.
+const unframed = (body: string) => body.replace(HANDBACK_FRAME, '').trim()
 async function mirrorHandback($: EngineInterface, e: { text: string; origin: { kind: string } }): Promise<string | undefined> {
   const roster = ownedRoster
   if (e.origin.kind !== 'peer' || !roster || roster.closed) return undefined
-  const found = /<agent-message from="([^"]+)">\s*\[Subagent hand-back\]\s*([\s\S]*?)\s*<\/agent-message>/.exec(e.text)
+  const found = HANDBACK.exec(e.text)
   const body = found?.[2] ?? ''
   if (!found) return undefined
   const from = found[1]!
@@ -1784,7 +1796,7 @@ async function mirrorHandback($: EngineInterface, e: { text: string; origin: { k
   const [name, member] = entry
   // The host frames every hand-back with a note of its own, longer than the least report worth a post: measured
   // and posted without it. Seen live: a one-line status was mirrored because its frame alone passed the minimum.
-  const report = body.replace(HANDBACK_FRAME, '').trim()
+  const report = unframed(body)
   const newest = parsePosts(board, fresh.members).findLast(post => post.agent === name)
   if (newest && newest.seq > Number(member.last_nudged_seq ?? 0)) {
     const compactBody = report.replace(/\s+/g, ' ').trim()
@@ -1794,14 +1806,9 @@ async function mirrorHandback($: EngineInterface, e: { text: string; origin: { k
     // A turn that ended on its own report has said it, even once the member read that post back: closing words that
     // repeat the report are not posted again. Seen live: a READY read back after an UNREAD note went up a second time
     // as a hand-back. Words the report does not hold are news (work done after it), and are posted as before.
-    if (report.length >= HANDBACK_MIN && ['READY', 'FINDING', 'VERIFIED', 'NOT PASSED'].includes(kindOf(newest.text)?.label ?? '')) {
-      const wordsOf = (text: string) => new Set(text.toLowerCase().match(/[a-z0-9_]{4,}/g) ?? [])
-      const said = wordsOf(newest.text)
-      const closing = [...wordsOf(report)]
-      // A replacer function: the report's own `$&` or `$'` must reach the notice as typed.
-      if (closing.length > 0 && closing.filter(word => said.has(word)).length >= closing.length * HANDBACK_REPEATS) {
-        return e.text.replace(body, () => `@${name} reported on the board in post #${newest.seq}. Its closing words began: ${clip(compactBody, 300)}`)
-      }
+    // A replacer function: the report's own `$&` or `$'` must reach the notice as typed.
+    if (report.length >= HANDBACK_MIN && ['READY', 'FINDING', 'VERIFIED', 'NOT PASSED'].includes(kindOf(newest.text)?.label ?? '') && repeatsPosts([newest.text], report)) {
+      return e.text.replace(body, () => `@${name} reported on the board in post #${newest.seq}. Its closing words began: ${clip(compactBody, 300)}`)
     }
     if (newest.seq > member.last_read_seq) return undefined
   }
@@ -1859,7 +1866,12 @@ async function repeatsBoard($: EngineInterface, e: { text: string; origin: { kin
   if (!found) return false
   const [name, member] = found
   const woken = Number(member.last_nudged_seq ?? 0)
-  const newest = parsePosts(board, fresh.members).reduce((seq, post) => post.agent === name && post.seq > seq ? post.seq : seq, 0)
+  const since = parsePosts(board, fresh.members).filter(post => post.agent === name && post.seq > woken)
+  const newest = since.reduce((seq, post) => post.seq > seq ? post.seq : seq, 0)
+  // Only what the member's posts since its wake already say: a hand-back with news is heard, whatever came before it.
+  // Seen live: a READY, then a hand-back with a new build failure, dropped because the READY was there.
+  const handedBack = HANDBACK.exec(e.text)
+  if (kind === 'peer' && (!handedBack || !repeatsPosts(since.map(post => post.text), unframed(handedBack[2]!)))) return false
   const key = `${roster.dir}\n${name}`
   const used = boardDrops.get(key)
   // Only a post newer than its last wake, and one turn's end per post: a member that read its wake and posted
@@ -2141,6 +2153,17 @@ function stoppedMember(agentId: string, reporting = false): string | undefined {
   return undefined
 }
 
+/** A member's command that is nothing but the board's `ready` or `post`: its report, which a pause lets through. */
+function reportsOnly(e: { agentId?: string; tool: string; command?: unknown }): boolean {
+  const said = e.agentId !== undefined && e.tool === 'Bash' ? String(e.command) : ''
+  const reports = boardCalls(said)
+  return reports.length > 0 && reports.every(c => (c.action === 'ready' || c.action === 'post') && !c.piped) &&
+    splitShellSegments(said).length === reports.length && substitutions(said).length === 0 && !writesFile(said)
+}
+/** True when a command, outside its quotes, opens a file to write: any `>` but a descriptor copy such as `2>&1`, or `<>`. */
+const writesFile = (command: string) =>
+  /<>|>(?!&(?:\d+|-)(?:\s|$))/.test(command.replace(/\$'(?:\\[\s\S]|[^\\'])*'?|'[^']*'?|"(?:\\[\s\S]|[^\\"])*"?|\\[\s\S]/g, '_'))
+
 const OVER = 'This Swarm run is over and its conversation drives another run now, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped.'
 async function refusal($: EngineInterface, agentId: string | undefined, reporting = false): Promise<string | undefined> {
   if (agentId === undefined) return isKillTurn ? 'The user ended the Swarm run with /swarm-kill. End your turn now, in one line.' : undefined
@@ -2180,7 +2203,7 @@ async function refusal($: EngineInterface, agentId: string | undefined, reportin
       } else if (stoppedIds.has(agentId) || (address !== undefined && stoppedIds.has(address))) {
         retired = new Set([...retired, ...stoppedIds])
       }
-      return stoppedMember(agentId)
+      return stoppedMember(agentId, reporting)
     } catch {
       return undefined
     }
@@ -2418,6 +2441,11 @@ async function reloadBrowsed($: EngineInterface): Promise<void> {
   }
 }
 
+/**
+ * A run's folder name, by which it is found among the project's runs: the board names a run by its real path, which a
+ * symlinked project folder (macOS's /tmp, say) spells otherwise than the session's folder.
+ */
+const runName = (dir: string) => dir.slice(dir.lastIndexOf('/') + 1)
 /** The project's run folders, newest first as the board orders them: `archive` and stray folders carry no run's name. */
 async function runNames($: EngineInterface, root: string): Promise<string[]> {
   const stamp = (name: string) => name.replace(/x*$/, '').slice(-15)
@@ -2431,8 +2459,8 @@ async function runNames($: EngineInterface, root: string): Promise<string[]> {
  */
 async function runFromAt($: EngineInterface, root: string, names: string[], liveDir: string, index: number, by: 1 | -1) {
   for (; index >= 0 && index < names.length; index += by) {
+    if (names[index] === runName(liveDir)) return { index, dir: liveDir }
     const dir = `${root}/${names[index]}`
-    if (dir === liveDir) return { index, dir }
     const roster = await $.fs.read(`${dir}/members.json`).catch(() => undefined)
     if (roster === undefined) continue
     try {
@@ -2457,7 +2485,7 @@ async function learnEdges($: EngineInterface, dir: string): Promise<void> {
     const root = `${await $.session.cwd()}/.swarm`
     const names = await runNames($, root)
     const liveDir = (await read($, swarm)).dir
-    const at = names.indexOf(dir.slice(root.length + 1))
+    const at = names.indexOf(runName(dir))
     if (at < 0) return
     const older = await runFromAt($, root, names, liveDir, at + 1, 1) !== undefined
     const newer = await runFromAt($, root, names, liveDir, at - 1, -1) !== undefined
@@ -2481,8 +2509,13 @@ async function browse($: EngineInterface, step: 1 | 0 | -1): Promise<void> {
     const names = step === 0 ? [] : await runNames($, root)
     if (gen !== browseGen) return
     const shownDir = (browsed ?? live).dir
-    const at = names.indexOf(shownDir.slice(root.length + 1))
+    const at = names.indexOf(runName(shownDir))
     const runFrom = (index: number, by: 1 | -1) => runFromAt($, root, names, live.dir, index, by)
+    // A run the list does not hold has no neighbours in it: from nowhere, the newest run is no older one.
+    if (step !== 0 && at < 0 && shownDir !== '') {
+      $.ui.toast('Swarm could not find this run among the project\'s runs.')
+      return
+    }
     if (step !== 0) {
       const found = await runFrom(at + step, step)
       if (gen !== browseGen) return
@@ -2998,10 +3031,7 @@ export const register: Register = on => {
     // A member's final report ends its run and spends nothing more: refused, the host demands it again each turn.
     if (e.agentId !== undefined && (e.tool as string) === 'SubagentHandback') return next(e)
     // A member's command that is nothing but the board's `ready` or `post` reports as the board tool does: let through a pause.
-    const said = e.agentId !== undefined && e.tool === 'Bash' ? String(e.command) : ''
-    const reports = boardCalls(said)
-    const reporting = reports.length > 0 && reports.every(c => (c.action === 'ready' || c.action === 'post') && !c.piped) &&
-      splitShellSegments(said).length === reports.length && substitutions(said).length === 0
+    const reporting = reportsOnly(e)
     const stopped = await refusal($, e.agentId, reporting)
     if (stopped) return { deny: stopped }
     const ceiling = e.agentId === undefined ? undefined : contextCeiling(e.agentId, e.tool)
@@ -3094,7 +3124,7 @@ export const register: Register = on => {
             const [memberName, member] = found ?? []
             if (memberName && memberName !== 'coordinator' && member) guarded = [memberName, member]
             // A roster read just now may have retired it.
-            const stoppedNow = stoppedMember(e.agentId)
+            const stoppedNow = stoppedMember(e.agentId, reporting)
             if (stoppedNow) return { deny: stoppedNow }
             // The owned roster naming this agent settles its run: a lookup that fails, by throwing or by an
             // error exit, must not let a known member past the guard.
@@ -3189,9 +3219,12 @@ export const register: Register = on => {
   }).catch((_, e, next) => {
     if (next.called) return next(e)
     if (e.agentId !== undefined) {
-      const stopped = stoppedMember(e.agentId)
+      // The parser may be what failed: a report it cannot read is no report.
+      let reporting = false
+      try { reporting = reportsOnly(e) } catch { /* refused below as any other call */ }
+      const stopped = stoppedMember(e.agentId, reporting)
       if (stopped) return { deny: stopped }
-      if (halted && agentRuns.get(e.agentId) === halted.dir) {
+      if (halted && agentRuns.get(e.agentId) === halted.dir && !reporting) {
         return { deny: `This Swarm run is ${halted.why}, so this tool call was not run. ${HAND_BACK} The coordinator decides what happens when the run resumes.` }
       }
       // A check that failed or ran out of time lets no known member edit or run arbitrary Bash unchecked; only safe
@@ -3645,6 +3678,7 @@ export const register: Register = on => {
           .then(landed => { if (sEpoch === sessionEpoch && !isEnding && landed !== false) stepped.landed(turn, landed ?? 0, e.index) })
         if (snapshot && !snapshot.isClosed && at === snapshot.dir && windingDown !== snapshot.dir && isWindingDown(tokensUsed(snapshot.tokens) + delta, snapshot.budget)) {
           windingDown = snapshot.dir
+          windBudget = snapshot.budget
           windTold.clear()
           notesOwed.push(`The run has spent 80% of its token budget of ${compact(snapshot.budget)} and pauses at 100%. Its members are being told to post what they have. Decide now what the rest is worth: narrow the remaining work, or ask the user about the budget before the pause.`)
         }
@@ -3714,7 +3748,7 @@ export const register: Register = on => {
         const ended = stepped.of(e.turnId)
         if (ended && owed > 0 && !ended.pending.has(END)) {
           stepped.held(ended, owed)
-          const taken = await account($, e.turnId, endReport(e.turnId, ended), e.agentId, owed, turnRuns.get(e.turnId) ?? at, sEpoch, stepped.detail(ended, END)).catch(() => false as const)
+          const taken = await account($, e.turnId, endReport(e.turnId, ended), e.agentId, owed, turnRuns.get(e.turnId) ?? at, sEpoch, withHeld(stepped.detail(ended, END), e.agentId)).catch(() => false as const)
           // The ledger may have been cleared meanwhile (a new session): nothing is left to mark.
           if (sEpoch !== sessionEpoch || isEnding) return next(e)
           if (taken !== false) stepped.landed(ended, taken ?? 0, END)
@@ -3926,7 +3960,9 @@ export const register: Register = on => {
       const path = `${folder}/${stamp}-${(await lookupKey($)).slice(0, 8)}.md`
       await $.fs.write(path, e.args)
       const size = e.args.length.toLocaleString('en-US')
-      args = `${e.args.slice(0, TASK_HEAD)}\n\n[Swarm: the task is ${size} characters long, and its middle is left out here. All of it is in ${path}. What you keep in this conversation is re-read at every step of the run: search that file with Grep and read the parts the task needs, all of it only when it is a specification to follow as a whole, and give a member the path and the lines to look at instead of pasting from it. The task ends:]\n\n${e.args.slice(-TASK_TAIL)}`
+      // Neither end starts or stops between the two halves of a character.
+      const tail = e.args.length - TASK_TAIL
+      args = `${head(e.args, TASK_HEAD)}\n\n[Swarm: the task is ${size} characters long, and its middle is left out here. All of it is in ${path}. What you keep in this conversation is re-read at every step of the run: search that file with Grep and read the parts the task needs, all of it only when it is a specification to follow as a whole, and give a member the path and the lines to look at instead of pasting from it. The task ends:]\n\n${e.args.slice(/[\udc00-\udfff]/.test(e.args[tail] ?? '') ? tail + 1 : tail)}`
       $.ui.toast(`Swarm: the task holds ${size} characters, so the coordinator got its start and its end and reads the rest from ${path}. Held in the conversation, every step of the run would re-read it.`)
     } catch {
       // The file could not be written: the task goes on whole.

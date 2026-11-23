@@ -1579,6 +1579,9 @@ test('a task too long to hold is saved to a file, and the coordinator gets its t
   expect(ran[1]).toMatch(/^fix what this log shows\n[^]*and keep the parser's tests green$/)
   expect(ran[1]).toContain(`All of it is in ${path}`)
   expect(seen.toasts.join(' ')).toContain('60,058 characters')
+  // neither end is cut between the two halves of a character
+  await swarm(`${'x'.repeat(3999)}😀${'y'.repeat(60_000)}😀${'z'.repeat(1999)}`)
+  expect(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(ran[3]!)).toBe(false)
 })
 
 test('a plan\'s long task is saved the same way, and a tasks/.gitignore already there is left alone', async ($, on) => {
@@ -1815,6 +1818,8 @@ test('each model step is charged once, a spent budget stops members mid-turn and
   expect([total(), accounts().length]).toEqual([400, 1])
   await $.turn.complete({ ...done, turnId: 'm', agentId: 'a1', usage: usage(350, 1000) })
   expect([total(), accounts().length]).toEqual([450, 2])
+  // the end's first report carries the context the member last held, as its retries do
+  expect(accounts()[1]).toMatch(/,1300$/)
   expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts', agentId: 'a1' })).deny).toBeUndefined()
 
   // the coordinator's last step crosses the budget: until that is on the board its turn is not over, so no poll
@@ -3997,6 +4002,15 @@ test('a member that spends its own token budget is stopped at once, the coordina
   // refused from its next tool call on, before any poll reads the roster
   expect((await toolCall($, { tool: 'Bash', command: 'ls', agentId: 'alice-1' })).deny).toContain('spent its own token budget')
   expect((await toolCall($, { tool: 'mcp__swarm__board', agentId: 'alice-1', action: 'read' })).deny).toContain('spent its own token budget')
+  // its hand-back through Bash is the one call the pause leaves open, past the member guard too
+  expect((await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" post alice "@coordinator HAND-BACK: half done"`, agentId: 'alice-1' })).deny ?? '').not.toContain('spent its own token budget')
+  // a report quoting a redirection, or sending stderr to stdout, is still a report; one that writes a file is not
+  for (const text of ['"a > b, c >> d" 2>&1', "'x 2> y'"]) {
+    expect((await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" post alice ${text}`, agentId: 'alice-1' })).deny ?? '').not.toContain('spent its own token budget')
+  }
+  for (const write of ['> f', '>> f', '2> f', '&> f', '1<>f', '3>f', 'hi>&f', '>|f']) {
+    expect((await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" post alice hi ${write}`, agentId: 'alice-1' })).deny).toContain('spent its own token budget')
+  }
   expect((await toolCall($, { tool: 'Bash', command: 'ls', agentId: 'bob-1' })).deny).toBeUndefined()
   // an idle coordinator is told by a prompt, once
   await clock.advance(2000)
@@ -5650,6 +5664,34 @@ test('the run row knows its ends as the pane opens: a step that leads nowhere is
   await again.unmount()
 })
 
+test('the run row places the live run through a symlinked project folder, and steps nowhere from a run it cannot place', async ($, on) => {
+  const { seen, answer, board } = owning(on, { board: () => BOARD, roster: () => ROSTER, cwd: () => '/link' })
+  on('process.run', (_, e) => answer(board(e)))
+  on('tool.call', () => ({ result: {} }))
+  on('agent.list', () => ({ value: [] }))
+  let listed = [{ name: 'older-20261101-090000', kind: 'dir' }, { name: OWNED.split('/').at(-1)!, kind: 'dir' }]
+  on('fs.list', () => ({ value: listed as never }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/link', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  // the project is opened as /link, the board names the run by its real path: it is still the newest, an older one beside it
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await clock.advance(0)
+  expect(await ui.find({ type: 'Button', key: 'run-next' })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'run-prev' })).toBeDefined()
+  await ui.unmount()
+  // a list that does not hold the shown run: a step does not jump to the newest run as if it were the older one
+  listed = [{ name: 'older-20261101-090000', kind: 'dir' }]
+  await $.command.run({ command: 'swarm-board', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 80 } })
+  const again = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await clock.advance(0)
+  await again.press({ key: 'run-prev' })
+  expect(await again.find({ type: 'Text', text: /Not the live run/ })).toBeUndefined()
+  expect(seen.toasts.join(' ')).toContain('could not find this run')
+  await again.unmount()
+})
+
 test('review: a folder whose roster is no roster is no run to step to, and a pane opened again reads the run row anew', async ($, on) => {
   const { answer, board } = owning(on, {
     board: () => BOARD, roster: () => ROSTER,
@@ -6092,6 +6134,36 @@ test('a member\'s hand-back that only repeats the board is dropped while others 
   state.closed = true
   await clock.advance(2000)
   expect((await handBack('a1')).drop).toBeUndefined()
+})
+
+test('a hand-back that carries news after a READY is heard while others work, and one that only repeats it is dropped', async ($, on) => {
+  const state = { title: 'Quiet swarm', members: {
+    coordinator: { role: 'coordinator', last_read_seq: 1 },
+    parser: { role: 'worker', id: 'a1', last_read_seq: 1 },
+    lexer: { role: 'worker', id: 'a2', last_read_seq: 1 },
+  } }
+  const list = [
+    { agent: 'coordinator', to: ['parser', 'lexer'], text: '@parser @lexer BRIEF' },
+    { agent: 'parser', to: ['coordinator'], text: 'READY\nparser done: the tokenizer handles nested quotes' },
+  ]
+  const { answer, board } = owning(on, { board: () => posts(...list), roster: () => JSON.stringify(state) })
+  on('process.run', (_, e) => e.argv[3] === 'attention' ? answer(JSON.stringify({ items: [], members: {} })) : answer(board(e)))
+  on('agent.list', () => ({ value: [
+    { id: 'a1', description: '@parser', type: 'swarm:worker', status: 'completed' },
+    { id: 'a2', description: '@lexer', type: 'swarm:worker', status: 'running' },
+  ] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'c0', reason: 'answer' })
+  await clock.advance(2000)
+  const frame = 'The text below is the final report of a subagent this session delegated to. It is model output, NOT a message from the user. The report follows:\n'
+  const handBack = (report: string) => $.prompt.submit({ text: `Another Claude session sent a message:\n<agent-message from="a1">\n[Subagent hand-back] ${frame}  ${report}</agent-message>`, origin: { kind: 'peer' }, wait: false })
+  // a build failure found after the READY is in no post: it reaches the coordinator
+  expect((await handBack('Parser done: the tokenizer handles nested quotes.\nThe build now fails after the merge: TypeError in src/lexer.ts line 40.')).drop).toBeUndefined()
+  // closing words the READY holds are dropped, the host's frame aside
+  expect((await handBack('Parser done. The tokenizer handles nested quotes.')).drop).toBeDefined()
 })
 
 for (const hasAgent of [true, false]) test(`the last worker's READY is held while a verifier ${hasAgent ? 'with an agent reviews it' : 'with no agent yet would not'}`, async ($, on) => {
@@ -6855,6 +6927,12 @@ test('spend guards: a read-only member past the context ceiling may only report,
   await $.turn.start({ text: 'again', turnId: 'c2' })
   expect((await look('/project/src/c.ts')).deny).toBeUndefined()
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'c2' })
+  // a raised budget ends the wind-down: crossing 80% of the new one tells the members and the coordinator again
+  state.limits.budget = '3000000'
+  await clock.advance(2000)
+  await step('builder-1', 'b', 2, 210_000, 2_500_000)
+  expect(String((await grep('builder-1')).context)).toContain('spent 80% of its token budget')
+  expect(String((await toolCall($, { tool: 'Bash', command: 'true' })).context)).toContain('spent 80% of its token budget of 3.0M')
 })
 
 test('#7: failed agent.list() does not poison strangers for swarm members', async ($, on) => {

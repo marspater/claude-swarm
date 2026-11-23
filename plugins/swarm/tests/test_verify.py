@@ -8,11 +8,14 @@ import fcntl
 import json
 import os
 import shlex
+import signal
 import subprocess
 import tempfile
 import unittest
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "skills" / "swarm" / "scripts"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import engine  # noqa: E402
 
 # A fixture's Git commands reach the temporary repository, whatever repository a hook that runs the tests is in.
 NO_GIT_ENV = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
@@ -21,6 +24,10 @@ ANSWERS = "\n".join("F%d: fixed — the change holds it" % n for n in range(1, 6
 
 
 def run(*args, cwd=None, text=None, ok=True, env=None):
+    if cwd is None and env is None and len(args) > 1 and args[0] == sys.executable and str(args[1]) == engine.BOARD:
+        code, out, err = engine.board(*args[2:], stdin=text)  # a board command: no process of its own (tests/engine.py)
+        assert (code == 0) == ok, (args, out, err)
+        return out.strip()
     result = subprocess.run(args, cwd=cwd, input=text, text=True, capture_output=True, env=env)
     assert (result.returncode == 0) == ok, (args, result.stdout, result.stderr)
     return result.stdout.strip()
@@ -2417,6 +2424,296 @@ class BaselineDiff(unittest.TestCase):
         result = subprocess.run([*gate, "test", cand, "v"], capture_output=True, text=True)
         assert result.returncode == 0 and result.stdout.splitlines()[-1].startswith("VERIFIED " + cand), (result.stdout, result.stderr)
         assert list(board.glob("baseline-*")) == [board / f"baseline-{cand}"]
+
+
+class AnalysisGaps(unittest.TestCase):
+    """Cases the diff analysis and the check runner once got wrong."""
+
+    def setUp(self):
+        sys.path.insert(0, str(SCRIPTS))
+        self.addCleanup(sys.path.remove, str(SCRIPTS))
+        import verify
+        self.verify = verify
+
+    def _prepare(self, files, changes):
+        """`prepare isolated` for one worker that turned FILES into CHANGES."""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        proj = Path(temp.name).resolve()
+
+        def g(*args):
+            return subprocess.run(["git", "-C", str(proj), *args], check=True, capture_output=True, text=True,
+                                  env=NO_GIT_ENV).stdout.strip()
+        g("init", "-b", "main")
+        for setting in (("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")):
+            g("config", *setting)
+        for name, content in files.items():
+            (proj / name).parent.mkdir(parents=True, exist_ok=True)
+            (proj / name).write_text(content)
+        g("add", ".")
+        g("commit", "-m", "init")
+        board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "gap", "init", "Gaps")
+        post = [sys.executable, SCRIPTS / "board.py", board]
+        run(*post, "member", "w")
+        run(*post, "member", "v", "role=verifier")
+        g("switch", "-q", "-c", "work")
+        for name, content in changes.items():
+            (proj / name).write_text(content)
+        g("add", "-A", "--", ":/", ":(exclude).swarm")
+        g("commit", "-q", "-m", "work")
+        commit = g("rev-parse", "HEAD")
+        g("switch", "-q", "main")
+        run(*post, "ready", "w", commit, text="done")
+        return subprocess.run([sys.executable, SCRIPTS / "verify.py", board, proj, "prepare", "isolated", "--check", "true"],
+                              capture_output=True, text=True)
+
+    def test_a_definition_replaced_by_an_alias_or_a_re_export_keeps_its_callers(self):
+        py = {"lib.py": "def helper():\n    return 1\n", "app.py": "from lib import helper\nhelper()\n"}
+        aliased = self._prepare(py, {"lib.py": "def new_helper():\n    return 1\n\n\nhelper = new_helper\n"})
+        assert aliased.returncode == 0, aliased.stderr
+        ts = {"lib.ts": "export function helper() {}\n", "app.ts": "import { helper } from './lib'\nhelper()\n"}
+        exported = self._prepare(ts, {"lib.ts": "export function newHelper() {}\nexport { newHelper as helper }\n"})
+        assert exported.returncode == 0, exported.stderr
+        gone = self._prepare(ts, {"lib.ts": "export function newHelper() {}\n"})
+        assert gone.returncode and 'app.ts:1 still refers to "helper"' in gone.stderr, gone.stderr
+
+    def test_a_nested_import_or_export_is_no_re_export(self):
+        py = {"lib.py": "def helper():\n    return 1\n", "app.py": "from lib import helper\nhelper()\n"}
+        nested = self._prepare(py, {"lib.py": "def run():\n    from other import helper\n    return helper()\n",
+                                    "other.py": "def helper():\n    return 1\n"})
+        assert nested.returncode and 'app.py:1 still refers to "helper"' in nested.stderr, nested.stderr
+        ts = {"lib.ts": "export function helper() {}\n", "app.ts": "import { helper } from './lib'\nhelper()\n"}
+        ambient = self._prepare(ts, {"lib.ts": "export function newHelper() {}\ndeclare module 'x' {\n  export { helper } from './other'\n}\n"})
+        assert ambient.returncode and 'app.ts:1 still refers to "helper"' in ambient.stderr, ambient.stderr
+
+    def test_a_removed_line_that_looks_like_a_patch_header_is_a_removed_line(self):
+        diff = ("diff --git a/m.ts b/m.ts\n--- a/m.ts\n+++ b/m.ts\n@@ -1,3 +0,0 @@\n--- /dev/null\n-export const gone = 1\n"
+                "--- a/other.ts\n-export const lost = 1\n@@ -9 +7 @@\n+++ b/other.ts\n+export const lost = 2\n")
+        assert self.verify.removed_public_symbols(diff) == {"gone": ["m.ts"]}
+
+    def test_output_left_in_the_pipe_after_exit_still_counts_toward_the_limit(self):
+        from unittest import mock
+        process = subprocess.Popen(["/bin/sh", "-c", "head -c 1000 /dev/zero"], stdout=subprocess.PIPE, start_new_session=True)
+        self.addCleanup(process.stdout.close)
+        process.wait()
+        # check_output's cleanup ignores these signals; run_check's finally would restore them.
+        for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            self.addCleanup(signal.signal, number, signal.getsignal(number))
+        with tempfile.TemporaryFile() as output, mock.patch.object(self.verify, "MAX_CHECK_OUTPUT", 100):
+            with self.assertRaises(self.verify.CheckOutputLimit):
+                self.verify.check_output(process, "head", 10, output)
+            assert output.tell() == 100
+
+    def test_a_parenthesized_import_reads_past_a_parenthesis_in_a_comment(self):
+        source = "from pkg.m import (  # the old (v1) names\n    a,  # see (x)\n    sym,\n)\n"
+        assert self.verify.imports_symbol("c.py", source, "sym", "pkg/m.py")
+        assert not self.verify.imports_symbol("c.py", "from pkg.m import (\n    a,  # not sym\n)\n", "sym", "pkg/m.py")
+        py = {"lib.py": "def helper():\n    return 1\n", "app.py": "from lib import helper\nhelper()\n"}
+        kept = self._prepare(py, {"lib.py": "from other import (  # moved (see other)\n    helper,\n)\n",
+                                  "other.py": "def helper():\n    return 1\n"})
+        assert kept.returncode == 0, kept.stderr
+        # A name in a comment is no re-export.
+        said = self._prepare(py, {"lib.py": "from other import (\n    other_thing,  # was helper\n)\n",
+                                  "other.py": "def helper():\n    return 1\n\n\nother_thing = 1\n"})
+        assert said.returncode and "app.py:1" in said.stderr, said.stderr
+
+    def test_a_base_run_over_the_output_limit_is_not_called_a_timeout(self):
+        result, _, _ = BaselineDiff._test(self, "head -c 17000000 /dev/zero\nexit 1\n", BaselineDiff.OLD, "--baseline-diff")
+        assert result.returncode and "Not waived" in result.stdout, (result.stdout, result.stderr)
+        assert "timed out" not in result.stdout and "more than a check may print" in result.stdout, result.stdout
+
+    def test_a_baseline_worktree_git_could_not_add_leaves_no_record(self):
+        from unittest import mock
+        verify = self.verify
+        with tempfile.TemporaryDirectory() as t:
+            board = Path(t)
+            log = board / "check.log"
+            log.write_text("FAILED tests/t.py::test_x\n")
+
+            def git(path, *args, **_):
+                if args[:2] == ("worktree", "add"):
+                    raise ValueError("fatal: cannot add")
+                return b""
+            candidate = {"worktree": t, "base": "0" * 40, "commit": "1" * 40, "candidate": "c1", "path": t}
+            with mock.patch.object(verify, "git", git):
+                verdicts = verify.same_on_base(board, board, candidate, [("false", 1, log)], 10, verify.time.monotonic() + 10, board)
+            assert verdicts == {0: (False, "the base could not be checked: fatal: cannot add")}, verdicts
+            assert not (board / verify.BASELINES_FILE).exists()
+
+
+class LandingDataLoss(unittest.TestCase):
+    """What lands, or is cleaned up, is what was verified, and nothing of the user's is lost on the way."""
+
+    _init_git = VerifyRegressions._init_git
+    _verified = VerifyRegressions._verified
+    _isolated_candidate = VerifyRegressions._isolated_candidate
+
+    def test_shared_commit_lands_when_the_project_ignores_its_run_data(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g = self._init_git(proj)
+            (proj / ".gitignore").write_text(".swarm/\n")
+            g("add", ".gitignore")
+            g("commit", "-m", "Ignore run data")
+            (proj / "file.txt").write_text("v2")
+            gate, cand, _ = self._verified(proj, "grep -qx v2 file.txt")
+            run(*gate, "accept", cand)
+            assert "COMMITTED" in run(*gate, "commit", cand, "-m", "land")
+            assert g("show", "HEAD:file.txt") == "v2" and g("ls-tree", "-r", "--name-only", "HEAD", ".swarm") == ""
+
+    def test_shared_commit_refuses_to_drop_an_executable_bit_the_checks_relied_on(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g = self._init_git(proj)
+            g("config", "core.filemode", "false")
+            script = proj / "run.sh"
+            script.write_text("#!/bin/sh\nexit 1\n")
+            # An untouched file whose bit differs from the index is no part of this commit and blocks nothing.
+            stray = proj / "stray.txt"
+            stray.write_text("old\n")
+            g("add", "run.sh", "stray.txt")
+            g("commit", "-m", "Add script")
+            stray.chmod(0o755)
+            base = g("rev-parse", "HEAD")
+            script.write_text("#!/bin/sh\nexit 0\n")
+            script.chmod(0o755)
+            gate, cand, _ = self._verified(proj, "./run.sh")
+            run(*gate, "accept", cand)
+            refused = subprocess.run([*gate, "commit", cand, "-m", "land"], capture_output=True, text=True)
+            assert refused.returncode and "run.sh" in refused.stderr and "--chmod=+x" in refused.stderr, refused.stderr
+            assert "stray.txt" not in refused.stderr, refused.stderr
+            assert g("rev-parse", "HEAD") == base
+            g("add", "--chmod=+x", "--", "run.sh")
+            assert "COMMITTED" in run(*gate, "commit", cand, "-m", "land")
+            assert g("ls-tree", "HEAD", "run.sh").startswith("100755 ")
+
+    def test_isolated_prepare_refuses_a_checkout_a_hook_left_unlike_its_commit(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+
+            def change(g):
+                (proj / "other.txt").write_text("work")
+                g("add", "other.txt")
+            g, base, board, post, gate = self._isolated_candidate(proj, change)
+            hook = proj / ".git" / "hooks" / "post-merge"
+            hook.write_text("#!/bin/sh\necho hooked > file.txt\n")
+            hook.chmod(0o755)
+            refused = subprocess.run([*gate, "prepare", "isolated", "--check", "grep -qx hooked file.txt"],
+                                     capture_output=True, text=True)
+            assert refused.returncode and "file.txt" in refused.stderr, refused.stderr
+            assert not list(Path(board).glob("integration-*")) and not (Path(board) / "verification.json").exists()
+            assert g("rev-parse", "HEAD") == base and (proj / "file.txt").read_text() == "v1"
+
+    def test_a_replacement_candidate_keeps_a_previous_checkout_that_holds_files_of_its_own(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+
+            def change(g):
+                (proj / "file.txt").write_text("v2")
+                g("add", "file.txt")
+            g, base, board, post, gate = self._isolated_candidate(proj, change)
+            first = json.loads(run(*gate, "prepare", "isolated", "--check", "true"))
+            diagnostic = Path(first["path"]) / "diagnostic.log"
+            diagnostic.write_text("only here")
+            replaced = subprocess.run([*gate, "prepare", "isolated", "--check", "true"], capture_output=True, text=True)
+            assert replaced.returncode == 0, replaced.stderr
+            assert diagnostic.read_text() == "only here"
+            assert first["path"] in replaced.stderr, replaced.stderr
+            # An ignored file is as much the user's: `git worktree remove` would delete it unasked.
+            second = json.loads(replaced.stdout)
+            (proj / ".git" / "info" / "exclude").write_text("local.env\n")
+            (Path(second["path"]) / "local.env").write_text("secret")
+            third = json.loads(run(*gate, "prepare", "isolated", "--check", "true"))
+            assert (Path(second["path"]) / "local.env").read_text() == "secret"
+            run(*gate, "prepare", "isolated", "--check", "true")
+            assert not Path(third["path"]).exists()  # a clean one is still removed
+
+    def test_recover_index_clears_only_the_lock_its_own_dead_publication_left(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g = self._init_git(proj)
+            (proj / "file.txt").write_text("verified contents\n")
+            gate, cand, board = self._verified(proj, "grep -qx 'verified contents' file.txt")
+            run(*gate, "accept", cand)
+            original = (proj / ".git/index").read_bytes()
+            # The publishing process dies between the ref update and the index replacement, finally blocks unrun.
+            killed = subprocess.run([sys.executable, "-c", (
+                "import os, sys; sys.path.insert(0, sys.argv[1]); import verify\n"
+                "real = os.replace\n"
+                "def replace(src, dest):\n"
+                "    if os.path.basename(src) == 'index.lock': os._exit(9)\n"
+                "    return real(src, dest)\n"
+                "verify.os.replace = replace\n"
+                "from pathlib import Path\n"
+                "verify.commit(Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4], 'land')\n"),
+                str(SCRIPTS), str(board), str(proj), cand], capture_output=True, text=True, env=NO_GIT_ENV)
+            assert killed.returncode == 9, (killed.stdout, killed.stderr)
+            lock = proj / ".git/index.lock"
+            revision = g("rev-parse", "HEAD")
+            assert lock.exists() and g("show", "HEAD:file.txt") == "verified contents"
+            recovery, owner = board / f"commit-recovery-{cand}.json", board / "index-lock.json"
+            assert recovery.exists()
+            record = json.loads(owner.read_text())
+            # A live owner may still be publishing: its lock stays.
+            owner.write_text(json.dumps({**record, "pid": os.getpid()}))
+            refused = subprocess.run([*gate, "recover-index", cand], capture_output=True, text=True)
+            assert refused.returncode and "locked" in refused.stderr and lock.exists(), refused.stderr
+            owner.write_text(json.dumps(record))
+            # A lock some other process made in its place is never Swarm's to remove.
+            ours = lock.read_bytes()
+            lock.unlink()
+            lock.write_bytes(b"someone else's index")
+            refused = subprocess.run([*gate, "recover-index", cand], capture_output=True, text=True)
+            assert refused.returncode and "locked" in refused.stderr and lock.read_bytes() == b"someone else's index"
+            lock.unlink()
+            assert (proj / ".git/index").read_bytes() == original
+            lock.write_bytes(ours)
+            refused = subprocess.run([*gate, "recover-index", cand], capture_output=True, text=True)
+            assert refused.returncode and lock.exists(), refused.stderr  # same bytes, another file
+            lock.unlink()
+            # The dead publication's own lock is cleared, and recovery goes on.
+            subprocess.run([sys.executable, "-c", (
+                "import os, sys; sys.path.insert(0, sys.argv[1]); import verify\n"
+                "real = os.replace\n"
+                "def replace(src, dest):\n"
+                "    if os.path.basename(src) == 'index.lock': os._exit(9)\n"
+                "    return real(src, dest)\n"
+                "verify.os.replace = replace\n"
+                "from pathlib import Path\n"
+                "verify.recover_index(Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4])\n"),
+                str(SCRIPTS), str(board), str(proj), cand], capture_output=True, text=True, env=NO_GIT_ENV)
+            assert lock.exists()  # a recovery that dies leaves its own lock, which the next one clears too
+            assert f"RECOVERED INDEX {revision}" in run(*gate, "recover-index", cand)
+            assert not lock.exists() and not recovery.exists() and not owner.exists()
+            assert g("diff", "--cached", "--name-only") == ""
+
+    def test_a_partial_candidate_reads_the_declarations_of_the_upstream_work_it_holds(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g = self._init_git(proj)
+            (proj / "notes.txt").write_text("line\n")
+            g("add", "notes.txt")
+            g("commit", "-m", "notes")
+            board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Partial")
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "a")
+            run(*post, "member", "b", "depends=a")
+            run(*post, "member", "v", "role=verifier")
+            g("switch", "-q", "-c", "a")
+            (proj / "notes.txt").write_text("changed")
+            g("commit", "-q", "-am", "a")
+            upstream = g("rev-parse", "HEAD")
+            g("switch", "-q", "-c", "b")
+            (proj / "other.txt").write_text("b\n")
+            g("add", "other.txt")
+            g("commit", "-q", "-m", "b")
+            downstream = g("rev-parse", "HEAD")
+            g("switch", "-q", "main")
+            run(*post, "ready", "a", upstream, text="done\nNEWLINE: notes.txt")
+            run(*post, "ready", "b", downstream, text="done")
+            assert json.loads(run(*gate, "prepare", "isolated", "--check", "true", "--members", "a,b"))["partial"]
+            assert json.loads(run(*gate, "prepare", "isolated", "--check", "true", "--members", "b"))["partial"]
 
 
 if __name__ == "__main__":

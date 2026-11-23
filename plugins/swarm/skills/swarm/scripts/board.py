@@ -77,7 +77,7 @@ SPEND_SHARE, PAIR_SHARE = 1 / 2, 3 / 4  # of the run's tokens with three or more
 # so a long stretch of honest edits stays well under it. Each step re-reads the member's conversation, some 14,000
 # charged tokens at 100,000 held, so the token count catches heavy spinning earlier too.
 LOOP_STEPS, LOOP_TOKENS = 150, 750_000
-AGENT_STATE = ("wake_claim", "last_nudged_seq", "told", "delivered", "clipped", "tested")  # what one agent read and was told: not its successor's
+AGENT_STATE = ("wake_claim", "last_nudged_seq", "told", "delivered", "clipped", "tested", "held")  # what one agent read, was told and holds: not its successor's
 # No run is without a bound: one made with no budget named pauses here and the user is asked. Seen live: a run nobody
 # had capped spent 7.8M tokens before the user looked. Five members on a task of a few files use about this much.
 DEFAULT_BUDGET = 3_000_000
@@ -1189,7 +1189,8 @@ def ledger(state, posts):
         word = REPORT_WORD.match(post["text"])
         if word and word[1] == "VERIFIED":  # a pass closes what it covers: the verifier saw every open id and passed
             for finding in found.values():
-                if not post.get("partial") or set(finding["owners"]) <= set(post.get("members", [])):
+                # Owners are their successors' (as a NOT PASSED's are below), so the workers a pass covered are too.
+                if not post.get("partial") or set(finding["owners"]) <= {successor(m, members) for m in post.get("members", [])}:
                     finding["open"] = False
             continue
         rulings = rulings_in(post["text"])
@@ -1224,7 +1225,8 @@ def ledger(state, posts):
             unruled = [kind for owner, (kind, _, seq) in finding["answers"].items()
                        if owner in names and seq > finding["judged"].get(owner, 0)]
             if (name in raised or rulings.get(name) == "open") and (unruled or not again):
-                finding["streak"] = finding["streak"] + 1 if "disputed" in unruled else 0
+                if unruled:  # with no answer since the last ruling, a review judges nothing new: the streak stands
+                    finding["streak"] = finding["streak"] + 1 if "disputed" in unruled else 0
                 for owner in names:  # a verdict about one owner leaves another's answer still to be judged
                     if owner in finding["owners"]:
                         finding["judged"][owner] = post["seq"]
@@ -1617,8 +1619,9 @@ def prune(root, args):
                         # Asked before anything is removed, so a dry run reports exactly what a prune would do.
                         if os.path.realpath(path) not in known:
                             print("kept %s: Git does not know it as a worktree" % path)
-                        elif (wt_status := verify.git(path, "status", "--porcelain", "--untracked-files=all", optional=True)) is None or wt_status.strip():
-                            print("kept %s: worktree has uncommitted changes" % path)
+                        elif (wt_status := verify.git(path, "status", "--porcelain", "--untracked-files=all", "--ignored", optional=True)) is None or wt_status.strip():
+                            # Ignored files count: `git worktree remove` refuses untracked ones but deletes those.
+                            print("kept %s: worktree has uncommitted changes, or untracked or ignored files" % path)
                         elif would or verify.git(project, "worktree", "remove", path, optional=True) is not None:
                             print("%sremove worktree %s" % (would, path))
                             gone.add(os.path.realpath(path))
@@ -2061,8 +2064,6 @@ def main(argv):
             if member.get("profile") in READ_ONLY and "profile" in changes and changes["profile"] not in READ_ONLY and "writes" not in changes:
                 member.pop("writes", None)  # a specialist turned worker or designer writes again unless told otherwise
             member.update(changes)
-            if changes.get("id"):
-                started_as(member)
             merge_after(member, changes, previous.get("after", ""))
             if member.get("killed"):  # a retired member runs no more turns: nothing is paused
                 member.pop("paused", None)
@@ -2071,6 +2072,8 @@ def main(argv):
                 if standing and "killed" not in previous:
                     member["stood"] = standing  # the commit that counted when it left: work built on it stays good
             validate_member(name, member, changes, members)
+            if changes.get("id"):  # after validation, which takes any effort= as named: one left empty comes from the size
+                started_as(member)
             if changes.get("group") in {"", "-"}:
                 member.pop("group", None)
             if "role" in changes or "consult" in changes:
@@ -2159,6 +2162,8 @@ def main(argv):
             limits = state.setdefault("limits", {})
             if "budget" in changes:  # the user's figure, or none: the board allocates no more
                 state.pop("auto_budget", None)
+                for member in members.values():  # nor stops anyone at a share of a budget it no longer sets
+                    member.pop("alloc", None)
             for k, v in changes.items():
                 if v == "" or (k in ("budget", "member_budget") and not int(v)):  # a budget of zero is no budget
                     limits.pop(k, None)
@@ -2272,6 +2277,8 @@ def main(argv):
             if named:
                 given["depends"] = asked
             validate_member(new, entry, given, members)
+            if given.get("id"):  # started as it is registered, as in `member`
+                started_as(entry)
             if given.get("group") in {"", "-"}:
                 entry.pop("group", None)
             if "depends" in given:
@@ -2724,9 +2731,12 @@ def main(argv):
                 members = state["members"]
                 member = members[name]
                 # Written for the agent that merged, in its checkout: one put in its place meanwhile works elsewhere.
+                # Added to what earlier syncs merged: after a merge that failed, their commits are in HEAD all the same.
+                had = member.get("synced_deps") if isinstance(member.get("synced_deps"), dict) else {}
+                record = {**had, **synced}
                 if member.get("id") == agent and not member.get("killed") and (
-                        member.get("synced_deps") != synced or (start and member.get("start") != start)):
-                    member["synced_deps"] = synced
+                        member.get("synced_deps") != record or (start and member.get("start") != start)):
+                    member["synced_deps"] = record
                     if start:
                         member["start"] = start
                     save(d, state)

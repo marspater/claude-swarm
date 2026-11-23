@@ -25,8 +25,12 @@ export function budgetOf(state: BudgetState): number {
   return positive(state.limits?.budget)
 }
 
+// A map read from the roster: a value that is no plain object, a string or a list, holds no entries.
+const entriesOf = <T>(value: Record<string, T> | null | undefined): [string, T][] =>
+  value !== null && typeof value === 'object' && !Array.isArray(value) ? Object.entries(value) : []
+
 export function tokensUsed(tokens?: Record<string, unknown> | null): number {
-  return Object.values(tokens ?? {}).reduce<number>((sum, count) => sum + positive(count), 0)
+  return entriesOf(tokens).reduce<number>((sum, [, count]) => sum + positive(count), 0)
 }
 
 // A member's context is read again by every step it takes, so a long read-only sweep costs with the square of its
@@ -106,7 +110,8 @@ export function ledger(kept = 256, graceMs = 600_000) {
           const owing = [...closed.raw].reduce((sum, [index, raw]) => index === END ? sum : sum + raw[kind], 0)
           rest[kind] = Math.max(0, (whole[kind] || 0) - closed.taken[kind] - owing)
         }
-        closed.raw.set(END, rest)
+        // A repeated end leaves the detail of the end still pending as it is: its retry carries that one.
+        if (!closed.pending.has(END)) closed.raw.set(END, rest)
         end(turnId, closed)
         return Math.max(0, total - closed.charged - pending)
       }
@@ -352,7 +357,7 @@ export function parse(
     members?: Roster
   } & BudgetState
   // A roster cut short or edited by hand still draws what it holds: an entry that is no object is left out.
-  const roster: Roster = Object.fromEntries(Object.entries(state.members ?? {}).filter(([, member]) => member && typeof member === 'object'))
+  const roster: Roster = Object.fromEntries(entriesOf(state.members).filter(([, member]) => member && typeof member === 'object'))
   const posts = parsePosts(board, roster)
   const activity = new Map<string, { sent: number; unread: number }>()
   const counts = (name: string) => {
@@ -407,7 +412,7 @@ export function parse(
     if (!isClosed && !state.paused && !member.paused && (member.role ?? 'worker') === 'worker' &&
         member.profile !== 'explorer' && member.profile !== 'architect' && member.consult !== '1' &&
         member.id !== undefined && status === 'waiting' &&
-        hint !== undefined && !hint.ready && !hint.asked && !hint.blocked_on?.length &&
+        hint !== undefined && !hint.ready && !hint.asked && !hint.paused && !hint.blocked_on?.length &&
         counts(name).unread === 0 && lastHeard > 0 && (said.get(name) ?? 0) < lastHeard) {
       zombieAttention.push({
         kind: 'silent',
@@ -448,6 +453,6 @@ export function parse(
     members,
     attention: [...(report?.items ?? []), ...zombieAttention],
     budget: budgetOf(state),
-    tokens: Object.fromEntries(Object.entries(state.usage?.tokens ?? {}).map(([actor, count]) => [actor, positive(count)])),
+    tokens: Object.fromEntries(entriesOf(state.usage?.tokens).map(([actor, count]) => [actor, positive(count)])),
   }
 }

@@ -15,6 +15,7 @@ import re
 import selectors
 import shlex
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -60,11 +61,20 @@ def not_source(found, run_data=None):
     return [run_data or own, *linked_worktrees(root)]
 
 
-def stage_paths(skip):
-    """The pathspecs that stage exactly what verification fingerprints, from any folder of the repository; SKIP is what
-    `not_source` returns. A plain `git add -A` would also stage run data the project's ignore rules let through, and a
-    linked worktree inside the repository as an embedded repository, neither of which any check read."""
-    return [":/", *(":(top,literal,exclude)" + os.fsdecode(b"/".join(path)) for path in skip)]
+def stage_verified(root, skip, index):
+    """Stage in INDEX exactly what verification fingerprints: tracked changes and the untracked files the ignore rules
+    let through, outside SKIP (what `not_source` returns). A plain `git add -A` would also stage run data the project's
+    ignore rules let through, and a linked worktree inside the repository as an embedded repository, neither of which
+    any check read. `git add -A` with an exclude pathspec fails once that path is ignored, so new files are named one
+    by one, as the fingerprint lists them; tracked ones take the exclusion, which `git add -u` never refuses."""
+    if git(root, "ls-files", "-z", index=index):  # with nothing tracked, `git add -u` says its pathspec matched nothing
+        git(root, "-c", "core.splitIndex=false", "add", "-u", "--", ":/",
+            *(":(top,literal,exclude)" + os.fsdecode(b"/".join(path)) for path in skip), index=index)
+    new = [name for name in git(root, "ls-files", "-z", "--others", "--exclude-standard", index=index).split(b"\0")
+           if name and not in_worktree(name, skip)]
+    if new:
+        git(root, "--literal-pathspecs", "-c", "core.splitIndex=false", "add", "--pathspec-from-file=-",
+            "--pathspec-file-nul", index=index, data=b"\0".join(new))
 
 
 def in_worktree(name, worktrees):
@@ -461,13 +471,13 @@ def mentions(clause, symbol):
     return re.search(r"(?<![\w$])%s(?![\w$])" % re.escape(symbol), clause, re.ASCII) is not None
 
 
-PY_FROM = re.compile(r"^[ \t]*from[ \t]+([\w.]+)[ \t]+import[ \t]+(\([^)]*\)|[^\n#]*(?:\\\n[^\n#]*)*)", re.ASCII | re.M)
+PY_FROM = re.compile(r"^[ \t]*from[ \t]+([\w.]+)[ \t]+import[ \t]+(\((?:[^)#]|#[^\n]*\n)*\)|[^\n#]*(?:\\\n[^\n#]*)*)", re.ASCII | re.M)
 
 
 def gives(clause, symbol):
     """Whether an import or export CLAUSE gives out the name SYMBOL: `sym`, `type sym` or `other as sym`, never
     `sym as other`."""
-    return any(part.split()[-1:] == [symbol] for part in re.sub(r"[()\\]", " ", clause).split(","))
+    return any(part.split()[-1:] == [symbol] for part in re.sub(r"#[^\n]*|[()\\]", " ", clause).split(","))
 
 
 def alt_stems(definition, stem):
@@ -574,7 +584,7 @@ def py_imports(source, symbol, definition, exact=False, importer=None):
 
     bound = []
     for module, clause in PY_FROM.findall(source):
-        clause = re.sub(r"[()\\]", " ", clause)
+        clause = re.sub(r"#[^\n]*|[()\\]", " ", clause)
         if clause.strip() == "*":
             if py_matches(module):
                 return True
@@ -610,12 +620,17 @@ def removed_public_symbols(diff, moved=None):
     """{symbol: the files it was removed from} for the public symbols a unified diff removes. One the same file defines
     again (a changed signature) is not removed from it; one a file loses and only another file defines is put in
     MOVED, when given, with the files it left."""
-    removed, added, old, new = {}, {}, "", ""
+    removed, added, old, new, in_hunk = {}, {}, "", "", False
     for line in diff.split("\n"):
+        # A file's headers come before its first hunk: inside one, `--- x` is a removed line `-- x`.
+        if line.startswith("diff --git "):
+            in_hunk = False
+        elif line.startswith("@@ "):
+            in_hunk = True
         # An unquoted Git patch header ends in a tab when its path has spaces.
-        if header := re.fullmatch(r"--- (?:a/([^\t]+)\t?|/dev/null)", line):
+        elif not in_hunk and (header := re.fullmatch(r"--- (?:a/([^\t]+)\t?|/dev/null)", line)):
             old = header[1] or ""
-        elif header := re.fullmatch(r"\+\+\+ (?:b/([^\t]+)\t?|/dev/null)", line):
+        elif not in_hunk and (header := re.fullmatch(r"\+\+\+ (?:b/([^\t]+)\t?|/dev/null)", line)):
             new = header[1] or ""
         elif line.startswith("-") and old:
             if symbol := defined_symbol(old, line[1:]):
@@ -664,21 +679,24 @@ def caller_issues(root, revisions, excluded, allowed):
         code = "\n".join("" if comment_only(name, line) else line
                          for line in path.read_text(encoding="utf-8", errors="replace").split("\n"))
         sym = re.escape(symbol)
+        # Only an unindented line is module level: an import in a function body or an export in a `declare module`
+        # block gives the module nothing.
         if is_python(name):
-            return (any(gives(clause, symbol) for _, clause in PY_FROM.findall(code))
+            return (any(gives(m[2], symbol) for m in PY_FROM.finditer(code) if m[0][0] not in " \t")
                     or re.search(r"^%s[ \t]*(?::[^=\n]*)?=" % sym, code, re.M | re.ASCII) is not None)
-        return any(gives(clause, symbol) for clause in re.findall(r"\bexport\s*(?:type\s*)?\{([^}]*)\}", code, re.ASCII))
+        return any(gives(clause, symbol) for clause in re.findall(r"^export\s*(?:type\s*)?\{([^}]*)\}", code, re.M | re.ASCII))
 
     by_symbol, elsewhere = {}, set()
     for symbol, origin in ((symbol, origin) for symbol, names in removed.items() for origin in names):
+        # The module still gives the name out (an alias, a re-export): its importers are not broken.
+        if provides(origin, symbol):
+            continue
         found = [hit for hit in hits if mentions(hit[2], symbol)]
         # Still defined somewhere (`def main` in another script, a second `export const config`, the file it moved
         # to): a caller may bind to that one, and a grep cannot tell a broken reference from a working one. What it
-        # can tell is an import that names the module the symbol left, and that one is broken unless a re-export
-        # stayed behind. Each module the symbol left is asked for itself.
+        # can tell is an import that names the module the symbol left, and that one is broken. Each module the symbol
+        # left is asked for itself.
         if symbol in moved or any(defined_symbol(name, text) == symbol for name, _, text in found):
-            if provides(origin, symbol):
-                continue
             elsewhere.add((symbol, origin))
         if found:
             by_symbol[symbol, origin] = found
@@ -783,8 +801,16 @@ def allowances(given):
 def check_hygiene(run, root, base, commit, recorded, skip, allowed=()):
     """Raise when the candidate's change has a hygiene defect that neither its workers declared in their READY reports
     nor the coordinator allowed (ALLOWED, what `allowances` returns)."""
+    state, posts = load(run)
     reports = {seq for seq, _ in recorded.values()}
-    texts = [*(post["text"] for post in load(run)[1] if post["seq"] in reports), "\n".join(allowed)]
+    if commit:
+        # A partial candidate holds the commits of the workers its members built on, and their changes come with the
+        # declarations made for them: a ready worker's whose commit the candidate holds and its base does not.
+        reports |= {post["seq"] for name, post in readiness(state["members"], posts).items()
+                    if name not in recorded and post.get("revision")
+                    and git(root, "merge-base", "--is-ancestor", post["revision"], commit, optional=True) is not None
+                    and git(root, "merge-base", "--is-ancestor", post["revision"], base, optional=True) is None}
+    texts = [*(post["text"] for post in posts if post["seq"] in reports), "\n".join(allowed)]
     issues = hygiene_issues(root, base, commit, texts, skip)
     if issues:
         raise ValueError("the candidate is not ready for a verifier:\n- %s\nSend each to its worker; a new READY and a new "
@@ -855,6 +881,15 @@ def prepare(run, project, mode, checks, onto=None, subset=None, baseline=False, 
                         raise ValueError(f"could not merge @{name}'s commit {revision[:12]}: {error}. If Git asks for an identity "
                                          "or a signing key, configure it for this repository, then prepare again") from None
             commit = git(integration, "rev-parse", "HEAD").decode().strip()
+            _, run_data = repository(project)
+            # The fingerprint is of the checkout's files, and later ones are compared with it: they stand for the commit
+            # only if these are the commit's. A hook that rewrote one after a merge would pass what never lands.
+            unlike = pending_changes(integration, run_data)
+            if unlike:
+                raise ValueError("the integration checkout differs from its commit after merging, in %s (a post-merge or "
+                                 "post-checkout hook?), so the checks would read files the commit does not hold. Stop "
+                                 "the hook from writing tracked or new files, then prepare again"
+                                 % ", ".join(shown(os.fsdecode(name)) for name in unlike[:5]))
             # Whatever chain it came down: `ready` reads only the members a worker waits for.
             state, posts = load(run)
             try:
@@ -869,7 +904,6 @@ def prepare(run, project, mode, checks, onto=None, subset=None, baseline=False, 
                                              integration, "merge-base", "--is-ancestor", held[1], revision, optional=True) is not None)
                                      or "a member's commit"))
             diff = git(integration, "diff", "--no-renames", "--ignore-submodules=none", "--raw", "-z", base, commit).split(b"\0")
-            _, run_data = repository(project)
             for meta, name in zip(diff[::2], diff[1::2]):
                 # The fingerprint leaves the project's .swarm folder out, so a commit that writes there would be
                 # merged into the board's own folder at acceptance without ever having been tested.
@@ -930,10 +964,20 @@ def prepare(run, project, mode, checks, onto=None, subset=None, baseline=False, 
     # The candidate this one supersedes leaves its checkout behind. An accepted one is the record of what was
     # tested and stays, and nothing outside this run's folder is ever removed.
     stale = Path(previous.get("worktree") or "") if isinstance(previous, dict) and not previous.get("accepted") else None
-    if stale and stale.parent == run and stale.name.startswith("integration-"):
-        git(project, "worktree", "remove", "--force", str(stale), optional=True)
+    if stale and stale.parent == run and stale.name.startswith("integration-") and stale.exists() \
+            and not remove_checkout(project, stale):
+        print(f"The checkout of the candidate this one replaces is kept at {stale}: it holds changes or files of its own, "
+              "which removing it would lose", file=sys.stderr)
     print(json.dumps({"candidate": identifier, "path": str(work), "commit": commit,
                       "digest": candidate["digest"], "partial": candidate["partial"]}))
+
+
+def remove_checkout(project, path):
+    """Remove the integration checkout at PATH unless that would lose something: a change, or a file of its own,
+    ignored ones included, which `git worktree remove` deletes unasked. True once it is gone."""
+    held = git(path, "status", "--porcelain", "--ignored", "--untracked-files=all", "--ignore-submodules=none",
+               optional=True)
+    return held == b"" and git(project, "worktree", "remove", str(path), optional=True) is not None
 
 
 DEFAULT_CHECK_TIMEOUT = 900
@@ -969,15 +1013,17 @@ def check_output(process, command, timeout, output):
     cleanup(process)
     # Pipes can still contain the shell's final output, or be held open by a detached helper.
     os.set_blocking(fd, False)
-    while remaining_bytes:
+    while True:
         try:
-            chunk = os.read(fd, min(65536, remaining_bytes))
+            chunk = os.read(fd, min(65536, remaining_bytes + 1))  # one byte more shows an overrun
         except BlockingIOError:
             break
         if not chunk:
             break
-        output.write(chunk)
+        output.write(chunk[:remaining_bytes])
         remaining_bytes -= len(chunk)
+        if remaining_bytes < 0:
+            raise CheckOutputLimit(f"output exceeded {MAX_CHECK_OUTPUT >> 20} MiB")
     return process.returncode
 
 
@@ -1268,20 +1314,25 @@ def same_on_base(run, project, candidate, ran, timeout, deadline, candidate_outp
                                                   "set up alike: " + diverged)
                     continue
                 base_log = log.with_name(log.stem + "-base.log")
+                overran = False
                 try:
                     with base_log.open("wb") as output:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             raise subprocess.TimeoutExpired(command, 0)
                         on_base = run_check(command, work, min(timeout, remaining), output, output_dir=output_dir)
-                except (subprocess.TimeoutExpired, CheckOutputLimit):
+                except subprocess.TimeoutExpired:
                     on_base = None
+                except CheckOutputLimit:
+                    on_base, overran = None, True
                 here, there = printed(log), printed(base_log)
                 if on_base != returncode or here is None or here != there:
                     diverged = command
                 if index not in asked:
                     continue
-                if on_base is None:
+                if overran:
+                    why = "its output on the base is over %d MiB, more than a check may print" % (MAX_CHECK_OUTPUT >> 20)
+                elif on_base is None:
                     why = "it timed out on the base"
                 elif on_base == 0:
                     why = "it passes on the base %s" % short
@@ -1304,7 +1355,8 @@ def same_on_base(run, project, candidate, ran, timeout, deadline, candidate_outp
         finally:
             if baseline.exists():
                 git(project, "worktree", "remove", "--force", str(baseline), optional=True)
-            if not baseline.exists():
+            # Gone, or never a worktree (Git could not add it) and so removed with the temporary folder.
+            if not (baseline / ".git").exists():
                 record_baseline(run, baseline.name, add=False)
     return verdicts
 
@@ -1567,17 +1619,61 @@ def index_digest(snapshot):
     return hashlib.sha256(snapshot[0]).hexdigest() if snapshot is not None else None
 
 
-def publish_index(root, live, original, private, parent, ref, revision, recovery=None):
+LOCK_IDENTITY = ("dev", "ino", "size", "mtime_ns")
+
+
+def lock_owner(run):
+    """Where a publication records the index lock it holds, under the board lock of RUN that every publication takes."""
+    return run / "index-lock.json"
+
+
+def stale_lock(lock, owner):
+    """Whether LOCK is the very file a Swarm publication made and recorded in OWNER, and that publication is gone. The
+    caller holds the board lock the recorded one held, so no publication of this run is part way; the process and host
+    say it ended; device, inode, size and mtime say the lock is that file and none Git or anyone made since."""
+    try:
+        record = json.loads(owner.read_text(encoding="utf-8"))
+        now = lock.lstat()
+    except (OSError, ValueError):
+        return False
+    pid = record.get("pid") if isinstance(record, dict) else None
+    if (not isinstance(pid, int) or pid <= 0 or pid == os.getpid() or record.get("lock") != str(lock)
+            or record.get("host") != socket.gethostname()
+            or [record.get(key) for key in LOCK_IDENTITY] != [getattr(now, "st_" + key) for key in LOCK_IDENTITY]):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:  # EPERM: alive, under another user
+        return False
+    return False
+
+
+def publish_index(root, live, original, private, parent, ref, revision, owner, recovery=None):
     # Respect Git's index lock. A concurrently staged change takes precedence over publishing our staging area.
     lock = live.with_name(live.name + ".lock")
     try:
-        locked = lock.open("xb")
+        try:
+            locked = lock.open("xb")
+        except FileExistsError:
+            # Only a lock this run's own dead publication left is cleared: one that may be Git's never is.
+            if not stale_lock(lock, owner):
+                raise
+            lock.unlink()
+            owner.unlink(missing_ok=True)
+            locked = lock.open("xb")
     except FileExistsError:
         raise ValueError("the Git index is locked by another operation; retry after it finishes") from None
     published = False
     try:
         with locked:
             locked.write(Path(private).read_bytes())
+        # Recorded before anything can stop part way, so that a publication that dies leaves a lock the next one can
+        # tell for its own. A death before this leaves a lock nobody clears unasked.
+        made = lock.lstat()
+        atomic_write(owner, json.dumps({"lock": str(lock), "pid": os.getpid(), "host": socket.gethostname(),
+                                        **{key: getattr(made, "st_" + key) for key in LOCK_IDENTITY}}))
         if index_snapshot(live) != original or ref_state(root) != (parent, ref):
             raise ValueError("the Git index or HEAD changed during the commit; inspect it and retry")
         if revision:
@@ -1601,6 +1697,7 @@ def publish_index(root, live, original, private, parent, ref, revision, recovery
     finally:
         if not published:
             lock.unlink(missing_ok=True)
+        owner.unlink(missing_ok=True)
 
 
 def commit_hook(root, name, *args, index=None):
@@ -1637,6 +1734,20 @@ def pending_commit_hooks(root, private, scratch, message):
     return msg
 
 
+def keeps_modes(root):
+    """Whether the volume under ROOT keeps an executable bit as set, both ways: on one that reports every file
+    executable, the bit the checks saw says nothing, and Git sets core.filemode=false for that very reason."""
+    fd, probe = tempfile.mkstemp(dir=root, prefix=".swarm-mode-")
+    try:
+        os.close(fd)
+        os.chmod(probe, 0o755)
+        on = os.stat(probe).st_mode & stat.S_IXUSR
+        os.chmod(probe, 0o644)
+        return bool(on) and not os.stat(probe).st_mode & stat.S_IXUSR
+    finally:
+        os.unlink(probe)
+
+
 def recovery_file(run, identifier):
     return run / f"commit-recovery-{identifier}.json"
 
@@ -1670,7 +1781,7 @@ def recover_index(run, project, identifier):
             recovery.unlink()
         else:
             git(root, "-c", "core.splitIndex=false", "read-tree", revision, index=private)
-            publish_index(root, live, original, private, revision, ref, None, recovery)
+            publish_index(root, live, original, private, revision, ref, None, lock_owner(run), recovery)
     print(f"RECOVERED INDEX {revision}")
 
 
@@ -1706,7 +1817,7 @@ def commit(run, project, identifier, message):
                 Path(private).write_bytes(data)
                 # Git uses this timestamp to recheck files written within the index's timestamp resolution.
                 os.utime(private, ns=(mtime, mtime))
-            git(root, "-c", "core.splitIndex=false", "add", "-A", "--", *stage_paths(skip), index=private)
+            stage_verified(root, skip, private)
             tree = git(root, "write-tree", index=private).decode().strip()
             names = [name for name in git(root, "diff", "--cached", "--name-only", "--no-renames", "-z", index=private)
                      .split(b"\0") if name]
@@ -1721,7 +1832,7 @@ def commit(run, project, identifier, message):
             checkout = Path(scratch) / "checkout"
             checkout.mkdir()
             git(root, "checkout-index", "--all", f"--prefix={checkout}/", index=private)
-            turned = []
+            turned, flipped, changed = [], [], set(names)
             for name, mode in modes.items():
                 if in_worktree(name, skip) or mode not in (b"100644", b"100755"):
                     continue
@@ -1729,6 +1840,10 @@ def commit(run, project, identifier, message):
                 source, restored = root / path, checkout / path
                 try:
                     same = filecmp.cmp(source, restored, shallow=False)
+                    # With core.filemode=false `git add` keeps the mode the index had, whatever the checks ran. Only
+                    # files this commit changes: a stray bit on an untouched one would refuse every commit.
+                    if same and name in changed and bool(source.lstat().st_mode & stat.S_IXUSR) != (mode == b"100755"):
+                        flipped.append(path)
                 except FileNotFoundError:
                     # A sparse checkout omits these paths from both the source and the private checkout.
                     same = not source.exists() and not restored.exists()
@@ -1738,6 +1853,13 @@ def commit(run, project, identifier, message):
                 raise ValueError("a fresh checkout of the commit would not bring back %s as the checks read it (a line-ending "
                                  "or filter rule converts it one way only). Fix the file or its .gitattributes rule, then "
                                  "prepare and test a new candidate" % ", ".join(turned[:5]))
+            if flipped and keeps_modes(root):
+                raise ValueError("the commit would record %s with another executable bit than the checks ran it with "
+                                 "(core.filemode is false, so staging keeps the mode the index had). Stage the mode "
+                                 "with %s (no file changes), then commit again" % (", ".join(map(shown, flipped[:5])), "; ".join(
+                                     shlex.join(["git", "add", "--chmod=" + ("+x" if (root / path).lstat().st_mode & stat.S_IXUSR
+                                                                             else "-x"), "--", ":(top,literal)" + path])
+                                     for path in flipped)))
             left = [shown(os.fsdecode(path)) for code, path in pending_changes(project, codes=True, git_index=private)
                     if code[1:] != b" "]
             if left:
@@ -1746,7 +1868,7 @@ def commit(run, project, identifier, message):
             if source_digest(project) != candidate["digest"]:
                 raise ValueError("source files changed after acceptance")
             if tree == (git(root, "rev-parse", "-q", "--verify", "HEAD^{tree}", optional=True) or b"").decode().strip():
-                publish_index(root, live, original, private, parent, ref, None)
+                publish_index(root, live, original, private, parent, ref, None, lock_owner(run))
                 print("Nothing to commit: HEAD already holds the verified files")
                 return
         # Release the board lock for hooks and signing, which can block on a build or user input.
@@ -1762,7 +1884,7 @@ def commit(run, project, identifier, message):
                 raise ValueError("the accepted candidate changed during the commit")
             check_current(run, candidate, allow_closed=True)
             try:
-                publish_index(root, live, original, private, parent, ref, revision, recovery)
+                publish_index(root, live, original, private, parent, ref, revision, lock_owner(run), recovery)
             except ValueError as error:
                 if not recovery.is_file():
                     raise
@@ -1874,7 +1996,7 @@ def accept(run, project, identifier):
     if guidance:
         print(guidance)
     integration = candidate.get("worktree") or candidate["path"]
-    if candidate["mode"] == "isolated" and git(project, "worktree", "remove", integration, optional=True) is None:
+    if candidate["mode"] == "isolated" and not remove_checkout(project, Path(integration)):
         print(f"Integration checkout retained at {integration}")
 
 

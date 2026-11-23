@@ -16,6 +16,8 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 BOARD = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "skills", "swarm", "scripts", "board.py")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import engine  # noqa: E402
 
 
 def saved(d):
@@ -24,9 +26,9 @@ def saved(d):
 
 
 def run(d, *args, stdin=None, ok=True):
-    r = subprocess.run([sys.executable, BOARD, d, *args], input=stdin, capture_output=True, text=True)
-    assert (r.returncode == 0) == ok, (args, r.stdout, r.stderr)
-    return r.stdout
+    code, out, err = engine.board(d, *args, stdin=stdin)
+    assert (code == 0) == ok, (args, out, err)
+    return out
 
 
 def woken(d):
@@ -2440,7 +2442,9 @@ class BoardRegressions(unittest.TestCase):
         run(d, "member", "lexer")
         run(d, "post", "coordinator", stdin="@money BRIEF\nShared: the money type, which @parser leads")
         run(d, "post", "coordinator", stdin="@lexer BRIEF\nOwns: the lexer; ask @parser about tokens")
-        assert [p.get("addressed") for p in map(json.loads, open(os.path.join(d, "board.jsonl")))] == [
+        with open(os.path.join(d, "board.jsonl"), encoding="utf-8") as f:
+            posts = [json.loads(line) for line in f]
+        assert [p.get("addressed") for p in posts] == [
             ["parser", "currency"], ["lexer"]]
         run(d, "member", "parser", "group=-")
         run(d, "replace", "parser", "parser-2")
@@ -2895,7 +2899,7 @@ class BoardRegressions(unittest.TestCase):
         shim, mark = os.path.join(self.root, "shim"), os.path.join(self.root, "mark")
         os.makedirs(shim)
         with open(os.path.join(shim, "git"), "w") as f:
-            f.write('#!/bin/sh\ncase " $* " in *" merge-tree "*|*" merge --no-autostash "*) touch "%s"; sleep 3;; esac\n'
+            f.write('#!/bin/sh\ncase " $* " in *" merge-tree "*|*" merge --no-autostash "*) touch "%s"; sleep 1.5;; esac\n'
                     'exec "%s" "$@"\n' % (mark, shutil.which("git")))
         os.chmod(os.path.join(shim, "git"), 0o755)
         env = dict(os.environ, PATH=shim + os.pathsep + os.environ["PATH"])
@@ -2921,7 +2925,7 @@ class BoardRegressions(unittest.TestCase):
         def quickly(*args):  # another member's command, while git works
             began = time.monotonic()
             out = run(d, *args)
-            assert time.monotonic() - began < 2, "the board was locked while git worked"
+            assert time.monotonic() - began < 1, "the board was locked while git worked"  # under the shim's 1.5 s
             return out
 
         slow = slowly("ready", "down", commit("down", "up", "b", "down\n"))
@@ -3150,6 +3154,112 @@ class BoardRegressions(unittest.TestCase):
         assert own(again) == {"w1.txt", "w2.txt", "w3.txt"}
         assert own(ready("w", refix)) == {"w1.txt", "w2.txt", "w3.txt", "w4.txt"}
 
+    def test_prune_keeps_an_integration_worktree_holding_ignored_files(self):
+        git = lambda *a: subprocess.run(["git", "-C", self.root, *a], check=True, capture_output=True)
+        git("init", "-q")
+        with open(os.path.join(self.root, ".gitignore"), "w", encoding="utf-8") as f:
+            f.write("*.env\nbuild/\n")
+        git("add", ".gitignore")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "x")
+        d = self.init_run()
+        run(d, "close")
+        wt = os.path.join(d, "integration-abc")
+        git("worktree", "add", "-q", "--detach", wt)
+        os.makedirs(os.path.join(wt, "build"))
+        for name in ("local.env", os.path.join("build", "out.bin")):  # an ignored file, and one in an ignored folder
+            with open(os.path.join(wt, name), "w", encoding="utf-8") as f:
+                f.write("only here\n")
+        self.init_run("shown")
+        plan = run(self.swarm, "prune", "--days=0", "--dry-run")
+        assert "kept " + wt + ": worktree has uncommitted changes" in plan and "would remove worktree" not in plan, plan
+        real = run(self.swarm, "prune", "--days=0")
+        assert "kept " + wt in real and "remove worktree" not in real, real
+        assert os.path.isfile(os.path.join(wt, "local.env")) and os.path.isfile(os.path.join(wt, "build", "out.bin")), real
+        git("worktree", "remove", "--force", wt)
+
+    def test_a_new_agent_starts_with_no_context_held_by_the_old_one(self):
+        d = self.init_run()
+        run(d, "member", "scout", "profile=investigator", "writes=0", "id=a1")
+
+        def hold(agent):
+            key = hashlib.sha256(("swarm-agent:" + agent).encode()).hexdigest()
+            self.turns = getattr(self, "turns", 0) + 1
+            run(d, "account", "%064x" % self.turns, key, "10", "mention:1,1,1,1,250000")
+            assert saved(d)["members"]["scout"]["held"] == 250000
+        hold("a1")
+        run(d, "member", "scout", "id=a2")
+        assert "held" not in saved(d)["members"]["scout"], saved(d)
+        hold("a2")
+        run(d, "started", "scout", "a3", "a2")
+        assert "held" not in saved(d)["members"]["scout"], saved(d)
+
+    def test_the_users_budget_drops_the_allocated_member_caps(self):
+        for figure in ("0", "9000000"):
+            d = self.init_run("cap" + figure)
+            run(d, "member", "w", "owns=src")
+            run(d, "member", "w", "id=agent-w")  # the allocation freezes, and w keeps a share to be stopped at
+            assert saved(d)["members"]["w"]["alloc"], saved(d)
+            run(d, "limit", "budget=" + figure)
+            assert "alloc" not in saved(d)["members"]["w"], saved(d)
+            assert "member_paused" not in self.account(d, "agent-w", 2_000_000)
+
+    def test_a_derived_effort_stays_derived_when_a_member_starts(self):
+        d = self.init_run()
+        run(d, "member", "w", "size=s", "effort=high")
+        run(d, "member", "w", "id=agent-w", "effort=")  # the named effort is cleared: the size gives it again
+        w = saved(d)["members"]["w"]
+        assert w.get("sized") == "1" and w.get("effort"), w
+        run(d, "replace", "w", "w2", "id=agent-w2")  # started as it is registered: what it runs on is recorded
+        w2 = saved(d)["members"]["w2"]
+        assert w2.get("effort") and w2.get("model") and w2.get("sized") == "1", w2
+
+    def test_a_failed_sync_keeps_what_an_earlier_sync_merged(self):
+        project = os.path.join(self.root, "proj")
+        os.makedirs(project)
+
+        def git(*args, cwd=None):
+            return subprocess.run(["git", "-C", cwd or project, *args], check=True, capture_output=True, text=True).stdout.strip()
+
+        def commit(start, name, text):
+            git("switch", "-q", "--detach", start)
+            with open(os.path.join(project, name), "w") as f:
+                f.write(text)
+            git("add", name)
+            git("commit", "-q", "-m", "change " + name)
+            return git("rev-parse", "HEAD")
+
+        git("init", "-q", "-b", "main")
+        for key, value in (("user.name", "T"), ("user.email", "t@example.invalid"), ("commit.gpgsign", "false")):
+            git("config", key, value)
+        with open(os.path.join(project, "a"), "w") as f:
+            f.write("0\n")
+        git("add", ".")
+        git("commit", "-q", "-m", "base")
+        d = run(os.path.join(project, ".swarm", "reg"), "init", "Sync").strip()
+        wt = os.path.join(self.root, "wt")
+        git("worktree", "add", "-q", "--detach", wt, "main")
+        run(d, "member", "up")
+        run(d, "member", "down", "depends=up")
+        c1 = commit("main", "a", "one\n")
+        run(d, "ready", "up", c1, stdin="a is one")
+        sync = lambda ok=True: subprocess.run([sys.executable, BOARD, d, "sync", "down"], capture_output=True, text=True, cwd=wt)
+        assert sync().returncode == 0
+        assert saved(d)["members"]["down"]["synced_deps"] == {"up": c1}
+        c2 = commit("main", "a", "two\n")  # rebuilt from main: it conflicts with c1, which down's HEAD holds
+        run(d, "ready", "up", c2, stdin="a is two")
+        failed = sync()
+        assert failed.returncode != 0 and "aborted" in failed.stderr, failed.stderr
+        assert saved(d)["members"]["down"]["synced_deps"] == {"up": c1}, saved(d)["members"]["down"]
+
+    def test_a_workers_status_note_after_the_verifiers_brief_starts_no_verifier(self):
+        d = self.init_run()
+        run(d, "member", "w")
+        run(d, "member", "v", "role=verifier")
+        run(d, "post", "coordinator", stdin="@w @v BRIEF\nThe parser")
+        run(d, "post", "w", "@v @coordinator build still running, nothing to test yet")
+        items = json.loads(run(d, "attention", "--json"))["items"]
+        assert "v" not in [i["member"] for i in items if i["kind"] == "unstarted"], items
+
 
 class FindingLedger(unittest.TestCase):
     """A verifier's defects get ids from the board, the worker answers each, and only the verifier closes one."""
@@ -3262,6 +3372,31 @@ class FindingLedger(unittest.TestCase):
         assert "paused: @w disputes F1 and @v keeps it open" in out, out
         item = [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "dispute"]
         assert [i["member"] for i in item] == ["w"] and "tell @w to fix it" in item[0]["text"], item
+
+    def test_a_dispute_stays_listed_through_a_review_the_worker_has_not_answered(self):
+        d = self._run()
+        run(d, "post", "v", "@w NOT PASSED. The handler swallows the error.")
+        run(d, "ready", "w", stdin="F1: disputed — handler.py:30 logs and re-raises it")
+        run(d, "post", "v", "@w NOT PASSED [F1]. It is swallowed on the retry path, handler.py:52.")
+        run(d, "resume")
+        # Another review keeps it open before the worker says anything new: the dispute it judged still stands.
+        run(d, "post", "v", "@w NOT PASSED [F1]. Still swallowed on the retry path.")
+        item = [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "dispute"]
+        assert [i["member"] for i in item] == ["w"], item
+
+    def test_a_partial_pass_still_covers_the_findings_its_worker_hands_to_a_successor(self):
+        sys.path.insert(0, os.path.dirname(BOARD))
+        try:
+            import board  # noqa: E402
+        finally:
+            sys.path.remove(os.path.dirname(BOARD))
+        members = {"coordinator": {"role": "coordinator"}, "w": {"role": "worker", "killed": "1", "replaced_by": "w2"},
+                   "w2": {"role": "worker"}, "v": {"role": "verifier"}}
+        posts = [{"seq": 1, "agent": "v", "text": "@w NOT PASSED [F1]. The key is dropped.", "to": ["w"], "rejects": ["w"],
+                  "findings": ["F1"], "candidate": "c1"},
+                 {"seq": 2, "agent": "v", "text": "@coordinator VERIFIED c2", "to": ["coordinator"], "rules": True,
+                  "partial": True, "members": ["w"]}]
+        assert not board.ledger({"members": members}, posts)["F1"]["open"]
 
     def test_quoted_output_raises_nothing_and_a_successor_inherits_the_findings(self):
         d = self._run()
