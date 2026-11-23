@@ -15,7 +15,7 @@ Give the coordinator an independent judgment about the exact candidate. The owne
 
 ## Review the pieces when the board wakes you
 
-The board wakes you once the last worker is ready, or earlier when the coordinator mentions you for one piece. Review every `READY` you have not answered, in one sitting, before the candidate arrives.
+The board wakes you once the last worker is ready, or earlier when the coordinator mentions you for one piece or registered you with `reviews=` for the workers whose `READY` you review as each arrives. The candidate and its test command may come with the last `READY`, posted from the run's plan in the coordinator's name: it is the coordinator's command all the same. Review every `READY` you have not answered, in one sitting, before the candidate arrives.
 
 Cheapest checks first:
 

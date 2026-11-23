@@ -3934,6 +3934,13 @@ test('the coordinator drives its run through the board tool, and what a typed bo
   expect((await tool({ action: 'member', options: ['role=worker'] })).deny).toContain('name missing')
   expect((await tool({ action: 'member', name: 'lexer', options: ['role worker'] })).deny).toContain('key=value')
   expect((await tool({ action: 'post', text: 'hi', name: 'parser' })).deny).toContain('not name')
+  // a read that names the coordinator itself is the plain read; any other name is still refused. Seen live: refused,
+  // it cost a step at 150k.
+  for (const self of ['coordinator', '@coordinator']) {
+    expect((await tool({ action: 'read', name: self })).deny).toBeUndefined()
+    expect(last('read')?.args).toBe('read coordinator --max-bytes=48000 --attention')
+  }
+  expect((await tool({ action: 'read', name: 'parser' })).deny).toContain('not name')
   await tool({ action: 'member', name: '@Lexer', options: ['role=worker', 'owns=the lexer, its tests'] })
   expect(last('member')).toEqual({ dir: OWNED, args: 'member lexer role=worker owns=the lexer, its tests', stdin: undefined })
   expect((await tool({ action: 'post', text: '@parser go on' })).result).toContain('posted #2')
@@ -6865,6 +6872,7 @@ test('spend guards: a read-only member past the context ceiling may only report,
   const mirrored: (string | undefined)[] = []
   let postFails = false
   let ready = ''
+  let urgent = ''
   let builderStatus = 'running'
   const symlinks: Record<string, string> = {
     '/project/.swarm': '/data/runs',
@@ -6874,7 +6882,8 @@ test('spend guards: a read-only member past the context ceiling may only report,
   on('fs.stat', (_, e) => symlinks[e.path] ? { value: { realPath: symlinks[e.path] } as never } : { deny: 'unavailable' })
   const { seen, answer, board } = owning(on, {
     board: () => posts({ agent: 'coordinator', to: ['scout', 'builder'], text: '@scout @builder BRIEF' },
-      ...(ready ? [{ agent: 'scout', to: ['coordinator'], text: ready }] : [])),
+      ...(ready ? [{ agent: 'scout', to: ['coordinator'], text: ready }] : []),
+      ...(urgent ? [{ agent: 'builder', to: ['coordinator'], text: urgent }] : [])),
     roster: () => JSON.stringify(state),
   })
   on('process.run', (_, e) => {
@@ -6996,6 +7005,21 @@ test('spend guards: a read-only member past the context ceiling may only report,
   state.members.scout.last_read_seq = 2
   await $.prompt.submit({ text: `<agent-message from="scout-1">\n[Subagent hand-back] ${frame}  ${findings} Which of the two fixes do you want?</agent-message>`, origin: { kind: 'peer' }, wait: false })
   expect([mirrored.length, seen.prompts.length, seen.prompts.at(-1)?.includes("@scout's final report is on the board")]).toEqual([8, heard + 1, true])
+  // with nobody else at work, it is held too while a post the coordinator must read is unread and not yet told: the
+  // "Unread board mentions" notice starts its turn within seconds anyway. Seen live: a verifier's "No change" right
+  // after a worker's READY started two turns.
+  builderStatus = 'completed'
+  urgent = '@coordinator the base moved: rebase or merge?'
+  state.members.coordinator.last_read_seq = 2  // only the new post is owed, and its notice is still to come
+  await clock.advance(2000)
+  const owedFirst = seen.prompts.length
+  const behind = await $.prompt.submit({ text: `<agent-message from="scout-1">\n[Subagent hand-back] ${frame}  ${findings}</agent-message>`, origin: { kind: 'peer' }, wait: false })
+  expect([mirrored.length, behind.drop, seen.prompts.length]).toEqual([9, expect.stringContaining('its report is on the board'), owedFirst])
+  await clock.advance(12_000)
+  expect(seen.prompts.slice(owedFirst).some(text => text.includes('Unread board mentions'))).toBe(true)
+  urgent = ''
+  state.members.coordinator.last_read_seq = 1
+  builderStatus = 'running'
   // an agent that is no member of the run is measured but told nothing: it has no board to post on
   await step('outsider', 'o', 0, 210_000)
   const stranger = await grep('outsider')

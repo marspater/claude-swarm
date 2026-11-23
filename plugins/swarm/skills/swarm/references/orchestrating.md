@@ -66,7 +66,7 @@ Many similar small jobs: failing tests grouped by package, lint fixes by directo
 
 ### Triage, then fan out
 
-An audit or sweep with no known symptom. One or two read-only members triage the whole area with searches (the risky constructs, the recent diff, the failing or missing tests) and post each suspect place as a `FINDING` with its path. You register a member only for the places that hold up: a worker for a small fix, an investigator for a suspect that needs tracing. Slices that triage reports clean get nobody.
+An audit or sweep with no known symptom. One or two read-only members triage the whole area with searches (the risky constructs, the recent diff, the failing or missing tests) and post each suspect place as a `FINDING` with its path. You register a member only for the places that hold up: a worker for a small fix, an investigator for a suspect that needs tracing. Slices that triage reports clean get nobody. A triage member's `READY` report is kept as `<run>/context/<name>.md`: name it in the briefs that follow, so nobody maps the same ground twice.
 
 ### Pipeline
 
@@ -105,7 +105,7 @@ A member starts with nothing but its brief and the first two lines (`@name BRIEF
 - **Depends on:** the members whose `READY` it must wait for, or `nothing`.
 - **Seams:** any contract it shares with another piece. When two or more members share one, post it once, before anyone is started and before the individual briefs: a post whose first line addresses those members and the verifier and ends in BRIEF (`@parser @currency @verifier BRIEF`), then a `Seams:` block. The individual briefs then do not repeat it, and each still writes only its own member's name with `@`. The shared post goes first because a mention wakes a started member; `BOARD replace` copies it into a successor's brief.
 - **Done when:** a check the member can run and see pass. "Works correctly" is not a check.
-- **Repository rules:** the user's standing instructions that apply, such as commit-message rules. State the few rules that apply in the seam post. Do not send every member to read the project's guides (`AGENTS.md`, an architecture document): each member pays for the same files again.
+- **Repository rules:** the user's standing instructions that apply, such as commit-message rules. State the few rules that apply in the seam post. Do not send every member to read the project's guides (`AGENTS.md`, an architecture document): each member pays for the same files again. When several members need the same background (a protocol, an interface map, where things are), have one read-only member distil it first: the board keeps an explorer's or architect's `READY` report as `<run>/context/<name>.md`, and each brief names that file in place of the sources.
 - **How to report:** `BOARD ready <name>`, or the board tool's `ready` action for a specialist. A verifier reports with a post: the board refuses it `ready`.
 - **Only what its tools can do.** An explorer, an investigator and an architect have no shell: they read and search. Do not tell one to run a command (`git diff`, a test, a script); the board refuses such a brief. Run the command yourself, write its output to a file outside the project, and name the file in the brief.
 

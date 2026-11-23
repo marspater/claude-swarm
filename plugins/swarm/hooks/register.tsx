@@ -1846,8 +1846,11 @@ async function mirrorHandback($: EngineInterface, e: { text: string; origin: { k
   // and posted without it. Seen live: a one-line status was mirrored because its frame alone passed the minimum.
   const report = unframed(body)
   const shown = snapshot
+  // Nor when a post the coordinator must read is unread and not yet told: the "Unread board mentions" notice starts its
+  // turn within seconds anyway. Seen live: a verifier's "No change" hand-back right after a worker's READY, two turns.
   const quiet = !halted && shown?.dir === roster.dir && member.consult !== '1' && !hasQuestion(report) &&
-    shown.members.some(m => m.role !== 'coordinator' && m.name !== name && m.status === 'working')
+    (shown.members.some(m => m.role !== 'coordinator' && m.name !== name && m.status === 'working') ||
+      (owed.count !== 0 && !isOwedRoutine && owed.last > prompted))
   const newest = parsePosts(board, fresh.members).findLast(post => post.agent === name)
   if (newest && newest.seq > Number(member.last_nudged_seq ?? 0)) {
     const compactBody = report.replace(/\s+/g, ' ').trim()
@@ -2815,6 +2818,8 @@ async function coordinatorBoard($: EngineInterface, e: BoardInput) {
   const takes = Object.hasOwn(COORDINATOR_TAKES, action) ? COORDINATOR_TAKES[action] : undefined
   if (!takes) return { deny: `Unknown board action. The coordinator's are ${Object.keys(COORDINATOR_TAKES).join(', ')}.` }
   const [needs, may] = takes
+  // The coordinator's own name on its own read says nothing more. Seen live: refused, it cost a whole step at 150k.
+  if (action === 'read' && typeof e.name === 'string' && e.name.trim().replace(/^@/, '').toLowerCase() === 'coordinator') e = { ...e, name: undefined }
   const given = BOARD_FIELDS.filter(field => e[field] !== undefined && !(typeof e[field] === 'string' && (e[field] as string).trim() === ''))
   const missing = needs.filter(field => !given.includes(field as typeof given[number]))
   const extra = given.filter(field => !needs.includes(field) && !may.includes(field))

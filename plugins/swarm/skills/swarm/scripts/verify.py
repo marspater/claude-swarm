@@ -32,6 +32,9 @@ GIT_ENV_STRIP = {
 }
 
 
+PLAN_FILE = "verification-plan.json"  # the `prepare` arguments recorded with --when-ready
+
+
 def clean_env():
     return {k: v for k, v in os.environ.items() if k not in GIT_ENV_STRIP}
 
@@ -288,16 +291,21 @@ def verification_lock(directory):
         yield
 
 
-def inputs(run, mode, subset=None, *, allow_closed=False):
-    """The READY post and commit of every contributing worker, or of the workers SUBSET names for a partial candidate."""
+def inputs(run, mode, subset=None, *, allow_closed=False, among=None):
+    """The READY post and commit of every contributing worker, or of the workers SUBSET names for a partial candidate.
+    AMONG, for a candidate already prepared, is the workers it holds."""
     state, posts = load(run)
     if state.get("closed") and not allow_closed:
         raise ValueError("the run is closed")
     members = state["members"]
     ready = readiness(members, posts)
-    # A consultant advises the coordinator: it contributes nothing to the candidate.
+    # A consultant advises the coordinator: it contributes nothing to the candidate. A worker registered after the
+    # candidate was prepared is not in it either. Seen live: a worker added for follow-up work held up `accept`.
     workers = [name for name, member in members.items()
-               if member.get("role") == "worker" and not member.get("killed") and member.get("consult") != "1"]
+               if member.get("role") == "worker" and not member.get("killed") and member.get("consult") != "1"
+               and (among is None or name in among
+                    # ...unless a NOT PASSED stands against it: accepting would move the ledger past its open finding.
+                    or (name not in ready and latest_reports(posts).get(name, {}).get("kind") == "ready"))]
     stray = sorted(set(subset or ()) - set(workers))
     if stray:
         raise ValueError("--members takes the active workers a candidate holds, and not " + ", ".join("@" + n for n in stray))
@@ -360,7 +368,7 @@ def subset_of(candidate):
 
 
 def check_inputs(run, candidate):
-    recorded = inputs(run, candidate["mode"], subset_of(candidate))
+    recorded = inputs(run, candidate["mode"], subset_of(candidate), among=candidate.get("members"))
     check_checks_field(run, candidate, recorded)
     if candidate["inputs"] != recorded:
         raise ValueError("worker readiness changed; prepare and test a new candidate")
@@ -825,7 +833,7 @@ def check_current(run, candidate, *, allow_closed=False):
         return check_inputs(run, candidate)
     # Accepted: its checkout may be gone, and the project itself now holds what was tested.
     project = Path(candidate["project"])
-    recorded = inputs(run, candidate["mode"], subset_of(candidate), allow_closed=allow_closed)
+    recorded = inputs(run, candidate["mode"], subset_of(candidate), allow_closed=allow_closed, among=candidate.get("members"))
     check_checks_field(run, candidate, recorded)
     if candidate["inputs"] != recorded:
         raise ValueError("worker readiness changed after acceptance")
@@ -844,11 +852,13 @@ def active_verifier(run, verifier):
         raise ValueError("an active verifier must run the checks")
 
 
-def prepare(run, project, mode, checks, onto=None, subset=None, baseline=False, allowed=()):
+def prepare(run, project, mode, checks, onto=None, subset=None, baseline=False, allowed=(), keep_standing=False):
     """CHECKS is None for a candidate with nothing a command could test, such as a designer's assets.
+    KEEP_STANDING leaves the candidate on the table in place when this one would be the same thing again.
     ONTO names the commit an isolated candidate is built on when that is not the checkout's own HEAD.
     SUBSET names the workers of a partial candidate, which is tested and never accepted."""
     identifier = uuid.uuid4().hex[:16]
+    standing = None
     with board_lock(run):
         recorded = inputs(run, mode, subset)
         if checks is None:
@@ -951,12 +961,29 @@ def prepare(run, project, mode, checks, onto=None, subset=None, baseline=False, 
                     previous = json.load(file)
             except (OSError, ValueError):
                 previous = None
+            # The same files, checks and reports of the same workers as the candidate on the table: a READY that
+            # changed nothing it holds (a follow-up worker's, or a second one racing the first) makes no new candidate,
+            # so a pass that stands is not thrown away and the verifier is not sent to test the same thing twice.
+            same = ("mode", "project", "base", "onto", "checks", "no_checks", "baseline", "partial", "digest", "exact")
+            if (keep_standing and isinstance(previous, dict) and isinstance(previous.get("candidate"), str)
+                    and all(previous.get(key) == candidate[key] for key in same)
+                    and previous.get("allowed", []) == candidate.get("allowed", [])
+                    and isinstance(previous.get("members"), list) and previous.get("inputs") == {
+                        name: report for name, report in recorded.items() if name in previous["members"]}):
+                standing = previous
             # The candidates this one replaces, with the reports each held: a verdict on one of them that arrives
             # late is the board's to tell from a verdict on this one.
-            if isinstance(previous, dict) and isinstance(previous.get("candidate"), str):
+            elif isinstance(previous, dict) and isinstance(previous.get("candidate"), str):
                 earlier = previous.get("superseded") if isinstance(previous.get("superseded"), list) else []
                 candidate["superseded"] = [*earlier, {"candidate": previous["candidate"], "inputs": previous.get("inputs")}]
-            save_candidate(run, candidate)
+            if standing is None:
+                save_candidate(run, candidate)
+        if standing is not None:
+            if integration is not None and integration.exists():
+                git(project, "worktree", "remove", "--force", str(integration), optional=True)
+            print(json.dumps({"candidate": standing["candidate"], "path": standing.get("path"), "commit": standing.get("commit"),
+                              "digest": standing["digest"], "partial": standing.get("partial", False), "standing": True}))
+            return
     except BaseException:  # an interrupt too: a half-built integration worktree is never left behind
         if integration is not None and integration.exists():
             git(project, "worktree", "remove", "--force", str(integration), optional=True)
@@ -2016,6 +2043,11 @@ def main():
     prep.add_argument("--baseline-diff", action="store_true",
                       help="waive a check that fails on the candidate's base with the same output (isolated only)")
     prep.add_argument("--members", help="a partial candidate of these workers, comma-separated: tested, never accepted")
+    prep.add_argument("--keep-standing", action="store_true",
+                      help="prepare nothing when the candidate on the table already holds these files, checks and reports")
+    prep.add_argument("--when-ready", action="store_true",
+                      help="record this command as the run's plan: the READY that completes the team prepares the "
+                           "candidate and posts its test command to the verifier, now and after each rework")
     test = actions.add_parser("test", allow_abbrev=False)
     test.add_argument("candidate")
     test.add_argument("verifier")
@@ -2033,6 +2065,7 @@ def main():
     private(run)
     git_dir = git(project, "rev-parse", "--absolute-git-dir", optional=True)
     lock_directory = Path(os.fsdecode(git_dir.rstrip(b"\n"))) if git_dir else run.parent
+    planned = False
     with verification_lock(lock_directory):
         if args.action == "prepare":
             if any(not check.strip() for check in args.check or []):
@@ -2053,8 +2086,18 @@ def main():
             if args.baseline_diff and (args.mode != "isolated" or args.no_checks):
                 # A shared candidate runs in the user's checkout, with dependencies no fresh checkout of its base has.
                 raise ValueError("--baseline-diff is for an isolated candidate with checks")
-            prepare(run, project, args.mode, None if args.no_checks else args.check, args.base, subset, args.baseline_diff,
-                    allowances(args.allow))
+            allowed = allowances(args.allow)
+            if args.when_ready:
+                if subset is not None:
+                    raise ValueError("--when-ready plans the whole candidate; a partial one is prepared by hand")
+                # The command as given, for `ready` to run again: every later READY that completes the team makes a
+                # candidate from it, so no turn of the coordinator's is spent on a step the board's state decides.
+                plan = [arg for arg in sys.argv[sys.argv.index("prepare") + 1:] if arg not in ("--when-ready", "--keep-standing")]
+                (run / PLAN_FILE).write_text(json.dumps(plan), encoding="utf-8")
+                planned = True
+            if not planned:
+                prepare(run, project, args.mode, None if args.no_checks else args.check, args.base, subset,
+                        args.baseline_diff, allowed, args.keep_standing)
         elif args.action == "test":
             test_candidate(run, project, args.candidate, args.verifier, args.timeout)
         elif args.action == "commit":
@@ -2065,6 +2108,11 @@ def main():
             recover_index(run, project, args.candidate)
         else:
             accept(run, project, args.candidate)
+    if planned:
+        # Prepared and handed to the verifier by the board, as each later READY will have it: one path for both. Run
+        # once the lock above is let go, since the board's prepare takes it.
+        done = subprocess.run([sys.executable, "-B", str(Path(__file__).with_name("board.py")), str(run), "dispatch"])
+        sys.exit(done.returncode)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ You are the coordinator. The roster in `<run>/members.json` is the team: who exi
 | Key | Meaning | Set by |
 | --- | --- | --- |
 | `role` | `worker` (default), `verifier`, `coordinator` | `role=verifier` when registering a verifier |
+| `reviews` | On a verifier: the workers whose `READY` it reviews as each arrives, while that worker's context is still warm, instead of once the last worker is ready. Each early review is one verifier wake, so it pays from about three writers. Attention lists the verifier as unstarted from the first such `READY`: start it then | `reviews=<a,b>` or `reviews=all` when registering the verifier; `reviews=` clears it |
 | `profile` | The agent type behind a specialist (`explorer`, `investigator`, `architect`) or a `designer` | `profile=<type>` with `writes=0` for a specialist; `profile=designer` for a designer, which writes files |
 | `backend` | `native` on the coordinator's own entry when the run uses native Agent Teams (`native-teams.md`); the plugin then expects named teammates. Nothing else is set on the coordinator | `BOARD member coordinator backend=native`, before any member starts |
 | `paths` | The files and folders a writer may edit, relative to the project folder, separated by commas. The board refuses a path that another active writer claims, or a folder that holds one. In a shared checkout, hooks enforce `paths=` on edits (blocking writes to another writer's paths, outside the member's own `paths=`, or inside `.swarm/`). A successor made with `replace` inherits them | `paths=Sources/Feed,Tests/FeedTests.swift` at registration, before the brief |
@@ -25,7 +26,7 @@ A member's life: register, brief, spawn, record its id, work, `READY` (and `revi
 
 Register every name before you post any brief, so a brief can name its neighbours and dependencies.
 
-Changing a member's assignment scope withdraws its previous report and asks it to report again. A retired member's recorded agent address stays reserved and its assignment no longer changes: `replace` it instead.
+Changing a member's assignment scope withdraws its previous report and asks it to report again; the notice tells the member your instruction follows, so post that instruction right after the change. A retired member's recorded agent address stays reserved and its assignment no longer changes: `replace` it instead.
 
 ## Spawning
 

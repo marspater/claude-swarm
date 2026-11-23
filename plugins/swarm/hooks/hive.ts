@@ -5,7 +5,7 @@ import { easeInOut, easeOut, loopDelay } from './motion'
 export type Mood = NonNullable<Swarm['mood']>
 // The board's subcommands, as tests/parity.json lists them: a word after `board.py <folder>` that is none of these
 // names a file, not a board call.
-export const BOARD_ACTIONS = new Set(['init', 'member', 'limit', 'plan', 'attention', 'retry', 'replace', 'post', 'read', 'show', 'ready', 'confirm',
+export const BOARD_ACTIONS = new Set(['init', 'member', 'limit', 'dispatch', 'plan', 'attention', 'retry', 'replace', 'post', 'read', 'show', 'ready', 'confirm',
   'revise', 'wake', 'claim', 'woke', 'rearm', 'pause', 'resume', 'bind', 'restore', 'adopt', 'locate', 'agent-run', 'started', 'close', 'kill',
   'account', 'status', 'prune', 'tail', 'sync', 'export'])
 /** The board subcommand a Bash command runs, if it runs one. */

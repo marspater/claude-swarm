@@ -484,6 +484,30 @@ class VerifyRegressions(unittest.TestCase):
             run(*post, "post", "v", "@coordinator " + line)
             run(*gate, "accept", cand["candidate"])
 
+    def test_a_worker_registered_after_prepare_holds_up_neither_accept_nor_commit(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g = self._init_git(proj)
+            board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Late")
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            run(*post, "ready", "w", text="done")
+            (proj / "file.txt").write_text("v2")
+            cand = json.loads(run(*gate, "prepare", "shared", "--check", "true"))["candidate"]
+            run(*post, "post", "v", "@coordinator " + run(*gate, "test", cand, "v").splitlines()[-1])
+            # Seen live: a worker for follow-up work, registered after the pass, refused both with "waiting for READY".
+            run(*post, "member", "late")
+            run(*gate, "accept", cand)
+            run(*post, "member", "late-2")
+            assert "COMMITTED" in run(*gate, "commit", cand, "-m", "land")
+            assert g("show", "HEAD:file.txt") == "v2"
+            # A worker the candidate holds still counts: new work from it voids the pass.
+            run(*post, "revise", "w", "one more thing")
+            refused = subprocess.run([*gate, "accept", cand], capture_output=True, text=True)
+            assert refused.returncode != 0 and "@w" in refused.stderr and "@late" not in refused.stderr, refused.stderr
+
     def test_nochecks_revalidation_and_moved_submodule_fail_fast_and_prune_worktree(self):
         with tempfile.TemporaryDirectory() as t_sub, tempfile.TemporaryDirectory() as t_proj:
             sub, proj = Path(t_sub).resolve(), Path(t_proj).resolve()
@@ -1026,6 +1050,69 @@ class VerifyRegressions(unittest.TestCase):
             sys.path.remove(str(SCRIPTS))
 
     # The audit of 0.3.47.
+
+    def test_a_planned_candidate_is_prepared_by_the_ready_that_completes_the_team(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            self._init_git(proj)
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "plan", "init", "Plan").strip())
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            for name in ("a", "b"):
+                run(*post, "member", name)
+            run(*post, "member", "v", "role=verifier")
+
+            def candidate():
+                return json.loads((board / "verification.json").read_text())["candidate"]
+
+            def last_post():
+                return json.loads((board / "board.jsonl").read_text().splitlines()[-1])
+            # Recorded while nobody is ready: nothing is prepared, and nothing fails.
+            assert run(*gate, "prepare", "shared", "--check", "test -d .git", "--when-ready").startswith("planned:")
+            assert not (board / "verification.json").exists()
+            assert "candidate" not in run(*post, "ready", "a", text="done a")
+            # The READY that completes the team prepares it and hands the verifier the exact command.
+            said = run(*post, "ready", "b", text="done b")
+            first = candidate()
+            request = last_post()
+            assert first in said and request["agent"] == "coordinator" and request["to"] == ["v"], (said, request)
+            command = request["text"].splitlines()[-1]
+            assert command.endswith("test %s v" % first), command
+            tested = subprocess.run(command, shell=True, capture_output=True, text=True, cwd=proj)
+            assert tested.returncode == 0 and "VERIFIED " + first in tested.stdout, tested.stderr
+            # A follow-up worker's READY that changes no file leaves the candidate, and its pass, where they are.
+            run(*post, "member", "late")
+            assert first in run(*post, "ready", "late", text="triage only, no files touched")
+            assert candidate() == first and last_post()["agent"] == "late", last_post()
+            # Nor does a consultant's report: it contributes nothing to the candidate.
+            run(*post, "member", "arch", "profile=architect", "writes=0", "consult=1")
+            assert first in run(*post, "ready", "arch", text="advice only")
+            assert candidate() == first
+            # A NOT PASSED against the follow-up worker holds the candidate up: a pass would close its finding unseen.
+            run(*post, "post", "v", "@late NOT PASSED: F1 the triage missed a thread")
+            held = subprocess.run(command, shell=True, capture_output=True, text=True, cwd=proj)
+            assert held.returncode and "waiting for READY from @late" in held.stderr, held.stderr
+            # Retiring the last worker that is not ready completes the team: the plan runs then too.
+            assert first in run(*post, "member", "late", "killed=1")
+            # After a rework the next READY prepares the next one, again with no word from the coordinator.
+            run(*post, "post", "v", "@a NOT PASSED: F2 the file is missing a line")
+            assert candidate() == first
+            assert "candidate" in run(*post, "ready", "a", text="F2: fixed — added the line, test -d .git passes")
+            assert candidate() != first and candidate() in last_post()["text"]
+            # A plan that cannot be prepared is the coordinator's to hear of, from the member whose READY met it.
+            (board / "verification-plan.json").write_text(json.dumps(["shared", "--check", "true", "--base", "main"]))
+            run(*post, "post", "v", "@b NOT PASSED: F3 one more")
+            run(*post, "ready", "b", text="F3: fixed — done")
+            failed = last_post()
+            assert failed["agent"] == "b" and failed["to"] == ["coordinator"] and "--base is for an isolated candidate" in failed["text"], failed
+            # Planned again with everyone ready: prepared at once, and the request goes to every verifier in one post.
+            run(*post, "member", "v2", "role=verifier")
+            before = candidate()
+            again = run(*gate, "prepare", "shared", "--check", "test -d .git", "--check", "true", "--when-ready")
+            request = last_post()
+            assert candidate() != before and candidate() in again and request["to"] == ["v", "v2"], (again, request)
+            assert request["text"].endswith("test %s <you>" % candidate()), request["text"]
+            json.loads(run(*post, "attention", "--json"))  # the journal still reads: one post, one number
 
     def test_the_commit_after_a_shared_accept_takes_the_verified_files_whatever_was_staged(self):
         with tempfile.TemporaryDirectory() as t:

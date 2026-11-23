@@ -54,6 +54,7 @@ import fcntl  # ponytail: POSIX only; swap in msvcrt.locking if Windows support 
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -165,7 +166,7 @@ SUMMARY_CHARS = 200
 ARG_COUNTS = {
     "init": (1, None), "restore": (1, 1), "adopt": (2, None), "locate": (2, None),
     "agent-run": (2, 3), "started": (3, 4), "member": (1, None),
-    "limit": (0, None), "plan": (0, 0), "attention": (0, 1), "retry": (1, 1),
+    "limit": (0, None), "dispatch": (0, 0), "plan": (0, 0), "attention": (0, 1), "retry": (1, 1),
     "replace": (2, None), "post": (1, None), "ready": (1, 2), "revise": (1, None),
     "confirm": (2, 2), "read": (1, 4), "show": (0, 2), "wake": (0, 0),
     "claim": (3, 3), "woke": (3, 3), "rearm": (2, None), "bind": (1, 1),
@@ -192,6 +193,16 @@ def atomic_write(path, value):
 def save(d, state):
     allocate(state)
     atomic_write(os.path.join(d, "members.json"), json.dumps(state, indent=1))
+
+
+def planned(d):
+    """The `prepare` arguments the coordinator recorded with `verify.py ... prepare ... --when-ready`, or None."""
+    try:
+        with open(os.path.join(d, "verification-plan.json"), encoding="utf-8") as f:
+            plan = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return plan if isinstance(plan, list) and plan and all(isinstance(arg, str) for arg in plan) else None
 
 
 def load_state(d):
@@ -479,7 +490,7 @@ READ_ONLY = {"explorer", "investigator", "architect"}
 PROFILES = {*READ_ONLY, "designer"}
 FAMILIES = ("haiku", "sonnet", "opus", "fable")
 LIMITS = {"max_workers", "max_members", "budget", "member_budget", *FAMILIES}
-INHERITED = ("role", "group", "profile", "writes", "depends", "after", "owns", "paths", "model", "effort", "consult", "size")
+INHERITED = ("role", "group", "profile", "writes", "depends", "after", "owns", "paths", "model", "effort", "consult", "size", "reviews")
 MEMBER_FIELDS = {*INHERITED, "backend", "id", "killed", "isolated", "budget"}
 # The budget a run gets from its planned team, in charged tokens, until the user names one. A piece costs what its
 # type usually spends, times the size the coordinator read from the task and the effort it runs at.
@@ -968,11 +979,16 @@ def unanswered(members, posts):
 
 def runnable(name, members, posts, ready):
     """Whether NAME can act now, so starting its agent costs no idle wait: a worker once its dependencies are READY,
-    a verifier once every non-consultant worker is, or once a post after its brief asks it for an early review."""
+    a verifier once every non-consultant worker is, once a worker its reviews= names is, or once a post after its
+    brief asks it for an early review."""
     member = members[name]
     if member.get("role") != "verifier":
         return not unmet(member, members, ready)
     if all(n in ready for n, e in team_of(members).items() if e.get("role") == "worker" and e.get("consult") != "1"):
+        return True
+    # With reviews= it reviews each named worker's READY as it arrives: one of them standing is work for it.
+    watched = set(filter(None, member.get("reviews", "").split(",")))
+    if any(n in ready and members[n].get("role") == "worker" for n in (ready if "all" in watched else watched)):
         return True
 
     def brief(p):
@@ -1951,7 +1967,10 @@ def main(argv):
                 post["to"] = recipients
                 if any(entry.get("role") == "worker" and entry.get("consult") != "1" and name not in current
                        for name, entry in team_of(members).items()):
-                    recipients = [name for name in recipients if members[name].get("role") != "verifier"]
+                    # A verifier hears before the last READY only of the workers its reviews= names: reviewed while
+                    # the worker's context is still warm, at the price of one verifier wake for each.
+                    recipients = [name for name in recipients if members[name].get("role") != "verifier"
+                                  or {subject, "all"} & set(filter(None, members[name].get("reviews", "").split(",")))]
                     post["to"] = recipients
             marked = progress(state, members[sender])
             if save_roster:
@@ -2024,6 +2043,56 @@ def main(argv):
             fcntl.flock(lock, fcntl.LOCK_EX)
             return load(d)
 
+        def run_plan(author):
+            """Prepare the run's planned candidate, if one is planned and the team is ready, and hand the verifiers its
+            test command in the coordinator's name. Called after each step that can complete the team: a READY, a
+            confirmed finding, a retirement, the plan itself. The board's state decides this step, so no turn of the
+            coordinator's is spent on it. Seen live: each candidate cost the coordinator a wake at 180k tokens to run
+            one command and post its output. The lock is let go meanwhile: verify.py takes it, and a merge may take
+            long. The candidate on the table is kept when it already holds these files and reports."""
+            nonlocal state, posts, members
+            plan = planned(d)
+            if not plan:
+                return
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            run_dir = os.path.abspath(d)
+            project = os.path.dirname(os.path.dirname(run_dir))
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verify.py")
+            done = subprocess.run([sys.executable, "-B", script, run_dir, project, "prepare", *plan, "--keep-standing"],
+                                  capture_output=True, text=True, stdin=subprocess.DEVNULL)
+            state, posts = relocked()
+            members = state["members"]
+            why = done.stderr.strip()
+            made = json.loads(done.stdout.strip().split("\n")[-1]) if done.returncode == 0 else {}
+            if made.get("standing"):
+                print("candidate %s on the table already holds these files and reports: no new one was prepared"
+                      % made["candidate"])
+            elif done.returncode == 0:
+                # One post for every verifier: each runs the command with its own name last.
+                verifiers = [name for name, entry in members.items() if entry.get("role") == "verifier" and not entry.get("killed")]
+                command = shlex.join(["python3", script, run_dir, project, "test", made["candidate"]])
+                if verifiers:
+                    last = (verifiers[0], "") if len(verifiers) == 1 else ("<you>", ", with your own name in place of <you>")
+                    post_message(COORDINATOR, "%s CANDIDATE %s (path %s, digest %s), prepared from the run's plan now that "
+                                 "every worker is READY. Review every READY you have not answered against your brief, "
+                                 "then run exactly%s:\n%s %s" % (
+                                     " ".join("@" + name for name in verifiers), made["candidate"], made["path"],
+                                     made["digest"], last[1], command, last[0]), verifiers)
+                print("candidate %s was prepared from the run's plan%s" % (
+                    made["candidate"], " and its test command posted to the verifier" if verifiers
+                    else ". No verifier is registered: its test command is\n%s <verifier>" % command))
+            elif "waiting for READY from" in why or "worker readiness changed" in why or "there are no active workers" in why:
+                if author == COORDINATOR and cmd == "dispatch":
+                    print("planned: the step that completes the team prepares this candidate and posts its test command "
+                          "to the verifier. Nothing is prepared yet (%s)" % why.replace("verification: ", ""))
+            elif author == COORDINATOR:
+                print("the planned candidate could not be prepared: " + why)  # the coordinator's own command: it reads this
+            else:
+                # Not this READY's to settle alone: the coordinator hears, and so does each worker a line names.
+                told = [COORDINATOR, *(n for n in targets(why, members, sender=author) if n not in (author, COORDINATOR))]
+                post_message(author, "@coordinator The planned candidate could not be prepared after this READY:\n" + why, told)
+                print("the planned candidate could not be prepared: " + why)
+
         def unmerged(repo, deps, revision):
             """The dependencies, of {name: READY post}, whose READY commit REVISION does not contain."""
             return [dep for dep, post in deps.items() if post.get("revision") and not is_ancestor(repo, post["revision"], revision)]
@@ -2094,6 +2163,16 @@ def main(argv):
             waited = set(dependencies(previous))
             member.update(changes)
             merge_after(member, changes, previous.get("after", ""))
+            if "reviews" in changes:
+                asked = list(dict.fromkeys(n.strip().lstrip("@").lower() for n in changes["reviews"].split(",") if n.strip()))
+                if asked and member.get("role") != "verifier":
+                    sys.exit("reviews= is a verifier's: it names the workers whose READY it reviews as each arrives")
+                unknown = [n for n in asked if n != "all" and (n not in members or members[n].get("role") != "worker")]
+                if unknown:
+                    sys.exit("reviews= takes registered workers, or all, and not " + ", ".join("@" + n for n in unknown))
+                member["reviews"] = ",".join(asked)
+                if not asked:
+                    member.pop("reviews")
             if member.get("killed"):  # a retired member runs no more turns: nothing is paused
                 member.pop("paused", None)
                 member.setdefault("retired_at", len(posts))
@@ -2143,6 +2222,10 @@ def main(argv):
                     name in dependencies(entry) or (entry.get("role") == "verifier" and in_play(d, name, members)))]
                 what = ("Review your scope and report again." if member.get("role") == "worker" else
                         "You are a %s now: your earlier report is withdrawn, and a %s posts no READY." % (member["role"], member["role"]))
+                # It reaches the member ahead of the coordinator's own instruction. Seen live: a member ended its turn
+                # on this notice alone, saying it could not act on it yet, and its hand-back woke the coordinator.
+                what += (" The coordinator's instruction follows in a later post: read the board again for it before you "
+                         "answer or report, and do not end your turn on this notice alone.")
                 return post_message(COORDINATOR, f"@{name} Your assignment changed. {what}",
                                     recipients, kind="revise", subject=name, save_roster=True)
             if "killed" in changes and not previous.get("killed"):
@@ -2153,17 +2236,31 @@ def main(argv):
                 old_members = {**members, name: previous}
                 old_ready = readiness(old_members, posts)
                 workers = {w for w, e in team_of(members).items() if e.get("role") == "worker" and e.get("consult") != "1"}
+                # A member that never started and posted nothing held nothing the verifier has: a verifier addressed
+                # since the newest READY already has the work. Seen live: retiring one woke the verifier only to answer
+                # that nothing changes, and its hand-back woke the coordinator.
+                started = previous.get("id") or any(p["agent"] == name for p in posts)
+                newest = max((p["seq"] for p in through.values()), default=0)
                 if workers and workers <= through.keys() and any(
                     e.get("role") == "worker" and e.get("consult") != "1" and w not in old_ready
                     for w, e in team_of(old_members).items()
                 ):
-                    freed.extend(n for n, entry in team_of(members).items() if entry.get("role") == "verifier")
+                    freed.extend(n for n, entry in team_of(members).items() if entry.get("role") == "verifier" and (
+                        started or not any(n in p.get("to", ()) for p in posts if p["seq"] >= newest)))
                 freed = list(dict.fromkeys(freed))
                 if freed:
-                    return post_message(COORDINATOR, "%s @%s was retired and reports nothing. Go on without it (if you merged its commit, rebuild without it), and name in "
+                    post_message(COORDINATOR, "%s @%s was retired and reports nothing. Go on without it (if you merged its commit, rebuild without it), and name in "
                                         "your report what is missing for that." % (" ".join("@" + n for n in freed), name),
-                                        freed, save_roster=True)
+                                 freed, save_roster=True)
+                    return run_plan(COORDINATOR)
             save(d, state)
+            if changes.get("killed"):
+                run_plan(COORDINATOR)  # so may a retirement, of the last worker that was not ready
+
+        elif cmd == "dispatch":  # verify.py's, after `prepare --when-ready` recorded the plan
+            if state.get("closed"):
+                sys.exit("the run is closed")
+            run_plan(COORDINATOR)
 
         elif cmd == "limit":
             changes = assignments(args, LIMITS)
@@ -2682,6 +2779,16 @@ def main(argv):
             for peer, clash in conflicts.items():
                 print("conflict: @%s's READY #%d and this commit both change %s. Agree with @%s who changes what before "
                       "the candidate is prepared" % (peer, clash["seq"], ", ".join(clash["files"]), peer))
+            if cmd == "ready" and kind_of(member) in READ_ONLY:
+                # A read-only member's report is the background others would each read the sources for again: kept as
+                # a file a brief can name. Seen live: three workers each read the same protocol and tooling documents.
+                os.makedirs(os.path.join(d, "context"), exist_ok=True)
+                kept = os.path.join(os.path.abspath(d), "context", sender + ".md")
+                with open(kept, "w", encoding="utf-8") as f:
+                    f.write(report + "\n")
+                print("context: this report is kept at %s for briefs to name" % kept)
+            if cmd == "ready":
+                run_plan(sender)
 
         elif cmd == "sync":
             name = known(args[0])
@@ -2797,6 +2904,7 @@ def main(argv):
             recipients = [dep for dep, entry in team_of(members).items() if name in dependencies(entry) or entry.get("role") == "verifier"]
             post_message(COORDINATOR, "READY %s\nConfirmed %s's finding #%d. Read it with show --post=%d (or the board tool's show action with seq: %d)."
                          % (name, name, latest["seq"], latest["seq"], latest["seq"]), recipients, kind="ready", subject=name, revision=None)
+            run_plan(COORDINATOR)  # a confirmed finding may be the report that completes the team
 
         elif cmd == "read":
             # A reader pays in full only for posts addressed to it; the rest of the board costs it a line each.
@@ -3200,12 +3308,15 @@ def main(argv):
                      "Status: %s. %d posts." % ("closed" if state.get("closed") else "paused: " + state["paused"]
                                                 if state.get("paused") else "open", len(posts)), "", "## Team", "",
                      "| Member | Type | Model | Effort | Owns | Ready | Tokens |", "| --- | --- | --- | --- | --- | --- | --- |"]
+            authors = {post["agent"] for post in posts}
             for name, member in members.items():
                 if name != COORDINATOR:
+                    # Seen live: members registered and never spawned read as unfinished work with a plain "no".
                     lines.append("| %s |" % " | ".join(cell(v) for v in (
                         "@" + name + (" (retired)" if member.get("killed") else " (paused)" if member.get("paused") else ""),
                         kind_of(member), model_of(member), effort_of(member), member.get("owns") or member.get("paths", ""),
-                        "yes" if name in ready else "no", f"{tokens.get(usage_key(member), 0):,}")))
+                        "yes" if name in ready else "no" if member.get("id") or name in authors else "not started",
+                        f"{tokens.get(usage_key(member), 0):,}")))
             lines += ["", "Tokens: %s in all%s, %s of them the coordinator's." % (
                 f"{total:,}", " of a %s budget" % f"{budget:,}" if budget else "", f"{tokens.get(COORDINATOR, 0):,}"),
                 ""]

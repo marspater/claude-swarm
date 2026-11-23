@@ -167,8 +167,8 @@ def scenario():
         with open(os.path.join(d, "board.jsonl"), "rb") as f:
             whole = f.read()
         assert run(d, "tail").encode() == whole
-        cut = run(d, "tail", "300").encode()
-        assert 0 < len(cut) <= 300 and whole.endswith(cut) and whole[len(whole) - len(cut) - 1:len(whole) - len(cut)] == b"\n"
+        cut = run(d, "tail", "600").encode()
+        assert 0 < len(cut) <= 600 and whole.endswith(cut) and whole[len(whole) - len(cut) - 1:len(whole) - len(cut)] == b"\n"
         json.loads(cut.split(b"\n")[0])
         run(d, "tail", "many", ok=False)
         # a verification file that is not a candidate is refused, not a traceback
@@ -2316,6 +2316,11 @@ class BoardRegressions(unittest.TestCase):
         run(d, "member", "v", "role=verifier")
         run(d, "post", "coordinator", "@w BRIEF\nOwns: a")
         run(d, "ready", "w", stdin="done")
+        # Seen live: members registered and never started read as unfinished work with a plain "no".
+        run(d, "member", "idle", "owns=later")
+        run(d, "member", "gone", "owns=dropped")
+        run(d, "member", "gone", "killed=1")
+        run(d, "member", "late", "owns=begun", "id=late-1")
         with open(os.path.join(d, "members.json"), "rb") as f:
             before = f.read()
         path = run(d, "export").strip()
@@ -2323,6 +2328,7 @@ class BoardRegressions(unittest.TestCase):
         with open(path, encoding="utf-8") as f:
             report = f.read()
         for part in ("# Regression", "Status: open. 2 posts.", "| @w | worker | sonnet | medium | a\\|b | yes | 0 |",
+                     "| later | not started | 0 |", "| @gone (retired) |", "| dropped | not started | 0 |", "| begun | no | 0 |",
                      "No candidate was prepared.", "## Transcript", "> @w BRIEF", "> Owns: a", "-> @w"):
             assert part in report, (part, report)
         out = os.path.join(self.root, "elsewhere.md")
@@ -2392,6 +2398,41 @@ class BoardRegressions(unittest.TestCase):
         assert len([i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]) == 1
         run(d, "post", "w", stdin='@coordinator should I use "strict" or "loose"?')
         assert [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "question"]
+
+    def test_a_verifier_with_reviews_hears_each_named_ready_as_it_arrives(self):
+        def unstarted(d):
+            return [i["member"] for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "unstarted"]
+
+        def posts(d):
+            with open(os.path.join(d, "board.jsonl")) as f:
+                return [json.loads(line) for line in f]
+
+        d = self.init_run()
+        for name in ("a", "b", "c"):
+            run(d, "member", name)
+        run(d, "member", "a", "reviews=b", ok=False)  # a verifier's option
+        run(d, "member", "v", "role=verifier", "reviews=a,ghost", ok=False)
+        run(d, "member", "v", "role=verifier", "reviews=@A")
+        run(d, "post", "coordinator", stdin="@a @b @c @v BRIEF\nShared: the parser")
+        run(d, "ready", "b", stdin="done")
+        assert "v" not in posts(d)[-1]["to"] and "v" not in unstarted(d)  # @b is not one it reviews early
+        run(d, "ready", "a", stdin="done")
+        assert "v" in posts(d)[-1]["to"] and "v" in unstarted(d)  # @a is: the verifier is to be started now
+        run(d, "member", "v", "reviews=all")
+        run(d, "revise", "a", "one more case")
+        assert "v" in unstarted(d)  # @b's READY still stands, and all of them are its to review
+        run(d, "member", "v", "reviews=")
+        assert "reviews" not in saved(d)["members"]["v"] and "v" not in unstarted(d)
+
+    def test_a_read_only_report_is_kept_as_a_file_for_briefs_to_name(self):
+        d = self.init_run()
+        run(d, "member", "scout", "profile=explorer")
+        run(d, "member", "w")
+        said = run(d, "ready", "scout", stdin="MAP\nparser: src/parse.py:10 entry, tests in tests/test_parse.py")
+        kept = os.path.join(d, "context", "scout.md")
+        with open(kept) as f:
+            assert kept in said and f.read() == "MAP\nparser: src/parse.py:10 entry, tests in tests/test_parse.py\n"
+        assert "context:" not in run(d, "ready", "w", stdin="done")  # a writer's report is no background
 
     def test_only_a_request_wakes_a_verifier_early(self):
         def unstarted(d):
@@ -3793,6 +3834,24 @@ class SoftDependencies(unittest.TestCase):
             assert saved(d)["members"]["s2"]["after"] == "e,r" and saved(d)["members"]["s2"]["depends"] == "e,r"
             run(d, "replace", "v", "v2", "after=r", ok=False)  # a verifier waits for no member, however it is put
 
+    def test_retiring_a_member_that_never_started_wakes_no_verifier(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = run(os.path.join(t, ".swarm", "idle"), "init", "Idle").strip()
+            run(d, "member", "a")
+            run(d, "member", "v", "role=verifier")
+            run(d, "ready", "a", stdin="a done")
+            # Seen live: the verifier woke on the notice only to answer that nothing changes.
+            run(d, "member", "kody")
+            board = os.path.join(d, "board.jsonl")
+            before = open(board, encoding="utf-8").read()
+            run(d, "member", "kody", "killed=1")
+            assert open(board, encoding="utf-8").read() == before
+            # One that started still says so: its work may be in what the verifier holds.
+            run(d, "member", "kody-2", "id=late")
+            out = run(d, "member", "kody-2", "killed=1")
+            post = json.loads(run(d, "show", "--post=%d" % int(out.split()[1][1:]), "--json"))
+            assert post["to"] == ["v"] and "@kody-2 was retired and reports nothing" in post["text"], post
+
     def test_a_fan_in_goes_on_when_a_member_it_comes_after_is_retired(self):
         with tempfile.TemporaryDirectory() as t:
             d = run(os.path.join(t, ".swarm", "soft"), "init", "Fan-in").strip()
@@ -3955,6 +4014,8 @@ class EngineRegressions(unittest.TestCase):
         run(d, "member", "b", "owns=new-part")
         revise_post = json.loads(run(d, "show", "--post=3", "--json"))["text"]
         assert "Review your scope and report again." in revise_post and "Review its scope" not in revise_post, revise_post
+        # It arrives ahead of the coordinator's instruction, and says so: no turn ends with a post about it alone.
+        assert "instruction follows in a later post: read the board again" in revise_post, revise_post
         # Status omits internal delivered/clipped lists.
         run(d, "member", "c", "depends=b")
         run(d, "read", "c")
