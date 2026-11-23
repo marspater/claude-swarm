@@ -117,7 +117,7 @@ export function swarmEmblem(state: EmblemState, elapsed = 0): string {
         `@media(prefers-reduced-motion:reduce){.ring{display:none}.c-hi{animation:none}}`
       : '')
   const badge = state === 'attention'
-    ? `<circle class="ring" cx="15.8" cy="4.4" r="2.5"/><circle class="dot" cx="15.8" cy="4.4" r="2.2"/>`
+    ? `<circle class="ring" cx="15.8" cy="4.9" r="2.5"/><circle class="dot" cx="15.8" cy="4.9" r="2.2"/>`
     : active
       ? `<circle class="ring" cx="10" cy="10.4" r="6.8"/><circle class="dot" cx="10" cy="7.4" r="1.25"/>`
       : state === 'paused'

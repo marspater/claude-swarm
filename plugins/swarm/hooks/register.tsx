@@ -138,17 +138,17 @@ let player: Timer | undefined
 let livePlayer: Timer | undefined
 let playGen = 0
 
-function stop($: EngineInterface): Promise<unknown> {
+async function stop($: EngineInterface): Promise<void> {
   playGen++
   player?.cancel()
   player = undefined
-  return update($, isPlaying, () => false)
+  if (await read($, isPlaying)) await update($, isPlaying, () => false)
 }
 
 async function stopLive($: EngineInterface): Promise<void> {
   livePlayer?.cancel()
   livePlayer = undefined
-  await update($, livePulse, () => 0)
+  if ((await read($, livePulse)) !== 0) await update($, livePulse, () => 0)
 }
 
 // Posts arriving together advance in board order without moving the replay cursor.
@@ -2720,7 +2720,7 @@ async function exportRun($: EngineInterface, dir: string): Promise<void> {
 }
 
 // The band's button that opens the pane.
-function shortcut($: EngineInterface, e: Parameters<EngineInterface['ui']['resolve']>[0], singleCaption = false, shown?: Swarm, emblemOffset = 0) {
+function shortcut($: EngineInterface, e: Parameters<EngineInterface['ui']['resolve']>[0], singleCaption = false, shown?: Swarm, emblemOffset = 0, besidePeer = false) {
   const { Box, Text, Button } = $.ui.resolve(e)
   const isLive = shown !== undefined && shown.dir !== '' && !shown.isClosed
   const working = isLive ? shown.members.filter(m => m.status === 'working').length : 0
@@ -2748,15 +2748,18 @@ function shortcut($: EngineInterface, e: Parameters<EngineInterface['ui']['resol
   // Cover the composer's tinted inset with the same theme surface as the crab.
   // Keep the honeycomb emblem beside the native Button (not trapped inside a separate outer border)
   // so the entire button pill highlights uniformly from edge to edge on mouse hover.
+  // When placed beside Crab Buddy, keep flexShrink={0} and positive right clearance so Crab Buddy's
+  // negative left inset margin overlaps only the matching background padding and never clips the button.
   return (
     <Box
       flexDirection="row"
       alignItems="center"
+      flexShrink={0}
       columnGap="xs"
       backgroundColor="userMessageBackground"
       marginLeft={-2}
       paddingLeft={2}
-      marginRight={-2}
+      marginRight={besidePeer ? 0 : -2}
       paddingRight={2}
       marginTop={-2}
       paddingTop={singleCaption ? 3 : 2}
@@ -3837,8 +3840,8 @@ export const register: Register = on => {
     const shown = await read($, swarm)
     const offset = phase(`${e.surface}:shortcut`, shown.dir, emblemStateOf(shown), await $.clock.now().catch(() => 0))
     return <Box flexDirection="row" columnGap={2}>
-      {shortcut($, e, textCount(findKey(peers[0]?.tree, 'crab-text')) === 1, shown, offset)}
-      <Box flexDirection="column" flexGrow={1} flexShrink={1}>{crab}</Box>
+      {shortcut($, e, textCount(findKey(peers[0]?.tree, 'crab-text')) === 1, shown, offset, true)}
+      <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>{crab}</Box>
     </Box>
   })
 
@@ -3852,6 +3855,7 @@ export const register: Register = on => {
     const borderColor = shown.dir === '' || shown.isClosed ? 'subtle'
       : shown.isPaused || shown.attention.length > 0 ? 'warning'
         : working > 0 ? 'success' : 'claude'
+    const emblemOffset = phase(`${e.surface}:reply:${shown.dir}`, shown.dir, state, await $.clock.now().catch(() => 0))
     return (
       <Box flexDirection="column" rowGap="sm">
         {reply}
@@ -3870,11 +3874,13 @@ export const register: Register = on => {
           paddingX="sm"
           paddingY="xs"
         >
-          <Box flexDirection="row" alignItems="center" columnGap="sm" flexShrink={1}>
-            <Svg source={swarmEmblem(state)} alt="Swarm" width={20} height={20} />
-            <Box flexDirection="column" flexShrink={1}>
-              <Text weight="semibold" color={shown.isClosed ? undefined : 'claude'}>Swarm</Text>
-              <Text size="caption" dimColor>Live multi-agent board &amp; graph</Text>
+          <Box flexDirection="row" alignItems="center" columnGap="sm" flexShrink={1} minWidth={0}>
+            <Box flexShrink={0}>
+              <Svg source={swarmEmblem(state, emblemOffset)} alt="Swarm" width={20} height={20} />
+            </Box>
+            <Box flexDirection="column" flexShrink={1} minWidth={0}>
+              <Text weight="semibold" color={shown.isClosed ? undefined : 'claude'} wrap="truncate-end">Swarm</Text>
+              <Text size="caption" dimColor wrap="truncate-end">Live multi-agent board &amp; graph</Text>
             </Box>
           </Box>
           <Button
@@ -3915,6 +3921,7 @@ export const register: Register = on => {
     const borderColor = !isShown || shown.isClosed ? 'subtle'
       : shown.isPaused || shown.attention.length > 0 ? 'warning'
         : working > 0 ? 'success' : 'claude'
+    const emblemOffset = Emblem ? phase(`${e.surface}:placed:${e.props.id}`, isShown ? shown.dir : e.props.id, state, await $.clock.now().catch(() => 0)) : 0
 
     return (
       <Box
@@ -3932,9 +3939,9 @@ export const register: Register = on => {
         paddingX="sm"
         paddingY="xs"
       >
-        <Box flexDirection="row" alignItems="center" columnGap="sm" flexShrink={1}>
-          {Emblem && <Emblem source={swarmEmblem(state)} alt="Swarm" width={22} height={22} />}
-          <Box flexDirection="column" flexShrink={1}>
+        <Box flexDirection="row" alignItems="center" columnGap="sm" flexShrink={1} minWidth={0}>
+          {Emblem && <Box flexShrink={0}><Emblem source={swarmEmblem(state, emblemOffset)} alt="Swarm" width={22} height={22} /></Box>}
+          <Box flexDirection="column" flexShrink={1} minWidth={0}>
             <Text wrap="truncate-end">
               <Text weight="semibold" color={isShown && !shown.isClosed ? 'claude' : undefined}>Swarm</Text>
               {isShown && <Text weight="medium">{`  ${shown.title}`}</Text>}
@@ -4007,8 +4014,12 @@ export const register: Register = on => {
     // The run row's ends are read as the pane opens, so they are drawn as no control from the first look on.
     if (runEdge.dir !== shown.dir || runEdge.older === undefined || runEdge.newer === undefined) void learnEdges($, shown.dir)
     const current = await read($, tab)
+    const columns = Math.max(20, e.props.bodyColumns ?? 40)
+    const tabView = current === 'members' && talk?.dir === shown.dir ? `members/talk/${talk.name}` : current
     const mood = shown.mood ?? 'sleep'
-    const hiveOffset = phase(slot('hive'), shown.dir, mood, now)
+    // Desktop reloads pane <Svg> images when the tab view changes: include tabView so the hive resumes at its
+    // live wall-clock phase instead of restarting from 0ms on every tab switch, while staying stable during polls.
+    const hiveOffset = phase(slot('hive'), shown.dir, `${shown.dir ? 'header' : 'empty'}/${mood}/${tabView}/${columns < 48 ? 's' : 'l'}`, now)
     if (current !== 'graph' || shown.posts.length === 0) {
       for (const part of ['route', 'live', 'timeline']) hideMotion(slot(part))
     }
@@ -4017,13 +4028,12 @@ export const register: Register = on => {
     const feedOf = async (name: string) => {
       talk = undefined
       await stop($)  // a replay left running would keep stepping behind the Board tab
-      await update($, query, () => `@${name}`)
-      await update($, inspected, () => null)
-      await update($, latestOnly, () => false)
-      await update($, tab, () => 'board')
+      if ((await read($, query)) !== `@${name}`) await update($, query, () => `@${name}`)
+      if ((await read($, inspected)) !== null) await update($, inspected, () => null)
+      if (await read($, latestOnly)) await update($, latestOnly, () => false)
+      if ((await read($, tab)) !== 'board') await update($, tab, () => 'board')
     }
     const hiding = await read($, hideInactive)
-    const columns = Math.max(20, e.props.bodyColumns ?? 40)
     // The rows the pane's own window shows, less the header and the tab row; the viewport only where the surface gives no window.
     const rows = Math.max(8, (e.props.scroll?.bodyRows ?? e.viewport?.rows ?? 24) - 7)
 
@@ -4123,12 +4133,12 @@ export const register: Register = on => {
       }
       await stop($)
       await stopLive($)
-      await update($, inspected, () => older ?? null)
-      await update($, query, () => '')  // a filter left on the Board would hide the post
-      await update($, latestOnly, () => false)
-      await update($, earlier, () => 0)
-      await update($, expanded, () => seq)
-      await update($, tab, () => 'board')
+      if ((await read($, inspected)) !== (older ?? null)) await update($, inspected, () => older ?? null)
+      if ((await read($, query)) !== '') await update($, query, () => '')  // a filter left on the Board would hide the post
+      if (await read($, latestOnly)) await update($, latestOnly, () => false)
+      if ((await read($, earlier)) !== 0) await update($, earlier, () => 0)
+      if ((await read($, expanded)) !== seq) await update($, expanded, () => seq)
+      if ((await read($, tab)) !== 'board') await update($, tab, () => 'board')
     }
 
     // Every route as one line, busiest first: the terminal's graph, and a graph too dense or narrow to draw.
@@ -4297,9 +4307,11 @@ export const register: Register = on => {
           <Box flexDirection="column" gap="sm">
             {bar(shown.posts.length > 0)}
             <Box flexDirection="column" gap="xs" marginTop={compose || shown.posts.length > 0 ? undefined : 'sm'} borderStyle="round" borderColor={browsed?.boardUnavailable ? 'warning' : 'subtle'} borderDimColor paddingX="sm" paddingY="xs">
-              <Box flexDirection="row" alignItems="center" columnGap="xs">
-                {HeaderArt && <HeaderArt source={semanticIcon(browsed?.boardUnavailable ? 'warn' : 'info')} alt={browsed?.boardUnavailable ? 'Unavailable' : 'Info'} width={12} height={12} />}
-                <Text dimColor>{shown.posts.length > 0 ? 'No posts match the filter.' : browsed?.boardUnavailable ? 'Board data unavailable: its board could not be read.' : 'No posts yet.'}</Text>
+              <Box flexDirection="row" alignItems="flex-start" columnGap="xs" minWidth={0}>
+                {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon(browsed?.boardUnavailable ? 'warn' : 'info')} alt={browsed?.boardUnavailable ? 'Unavailable' : 'Info'} width={12} height={16} /></Box>}
+                <Box flexShrink={1} minWidth={0}>
+                  <Text dimColor>{shown.posts.length > 0 ? 'No posts match the filter.' : browsed?.boardUnavailable ? 'Board data unavailable: its board could not be read.' : 'No posts yet.'}</Text>
+                </Box>
               </Box>
               {browsed?.boardUnavailable && retry}
             </Box>
@@ -4453,9 +4465,11 @@ export const register: Register = on => {
       // The live run's report is read again on the next poll; a browsed run's only on Retry.
       body = shown.attention.length === 0 ? (
         <Box flexDirection="column" gap="xs" marginTop="sm" borderStyle="round" borderColor="subtle" borderDimColor paddingX="sm" paddingY="xs">
-          <Box flexDirection="row" alignItems="center" columnGap="xs">
-            {HeaderArt && !shown.attentionUnavailable && <HeaderArt source={semanticIcon('pass')} alt="All clear" width={12} height={12} />}
-            <Text dimColor>{!shown.attentionUnavailable ? 'Nothing needs attention.' : browsed ? 'Attention details unavailable for this run.' : 'Attention details unavailable. Swarm will retry.'}</Text>
+          <Box flexDirection="row" alignItems="flex-start" columnGap="xs" minWidth={0}>
+            {HeaderArt && !shown.attentionUnavailable && <Box flexShrink={0}><HeaderArt source={semanticIcon('pass')} alt="All clear" width={12} height={16} /></Box>}
+            <Box flexShrink={1} minWidth={0}>
+              <Text dimColor>{!shown.attentionUnavailable ? 'Nothing needs attention.' : browsed ? 'Attention details unavailable for this run.' : 'Attention details unavailable. Swarm will retry.'}</Text>
+            </Box>
           </Box>
           {browsed?.boardUnavailable && <Text dimColor>Board data unavailable: its board could not be read.</Text>}
           {(browsed?.boardUnavailable || shown.attentionUnavailable) && retry}
@@ -4492,12 +4506,14 @@ export const register: Register = on => {
               paddingX="sm"
               paddingY="xs"
             >
-              <Box flexDirection="row" alignItems="center" columnGap="xs" flexWrap="wrap">
-                {HeaderArt && <HeaderArt source={semanticIcon(attentionIconOf(item.kind, itemTone))} alt={item.kind || 'note'} width={12} height={12} />}
-                <Text>
-                  <Text weight="semibold" color={itemTone}>{String(item.kind || 'note').toUpperCase()}</Text>
-                  <Text>{`  ${item.text}`}</Text>
-                </Text>
+              <Box flexDirection="row" alignItems="flex-start" columnGap="xs" minWidth={0}>
+                {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon(attentionIconOf(item.kind, itemTone))} alt={item.kind || 'note'} width={12} height={16} /></Box>}
+                <Box flexShrink={1} minWidth={0}>
+                  <Text>
+                    <Text weight="semibold" color={itemTone}>{String(item.kind || 'note').toUpperCase()}</Text>
+                    <Text>{`  ${item.text}`}</Text>
+                  </Text>
+                </Box>
               </Box>
               {hasActions && (
               <Box flexDirection="row" gap="sm" flexWrap="wrap">
@@ -4613,12 +4629,16 @@ export const register: Register = on => {
           >
             <Button key="talk-back" plain label="‹ Members" onPress={() => closeTalk($)} />
             {HeaderArt && member && member.status !== 'closed' && (
-              <HeaderArt source={statusDot(member.status, memberOffset)} alt={member.status} width={12} height={12} />
+              <Box flexShrink={0}>
+                <HeaderArt source={statusDot(member.status, memberOffset)} alt={member.status} width={12} height={12} />
+              </Box>
             )}
-            <Text wrap="truncate-end">
-              <Text weight="semibold" color={hueOf(open.name)}>@{open.name}</Text>
-              <Text dimColor>{`  conversation${member ? ` · ${member.status}` : ''}`}</Text>
-            </Text>
+            <Box flexShrink={1} minWidth={0}>
+              <Text wrap="truncate-end">
+                <Text weight="semibold" color={hueOf(open.name)}>@{open.name}</Text>
+                <Text dimColor>{`  conversation${member ? ` · ${member.status}` : ''}`}</Text>
+              </Text>
+            </Box>
           </Box>
           {open.rows.length === 0 ? <Text dimColor>Nothing said yet.</Text> : draw(open.rows[0]!, 0)}
           {from > 1 ? (
@@ -4769,9 +4789,11 @@ export const register: Register = on => {
         <Box flexDirection="column" marginTop="sm" gap="sm">
           <Box flexDirection="row" justifyContent="flex-end">{inactiveToggle(inactive.size)}</Box>
           {visibleGroups.length === 0 && shown.members.length > 0 ? (
-            <Box flexDirection="row" alignItems="center" columnGap="xs" borderStyle="round" borderColor="subtle" borderDimColor paddingX="sm" paddingY="xs">
-              {HeaderArt && <HeaderArt source={semanticIcon('info')} alt="Info" width={12} height={12} />}
-              <Text dimColor>All members are inactive.</Text>
+            <Box flexDirection="row" alignItems="flex-start" columnGap="xs" borderStyle="round" borderColor="subtle" borderDimColor paddingX="sm" paddingY="xs" minWidth={0}>
+              {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon('info')} alt="Info" width={12} height={16} /></Box>}
+              <Box flexShrink={1} minWidth={0}>
+                <Text dimColor>All members are inactive.</Text>
+              </Box>
             </Box>
           ) : (
             visibleGroups.map(([title, list]) => (
@@ -4786,9 +4808,11 @@ export const register: Register = on => {
     } else if (shown.posts.length === 0) {
       body = (
         <Box flexDirection="column" gap="xs" marginTop="sm" borderStyle="round" borderColor={browsed?.boardUnavailable ? 'warning' : 'subtle'} borderDimColor paddingX="sm" paddingY="xs">
-          <Box flexDirection="row" alignItems="center" columnGap="xs">
-            {HeaderArt && <HeaderArt source={semanticIcon(browsed?.boardUnavailable ? 'warn' : 'info')} alt={browsed?.boardUnavailable ? 'Unavailable' : 'Info'} width={12} height={12} />}
-            <Text dimColor>{browsed?.boardUnavailable ? 'Board data unavailable: its board could not be read.' : 'No posts yet.'}</Text>
+          <Box flexDirection="row" alignItems="flex-start" columnGap="xs" minWidth={0}>
+            {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon(browsed?.boardUnavailable ? 'warn' : 'info')} alt={browsed?.boardUnavailable ? 'Unavailable' : 'Info'} width={12} height={16} /></Box>}
+            <Box flexShrink={1} minWidth={0}>
+              <Text dimColor>{browsed?.boardUnavailable ? 'Board data unavailable: its board could not be read.' : 'No posts yet.'}</Text>
+            </Box>
           </Box>
           {browsed?.boardUnavailable && retry}
         </Box>
@@ -4949,14 +4973,17 @@ export const register: Register = on => {
             <Box flexDirection="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" columnGap="sm">
               <Box flexDirection="row" alignItems="center" columnGap="xs" flexWrap="wrap">
                 <Text color={hueOf(post.agent)}>●</Text>
-                <Text wrap="wrap">
-                  <Text weight="semibold" color={hueOf(post.agent)}>@{post.agent}</Text>
-                  <Text dimColor>{post.to.length ? ` → ${post.to.map(name => `@${name}`).join(' ')}` : ' · no mentions'}</Text>
-                </Text>
+                <Button
+                  key="graph-post-agent"
+                  plain
+                  label={`@${post.agent}`}
+                  onPress={async () => { if (!(await viewAgent($, memberOf(post.agent)))) await feedOf(post.agent) }}
+                />
+                <Text dimColor>{post.to.length ? `→ ${post.to.map(name => `@${name}`).join(' ')}` : '· no mentions'}</Text>
                 {postKind !== undefined && (
                   <Box flexDirection="row" alignItems="center" columnGap="xs">
-                    <Svg source={semanticIcon(verdictIconOf(postKind.label))} alt={postKind.label} width={12} height={12} />
                     <Text size="caption" weight="semibold" color={postKind.color}>{` · ${postKind.covered?.length ? `${postKind.label} of ${postKind.covered.map(name => `@${name}`).join(', ')}` : postKind.label}`}</Text>
+                    <Svg source={semanticIcon(verdictIconOf(postKind.label))} alt={postKind.label} width={12} height={12} />
                   </Box>
                 )}
               </Box>
@@ -5010,7 +5037,7 @@ export const register: Register = on => {
     const budgetRatio = shown.budget > 0 ? total / shown.budget : 0
     const budgetTone: BarTone = budgetRatio >= 0.9 ? 'error' : budgetRatio >= 0.75 ? 'warning' : 'accent'
     const isHeaderLive = !browsed && !shown.isClosed && !shown.isPaused
-    const budgetOffset = phase(slot('budget'), shown.dir, `${progressUnits(budgetRatio)}/${budgetTone}/${isHeaderLive}`, now)
+    const budgetOffset = phase(slot('budget'), shown.dir, `${progressUnits(budgetRatio)}/${budgetTone}/${isHeaderLive}/${tabView}`, now)
 
     return (
       <Box flexDirection="column">
@@ -5087,8 +5114,8 @@ export const register: Register = on => {
                   await stop($)
                   await stopLive($)
                   // A post opened from another tab belongs to that visit: it is not kept selected behind the next tab.
-                  await update($, inspected, () => null)
-                  await update($, expanded, () => 0)
+                  if ((await read($, inspected)) !== null) await update($, inspected, () => null)
+                  if ((await read($, expanded)) !== 0) await update($, expanded, () => 0)
                   await update($, tab, () => name)
                 }
               }}

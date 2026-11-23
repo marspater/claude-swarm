@@ -1131,22 +1131,30 @@ test('visual polish: animated emblems, progress bars, semantic icons, status dot
   expect(graphSvg(withAll, 1, new Set(), false, false, false, 0, false)).toContain('no @all posts yet')
 })
 
-test('member bees keep their wings, antennae, and striped body in place across statuses', () => {
+test('member bees keep their wings, antennae, and striped body across statuses and energize when working', () => {
   const accent = '#628fd2'
   const outline = (svg: string) => svg.match(/<path class="(?:bee-body|bee-antennae|bee-band|wing-front|wing-back)"[^>]+>/g)
   const active = memberBee(accent, 'working', 300)
+  const coord = memberBee(accent, 'coordinating', 300)
   expect(active).toContain(`class="bee-body" fill="${accent}"`)
-  expect(active).toContain('viewBox="0 0 16 10"')
+  expect(active).toContain('viewBox="0 0 20 12"')
   expect(active).toContain('shape-rendering="crispEdges"')
   expect(active).toContain('@media(prefers-reduced-motion:no-preference)')
   expect(active).toContain('@keyframes flutter')
-  expect(active).not.toContain('transform:')
+  expect(active).toContain('@keyframes hover')
+  expect(active).toContain('class="spark s3"')
+  expect(active).toContain('animation:flutter 150ms')
+  expect(coord).toContain('animation:flutter 220ms')
+  expect(coord).not.toContain('class="spark s3"')
   expect(outline(active)).toHaveLength(6)
-  expect(outline(memberBee(accent, 'coordinating'))).toEqual(outline(active))
+  expect(outline(coord)).toEqual(outline(active))
   for (const status of ['waiting', 'not started', 'failed', 'unreachable', 'stopped', 'closed', 'killed']) {
     const resting = memberBee(accent, status, 300)
     expect(outline(resting)).toEqual(outline(active))
     expect(resting).not.toContain('@keyframes flutter')
+    expect(resting).not.toContain('@keyframes hover')
+    expect(resting).not.toContain('class="spark')
+    expect(resting).not.toContain('radialGradient')
     // only a member that never started or was retired is faded, whole, as its grey status dot says
     expect(resting.includes('svg{opacity:.5}')).toBe(status === 'not started' || status === 'killed')
   }

@@ -100,38 +100,76 @@ function sleepMarks(elapsed: number): { style: string; art: string } {
 
 export const MEMBER_BEE_SIZE = { width: 16, height: 10 } as const
 
-/** Front-facing card bee with stationary bounds. Active bees animate the light across both wings. */
+/** Front-facing card bee with room to hover and flap cleanly. Working bees buzz energetically; coordinating bees hover steadily. */
 export function memberBee(accent: `#${string}`, status: string, elapsed = 0): string {
-  const active = status === 'working' || status === 'coordinating'
+  const working = status === 'working'
+  const active = working || status === 'coordinating'
   const sleeping = status === 'waiting' || status === 'not started' || status === 'closed' || status === 'killed'
-  const eyes = sleeping ? 'M6 3.5h1.5v.5H6zM8.5 3.5h1.5v.5H8.5z' : 'M6 3h1v1H6zM9 3h1v1H9z'
-  const duration = 320
+  const eyes = sleeping ? 'M8 4.5h1.5v.5H8zM10.5 4.5h1.5v.5H10.5z' : 'M8 4h1v1H8zM11 4h1v1h-1z'
+  const flapDur = working ? 150 : 220
+  const hoverDur = working ? 960 : 1650
+  const antennaDur = working ? 480 : 820
+  const sparkDur = working ? 1100 : 1750
+  const auraDur = working ? 1500 : 2400
   const style =
-    // The hive bees' wing and honey, so both sprites read as one family in either theme; the back wing is the hive's
-    // own tone and the front one a step lighter.
-    'svg{--wing-front:#6ba6a8;--wing-back:#4b8f91;--glint:#e5f4f4;--honey:#e9ac55;--stripe:#483328;--antennae:#78573e;--ink:#251e22}' +
-    '@media(prefers-color-scheme:dark){svg{--wing-front:#b9dcdc;--wing-back:#99c8c8;--glint:#edfbf6;--honey:#f2bd6a;--antennae:#d4b79c}}' +
+    // The hive bees' wing, honey and spark tokens, so both sprites read as one family in either theme; the back wing is
+    // the hive's own tone and the front one a step lighter.
+    'svg{--wing-front:#6ba6a8;--wing-back:#4b8f91;--glint:#e5f4f4;--honey:#e9ac55;--spark:#f6cf6e;--stripe:#483328;--antennae:#78573e;--ink:#251e22}' +
+    '@media(prefers-color-scheme:dark){svg{--wing-front:#b9dcdc;--wing-back:#99c8c8;--glint:#edfbf6;--honey:#f2bd6a;--spark:#ffe08a;--antennae:#d4b79c}}' +
     // A member that never started or was retired is drawn faded, as its status dot is grey. A closed run's members
     // are not: there the whole team is history, and a faded roster would read as broken.
     (status === 'killed' || status === 'not started' ? 'svg{opacity:.5}' : '') +
     '.wing-glint{fill:var(--glint);opacity:.54}' +
     (active
-      ? `@media(prefers-reduced-motion:no-preference){` +
-        `.wing-glint{animation:flutter ${duration}ms ${easeInOut} ${loopDelay(elapsed, duration)} infinite}` +
-        `.wing-glint-back{animation-delay:${loopDelay(elapsed, duration, duration / 2)}}}` +
-        '@keyframes flutter{0%,100%{opacity:.24}50%{opacity:.88}}'
+      ? '.aura{opacity:.52}.buzz,.spark{opacity:0}' +
+        `@media(prefers-reduced-motion:no-preference){` +
+        `.bee-hover,.wing-l,.wing-r,.bee-antennae,.buzz,.spark{shape-rendering:auto}` +
+        `.bee-hover{transform-box:fill-box;transform-origin:50% 55%;animation:hover ${hoverDur}ms ${easeInOut} ${loopDelay(elapsed, hoverDur)} infinite}` +
+        `.wing-l{transform-box:fill-box;transform-origin:95% 58%;animation:flutter ${flapDur}ms ${easeInOut} ${loopDelay(elapsed, flapDur)} infinite}` +
+        `.wing-r{transform-box:fill-box;transform-origin:5% 58%;animation:flutter-r ${flapDur}ms ${easeInOut} ${loopDelay(elapsed, flapDur)} infinite}` +
+        `.wing-glint{animation:glint ${flapDur}ms ${easeInOut} ${loopDelay(elapsed, flapDur)} infinite}` +
+        `.wing-glint-back{animation-delay:${loopDelay(elapsed, flapDur, Math.round(flapDur / 2))}}` +
+        `.bee-antennae{transform-box:fill-box;transform-origin:50% 100%;animation:antenna ${antennaDur}ms ${easeInOut} ${loopDelay(elapsed, antennaDur)} infinite}` +
+        `.buzz{animation:buzz ${flapDur}ms linear ${loopDelay(elapsed, flapDur, Math.round(flapDur / 2))} infinite}` +
+        `.spark{transform-box:fill-box;transform-origin:center;animation:spark ${sparkDur}ms ${easeOut} ${loopDelay(elapsed, sparkDur)} infinite}` +
+        `.s2{animation-delay:${loopDelay(elapsed, sparkDur, Math.round(sparkDur * .46))}}` +
+        `.s3{animation-delay:${loopDelay(elapsed, sparkDur, Math.round(sparkDur * .74))}}` +
+        `.aura{transform-box:fill-box;transform-origin:center;animation:aura ${auraDur}ms ${easeInOut} ${loopDelay(elapsed, auraDur)} infinite}}` +
+        (working
+          ? '@keyframes hover{0%,100%{transform:translate(0,-.9px) rotate(-3.2deg)}25%{transform:translate(.45px,.2px) rotate(1.8deg)}50%{transform:translate(0,.75px) rotate(3.2deg)}75%{transform:translate(-.45px,-.25px) rotate(-1.6deg)}}' +
+            '@keyframes flutter{0%,100%{transform:rotate(24deg) scaleY(.92)}50%{transform:rotate(-22deg) scaleY(.76)}}' +
+            '@keyframes flutter-r{0%,100%{transform:rotate(-24deg) scaleY(.92)}50%{transform:rotate(22deg) scaleY(.76)}}' +
+            '@keyframes antenna{0%,100%{transform:scaleY(1) rotate(0deg)}35%{transform:scaleY(1.1) rotate(-4deg)}70%{transform:scaleY(.95) rotate(4deg)}}'
+          : '@keyframes hover{0%,100%{transform:translate(0,-.6px) rotate(-1.5deg)}50%{transform:translate(0,.55px) rotate(1.5deg)}}' +
+            '@keyframes flutter{0%,100%{transform:rotate(16deg) scaleY(.95)}50%{transform:rotate(-15deg) scaleY(.84)}}' +
+            '@keyframes flutter-r{0%,100%{transform:rotate(-16deg) scaleY(.95)}50%{transform:rotate(15deg) scaleY(.84)}}' +
+            '@keyframes antenna{0%,100%{transform:scaleY(1)}50%{transform:scaleY(1.06)}}') +
+        '@keyframes glint{0%,100%{opacity:.28}50%{opacity:.95}}' +
+        `@keyframes buzz{0%,100%{opacity:0}45%,65%{opacity:${working ? '.65' : '.38'}}}` +
+        '@keyframes spark{0%{opacity:0;transform:translateY(.6px) scale(.8)}22%{opacity:.95;transform:translateY(-.3px) scale(1)}100%{opacity:0;transform:translateY(-2.1px) scale(.7)}}' +
+        `@keyframes aura{0%,100%{opacity:${working ? '.42' : '.28'};transform:scale(.94)}50%{opacity:${working ? '.82' : '.52'};transform:scale(1.08)}}`
       : '')
-  const { width, height } = MEMBER_BEE_SIZE
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" shape-rendering="crispEdges"><style>${style}</style>` +
-    '<path class="wing-back" fill="var(--wing-back)" d="M14 1h-2v1h-1v2h1v2h1V5h1V4h1V2h-1z"/>' +
-    '<path class="wing-glint wing-glint-back" d="M13 2h1v1H13z"/>' +
-    '<path class="wing-front" fill="var(--wing-front)" d="M2 1h2v1h1v2H4v2H3V5H2V4H1V2h1z"/>' +
-    '<path class="wing-glint" d="M2 2h1v1H2z"/>' +
-    '<path class="bee-antennae" fill="var(--antennae)" d="M5 0h1v1h1v1H6V1H5zM10 0h1v1h-1v1H9V1h1z"/>' +
-    `<path class="bee-body" fill="${accent}" d="M6 2h4v1h1v1h1v4h-1v1h-1v1H6V9H5V8H4V4h1V3h1z"/>` +
-    '<path class="bee-band" fill="var(--honey)" d="M5 5h6v1H5zM5 7h6v1H5z"/>' +
-    '<path class="bee-band" fill="var(--stripe)" d="M5 6h6v1H5zM6 8h4v1H6z"/>' +
-    `<path fill="var(--ink)" d="${eyes}"/></svg>`
+  const aura = active
+    ? '<defs><radialGradient id="bg"><stop offset="0%" stop-color="var(--spark)" stop-opacity=".38"/><stop offset="65%" stop-color="var(--honey)" stop-opacity=".14"/><stop offset="100%" stop-color="var(--honey)" stop-opacity="0"/></radialGradient></defs>' +
+      '<ellipse class="aura" cx="10" cy="6.5" rx="7.5" ry="4.8" fill="url(#bg)" shape-rendering="auto"/>'
+    : ''
+  const fx = active
+    ? '<path class="buzz" fill="var(--wing-front)" d="M1.5 3.5h1v1h-1zM2 5.5h1v1H2zM17.5 3.5h1v1h-1zM17 5.5h1v1h-1z"/>' +
+      '<rect class="spark s1" x="1" y="2.5" width="1" height="1" fill="var(--spark)"/>' +
+      '<rect class="spark s2" x="18" y="3" width="1" height="1" fill="var(--spark)"/>' +
+      (working ? '<rect class="spark s3" x="17" y="8.5" width="1" height="1" fill="var(--spark)"/>' : '')
+    : ''
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 12" shape-rendering="crispEdges"><style>${style}</style>${aura}` +
+    '<g class="bee-hover">' +
+    '<g class="wing-r"><path class="wing-back" fill="var(--wing-back)" d="M16 2h-2v1h-1v2h1v2h1V6h1V5h1V3h-1z"/>' +
+    '<path class="wing-glint wing-glint-back" d="M15 3h1v1H15z"/></g>' +
+    '<g class="wing-l"><path class="wing-front" fill="var(--wing-front)" d="M4 2h2v1h1v2H6v2H5V6H4V5H3V3h1z"/>' +
+    '<path class="wing-glint" d="M4 3h1v1H4z"/></g>' +
+    '<path class="bee-antennae" fill="var(--antennae)" d="M7 1h1v1h1v1H8V2H7zM12 1h1v1h-1v1h-1V2h1z"/>' +
+    `<path class="bee-body" fill="${accent}" d="M8 3h4v1h1v1h1v4h-1v1h-1v1H8v-1H7V9H6V5h1V4h1z"/>` +
+    '<path class="bee-band" fill="var(--honey)" d="M7 6h6v1H7zM7 8h6v1H7z"/>' +
+    '<path class="bee-band" fill="var(--stripe)" d="M7 7h6v1H7zM8 9h4v1H8z"/>' +
+    `<path fill="var(--ink)" d="${eyes}"/></g>${fx}</svg>`
 }
 
 export function hiveArt(shown: Mood, elapsed = 0): string {

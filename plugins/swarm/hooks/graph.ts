@@ -714,6 +714,7 @@ export function drawGraph(
       .chip rect{fill:var(--pill);stroke:var(--border)}.chip text{fill:var(--ink);opacity:.82;font-size:10.5px;font-weight:600;text-anchor:middle}
       .chip.on rect{fill:var(--tint);stroke:var(--accent)}
       .legend>text{fill:var(--ink);opacity:.72;font-size:12px}
+      .legend .pill{filter:none;stroke-dasharray:3.5 2.5;stroke-width:1.15}
       ${statusCss}${pingCss}
       .presence{fill:none;stroke:var(--status-inactive);stroke-width:1.2}
       .presence-ring{fill:none;stroke:var(--status-waiting);stroke-width:1.2}

@@ -247,7 +247,8 @@ test('the pane draws the board, the members and the graph', async ($, on) => {
   await clock.advance(317)
   await ui.press({ key: 'tab-graph' })
   const afterSwitch = String((await findSvg(ui, /Swarm hive/))?.props.source)
-  expect(afterSwitch).toBe(beforeSwitch)
+  expect(afterSwitch).not.toBe(beforeSwitch)
+  expect(afterSwitch).toMatch(/-[1-9][0-9]*ms/)
   const routeBefore = String((await findSvg(ui, /^Post /))?.props.source)
   const badgeBefore = (await findSvg(ui, /^Live activity$/))?.props.source
   await ui.press({ key: 'tab-board' })
