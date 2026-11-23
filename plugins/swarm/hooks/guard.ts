@@ -157,11 +157,12 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
         else if (/^--(?:git-dir|work-tree)(?:=|$)/.test(tok)) {
           isMoved = true
           if (!tok.includes('=')) i++
-        } else if (tok.startsWith('-c') || tok.startsWith('--config-env')) {
-          const isC = tok.startsWith('-c')
-          const value = tok === '-c' || tok === '--config-env' ? args[++i] ?? '' : isC ? tok.slice(2) : tok.slice('--config-env='.length)
+        } else if (tok === '-c' || tok === '--config-env' || tok.startsWith('--config-env=')) {
+          const value = tok.includes('=') ? tok.slice('--config-env='.length) : args[++i] ?? ''
           const alias = /^alias\.([^=]+)=([\s\S]*)$/i.exec(value)
-          if (alias) given.set(alias[1]!.toLowerCase(), isC ? alias[2] : undefined)
+          if (alias) given.set(alias[1]!.toLowerCase(), tok === '-c' ? alias[2] : undefined)
+        } else if (tok.startsWith('-c')) {
+          return false // Git rejects an attached -c argument before dispatching a subcommand.
         } else if (['--namespace', '--super-prefix', '--attr-source', '--exec-path', '--list-cmds'].includes(tok)) i++
         else if (!tok.startsWith('-')) break
       }

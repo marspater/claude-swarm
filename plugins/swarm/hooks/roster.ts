@@ -34,11 +34,10 @@ export function tokensUsed(tokens?: Record<string, unknown> | null): number {
 type Spent = { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number }
 const weigh = (spent: Spent | undefined) => spent === undefined ? 0
   : (spent.input_tokens || 0) + (spent.cache_creation_input_tokens || 0) + (spent.output_tokens || 0) + Math.round((spent.cache_read_input_tokens || 0) * 0.1)
-// `sum` is what the steps reported, `charged` the whole tokens the board took for the turn, `cap` the highest total
-// usage weighed for the turn (used to prevent duplicate/concurrent end landings from double-counting), `pending` each
-// step charge the board has not acknowledged yet, by step index; `landing` settles once every step charge sent so far has been answered.
-type Turn = { steps: Set<number>; sum: Spent; charged: number; cap: number; pending: Map<number, number>; landing: Promise<unknown>; agentId?: string; last: number }
-const fresh = (agentId: string | undefined, last: number): Turn => ({ steps: new Set(), sum: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }, charged: 0, cap: 0, pending: new Map(), landing: Promise.resolve(), agentId, last })
+// `sum` is what the steps reported, `charged` what the board took, and `endCharged` its share of that under END reports.
+// `pending` holds unacknowledged charges by step index (END for turn totals), and `landing` waits for their step calls.
+type Turn = { steps: Set<number>; sum: Spent; charged: number; endCharged: number; pending: Map<number, number>; landing: Promise<unknown>; agentId?: string; last: number }
+const fresh = (agentId: string | undefined, last: number): Turn => ({ steps: new Set(), sum: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }, charged: 0, endCharged: 0, pending: new Map(), landing: Promise.resolve(), agentId, last })
 /**
  * What each turn's model steps have been charged so far, so its end charges only what the board did not take. A
  * running turn keeps its entry however long it runs or waits between steps, or its end would charge its steps a
@@ -57,7 +56,7 @@ export function ledger(kept = 256, graceMs = 600_000) {
     ended.set(turnId, turn)
     if (ended.size > kept) {
       // The oldest the board owes nothing for goes first: one with a charge still pending is kept while it can be.
-      const settled = [...ended].find(([, old]) => old.pending.size === 0)
+      const settled = [...ended].find(([id, old]) => id !== turnId && old.pending.size === 0)
       ended.delete(settled ? settled[0] : ended.keys().next().value!)
     }
   }
@@ -80,7 +79,6 @@ export function ledger(kept = 256, graceMs = 600_000) {
       if (index === undefined) {
         const closed = turn ?? fresh(agentId, now)
         const total = weigh(spent ?? closed.sum)
-        closed.cap = Math.max(closed.cap, total)
         const pending = [...closed.pending.values()].reduce((sum, amount) => sum + amount, 0)
         end(turnId, closed)
         return Math.max(0, total - closed.charged - pending)
@@ -98,31 +96,20 @@ export function ledger(kept = 256, graceMs = 600_000) {
       const before = weigh(turn.sum)
       for (const key of Object.keys(turn.sum) as (keyof Spent)[]) turn.sum[key] += spent[key] || 0
       const after = weigh(turn.sum)
-      turn.cap = Math.max(turn.cap, after)
       const delta = after - before
       if (delta > 0) turn.pending.set(index, delta)
       return delta
     },
     /**
-     * A charge the board took: step `index`'s, or the turn's end. A step charge it did not take (a failed command)
-     * stays pending, and the turn's end retries it under the step's own report; one never sent lands as 0, so the turn's
-     * end charges it under its own. A step settled twice (two ends retrying it at once) counts once, and concurrent or
-     * duplicate end landings are bounded by `cap` less still-pending step charges.
+     * Settle a pending report for the amount the board took. A report settled twice counts once. One never sent
+     * lands as 0 so its tokens can be charged under the turn's end.
      */
-    landed(turn: Turn, amount: number, index?: number): void {
-      if (index !== undefined) {
-        if (!turn.pending.delete(index)) return
-        turn.charged += amount
-        return
-      }
-      turn.pending.delete(END)
-      if (amount <= 0) return
-      let stepPending = 0
-      for (const [k, v] of turn.pending) if (k !== END) stepPending += v
-      const maxCharged = Math.max(turn.charged, turn.cap - stepPending)
-      turn.charged = Math.min(maxCharged, turn.charged + amount)
+    landed(turn: Turn, amount: number, index: number): void {
+      if (!turn.pending.delete(index)) return
+      turn.charged += amount
+      if (index === END) turn.endCharged += amount
     },
-    /** A turn's end charge the board did not take: pending, as a step's is, until the board takes it. */
+    /** Keep a turn's end charge pending under the same report until the board takes it. */
     held(turn: Turn, amount: number): void {
       if (amount > 0) turn.pending.set(END, amount)
     },

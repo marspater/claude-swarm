@@ -358,6 +358,7 @@ test('F16: board calls are recognised quoted, wrapped, flagged and run directly,
     [`python3 /p/board.py /project/.swarm agent-run key id`, 'agent-run'],
     [`python3 -Xutf8 /p/board.py ${run} status`, 'status'],
     [`python3 -B -- /p/board.py ${run} status`, 'status'],
+    [`python3 -i /p/board.py ${run} status`, 'status'],
     [`env PYTHONUTF8=1 python3 /p/board.py ${run} plan`, 'plan'],
     [`nohup python3 /p/board.py ${run} wake`, 'wake'],
     [`( python3 /p/board.py ${run} show )`, 'show'],
@@ -369,6 +370,10 @@ test('F16: board calls are recognised quoted, wrapped, flagged and run directly,
   }
   expect(boardCalls(`python3 -c "a/board.py" ${run} read coordinator`)).toEqual([])
   expect(boardCalls(`python3 -m "a/board.py" ${run} read coordinator`)).toEqual([])
+  for (const options of ['-cpass', '-Bcpass', '-B -c pass', '-mexample', '-Bmexample', '-B -m example']) {
+    expect(boardCalls(`python3 ${options} board.py ${run} read coordinator`), options).toEqual([])
+  }
+  expect(boardCalls(`python3 -BWonce board.py ${run} read coordinator`).map(call => call.action)).toEqual(['read'])
   expect(boardCalls(`cat /p/board.py ${run} read coordinator`)).toEqual([])
   expect(COORDINATOR_READ.test('read "--all" coordinator')).toBe(true)
   // the member `show` names: a flag or a redirection names none
@@ -376,6 +381,11 @@ test('F16: board calls are recognised quoted, wrapped, flagged and run directly,
   expect([shown('show 2>&1'), shown('show --post=3'), shown('show @Parser 2>&1'), shown('show')]).toEqual([undefined, undefined, 'parser', undefined])
   expect(COORDINATOR_READ.test("read '--max-bytes=4000' --headers coordinator>out")).toBe(true)
   expect(COORDINATOR_READ.test('read --all coordinators')).toBe(false)
+})
+
+test('a grouped command in process substitution stays inside its parameter word', () => {
+  const word = '${source:-<( { printf ok; } )}'
+  expect(shellWords(`echo ${word} tail`)).toEqual(['echo', word, 'tail'])
 })
 
 test('F17: only stdout sent away from the tool result counts as piped', () => {
@@ -730,7 +740,7 @@ test('a turn that runs past any count keeps what its steps were charged until it
   // an end counts as charged only once the board took it
   for (let i = 0; i < 2000; i++) {
     const owed = book.charge(`t${i}`, used)
-    book.landed(book.of(`t${i}`)!, owed)
+    book.landed(book.of(`t${i}`)!, owed, END)
   }
   // the turns of an agent that ended are dropped only once it has been gone a while
   book.charge('live', used, 0, 'agent-0', 5000)
@@ -798,7 +808,8 @@ test('a turn\'s end charges its whole usage less what the board took and what it
   const whole = bare.charge('v', both)
   expect(whole).toBeGreaterThan(0)
   expect(bare.charge('v', both)).toBe(whole)
-  bare.landed(bare.of('v')!, whole)
+  bare.held(bare.of('v')!, whole)
+  bare.landed(bare.of('v')!, whole, END)
   expect(bare.charge('v', both)).toBe(0)
   // a step that reports after its turn's end was charged with the end
   expect(bare.charge('v', cached, 0)).toBe(0)
@@ -928,10 +939,11 @@ test('guard regressions (#1-#4): parameter-expansion quote flip, unclosed quotes
     expect(await commitsInSharedCheckout($, cmd, '/project'), cmd).toBe(false)
   }
 
-  // #4: attached git -calias.x=... is inspected like -c alias.x=...
-  expect(await commitsInSharedCheckout($, 'git -calias.x=commit x -m pwn', '/project')).toBe(true)
-  expect(await commitsInSharedCheckout($, 'git -calias.x=cherry-pick x abc', '/project')).toBe(true)
+  expect(await commitsInSharedCheckout($, 'git -c alias.x=commit x -m example', '/project')).toBe(true)
+  expect(await commitsInSharedCheckout($, 'git -c alias.x=status x', '/project')).toBe(false)
   expect(await commitsInSharedCheckout($, 'git -calias.x=status x', '/project')).toBe(false)
+  expect(await commitsInSharedCheckout($, 'git -ccolor.ui=never commit -m example', '/project')).toBe(false)
+  expect(await commitsInSharedCheckout($, 'git --config-env=alias.x=GIT_ACTION x', '/project')).toBe(true)
 })
 
 test('guard and roster regressions (#5-#8): BOARD_CALL/actsAsAnother false positives, silent read-only exclusion, and duplicate landed accounting', () => {
@@ -976,22 +988,30 @@ test('guard and roster regressions (#5-#8): BOARD_CALL/actsAsAnother false posit
   const whole = { input_tokens: 100, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
   const part = { input_tokens: 40, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
   const owed1 = book.charge('dup', whole)
+  book.held(book.of('dup')!, owed1)
   const owed2 = book.charge('dup', whole)
-  expect([owed1, owed2]).toEqual([100, 100])
-  book.landed(book.of('dup')!, owed1)
-  book.landed(book.of('dup')!, owed2)
+  expect([owed1, owed2]).toEqual([100, 0])
+  book.landed(book.of('dup')!, owed1, END)
+  book.landed(book.of('dup')!, owed1, END)
   expect(book.of('dup')!.charged).toBe(100)
   expect(book.charge('dup', whole)).toBe(0)
 
   expect(book.charge('dup2', part, 0)).toBe(40)
   const rem1 = book.charge('dup2', whole)
+  book.held(book.of('dup2')!, rem1)
   const rem2 = book.charge('dup2', whole)
-  expect([rem1, rem2]).toEqual([60, 60])
-  book.landed(book.of('dup2')!, rem1)
-  book.landed(book.of('dup2')!, rem2)
+  expect([rem1, rem2]).toEqual([60, 0])
+  book.landed(book.of('dup2')!, rem1, END)
+  book.landed(book.of('dup2')!, rem1, END)
   expect(book.of('dup2')!.charged).toBe(60)
   book.landed(book.of('dup2')!, 40, 0)
   expect(book.of('dup2')!.charged).toBe(100)
+
+  // The first acknowledgment after a restart can describe a larger amount than the replay requested.
+  const replayed = book.charge('replayed', part)
+  book.held(book.of('replayed')!, replayed)
+  book.landed(book.of('replayed')!, 100, END)
+  expect(book.charge('replayed', whole)).toBe(0)
 })
 
 test('visual polish: animated emblems, progress bars, semantic icons, status dots, and graph animations', () => {

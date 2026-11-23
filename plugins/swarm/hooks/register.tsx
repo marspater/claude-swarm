@@ -312,9 +312,14 @@ let hadRun = false
 let halted: { dir: string; why: string } | undefined
 // What each turn's model steps have been charged so far, so its end charges only what no step reported.
 const stepped = ledger()
-// The run the coordinator drove when a turn of its own last stepped. Kept past the turn's end, so a replayed end still
-// finds it: the oldest go first.
-const turnRuns = new Map<string, string>()
+// A turn's run, or the ownership generation in which an unresolved member or completion arrived. Kept past the
+// turn's end so a replay cannot be attributed to a replacement run.
+type TurnOwner = string | number
+const turnRuns = new Map<string, TurnOwner>()
+function rememberTurnRun(turnId: string, owner: TurnOwner): void {
+  turnRuns.set(turnId, owner)
+  if (turnRuns.size > TURNS_KEPT) turnRuns.delete(turnRuns.keys().next().value!)
+}
 // Runs closed or deleted in this session: never billed again, and their pending retries are dropped without
 // clearing completed-turn accounting records (`stepped`) or `turnRuns` associations.
 const retiredRuns = new Set<string>()
@@ -498,7 +503,7 @@ let relayRun = ''
 let relayHinted = ''
 let relayPrompted = ''
 
-const relayKey = (dir: string) => dir === relayRun && specialistWakes.length ? JSON.stringify([dir, specialistWakes]) : ''
+const relayKey = (dir: string) => dir === relayRun && specialistWakes.length ? JSON.stringify([dir, specialistWakes, unaddressed]) : ''
 const teammateName = (address: string) => address.split('@', 1)[0] || address
 // Each line carries the address to send to, so the relay costs no `wake` lookup first.
 const relayNotice = () => 'Relay these Swarm board wakes now with your own SendMessage tool, each to the recipient given, ' +
@@ -1811,28 +1816,27 @@ function forgetKills(): void {
 // run to charge yet), so a step's falls to its turn's end.
 async function account(
   $: EngineInterface,
+  turnId: string,
   report: string,
   agentId: string | undefined,
   amount: number,
-  at?: string,
-  expectedEpoch = sessionEpoch,
-  expectedGen?: number,
-): Promise<boolean | undefined> {
-  if (expectedEpoch !== sessionEpoch || isEnding) return undefined
-  if (!at && expectedGen !== undefined && expectedGen !== generation) return undefined
+  owner: TurnOwner,
+  expectedEpoch: number,
+): Promise<number | false | undefined> {
+  const at = typeof owner === 'string' ? owner : undefined
+  const isCurrent = () => expectedEpoch === sessionEpoch && !isEnding && (at !== undefined || owner === generation)
+  if (!isCurrent()) return undefined
   if (!Number.isSafeInteger(amount) || amount <= 0 || (agentId && strangers.has(agentId) && !agentRuns.has(agentId))) return undefined
 
   let listFailed = false
   const agent = agentId ? await $.agent.list().then(agents => agents.find(one => one.id === agentId)).catch(() => { listFailed = true; return undefined }) : undefined
-  if (expectedEpoch !== sessionEpoch || isEnding) return undefined
-  if (!at && expectedGen !== undefined && expectedGen !== generation) return undefined
+  if (!isCurrent()) return undefined
   const address = agentId && (teammateOf($, agentId, agent) ?? agentId)
   // AT is the run the actor drove when it spent this: a charge that waits is not another run's by the time it lands.
-  const dir = at || (agentId ? await agentRun($, agentId, agent, listFailed, expectedEpoch, expectedGen) : await read($, run))
-  if (expectedEpoch !== sessionEpoch || isEnding) return undefined
-  if (!at && expectedGen !== undefined && expectedGen !== generation) return undefined
-  if (!dir) return undefined
-  if (retiredRuns.has(dir)) return true
+  const dir = at ?? (agentId ? await agentRun($, agentId, agent, listFailed, expectedEpoch, typeof owner === 'number' ? owner : undefined) : await read($, run))
+  if (!isCurrent() || !dir) return undefined
+  rememberTurnRun(turnId, dir)
+  if (retiredRuns.has(dir)) return amount
   // A closed or deleted run is charged nothing more and is no longer this conversation's run.
   const rosterPath = `${dir}/members.json`
   const rosterText = await $.fs.read(rosterPath).catch(async () =>
@@ -1849,14 +1853,14 @@ async function account(
       strangers.clear()
       await update($, run, () => '')
     }
-    return true
+    return amount
   }
   const isClosed = rosterText !== '' && (() => {
     try { return (JSON.parse(rosterText) as { closed?: boolean }).closed === true } catch { return false }
   })()
   if (isClosed) {
     await released($, dir)
-    return true
+    return amount
   }
   const [turn, actor] = await Promise.all([
     digest(`swarm-turn:${report}`),
@@ -1865,11 +1869,12 @@ async function account(
   if (expectedEpoch !== sessionEpoch || isEnding) return undefined
   const result = await boardCommand($, dir, ['account', turn, actor, String(amount)])
   if (result.exitCode !== 0 || result.stdout.trim() === '') return false
-  if (expectedEpoch !== sessionEpoch || isEnding) return true
-  const entry = JSON.parse(result.stdout) as { title: string; total: number; budget: number; paused: boolean; member_paused?: unknown }
+  if (expectedEpoch !== sessionEpoch || isEnding) return amount
+  const entry = JSON.parse(result.stdout) as { title: string; total: number; budget: number; paused: boolean; member_paused?: unknown; accepted?: number }
+  const accepted = entry.accepted ?? amount
   const pausedName = typeof entry.member_paused === 'string' ? entry.member_paused : ''
   if (pausedName && dir === await read($, run)) {
-    if (expectedEpoch !== sessionEpoch || isEnding) return true
+    if (expectedEpoch !== sessionEpoch || isEnding) return accepted
     // Known at once, as a run's pause is: the member this turn charged is refused from its next tool call on.
     const id = ownedRoster?.dir === dir ? memberNamed(ownedRoster.members, pausedName)?.id : undefined
     memberPaused = new Set([...memberPaused, ...(id ? [id] : []), ...(agentId && (!id || id === address) ? [agentId] : [])])
@@ -1878,8 +1883,8 @@ async function account(
       memberPausesOwed.push({ name: pausedName, read: rosterReads })
     }
   }
-  if (!entry.paused || dir !== await read($, run)) return true
-  if (expectedEpoch !== sessionEpoch || isEnding) return true
+  if (!entry.paused || dir !== await read($, run)) return accepted
+  if (expectedEpoch !== sessionEpoch || isEnding) return accepted
   const reason = `token budget of ${compact(entry.budget)} spent`
   const rawReason = `token budget of ${entry.budget} spent`
   const isTold = budgetPauseNotifiedFor === rawReason || budgetPauseNotifiedFor === reason
@@ -1890,12 +1895,12 @@ async function account(
   halted = { dir, why: `paused (${reason})` }
   // The board reports the crossing once. A prompt that does not land would leave the run paused with nobody told.
   const unheard = () => $.ui.toast(`Swarm paused "${entry.title}": its token budget of ${compact(entry.budget)} is spent, and the coordinator could not be told. Raise the budget or close the run.`)
-  if (isTold) return true
+  if (isTold) return accepted
   noticeHold = (await $.clock.now()) + NOTICE_HOLD_MS
   void $.prompt.submit({
     text: `Swarm: Run paused at token budget\n${entry.title} spent ${compact(entry.total)} tokens and reached its budget of ${compact(entry.budget)}. Tell the user what is done and ask whether to raise the budget with limit and then resume, or close the run.`,
   }).then(result => { if (result.drop) { noticeHold = 0; unheard() } }).catch(() => { noticeHold = 0; unheard() })
-  return true
+  return accepted
 }
 
 // A member of a paused or spent run is refused its next tool call, so a turn in flight ends there instead of
@@ -1917,9 +1922,10 @@ async function refusal($: EngineInterface, agentId: string | undefined): Promise
   const stopped = stoppedMember(agentId)
   if (stopped) return stopped
   const sEpoch = sessionEpoch
+  const owner = generation
   // The run this conversation drives, or drove until its close: closing it makes no earlier run's agents welcome.
   const active = (await read($, run).catch(() => '')) || closedRun
-  if (sEpoch !== sessionEpoch || isEnding) return undefined
+  if (sEpoch !== sessionEpoch || owner !== generation || isEnding) return undefined
   if (!halted && !active) {
     // After a restart/resume, a closed or killed run is no longer in `run` or `closedRun`: check whether this
     // registered member (including a general-purpose stand-in) belongs to one so retired members are blocked on
@@ -1928,15 +1934,15 @@ async function refusal($: EngineInterface, agentId: string | undefined): Promise
     try {
       let listFailed = false
       const agents = await $.agent.list().catch(() => { listFailed = true; return [] as AgentInfo[] })
-      if (sEpoch !== sessionEpoch || isEnding) return undefined
+      if (sEpoch !== sessionEpoch || owner !== generation || isEnding) return undefined
       const agent = agents.find(one => one.id === agentId)
-      const dir = agentRuns.get(agentId) ?? await agentRun($, agentId, agent, listFailed, sEpoch)
-      if (sEpoch !== sessionEpoch || isEnding) return undefined
+      const dir = agentRuns.get(agentId) ?? await agentRun($, agentId, agent, listFailed, sEpoch, owner)
+      if (sEpoch !== sessionEpoch || owner !== generation || isEnding) return undefined
       if (!dir) return undefined
       const state = await $.fs.read(`${dir}/members.json`)
         .then(text => JSON.parse(text) as { closed?: boolean; members?: Roster })
         .catch(() => undefined)
-      if (sEpoch !== sessionEpoch || isEnding) return undefined
+      if (sEpoch !== sessionEpoch || owner !== generation || isEnding) return undefined
       if (!state?.members) return undefined
       const stoppedIds = agentIdsOf(state.members, agents, member => Boolean(member.killed))
       const address = teammates.get(agentId) ?? agent?.teammateId
@@ -1959,8 +1965,8 @@ async function refusal($: EngineInterface, agentId: string | undefined): Promise
     // has nobody left to guard its agents, whatever tool they call. Asked of the board once per agent, so a resume,
     // which forgets the runs driven before, forgets none of this.
     const dir = agentRuns.get(agentId) ?? (strangers.has(agentId) ? '' :
-      await agentRun($, agentId, (await $.agent.list()).find(one => one.id === agentId), false, sEpoch))
-    if (sEpoch !== sessionEpoch || isEnding) return undefined
+      await agentRun($, agentId, (await $.agent.list()).find(one => one.id === agentId), false, sEpoch, owner))
+    if (sEpoch !== sessionEpoch || owner !== generation || isEnding) return undefined
     if (dir && active && dir !== active) return OVER
     if (dir !== halted?.dir) return undefined
     return `This Swarm run is ${halted.why}, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped. The coordinator decides what happens when the run resumes.`
@@ -3272,6 +3278,14 @@ export const register: Register = on => {
   on('turn.step', async function* ($, e, next) {
     const sEpoch = sessionEpoch
     const rGen = generation
+    let owner = turnRuns.get(e.turnId)
+    if (owner === undefined) {
+      const dir = e.agentId === undefined ? await read($, run).catch(() => '') : agentRuns.get(e.agentId)
+      if (sEpoch === sessionEpoch && !isEnding) {
+        owner = turnRuns.get(e.turnId) ?? (rGen === generation ? dir || undefined : rGen)
+        if (owner !== undefined) rememberTurnRun(e.turnId, owner)
+      }
+    }
     const response = yield* next(e)
     try {
       if (sEpoch !== sessionEpoch || isEnding) return response
@@ -3285,32 +3299,16 @@ export const register: Register = on => {
         void $.agent.list().then(agents => stepped.prune(id => agents.some(agent => agent.id === id && !['completed', 'failed', 'killed'].includes(agent.status)), now)).catch(() => undefined)
       }
       if (spent && turn) {
-        // Queued before anything is awaited: the turn's end waits for this charge, and so never charges it again. The
-        // charge itself goes out once the budget below is judged, as it always did.
-        let judged = () => {}
-        const judging = new Promise<void>(resolve => { judged = resolve })
-        let at: string | undefined
+        const at = owner ?? (e.agentId === undefined ? undefined : rGen)
+        if (at !== undefined && !turnRuns.has(e.turnId)) rememberTurnRun(e.turnId, at)
+        // The turn's end waits for this charge. Planning steps that begin before a run is bound fall to that end.
         turn.landing = turn.landing
-          .then(() => judging)
-          .then(() => account($, `${e.turnId}:${e.index}`, e.agentId, delta, at, sEpoch, at ? undefined : rGen))
-          .catch(() => false)
+          .then(() => at === undefined ? undefined : account($, e.turnId, `${e.turnId}:${e.index}`, e.agentId, delta, at, sEpoch))
+          .catch(() => false as const)
           // One never sent is no longer pending under its own report: its turn's end charges it.
-          .then(landed => { if (sEpoch === sessionEpoch && !isEnding && landed !== false) stepped.landed(turn, landed ? delta : 0, e.index) })
-        try {
-          // Only a step of this run's own spends its budget: the coordinator's, or an agent already known to be a member.
-          at = e.agentId === undefined ? (await read($, run)) || undefined : agentRuns.get(e.agentId)
-          if (sEpoch !== sessionEpoch || isEnding) return response
-          if (at) {
-            turnRuns.set(e.turnId, at)
-            // A turn that never reports its end leaves its entry: the oldest go first.
-            if (turnRuns.size > TURNS_KEPT) turnRuns.delete(turnRuns.keys().next().value!)
-          }
-          const isOwn = snapshot !== undefined && (e.agentId === undefined ? at : agentRuns.get(e.agentId)) === snapshot.dir
-          if (snapshot && !snapshot.isClosed && isOwn && snapshot.budget > 0 && tokensUsed(snapshot.tokens) + delta >= snapshot.budget) {
-            halted = { dir: snapshot.dir, why: `paused (token budget of ${compact(snapshot.budget)} spent)` }
-          }
-        } finally {
-          judged()
+          .then(landed => { if (sEpoch === sessionEpoch && !isEnding && landed !== false) stepped.landed(turn, landed ?? 0, e.index) })
+        if (snapshot && !snapshot.isClosed && at === snapshot.dir && snapshot.budget > 0 && tokensUsed(snapshot.tokens) + delta >= snapshot.budget) {
+          halted = { dir: snapshot.dir, why: `paused (token budget of ${compact(snapshot.budget)} spent)` }
         }
       }
     } catch {
@@ -3325,13 +3323,16 @@ export const register: Register = on => {
     let isCharged = false
     const sEpoch = sessionEpoch
     const rGen = generation
-    const pinnedAt = turnRuns.get(e.turnId) ?? (e.agentId !== undefined ? agentRuns.get(e.agentId) : undefined)
-    // Serialize concurrent turn.complete events for the same turnId so two overlapping ends never double-charge.
-    const prevComplete = completing.get(e.turnId)
+    const pinnedAt = turnRuns.get(e.turnId) ?? (e.agentId !== undefined ? agentRuns.get(e.agentId) : undefined) ?? rGen
+    if (!isEnding && !turnRuns.has(e.turnId)) rememberTurnRun(e.turnId, pinnedAt)
+    // A completion still in flight during /clear must not serialize turns in the new session.
+    const queueKey = (turnId: string) => `${sEpoch}:${turnId}`
+    const key = queueKey(e.turnId)
+    const prevComplete = completing.get(key)
     let doneComplete!: () => void
     const thisComplete = new Promise<void>(resolve => { doneComplete = resolve })
     const tailComplete = prevComplete ? prevComplete.then(() => thisComplete) : thisComplete
-    completing.set(e.turnId, tailComplete)
+    completing.set(key, tailComplete)
     try {
       try {
         if (prevComplete) await prevComplete
@@ -3343,75 +3344,57 @@ export const register: Register = on => {
           await seen
         }
         if (sEpoch !== sessionEpoch || isEnding) return next(e)
-        // What its steps left uncharged goes to the run they were spent under, where one was driven then: a step charge
-        // the board did not take is retried under its own report, so the board still records it once, and the rest
-        // under the turn's. Kept for the run, not dropped: a replayed end, or one that fails, still finds it.
-        // A coordinator's turn that reported no step has no run on record yet: the one it drives now is its run.
-        const at = pinnedAt ?? turnRuns.get(e.turnId) ?? (e.agentId === undefined
-          ? (rGen === generation ? (await read($, run)) || undefined : undefined)
-          : (rGen === generation ? agentRuns.get(e.agentId) : undefined))
-        if (sEpoch !== sessionEpoch || isEnding) return next(e)
+        const at = turnRuns.get(e.turnId) ?? pinnedAt
         const turn = stepped.of(e.turnId)
-        // Each one left was sent and not taken, so it stays pending until the board takes it under its own report, even
-        // when it cannot be sent now: charged under the turn's, it could be taken twice.
-        const settle = async (turnId: string, owing: NonNullable<typeof turn>, agentId: string | undefined, under?: string, isOwn = false, expectedGen?: number) => {
-          if (settling.has(turnId)) return
-          settling.add(turnId)
+        // Retry the same amount under the same report ID: a missing response can hide a successful write.
+        const endReport = (turnId: string, owing: NonNullable<typeof turn>) =>
+          owing.endCharged === 0 ? turnId : `${turnId}:end:${owing.endCharged}`
+        const settle = async (turnId: string, owing: NonNullable<typeof turn>, under: TurnOwner) => {
+          const key = queueKey(turnId)
+          if (settling.has(key)) return
+          settling.add(key)
           try {
             for (const [index, amount] of [...owing.pending]) {
               if (sEpoch !== sessionEpoch || isEnding) break
-              // Its end is reported again with usage: what that end owed is worked out anew below, and sent once under
-              // the one report. A replay without usage keeps and retries the stored END charge instead of dropping it.
-              if (isOwn && index === END && e.usage !== undefined) {
-                owing.pending.delete(END)
-                continue
-              }
-              if (await account($, index === END ? turnId : `${turnId}:${index}`, agentId, amount, under, sEpoch, under ? undefined : expectedGen).catch(() => false)) {
-                stepped.landed(owing, amount, index)
+              const report = index === END ? endReport(turnId, owing) : `${turnId}:${index}`
+              const accepted = await account($, turnId, report, owing.agentId, amount, under, sEpoch).catch(() => false as const)
+              if (accepted) {
+                stepped.landed(owing, accepted, index)
                 isCharged = true
               }
             }
           } finally {
-            settling.delete(turnId)
+            settling.delete(key)
           }
         }
-        if (turn) await settle(e.turnId, turn, e.agentId, at, true, rGen)
+        if (turn) await settle(e.turnId, turn, at)
         if (sEpoch !== sessionEpoch || isEnding) return next(e)
         const owed = stepped.charge(e.turnId, e.usage, undefined, e.agentId)
-        const taken = await account($, e.turnId, e.agentId, owed, at, sEpoch, at ? undefined : rGen).catch(() => false)
-        // The ledger may have been cleared meanwhile (a new session): nothing is left to mark.
-        if (sEpoch !== sessionEpoch || isEnding) return next(e)
         const ended = stepped.of(e.turnId)
-        if (taken) {
-          if (ended) stepped.landed(ended, owed)
-          if (at && owed > 0) {
-            turnRuns.set(e.turnId, at)
-            if (turnRuns.size > TURNS_KEPT) turnRuns.delete(turnRuns.keys().next().value!)
-          }
-          isCharged = true
-        } else if (taken === false && ended) {
+        if (ended && owed > 0 && !ended.pending.has(END)) {
           stepped.held(ended, owed)
-          if (at && owed > 0) {
-            turnRuns.set(e.turnId, at)
-            if (turnRuns.size > TURNS_KEPT) turnRuns.delete(turnRuns.keys().next().value!)
-          }
+          const taken = await account($, e.turnId, endReport(e.turnId, ended), e.agentId, owed, turnRuns.get(e.turnId) ?? at, sEpoch).catch(() => false as const)
+          // The ledger may have been cleared meanwhile (a new session): nothing is left to mark.
+          if (sEpoch !== sessionEpoch || isEnding) return next(e)
+          if (taken !== false) stepped.landed(ended, taken ?? 0, END)
+          if (taken) isCharged = true
         }
         // What earlier turns still owe is tried again now: their own end is not reported twice, so a board that was
         // out of reach then would never be charged. Under each one's own report and run; a coordinator's turn whose
         // run is no longer known is left for its own end.
         // ponytail: the oldest few an end, so a board that stays out of reach costs each end a bounded number of commands.
         // Taken in turn, so one the board keeps refusing does not hold up those behind it.
-        const late = stepped.owed().filter(([turnId]) => turnId !== e.turnId && !settling.has(turnId) && !completing.has(turnId))
+        const late = stepped.owed().filter(([turnId]) => turnId !== e.turnId && !settling.has(queueKey(turnId)) && !completing.has(queueKey(turnId)))
         for (let tried = 0; tried < Math.min(STRANDED_RETRIES, late.length); tried++) {
           if (sEpoch !== sessionEpoch || isEnding) break
           const [turnId, owing] = late[(strandedFrom + tried) % late.length]!
           const under = turnRuns.get(turnId)
-          if (owing.agentId !== undefined || under) await settle(turnId, owing, owing.agentId, under)
+          if (under !== undefined) await settle(turnId, owing, under)
         }
         if (sEpoch === sessionEpoch && !isEnding) strandedFrom += STRANDED_RETRIES
       } finally {
         doneComplete()
-        if (completing.get(e.turnId) === tailComplete) completing.delete(e.turnId)
+        if (completing.get(key) === tailComplete) completing.delete(key)
         // Only once its usage is on the board: a poll in between would act on the roster as it was before a budget pause.
         const ownsCoordTurn = activeCoordinatorTurnId === undefined || activeCoordinatorTurnId === e.turnId
         if (e.agentId === undefined && sEpoch === sessionEpoch && !isEnding && ownsCoordTurn) {
@@ -3435,12 +3418,19 @@ export const register: Register = on => {
           }
         }
       }
-      if (sEpoch === sessionEpoch && !isEnding && e.agentId !== undefined) {
+      const owner = turnRuns.get(e.turnId) ?? pinnedAt
+      if (sEpoch === sessionEpoch && !isEnding && rGen === generation && e.agentId !== undefined &&
+          (typeof owner === 'string' || owner === rGen)) {
         // A member that was woken and ended its turn without reading is owed the wake again.
         const agent = findAgent(await $.agent.list(), e.agentId)
-        const dir = await agentRun($, e.agentId, agent)
-        const address = teammateOf($, e.agentId, agent)
-        if (sEpoch === sessionEpoch && !isEnding && dir) await boardCommand($, dir, ['rearm', String(Math.ceil(e.durationMs)), e.agentId, ...(address ? [address] : [])]).catch(() => undefined)
+        if (sEpoch === sessionEpoch && !isEnding && rGen === generation) {
+          const dir = typeof owner === 'string' ? owner : await agentRun($, e.agentId, agent, false, sEpoch, rGen)
+          if (sEpoch === sessionEpoch && !isEnding && rGen === generation && dir && !retiredRuns.has(dir)) {
+            rememberTurnRun(e.turnId, dir)
+            const address = teammateOf($, e.agentId, agent)
+            await boardCommand($, dir, ['rearm', String(Math.ceil(e.durationMs)), e.agentId, ...(address ? [address] : [])]).catch(() => undefined)
+          }
+        }
       }
       if (sEpoch === sessionEpoch && !isEnding && (e.agentId !== undefined || e.usage || isCharged)) $.clock.after(0, () => void refresh($))
     } catch {
@@ -3637,11 +3627,6 @@ export const register: Register = on => {
     if (e.surface !== 'desktop' || e.props.isSummary || !DEPLOYED.test(e.props.text) || !(await read($, run))) return next(e)
     const { Box, Text, Button, Svg } = $.ui.resolve(e)
     const reply = await next(e)
-    const shown = await read($, swarm)
-    const state = emblemStateOf(shown)
-    const activeMembers = shown.members.filter(m => m.role !== 'coordinator' && m.status !== 'killed').length
-    const working = shown.members.filter(m => m.status === 'working').length
-    const borderColor = shown.isClosed ? 'subtle' : shown.isPaused || shown.attention.length > 0 ? 'warning' : 'claude'
     return (
       <Box flexDirection="column" rowGap="sm">
         {reply}
@@ -3654,24 +3639,17 @@ export const register: Register = on => {
           columnGap="md"
           rowGap="xs"
           borderStyle="round"
-          borderColor={borderColor}
+          borderColor="claude"
           borderDimColor
           hover={{ borderDimColor: false }}
           paddingX="sm"
           paddingY="xs"
         >
           <Box flexDirection="row" alignItems="center" columnGap="sm" flexShrink={1}>
-            <Svg source={swarmEmblem(state)} alt="Swarm" width={20} height={20} />
+            <Svg source={swarmEmblem('idle')} alt="Swarm" width={20} height={20} />
             <Box flexDirection="column" flexShrink={1}>
-              <Text wrap="truncate-end">
-                <Text weight="semibold" color="claude">Swarm</Text>
-                {shown.title !== '' && <Text weight="medium">{`  ${shown.title}`}</Text>}
-              </Text>
-              <Text size="caption" dimColor tabular>
-                {shown.dir !== ''
-                  ? `${shown.isClosed ? 'closed' : shown.isPaused ? 'paused' : working > 0 ? `${working} working` : 'active'} · ${counted(activeMembers, 'member')} · ${counted(shown.total ?? shown.posts.length, 'post')}`
-                  : 'Live multi-agent board & graph'}
-              </Text>
+              <Text weight="semibold" color="claude">Swarm</Text>
+              <Text size="caption" dimColor>Live multi-agent board &amp; graph</Text>
             </Box>
           </Box>
           <Button

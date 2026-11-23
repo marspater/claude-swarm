@@ -1003,9 +1003,13 @@ def fenced(lines):
     return found
 
 
-def unfenced(text):
+def quoted_code(lines):
+    return fenced(lines) | {index for index, line in enumerate(lines) if re.match(r"^(?: {4}| {0,3}\t)", line)}
+
+
+def unfenced(text, *, include_indented=False):
     lines = text.split("\n")
-    quoted = fenced(lines)
+    quoted = quoted_code(lines) if include_indented else fenced(lines)
     return "\n".join("" if index in quoted else line for index, line in enumerate(lines))
 
 
@@ -1013,7 +1017,7 @@ def rulings_in(text):
     """{id: "resolved" or "open"} as a verifier's text rules. `F2: resolved` (or closed, verified) closes, only as a whole
     line; `F2: open`, `still open` or `not fixed` keeps open, read anywhere. "fixed" closes nothing: it is the worker's
     word, and a verifier quoting the worker must not close an id. Where an id carries both, open wins."""
-    rulings, text = {}, unfenced(text)
+    rulings, text = {}, unfenced(text, include_indented=True)
     for match in RULING_LINE.finditer(text):
         name = (match[1] or match[2]).upper()
         if rulings.get(name) != "open":
@@ -1027,7 +1031,7 @@ def answers_in(text, known):
     """{id: (fixed or disputed, the evidence)} for the ids in KNOWN that a worker's report answers. An answer with no
     evidence is none, and neither are two different answers to one id, since neither can be trusted."""
     seen, conflicted = {}, set()
-    for match in RESPONSE_LINE.finditer(unfenced(text)):
+    for match in RESPONSE_LINE.finditer(unfenced(text, include_indented=True)):
         name, evidence = match[1].upper(), match[3].strip()
         if name not in known:
             continue
@@ -1041,7 +1045,7 @@ def answers_in(text, known):
 def tagged(text):
     """[(the id a NOT PASSED puts on a defect, the defect's text)]: an id on a bullet, or one in brackets right after
     the verdict word for a verdict that is one defect in prose."""
-    lines, found = unfenced(text).split("\n"), []
+    lines, found = unfenced(text, include_indented=True).split("\n"), []
     for line in lines:
         mark = BULLET.match(line)
         tag = mark and not RULING_LINE.fullmatch(line) and ID_TAG.match(line, mark.end())
@@ -1066,7 +1070,7 @@ def tag_findings(text, known, number, members=None):
     def fresh():
         given.append("F%d" % (number + len(given)))
         return given[-1]
-    bullets, quoted = False, fenced(lines)
+    bullets, quoted = False, quoted_code(lines)
     for index, line in enumerate(lines):
         mark = BULLET.match(line)
         if not mark or index in quoted:
@@ -1082,7 +1086,7 @@ def tag_findings(text, known, number, members=None):
     if not bullets and word:
         rest = lines[0][word.end():]
         whole = re.match(r"[ \t]*\[(F\d+)\]", rest, re.I | re.A)
-        about = {name.upper() for name in re.findall(FINDING_ID + r"\]?[ \t]*[:\-—–\]]", unfenced(text), re.I | re.A)} & known
+        about = {name.upper() for name in re.findall(FINDING_ID + r"\]?[ \t]*[:\-—–\]]", unfenced(text, include_indented=True), re.I | re.A)} & known
         if whole and whole[1].upper() not in known:
             rest = rest[whole.end():]  # an id the board never gave
         # A verdict that only closes known ids says what is wrong in its prose: that is a new defect.
@@ -1380,8 +1384,8 @@ def account(d, args):
     turns = usage.setdefault("turns", {})
     recorded = turn not in turns
     if recorded:
-        turns[turn] = True
-        tokens[actor] = tokens.get(actor, 0) + int(count)
+        turns[turn] = int(count)
+        tokens[actor] = tokens.get(actor, 0) + turns[turn]
         steps = usage.setdefault("steps", {})
         steps[actor] = steps.get(actor, 0) + 1
         # Only a retried report repeats a turn, and it does so at once: the oldest entries are never asked about again.
@@ -1392,6 +1396,9 @@ def account(d, args):
     if paused:
         state["paused"] = spent(budget)
     result = {"title": state["title"], "total": total, "budget": budget, "paused": paused}
+    # Older runs stored only True for a recorded report, with no amount to echo on a retry.
+    if type(turns[turn]) is int:
+        result["accepted"] = turns[turn]
     # A member over its own budget stops alone: the others keep running.
     for name, member in state["members"].items():
         own = member_budget(state, member)
@@ -2299,6 +2306,11 @@ def main(argv):
                 reported = latest_reports(posts).get(sender, {}).get("seq")
                 scope = (assignment_scope(member), member.get("id"))  # a replaced or restarted agent is another
 
+                def latest_rejection():
+                    return next((post["seq"] for post in reversed(posts) if sender in rejected(post, members)), None)
+
+                rejection = latest_rejection()
+
                 def revalidate(when):
                     if state.get("closed") or member.get("role") != "worker" or member.get("killed"):
                         sys.exit("only an active worker of an open run can ready, and @%s no longer is one: the board changed "
@@ -2315,6 +2327,9 @@ def main(argv):
                     if (assignment_scope(member), member.get("id")) != scope:
                         sys.exit("@%s's assignment changed %s, so nothing was posted. Read the "
                                  "board, check the work against the new assignment, then report again" % (sender, when))
+                    if latest_rejection() != rejection:
+                        sys.exit("@%s's work was rejected %s, so nothing was posted. Read the verdict, then report again"
+                                 % (sender, when))
 
                 if revision is not None:
                     import verify  # late: verify.py imports this module
@@ -2362,8 +2377,8 @@ def main(argv):
                     guessed = [] if known_starts else branch_starts(home, revision)
                     base, exclude = own_range(home, revision, [*(guessed if len(guessed) == 1 else []), *known_starts],
                                               merged, earlier)
-                    report = sys.stdin.read().strip()
-                    if not report:
+                    report = sys.stdin.read().strip("\r\n")
+                    if not report.strip():
                         sys.exit("READY needs a report on stdin")
                     state, posts = relocked()
                     members = state["members"]
@@ -2388,8 +2403,8 @@ def main(argv):
                         start = None
                 else:
                     fcntl.flock(lock, fcntl.LOCK_UN)
-                    report = sys.stdin.read().strip()
-                    if not report:
+                    report = sys.stdin.read().strip("\r\n")
+                    if not report.strip():
                         sys.exit("READY needs a report on stdin")
                     state, posts = relocked()
                     members = state["members"]

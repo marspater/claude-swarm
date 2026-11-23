@@ -1,6 +1,6 @@
 // The text forms this module recognises: a board command in a Bash call, a run folder, a wake message.
 
-// python with any flags (-B, -X utf8, -Xutf8, --check-hash-based-pycs always; never -c or -m, which run something else)
+// python with options, checked separately by pythonRuns to make sure it runs the script,
 // or the script run by its shebang, the script, the run folder (a trailing slash allowed), the subcommand. A backslash
 // is only ever half of an escape, so no input can be matched two ways. An assignment's value holds no `(`:
 // `R=$(board.py … init …)` is a call inside a substitution, whose output the shell keeps, not one this pattern reads.
@@ -61,10 +61,11 @@ const ansiQuoteEnd = (command: string, i: number): number => {
   return -1
 }
 
-/** Index of the end of a `${…}`, `$((…))`, `$(…)` or backtick expansion at `i`, -1 if unclosed, or undefined if none. */
+/** Index of the end of a shell expansion at `i`, -1 if unclosed, or undefined if none. */
 const expansionEnd = (command: string, i: number, inDouble = false): number | undefined => {
   const ch = command[i]
   if (ch === '`') return tickEnd(command, i)
+  if (!inDouble && (ch === '<' || ch === '>') && command[i + 1] === '(') return parenEnd(command, i + 2)
   if (ch !== '$') return undefined
   if (command[i + 1] === '{') return braceEnd(command, i + 2, inDouble)
   if (command[i + 1] === '(') {
@@ -630,6 +631,10 @@ export function boardCalls(command: string): ParsedBoardCall[] {
     const segment = unwrap(text).text
     const match = BOARD_CALL.exec(segment)
     if (!match) continue
+    const words = shellWords(segment)
+    const first = words.findIndex(word => !/^[A-Za-z_]\w*=/.test(word))
+    if (first >= 0 && PYTHON.test(words[first]!.replace(/^.*\//, '')) &&
+        pythonRuns(words.slice(first + 1), 'board.py', '', true) !== 'script') continue
     const rawDir = match[1] ?? match[2] ?? match[3]?.replace(/\\(.)/g, '$1') ?? ''
     const dir = rawDir.replace(/\/+$/, '')
     const action = match[4]!
@@ -886,10 +891,11 @@ const SCRIPTERS = /^(?:perl|ruby|node|nodejs|bun|deno|php|lua|osascript|[gmn]?aw
  * them: -W, -X and --check-hash-based-pycs take a value (`-Wonce` holds no c), and -c and -m end the options, with
  * their value attached (`-Bc…`) or the next word.
  */
-function pythonRuns(args: readonly string[], file: string, input: string): 'script' | 'other' | undefined {
+function pythonRuns(args: readonly string[], file: string, input: string, includeInteractive = false): 'script' | 'other' | undefined {
   const named = (words: readonly string[]) => words.some(word => word.includes(file))
   let inspects = false
-  const script = (word: string | undefined) => word?.replace(/^.*\//, '') !== file ? undefined : inspects ? 'other' : 'script'
+  const script = (word: string | undefined) =>
+    word?.replace(/^.*\//, '') !== file ? undefined : inspects && !includeInteractive ? 'other' : 'script'
   for (let i = 0; i < args.length; i++) {
     const word = args[i]!
     if (word === '-') return input.includes(file) || named(args.slice(i + 1)) ? 'other' : undefined

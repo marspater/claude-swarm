@@ -1050,12 +1050,14 @@ test('starting a registered member binds the run, however the board commands wer
     const known = isAdopt && ['parser', 'probe'].includes(event.argv.at(-1) ?? '')
     return { value: { exitCode: 0, stdout: known ? run : event.argv.includes('read') ? 'brief for probe' : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
-  on('fs.read', () => ({
-    value: JSON.stringify({ members: { coordinator: {}, parser: {}, probe: { role: 'worker', profile: 'investigator', writes: '0' } } }),
+  on('fs.read', (_, e) => ({
+    value: e.path.endsWith('/members.json')
+      ? JSON.stringify({ title: 'Current run title', members: { coordinator: {}, parser: {}, probe: { role: 'worker', profile: 'investigator', writes: '0' } } })
+      : '',
   }))
   on('agent.spawn', () => ({ model: 'sonnet', agentId: 'started' }))
   on('tool.call', () => ({ result: 'unused' }))
-  mock.clock(on)
+  const clock = mock.clock(on)
 
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
   expect(placed).toEqual([])
@@ -1086,11 +1088,14 @@ test('starting a registered member binds the run, however the board commands wer
   await shortcut.unmount()
 
   await $.turn.start({ text: 'Continue coordinating', turnId: 'fixture-turn' })
+  await clock.advance(2000)
   const reply = await $.ui.mount({
     component: 'AssistantMessage', plugin: 'swarm', surface: 'desktop',
     props: { text: 'Swarm deployed.\n\nParser is checking date.ts.', isFirstOfReply: true },
   })
   expect(await reply.find({ type: 'Text', text: /Parser is checking date\.ts/ })).toBeDefined()
+  expect(await reply.find({ type: 'Text', text: /Current run title/ })).toBeUndefined()
+  expect(await reply.find({ type: 'Text', text: 'Live multi-agent board & graph' })).toBeDefined()
   await reply.press({ key: 'swarm-board-from-reply' })
   expect(opened).toEqual(['swarm', 'swarm', 'swarm', 'swarm'])
   expect(submitted).toEqual([])
@@ -1750,6 +1755,37 @@ test('a turn\'s end whose write failed is charged in full when it is reported ag
   // once it landed, a further report adds nothing
   await $.turn.complete({ ...ends, turnId: 'r', usage: ten })
   expect([run.state.usage.tokens.coordinator, run.landed.length]).toEqual([105, 1])
+})
+
+test('losing the response to an END charge preserves its amount when a step and a revised total arrive', async ($, on) => {
+  const { answer, board } = owning(on, { board: () => '', roster: () => ROSTER })
+  const usage = (input_tokens: number) => ({ model: 'm', input_tokens, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 })
+  const attempts: number[] = []
+  const persisted = new Map<string, number>()
+  on('process.run', (_, e) => {
+    if (e.argv[3] !== 'account') return answer(board(e))
+    const id = e.argv[4]!
+    const requested = Number(e.argv.at(-1))
+    attempts.push(requested)
+    if (attempts.length >= 3 && !persisted.has(id)) persisted.set(id, requested)
+    if (attempts.length <= 3) return { value: { ...answer('').value, exitCode: 1 } }
+    return answer(JSON.stringify({ title: 'Demo swarm', accepted: persisted.get(id), total: 0, budget: 0, paused: false }))
+  })
+  on('tool.call', () => ({ result: {} }))
+  on('agent.list', () => ({ value: [] }))
+  on('turn.step', async function* (_, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'tool_use' as const, usage: usage(100) }
+  })
+  mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  for await (const _ of $.turn.step({ turnId: 'lost-end', index: 0, model: 'm', messageCount: 1 })) { /* no chunks */ }
+  await $.turn.complete({ ...ends, turnId: 'lost-end', usage: usage(250) })
+  expect(attempts).toEqual([100, 100, 150])
+  await $.turn.complete({ ...ends, turnId: 'lost-end', usage: usage(260) })
+  await $.turn.complete({ ...ends, turnId: 'lost-end', usage: usage(260) })
+  expect(attempts).toEqual([100, 100, 150, 100, 150, 10])
+  expect([...persisted.values()]).toEqual([150, 100, 10])
 })
 
 test('a charge the board took neither at its step nor at its turn\'s end is charged when a later turn ends', async ($, on) => {
@@ -6355,6 +6391,9 @@ test('#8a & #8c: deleted run stops account retries and concurrent turn.complete 
   let isGone = false
   let accountCalls = 0
   let releaseAccount!: () => void
+  let enteredAccount!: () => void
+  const accountRelease = new Promise<void>(resolve => { releaseAccount = resolve })
+  const accountEntered = new Promise<void>(resolve => { enteredAccount = resolve })
   let holdAccount = false
   const { answer, board } = owning(on, {
     board: () => posts({ agent: 'coordinator', to: [], text: 'plan' }),
@@ -6367,7 +6406,10 @@ test('#8a & #8c: deleted run stops account retries and concurrent turn.complete 
   on('process.run', async (_, e) => {
     if (e.argv[3] === 'account') {
       accountCalls++
-      if (holdAccount) await new Promise<void>(resolve => { releaseAccount = resolve })
+      if (holdAccount) {
+        enteredAccount()
+        await accountRelease
+      }
       return answer(JSON.stringify({ title: 'Accounting swarm', total: 100, budget: 0, paused: false }))
     }
     return answer(board(e))
@@ -6383,6 +6425,7 @@ test('#8a & #8c: deleted run stops account retries and concurrent turn.complete 
   // #8c: two concurrent turn.complete events for the same turnId only charge once
   holdAccount = true
   const first = $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'dup-1', usage })
+  await accountEntered
   const second = $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'dup-1', usage })
   await clock.advance(0)
   holdAccount = false
@@ -6465,7 +6508,7 @@ test('#9: no askStall while all workers unstarted, unmet depends excluded from u
   boardText = posts(
     { agent: 'coordinator', to: ['builder', 'arch'], text: '@builder @arch BRIEF' },
     { agent: 'coordinator', to: ['scout'], text: '@scout check files' },
-    { agent: 'coordinator', to: ['scout', 'arch'], text: '@scout @arch confirmed finding, proceed' },
+    { agent: 'builder', to: [], text: 'READY' },
   )
   await clock.advance(12_000)
   const releasedPrompt = seen.prompts.findLast(p => p.includes('Delivering board mentions'))
@@ -6637,8 +6680,9 @@ test('token-economy #3: heavy context reminder, independent FINDING coalescing, 
   await clock.advance(12_000)
   expect(seen.prompts.filter(p => p.includes('Unread board mentions'))).toEqual([])
 
-  // When an active member depends on inv1, FINDING wakes coordinator after MENTION_GRACE_MS (10s)
+  // The board stores after=inv1 in depends too. That finding wakes the coordinator after the usual grace.
   state.members.impl.depends = 'inv1'
+  state.members.impl.after = 'inv1'
   await clock.advance(2000)
   await clock.advance(12_000)
   expect(seen.prompts.filter(p => p.includes('Unread board mentions')).length).toBe(1)
@@ -6758,6 +6802,7 @@ test('CR3-4 & CR3-5: replay without usage retries failed END charge, and cross-s
   let holdAccount = false
   let releaseAccount!: () => void
   const charged: string[] = []
+  const newRun = '/project/.swarm/new-session-20261123-120000'
   const { answer, board } = owning(on, {
     board: () => posts({ agent: 'coordinator', to: [], text: 'plan' }),
     roster: () => JSON.stringify({ title: 'Accounting swarm', members: { coordinator: { role: 'coordinator', last_read_seq: 1 } } }),
@@ -6797,9 +6842,14 @@ test('CR3-4 & CR3-5: replay without usage retries failed END charge, and cross-s
   await $.session.end({ reason: 'clear', sessionId: 'fixture-conversation', resume: { id: 'fixture-conversation' } })
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
   holdAccount = false
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${newRun}" read coordinator` })
+  const fresh = $.turn.complete({ ...ends, turnId: 'stale-t', usage })
+  await clock.advance(0)
+  const beforeRelease = [...charged]
   releaseAccount()
-  await stale
-  // In the new session (no owned run), replaying stale-t without usage must not charge the old run
+  await Promise.all([stale, fresh])
+  expect(beforeRelease).toEqual([`${OWNED}:200`, `${newRun}:200`])
+  // Replaying the new session's end without usage must not charge either run again.
   const before = charged.length
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'stale-t' })
   expect(charged.length).toBe(before)
@@ -6961,8 +7011,13 @@ test('P1 same-session run switch cannot bill new run for uncached member, and st
   let releaseAgentList!: () => void
   let holdAgentRun = false
   let releaseAgentRun!: () => void
+  let releaseModel!: () => void
+  let enteredModel!: () => void
+  const modelRelease = new Promise<void>(resolve => { releaseModel = resolve })
+  const modelEntered = new Promise<void>(resolve => { enteredModel = resolve })
   let agentRunDir = OWNED
   const charged: string[] = []
+  const rearmed: string[] = []
   const { answer, board } = owning(on, {
     board: () => posts({ agent: 'coordinator', to: ['w'], text: '@w BRIEF' }),
     roster: () => JSON.stringify({
@@ -6981,13 +7036,15 @@ test('P1 same-session run switch cannot bill new run for uncached member, and st
   })
   on('process.run', async (_, e) => {
     if (e.argv[3] === 'agent-run') {
+      const found = agentRunDir
       if (holdAgentRun) await new Promise<void>(resolve => { releaseAgentRun = resolve })
-      return answer(agentRunDir)
+      return answer(found)
     }
     if (e.argv[3] === 'account') {
       charged.push(`${e.argv[2]}:${e.argv.at(-1)}`)
       return answer(JSON.stringify({ title: 'Run', total: 400, budget: 0, paused: false }))
     }
+    if (e.argv[3] === 'rearm') rearmed.push(e.argv[2]!)
     return answer(board(e))
   })
   on('agent.list', async () => {
@@ -6995,13 +7052,25 @@ test('P1 same-session run switch cannot bill new run for uncached member, and st
     return { value: [{ id: 'uncached-m', teammateId: 'tm-same', description: '@w', type: 'swarm:worker', status: 'completed' }] as never }
   })
   on('tool.call', () => ({ result: {} }))
+  const usage = { model: 'm', input_tokens: 400, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+  on('turn.step', async function* (_, e) {
+    if (e.turnId === 'old-coordinator' && e.index === 0) {
+      enteredModel()
+      await modelRelease
+    }
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'tool_use' as const, usage }
+  })
+  const step = async (turnId: string, index: number) => {
+    for await (const _ of $.turn.step({ turnId, index, model: 'm', messageCount: 1 })) { /* no chunks */ }
+  }
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
   await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
   await clock.advance(2000)
 
   // Delay uncached member's turn.complete while closing Run A and opening Run B in the SAME session reusing tm-same
-  const usage = { model: 'm', input_tokens: 400, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+  const oldStep = step('old-coordinator', 0)
+  await modelEntered
   holdAgentList = true
   const sameSessionDelayed = $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'same-sess-t', agentId: 'uncached-m', usage })
   await clock.advance(0)
@@ -7012,8 +7081,21 @@ test('P1 same-session run switch cannot bill new run for uncached member, and st
   await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${RUN_B}" read coordinator` })
   await clock.advance(2000)
   releaseAgentList()
-  await sameSessionDelayed
+  releaseModel()
+  await Promise.all([sameSessionDelayed, oldStep])
+  await step('old-coordinator', 1)
+  await $.turn.complete({ ...ends, turnId: 'old-coordinator', usage: { ...usage, input_tokens: 800 } })
   expect(charged).toEqual([])
+  expect(rearmed).toEqual([])
+  await $.turn.complete({ ...ends, turnId: 'same-sess-t', agentId: 'uncached-m', usage })
+  expect(charged).toEqual([])
+  expect(rearmed).toEqual([])
+  await $.turn.complete({ ...ends, turnId: 'new-turn', agentId: 'uncached-m', usage })
+  expect(charged).toEqual([`${RUN_B}:400`])
+  expect(rearmed).toEqual([RUN_B])
+  await step('new-coordinator', 0)
+  await $.turn.complete({ ...ends, turnId: 'new-coordinator', usage })
+  expect(charged).toEqual([`${RUN_B}:400`, `${RUN_B}:400`])
 
   // Stale agent-run lookup held across session restart must not poison next session's agentRuns and refuse member Read
   agentRunDir = OWNED
@@ -7030,4 +7112,42 @@ test('P1 same-session run switch cannot bill new run for uncached member, and st
   await staleRead
   // In the new session driving RUN_B, reused-id (whose current agent-run is RUN_B) must NOT be refused with OVER
   expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts', agentId: 'reused-id' } as never)).deny).toBeUndefined()
+})
+
+test('a delayed retirement read cannot mark a replacement run’s member retired', async ($, on) => {
+  const newRun = '/project/.swarm/new-roster-20261123-120000'
+  let releaseRoster!: () => void
+  let enteredRoster!: () => void
+  const rosterRelease = new Promise<void>(resolve => { releaseRoster = resolve })
+  const rosterEntered = new Promise<void>(resolve => { enteredRoster = resolve })
+  const { answer, board } = owning(on, {
+    board: () => '',
+    roster: () => JSON.stringify({
+      closed: true, title: 'Old run',
+      members: { w: { role: 'worker', id: 'shared-address', killed: '1', last_read_seq: 0 } },
+    }),
+    hold: path => {
+      if (path !== `${OWNED}/members.json`) return undefined
+      enteredRoster()
+      return rosterRelease
+    },
+    read: path => path === `${newRun}/members.json` ? JSON.stringify({
+      title: 'New run',
+      members: { coordinator: { role: 'coordinator', last_read_seq: 0 }, w: { role: 'worker', id: 'shared-address', last_read_seq: 0 } },
+    }) : undefined,
+    exists: true,
+  })
+  on('process.run', (_, e) => answer(e.argv[3] === 'agent-run' ? OWNED : board(e)))
+  on('agent.list', () => ({
+    value: [{ id: 'old-member', teammateId: 'shared-address', description: '@w', type: 'swarm:worker', status: 'completed' }] as never,
+  }))
+  on('tool.call', () => ({ result: {} }))
+  mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  const stale = toolCall($, { tool: 'Read', file_path: '/project/a.ts', agentId: 'old-member' } as never)
+  await rosterEntered
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${newRun}" read coordinator` })
+  releaseRoster()
+  await stale
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts', agentId: 'shared-address' } as never)).deny).toBeUndefined()
 })

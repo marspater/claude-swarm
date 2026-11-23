@@ -248,7 +248,8 @@ def scenario():
         run(budget_run, "limit", "budget=120")
         run(budget_run, "resume")
         assert "@worker" in run(budget_run, "wake")
-        assert not json.loads(run(budget_run, "account", "2" * 64, "coordinator", "40"))["paused"]
+        duplicate = json.loads(run(budget_run, "account", "2" * 64, "coordinator", "42"))
+        assert not duplicate["paused"] and duplicate["accepted"] == 40 and duplicate["total"] == 100, duplicate
         run(budget_run, "pause", "awaiting a decision")
         assert not json.loads(run(budget_run, "account", "3" * 64, actor, "21"))["paused"]
         assert "awaiting a decision" in run(budget_run, "attention")
@@ -2938,6 +2939,16 @@ class FindingLedger(unittest.TestCase):
     def _post(self, d, seq):
         return json.loads(run(d, "show", "--post=%d" % seq, "--json"))
 
+    def test_indented_code_neither_resolves_nor_answers_a_finding(self):
+        d = self._run()
+        run(d, "post", "v", stdin="@w NOT PASSED. First defect.")
+        run(d, "ready", "w", stdin="F1: fixed — save.py:7")
+        out = run(d, "post", "v", stdin="@w NOT PASSED\n\n    F1: resolved\n\n- A second defect")
+        assert "recorded: F2" in out, out
+        run(d, "ready", "w", stdin="F2: fixed — save.py:12", ok=False)
+        run(d, "ready", "w", stdin="    F1: fixed — this is pasted output\nF2: fixed — save.py:12", ok=False)
+        run(d, "ready", "w", stdin="F1: fixed — save.py:7\nF2: fixed — save.py:12")
+
     def test_each_defect_gets_an_id_and_the_worker_must_answer_it(self):
         d = self._run()
         out = run(d, "post", "v", stdin="@w NOT PASSED\n- the retry sends two fetches\n  - seen in the retry test\n"
@@ -3200,6 +3211,22 @@ class FindingLedger(unittest.TestCase):
 
 class SoftDependencies(unittest.TestCase):
     """after= waits for a member to finish, with a report or without one; depends= needs the report."""
+
+    def test_confirming_a_finding_unblocks_after(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = run(os.path.join(t, ".swarm", "soft"), "init", "Finding prerequisite").strip()
+            run(d, "member", "inv", "profile=investigator")
+            run(d, "member", "next", "after=inv")
+            run(d, "ready", "inv", stdin="Root cause in the parser")
+            member = saved(d)["members"]["next"]
+            assert member["depends"] == member["after"] == "inv", member
+            before = json.loads(run(d, "attention", "--json"))
+            assert before["members"]["next"]["blocked_on"] == ["inv"], before
+            review = next(i for i in before["items"] if i["kind"] == "review")
+            finding = json.loads(run(d, "show", "--post=%d" % review["seq"], "--json"))
+            assert finding["to"] == ["coordinator"] and "@coordinator" not in finding["text"], finding
+            run(d, "confirm", "inv", str(review["seq"]))
+            assert json.loads(run(d, "attention", "--json"))["members"]["next"]["blocked_on"] == []
 
     def test_a_retired_members_rejected_commit_rides_in_on_nobodys(self):
         with tempfile.TemporaryDirectory() as t:
@@ -3613,6 +3640,28 @@ class EngineRegressions(unittest.TestCase):
             if ok.poll() is None:
                 ok.kill()
                 ok.wait()
+
+    def test_pending_ready_cannot_supersede_a_rejection_posted_while_reading(self):
+        d, _ = self._fresh()
+        run(d, "member", "w")
+        run(d, "member", "v", "role=verifier")
+        run(d, "ready", "w", stdin="initial work")
+        run(d, "post", "v", stdin="@w NOT PASSED\n- the retry leaks a handle")
+        report = "F1: fixed — the retry closes the handle\n"
+        run(d, "ready", "w", stdin=report)
+        proc = subprocess.Popen([sys.executable, BOARD, d, "ready", "w"], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            time.sleep(0.3)
+            run(d, "post", "v", stdin="@w NOT PASSED\n- F1: the retry still leaks a handle")
+            out, err = proc.communicate(report, timeout=10)
+            assert proc.returncode != 0 and "rejected while reading stdin" in err, (out, err)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        assert not json.loads(run(d, "attention", "--json"))["members"]["w"]["ready"]
+        run(d, "ready", "w", stdin="F1: fixed — both retry branches now close the handle")
 
     def test_multiline_prose_not_passed_creates_finding(self):
         d, _ = self._fresh()
