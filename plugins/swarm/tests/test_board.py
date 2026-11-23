@@ -2039,7 +2039,11 @@ class BoardRegressions(unittest.TestCase):
             run(d, "member", who, *extra)
         board("sync", "down", ok=False)  # its dependency has not reported
         up = commit("up", "main", "a", "up\n")
+        assert "sync first" not in board("read", "down")  # nothing to take yet
         run(d, "ready", "up", up, stdin="a is up")
+        # where a downstream writer reads before it builds: the command, and only for it
+        assert "sync first: the board has not seen your checkout take the READY commit of @up" in board("read", "down")
+        assert "sync first" not in board("read", "side") and "sync first" not in board("read", "up")
         commit("down", "main", "b", "down\n")
         assert "sync down" in board("ready", "down", "HEAD", ok=False, stdin="b is down")
         assert "unmerged: @up " + up in board("sync", "down", "--check-only", ok=False)
@@ -2051,6 +2055,7 @@ class BoardRegressions(unittest.TestCase):
         assert refused.returncode != 0 and "not your worktree" in refused.stderr
         assert "merged @up's commit" in board("sync", "down")
         assert saved(d)["members"]["down"]["synced_deps"] == {"up": up}
+        assert "sync first" not in board("read", "down")  # taken: said no more, until @up reports a new commit
         assert "in sync" in board("sync", "down", "--check-only")
         board("ready", "down", "HEAD", stdin="b is down, on top of up")
         # its base is the project checkout's HEAD, not the worktree's: from there the log shows down's work, not up's

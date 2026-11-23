@@ -3022,6 +3022,18 @@ def main(argv):
                     f"{remaining} new post(s) deferred to next page" if remaining else "no new posts")
             if remaining:
                 say(f"{remaining} more post(s) remain. Read again for the next page.")
+            if reader.get("role") == "worker" and not reader.get("killed") and reader.get("writes") != "0" and kind_of(reader) not in READ_ONLY:
+                # A dependency's READY commit the board has not seen this writer merge: said where it reads before it
+                # builds, at its start and after each rework upstream. `ready` would refuse the commit only once the
+                # work was done on the old one.
+                through = readiness(members, posts)
+                merged = reader.get("synced_deps") if isinstance(reader.get("synced_deps"), dict) else {}
+                behind = [dep for dep in dependencies(reader)
+                          if through.get(dep, {}).get("revision") and merged.get(dep) != through[dep]["revision"]]
+                if behind:
+                    say("sync first: the board has not seen your checkout take the READY commit of %s. Before you build, "
+                        "run `board.py DIR sync %s` from your worktree: it merges what is missing and nothing else"
+                        % (", ".join("@" + dep for dep in behind), me))
             sys.stdout.flush()
             # Kept to the posts that are still some subject's latest report: a replaced one is never needed again.
             changed = False
