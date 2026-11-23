@@ -2593,7 +2593,6 @@ function shortcut($: EngineInterface, e: Parameters<EngineInterface['ui']['resol
   const button = (
     <Button
       key={SHORTCUT}
-      plain={e.surface === 'desktop' ? true : undefined}
       variant={isLive && !shown.isPaused ? 'primary' : 'secondary'}
       label="Swarm: The Board"
       hover={{ scope: 'swarm-shortcut' }}
@@ -2633,14 +2632,22 @@ function shortcut($: EngineInterface, e: Parameters<EngineInterface['ui']['resol
         borderColor={pillBorder}
         borderDimColor
         hover={{ scope: 'swarm-shortcut', borderDimColor: false }}
-        paddingX="sm"
+        paddingLeft="sm"
+        paddingRight="md"
         paddingY="xs"
       >
         <Svg source={swarmEmblem(state)} alt="Swarm" width={16} height={16} />
-        {button}
+        <Button
+          key={SHORTCUT}
+          plain
+          label="Swarm: The Board"
+          hover={{ scope: 'swarm-shortcut' }}
+          onPress={() => void openBoard($).catch(() => undefined)}
+        />
         {badgeText !== '' && !singleCaption && (
           <Text size="caption" weight="medium" color={badgeColor} tabular>{`· ${badgeText}`}</Text>
         )}
+        <Box width={1} />
       </Box>
     </Box>
   )
@@ -4454,7 +4461,6 @@ export const register: Register = on => {
         return (
           <Box
             key={member.name}
-            position="relative"
             flexDirection="column"
             gap="xs"
             borderStyle="round"
@@ -4464,12 +4470,17 @@ export const register: Register = on => {
             paddingX="sm"
             paddingY="xs"
           >
-            <Text strikethrough={member.status === 'killed'} wrap="truncate-end">
-              <Text weight="semibold" color={hueOf(member.name)}>@{member.name}</Text>
-              <Text dimColor>
-                {`  ${[member.role === 'coordinator' ? '' : member.type, `${member.model} ${member.effort}`.trim()].filter(part => part !== '').join(' · ')}`}
+            <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap="sm">
+              <Text strikethrough={member.status === 'killed'} wrap="truncate-end">
+                <Text weight="semibold" color={hueOf(member.name)}>@{member.name}</Text>
+                <Text dimColor>
+                  {`  ${[member.role === 'coordinator' ? '' : member.type, `${member.model} ${member.effort}`.trim()].filter(part => part !== '').join(' · ')}`}
+                </Text>
               </Text>
-            </Text>
+              {HeaderArt && (
+                <HeaderArt source={memberBee(hueOf(member.name), member.status, hiveOffset)} alt={`${member.name} bee`} width={24} height={16} />
+              )}
+            </Box>
             <Box flexDirection="row" alignItems="center" columnGap="xs">
               {member.status === 'closed' ? null : HeaderArt ? <HeaderArt source={statusDot(member.status, hiveOffset)} alt={member.status} width={12} height={12} /> :
               <Text color={statusColor}>{isBroken ? '!' : ['killed', 'not started'].includes(member.status) ? '○' : '●'}</Text>}
@@ -4499,11 +4510,6 @@ export const register: Register = on => {
                   <Button key={`feed-${member.name}`} plain dimColor hover={{ dimColor: false }} label="Posts" onPress={() => feedOf(member.name)} />
                 )}
                 {member.role === 'coordinator' && !hasMainTalk && <Text size="caption" dimColor>Its conversation is not available here.</Text>}
-              </Box>
-            )}
-            {HeaderArt && (
-              <Box position="absolute" top={0} right={1}>
-                <HeaderArt source={memberBee(hueOf(member.name), member.status, hiveOffset)} alt=" " width={24} height={16} />
               </Box>
             )}
           </Box>
@@ -4673,7 +4679,6 @@ export const register: Register = on => {
           {source !== undefined && (graph?.hidden ?? 0) > 0 && (
             <Text size="caption" dimColor>{`${counted(graph?.hidden ?? 0, 'quieter route')} not drawn: one drawing holds only so many.`}</Text>
           )}
-          {source !== undefined && <Text key="graph-key" size="caption" dimColor>{graph?.key}</Text>}
           {/* The host reads a drawing's alt and nothing inside it: the routes in words are one press away, in reach of the keyboard. */}
           {source !== undefined && (
             <Button key="graph-routes" plain dimColor label={routesListed ? 'Hide the route list' : 'List the routes'}

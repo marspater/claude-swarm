@@ -131,7 +131,7 @@ test('the pane draws the board, the members and the graph', async ($, on) => {
     expect(cards.length).toBeGreaterThan(2)
     for (const card of cards) {
       const [identity, state] = card.children as { type: string; props: Record<string, unknown>; text?: string }[]
-      expect(identity?.type).toBe('Text')
+      expect(identity?.type).toBe('Box')
       expect(String(card.text)).toMatch(new RegExp(`^@${card.key}\\b`))
       expect(state?.type).toBe('Box')
       expect(state?.props.flexDirection).toBe('row')
@@ -436,7 +436,7 @@ test('the shortcut leads crab-buddy\'s row and Swarm\'s own row goes', async ($,
   const band = await $.ui.mount({ component: 'AbovePrompt', plugin: 'swarm', surface: 'desktop', props })
   // One row: the shortcut first on the crab's line, Swarm's own row left out.
   expect(keys(await band.drawn() as Tree)).toEqual(['swarm-board-shortcut', 'crab-band', 'crab-fill', 'crab-text', 'crab-buddy'])
-  expect(await band.find({ type: 'Button', text: 'Swarm: The Board' })).toBeDefined()
+  expect(await band.find({ type: 'Button', text: /Swarm: The Board/ })).toBeDefined()
   await band.press({ key: 'swarm-board-shortcut' })
   expect(opened).toEqual(['swarm'])
   await band.unmount()
@@ -4216,7 +4216,7 @@ for (const members of [18, 24]) test(`audit: a dense graph of ${members} never h
       const [, from, to] = /^Post \d+ · @(\S+) to @([\w-]+)/.exec(String(graph?.props.alt)) ?? []
       // on the highlighted route itself: an earlier @all route between the same two members carries a like title
       expect(String(graph?.props.source)).toMatch(new RegExp(`<path class="route(?: motion-route)?" d="[^"]*" pathLength="100"[^>]*><title>${from} to ${to} · \\d+ mentions?</title>`))
-      expect(await ui.find({ type: 'Text', text: /^Arrow: @mention, thicker for more · Dashed arrow: reached via @all/ })).toBeDefined()
+      expect(String(graph?.props.source)).toContain('class="legend"')
       // expanded, there are more routes than one drawing holds, and the pane says how many it left out
       if (stage === 'expanded') expect(await ui.find({ type: 'Text', text: /^\d+ quieter routes? not drawn/ })).toBeDefined()
       if (stage === 'collapsed') await ui.press({ key: 'expand-all' })
