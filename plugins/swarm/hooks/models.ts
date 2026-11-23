@@ -17,6 +17,6 @@ export const latestOf = (model: string | undefined) => {
 export const DEFAULT_MODEL: Record<string, string> = {
   worker: LATEST.sonnet!, verifier: LATEST.sonnet!, explorer: LATEST.haiku!, investigator: LATEST.opus!, architect: LATEST.fable!, designer: LATEST.opus!,
 }
-export const DEFAULT_EFFORT: Record<string, string> = { worker: 'medium', verifier: 'medium', explorer: 'medium', investigator: 'high', architect: 'high', designer: 'high' }
+export const DEFAULT_EFFORT: Record<string, string> = { worker: 'medium', verifier: 'medium', explorer: 'medium', investigator: 'medium', architect: 'high', designer: 'high' }
 export const familyOf = (model: string) =>
   Object.keys(LATEST).find(name => model.toLowerCase().includes(name)) ?? model

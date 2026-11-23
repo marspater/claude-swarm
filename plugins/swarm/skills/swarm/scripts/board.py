@@ -2,7 +2,7 @@
 """Shared message board for a swarm: numbered posts, @mentions, unread cursors.
 
 usage: board.py DIR init TITLE                    prints the run folder it created; use that as DIR from then on
-       board.py DIR member NAME [key=value ...]   add or update (role= profile= writes= consult= group= depends= after= owns= paths= model= effort= id= backend= isolated= budget=<tokens> killed=1)
+       board.py DIR member NAME [key=value ...]   add or update (role= profile= writes= consult= group= depends= after= owns= paths= model= effort= size=<s|m|l> id= backend= isolated= budget=<tokens> killed=1)
        board.py DIR limit [key=value ...]         set run limits: max_workers= max_members= budget=<tokens> member_budget=<tokens> <model>=<types>
        board.py DIR plan                          the team as a table: type, model, effort, dependencies, ownership
        board.py DIR attention [--json]            what needs someone: a paused run or member, unread posts, unanswered questions, findings to review, rework, disputed findings, heavy spend, loops, unstarted, unreachable, ignoring or blocked members, stale verification, conflicting commits
@@ -92,12 +92,14 @@ REPORT_WORD = re.compile(r"^(?:@[\w-]+[ \t,:]*)*(READY|REVISE|BRIEF|SHUTDOWN|FIN
 # A fence closes on a run at least as long as the one that opened it, and the whole run goes with it, so a longer
 # fence can quote a shorter one.
 # What is taken out leaves a space: with nothing there, the words on either side would join into one.
+# A URL's scheme starts where its word does: tried from every letter, one long unbroken token (a hash, base64, a
+# minified line) costs the square of its length each time a post is read for questions.
 # Blanks and line starts are JavaScript's, as the pane reads them: its \s has U+FEFF and lacks U+001C-U+001F and U+0085,
 # and its ^ also follows a CR, U+2028 or U+2029.
 _BLANK = "\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 _LINE = "(?:^|(?<=[\r\u2028\u2029]))"
 QUOTED = re.compile(r"(?P<f>`{3,}).*?(?P=f)`*|%s {0,3}(?P<t>~{3,}).*?%s {0,3}(?P=t)~*|(?P<s>`+)[^\n]*?(?P=s)"
-                    r"|[A-Za-z0-9_]+://[^%s]+?(?=[.,;:!)]*(?:\?(?=[%s]|$))?(?:[%s]|$))"
+                    r"|(?<![A-Za-z0-9_])[A-Za-z0-9_]+://[^%s]+?(?=[.,;:!)]*(?:\?(?=[%s]|$))?(?:[%s]|$))"
                     % (_LINE, _LINE, _BLANK, _BLANK, _BLANK), re.DOTALL | re.MULTILINE)
 # `c ? a : b` asks nothing, and neither does `a ?? b`; "sure??" and "A? (Option A : yes)" do.
 # One blank after the mark and one before the colon are enough to look for: the class between them takes any more,
@@ -170,6 +172,7 @@ def atomic_write(path, value):
 
 
 def save(d, state):
+    allocate(state)
     atomic_write(os.path.join(d, "members.json"), json.dumps(state, indent=1))
 
 
@@ -452,14 +455,27 @@ def readiness(members, posts):
 
 # The model and effort each agent type runs at unless the roster says otherwise.
 DEFAULTS = {"worker": ("sonnet", "medium"), "verifier": ("sonnet", "medium"), "explorer": ("haiku", "medium"),
-            "investigator": ("opus", "high"), "architect": ("fable", "high"), "designer": ("opus", "high")}
+            "investigator": ("opus", "medium"), "architect": ("fable", "high"), "designer": ("opus", "high")}
 # Specialists read and report through the board tool. A designer is a profile that writes files, like a worker.
 READ_ONLY = {"explorer", "investigator", "architect"}
 PROFILES = {*READ_ONLY, "designer"}
 FAMILIES = ("haiku", "sonnet", "opus", "fable")
 LIMITS = {"max_workers", "max_members", "budget", "member_budget", *FAMILIES}
-INHERITED = ("role", "group", "profile", "writes", "depends", "after", "owns", "paths", "model", "effort", "consult")
+INHERITED = ("role", "group", "profile", "writes", "depends", "after", "owns", "paths", "model", "effort", "consult", "size")
 MEMBER_FIELDS = {*INHERITED, "backend", "id", "killed", "isolated", "budget"}
+# The budget a run gets from its planned team, in charged tokens, until the user names one. A piece costs what its
+# type usually spends, times the size the coordinator read from the task and the effort it runs at.
+# Measured: a worker's piece 0.4-1.1M, a verifier 0.3-1.3M, the coordinator about 0.3M in a fresh conversation, an
+# investigator about 0.45M by the 200k context ceiling. The architect, the explorer and the factors are estimates:
+# tune them against the Usage table of exported runs.
+ALLOWANCE = {"worker": 700_000, "designer": 700_000, "verifier": 600_000, "investigator": 500_000, "architect": 400_000,
+             "explorer": 150_000}
+SIZES = {"s": 0.5, "m": 1, "l": 2}
+EFFORT_COST = {"low": 0.7, "medium": 1, "high": 1.5, "xhigh": 2, "max": 2.5}
+COORDINATOR_BASE, COORDINATOR_PER_MEMBER = 300_000, 40_000
+RESERVE = 0.2      # of the members' shares, for rework and replacements
+MEMBER_CAP = 1.5   # a member is stopped alone at this multiple of its share: a runaway, not a tight piece
+AUTO_MAX = 8_000_000  # a plan that needs more is the user's decision: limit budget=<tokens>
 RESERVED = {"all", "verifiers", "dependents"}  # mentions that reach several members, so no member or group takes them
 
 
@@ -556,6 +572,8 @@ def validate_member(name, member, changes, members):
     for flag in ("writes", "consult", "isolated"):
         if flag in changes and changes[flag] not in {"", "0", "1"}:
             raise ValueError(f"{flag} must be 0 or 1")
+    if "size" in changes and changes["size"] not in {"", *SIZES}:
+        raise ValueError("size is s, m or l: how large this member's piece of the task is")
     if "effort" in changes and changes["effort"] not in {"", "low", "medium", "high", "xhigh", "max"}:
         raise ValueError("effort must be low, medium, high, xhigh, or max")
     if member.get("profile") in READ_ONLY:
@@ -1340,7 +1358,42 @@ def usage_key(member):
 
 
 def member_budget(state, member):
-    return int(member.get("budget") or state.get("limits", {}).get("member_budget", "0"))
+    return int(member.get("budget") or state.get("limits", {}).get("member_budget")
+               or member.get("alloc", 0) * MEMBER_CAP)
+
+
+def allocation(state):
+    """Each active member's share of an allocated budget, the coordinator's, and the reserve."""
+    team = {name: m for name, m in team_of(state["members"]).items() if not m.get("killed")}
+    shares = {name: int(ALLOWANCE.get(kind_of(m), ALLOWANCE["worker"]) * SIZES.get(m.get("size") or "m", 1)
+                        * EFFORT_COST.get(effort_of(m), 1)) for name, m in team.items()}
+    return shares, COORDINATOR_BASE + COORDINATOR_PER_MEMBER * len(team), int(sum(shares.values()) * RESERVE)
+
+
+def allocate(state):
+    """While the budget is the board's to set and nobody has started, it follows the planned team. It freezes when the
+    first member starts: from then on only the user's word (`limit budget=`) moves it, so a coordinator cannot raise
+    its own bound by adding members. Never stored at or below what is used: that would pause the run at once."""
+    members = state.get("members", {})
+    team = team_of(members) if COORDINATOR in members else {}
+    if not state.get("auto_budget") or not team:
+        return
+    shares, coordinator, reserve = allocation(state)
+    if state["auto_budget"] is not True or any(m.get("id") for name, m in members.items() if name != COORDINATOR):
+        state["auto_budget"] = "fixed"  # for good: a retired first member does not open it again
+        # The total stays, but a member added since still gets a share to be stopped at: with none it could spend
+        # whatever the run has left. Shares already given are kept.
+        for name in shares:
+            members[name].setdefault("alloc", shares[name])
+        return
+    for name, member in members.items():  # a member retired before any start gives its share back
+        if name in shares:
+            member["alloc"] = shares[name]
+        else:
+            member.pop("alloc", None)
+    total = min(sum(shares.values()) + coordinator + reserve, AUTO_MAX)
+    if total > budget_usage(state)[1]:
+        state.setdefault("limits", {})["budget"] = str(total)
 
 
 def pause_over_budget(state, names):
@@ -1629,11 +1682,11 @@ def init(d, title):
                           % os.path.join(parent, ".gitignore"), file=sys.stderr)
         open(os.path.join(d, "board.jsonl"), "a").close()
         save(d, {"title": title, "members": {COORDINATOR: {"role": COORDINATOR, "last_read_seq": 0}},
-                 "limits": {"budget": str(DEFAULT_BUDGET)}})
+                 "limits": {"budget": str(DEFAULT_BUDGET)}, "auto_budget": True})
         atomic_write(os.path.join(parent, "current"), run + "\n")
     print(d)
-    print("note: the run pauses at %s tokens unless the user names another budget: limit budget=<tokens>, or budget= for none"
-          % f"{DEFAULT_BUDGET:,}", file=sys.stderr)
+    print("note: the run pauses at %s tokens until the team is registered; `plan` then shows the budget allocated from it. "
+          "The user names another with limit budget=<tokens>, or budget= for none" % f"{DEFAULT_BUDGET:,}", file=sys.stderr)
 
 
 def main(argv):
@@ -2022,6 +2075,8 @@ def main(argv):
                          "mid-work. Set a budget above what is used (used plus what the rest may cost), or stop the run "
                          "with pause" % (f"{used:,}", changes["budget"]))
             limits = state.setdefault("limits", {})
+            if "budget" in changes:  # the user's figure, or none: the board allocates no more
+                state.pop("auto_budget", None)
             for k, v in changes.items():
                 if v == "" or (k in ("budget", "member_budget") and not int(v)):  # a budget of zero is no budget
                     limits.pop(k, None)
@@ -2054,6 +2109,27 @@ def main(argv):
                 print("  limits: " + " ".join("%s=%s" % kv for kv in state["limits"].items()))
             for error in limit_errors(state):
                 print("  over limit: " + error)
+            if state.get("auto_budget") and team:
+                _, coordinator, reserve = allocation(state)
+                frozen = state["auto_budget"] != True or any(m.get("id") for m in team.values())
+                # Once fixed, the coordinator's share and the reserve are whatever the members' shares leave of it.
+                print("  budget: %s tokens, allocated from this team%s: %s%s" % (
+                    f"{budget:,}", " and fixed since the first member started" if frozen else "",
+                    ", ".join("@%s %s" % (n, f"{team[n].get('alloc', 0):,}") for n in team if "alloc" in team[n]),
+                    "" if frozen else ", coordinator %s, reserve %s" % (f"{coordinator:,}", f"{reserve:,}")))
+                if not frozen:
+                    print("  note: a piece is sized m unless told: member <name> size=s for one file or question, size=l for a "
+                          "piece across sub-systems. Only the user changes the total: limit budget=<tokens>")
+            if budget and team:
+                # The budget stands, whoever set it, so the plan is what has to fit it: said before anyone starts, not
+                # at the pause. An allocated one is short too when the team is estimated past what the board allocates.
+                shares, coordinator, reserve = allocation(state)
+                estimate = sum(shares.values()) + coordinator + reserve
+                if estimate > budget:
+                    costly = sorted(shares, key=shares.get, reverse=True)[:3]
+                    print("  over budget: this team is estimated at %s tokens, the budget is %s. Before anyone starts, merge or "
+                          "drop pieces, shrink one with size=s, lower an effort, or ask the user about the budget. Costliest: %s"
+                          % (f"{estimate:,}", f"{budget:,}", ", ".join("@%s %s" % (n, f"{shares[n]:,}") for n in costly)))
             if not budget:
                 print("  note: no token budget is set. `limit budget=<tokens>` pauses the run when it is spent")
             if len(team) > 1:
@@ -2095,6 +2171,8 @@ def main(argv):
                              and effort_of(entry) == "medium")):
                 sys.exit("Fable escalation requires replacing an Opus investigator with model=fable effort=medium")
             entry["last_read_seq"] = len(posts)
+            if "alloc" in members[old]:  # the piece changes hands, and its share with it
+                entry["alloc"] = members[old]["alloc"]
             # As at a retirement: the commit that counted when it left, so work built on a report that stood stays good.
             standing = readiness(members, posts).get(old, {}).get("revision")
             if standing:

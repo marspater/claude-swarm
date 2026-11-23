@@ -1,4 +1,5 @@
 import { statusCss, statusKey } from './palette'
+import { easeOut, elapsedMs, loopDelay } from './motion'
 import { head as clipHead, unquoted as stripCode } from './text'
 import type { Post, Swarm } from '../types'
 
@@ -41,6 +42,14 @@ export function pairOf(edge: string): [string, string] | undefined {
 
 const PILL_HEIGHT = 38
 const LEGEND = 50
+const ROUTE_LOOP_MS = 3600
+const TRAVEL_MS = 840
+const TAIL_DELAY_MS = 62
+const TRAVEL_EASE = '.37 0 .3 1'
+const FADE_EASE = '.4 0 .6 1'
+const LINEAR = '0 0 1 1'
+const keyTimes = (duration: number, ...marks: number[]) =>
+  marks.map(mark => String(Math.round(mark / duration * 10_000) / 10_000)).join(';')
 // The host refuses an Svg source longer than this, and the whole pane with it.
 export const SVG_LIMIT = 131_072
 // The name font is 14px in the drawing's own units; drawn smaller than this on screen, the graph gives way to a list.
@@ -256,7 +265,10 @@ export function drawGraph(
   expandAll = false,
   limit = SVG_LIMIT,
 ): { svg?: string; hidden: number; key: string } {
-  const phase = Number.isFinite(elapsed) && elapsed > 0 ? Math.floor(elapsed) % 3600 : 0
+  const ms = elapsedMs(elapsed)
+  const phase = repeat ? ms % ROUTE_LOOP_MS : ms
+  const timing = (duration: number, start = 0) => `begin="${start - phase}ms" dur="${duration / 1000}s"`
+  const repeatAttr = repeat ? ' repeatCount="indefinite"' : ''
   const current = swarm.posts.find(post => post.seq === upTo)
   const earlier = Object.entries(swarm.earlierEdges ?? {})
   const members = visibleMembers(swarm, upTo, hidden, live)
@@ -534,39 +546,39 @@ export function drawGraph(
         `<path class="tip" d="${tip}"/></g>`
     }
 
-    const draw = '<animate attributeName="stroke-dashoffset" from="102" to="0" dur="0.8s" calcMode="spline" keyTimes="0;1" keySplines=".22 .61 .36 1" fill="freeze"/>'
     active.push(`<path class="route-base" d="${d}" stroke-width="${n1(weight + 4)}"/>`)
     if (animate) active.push(`<path class="route reduced-route${isDashed ? ' via-all' : ''}" d="${d}" stroke-width="${n1(weight + 0.9)}"/>`)
     // A dashed line cannot also be drawn on by its dashes, so it fades in instead.
+    const draw = !animate ? '' : isDashed
+      ? `<animate attributeName="opacity" from="0" to="1" ${timing(610)} calcMode="spline" keyTimes="0;1" keySplines="${FADE_EASE}" fill="freeze"/>`
+      : `<animate attributeName="stroke-dashoffset" from="102" to="0" ${timing(TRAVEL_MS)} calcMode="spline" keyTimes="0;1" keySplines="${TRAVEL_EASE}" fill="freeze"/>`
     active.push(isDashed
-      ? `<path class="route via-all${animate ? ' motion' : ''}" d="${d}" stroke-width="${n1(weight + 0.9)}"${animate ? ' opacity="0"' : ''}>${description}` +
-        (animate ? '<animate attributeName="opacity" from="0" to="1" dur="0.65s" calcMode="spline" keyTimes="0;1" keySplines=".22 .61 .36 1" fill="freeze"/>' : '') + '</path>'
-      : `<path class="route${animate ? ' motion-route' : ''}" d="${d}" pathLength="100" stroke-width="${n1(weight + 0.9)}"${animate ? ' stroke-dashoffset="102"' : ''}>${description}` +
-        (animate ? draw : '') + '</path>')
-    // The head lands when the line reaches it, not before.
+      ? `<path class="route via-all${animate ? ' motion' : ''}" d="${d}" stroke-width="${n1(weight + 0.9)}"${animate ? ' opacity="0"' : ''}>${description}${draw}</path>`
+      : `<path class="route${animate ? ' motion-route' : ''}" d="${d}" pathLength="100" stroke-width="${n1(weight + 0.9)}"${animate ? ' stroke-dashoffset="102"' : ''}>${description}${draw}</path>`)
+    // The arrowhead eases in as the packet reaches its destination.
     active.push(animate
-      ? `<path class="tip-current motion" d="${tip}" opacity="0"><animate attributeName="opacity" values="0;0;1" keyTimes="0;.72;1" dur="0.8s" fill="freeze"/></path>` +
+      ? `<path class="tip-current motion" d="${tip}" opacity="0"><animate attributeName="opacity" from="0" to="1" ${timing(160, TRAVEL_MS - 125)} calcMode="spline" keyTimes="0;1" keySplines="${FADE_EASE}" fill="freeze"/></path>` +
         `<path class="tip-current reduced-route" d="${tip}"/>`
       : `<path class="tip-current" d="${tip}"/>`)
     if (animate || repeat) {
       const route = `M${n1(x1)} ${n1(y1)} Q${n1(cx)} ${n1(cy)} ${n1(x2)} ${n1(y2)}`
-      const tailPhase = (phase + 3530) % 3600
-      const motion = repeat
-        ? `<animateMotion begin="-${phase}ms" dur="3.6s" path="${route}" calcMode="spline" keyPoints="0;1;1" keyTimes="0;.24;1" keySplines=".22 .61 .36 1;0 0 1 1" repeatCount="indefinite"/>`
-        : `<animateMotion dur="0.86s" path="${route}" calcMode="spline" keyPoints="0;1" keyTimes="0;1" keySplines=".22 .61 .36 1" fill="freeze"/>`
-      const tailMotion = repeat
-        ? `<animateMotion begin="-${tailPhase}ms" dur="3.6s" path="${route}" calcMode="spline" keyPoints="0;1;1" keyTimes="0;.24;1" keySplines=".22 .61 .36 1;0 0 1 1" repeatCount="indefinite"/>`
-        : `<animateMotion begin="0.06s" dur="0.86s" path="${route}" calcMode="spline" keyPoints="0;1" keyTimes="0;1" keySplines=".22 .61 .36 1" fill="freeze"/>`
-      const opacity = (peak: string, offsetMs = phase) => repeat
-        ? `<animate attributeName="opacity" values="0;${peak};${peak};0;0" keyTimes="0;.025;.19;.265;1" begin="-${offsetMs}ms" dur="3.6s" repeatCount="indefinite"/>`
-        : `<animate attributeName="opacity" values="0;${peak};${peak};0" keyTimes="0;.1;.8;1" dur="0.95s"/>`
+      const motion = (lag = 0) => repeat
+        ? `<animateMotion ${timing(ROUTE_LOOP_MS, lag)} path="${route}" calcMode="spline" keyPoints="0;1;1" keyTimes="${keyTimes(ROUTE_LOOP_MS, 0, TRAVEL_MS, ROUTE_LOOP_MS)}" keySplines="${TRAVEL_EASE};${LINEAR}"${repeatAttr}/>`
+        : `<animateMotion ${timing(TRAVEL_MS, lag)} path="${route}" calcMode="spline" keyPoints="0;1" keyTimes="0;1" keySplines="${TRAVEL_EASE}" fill="freeze"/>`
+      const opacity = (peak: string, lag = 0) => {
+        const finish = TRAVEL_MS + 130
+        const duration = repeat ? ROUTE_LOOP_MS : finish
+        const marks = repeat ? [0, 105, TRAVEL_MS - 65, finish, duration] : [0, 105, TRAVEL_MS - 65, finish]
+        return `<animate attributeName="opacity" values="0;${peak};${peak};0${repeat ? ';0' : ''}" keyTimes="${keyTimes(duration, ...marks)}" calcMode="spline" keySplines="${FADE_EASE};${LINEAR};${FADE_EASE}${repeat ? `;${LINEAR}` : ''}" ${timing(duration, lag)}${repeatAttr}/>`
+      }
+      const headMotion = motion()
       active.push(
         '<circle class="motion packet-tail" r="2.2" opacity="0">' +
-        tailMotion + opacity('.5', tailPhase) + '</circle>' +
+        motion(TAIL_DELAY_MS) + opacity('.48', TAIL_DELAY_MS) + '</circle>' +
         '<circle class="motion packet-halo" r="7.5" opacity="0">' +
-        motion + opacity('.38') + '</circle>' +
+        headMotion + opacity('.3') + '</circle>' +
         '<circle class="motion packet" r="3.5" opacity="0">' +
-        motion + opacity('1') + '</circle>',
+        headMotion + opacity('1') + '</circle>',
       )
     }
     if (total > 1 && (current?.to.length ?? 0) <= 3) {
@@ -590,9 +602,11 @@ export function drawGraph(
   for (const one of edges) if (isCurrentEdge(one.edge, one.isDashed)) routeOf(one)
 
   const allPosts = [...broadcasts.values()].reduce((sum, count) => sum + count, 0)
-  const pulse = (beginMs: number) => repeat
-    ? `<animate attributeName="opacity" values="0;.65;0;0" keyTimes="0;.027;.12;1" begin="${beginMs - phase}ms" dur="3.6s" repeatCount="indefinite"/>`
-    : `<animate attributeName="opacity" values="0;.65;0" keyTimes="0;.22;1" begin="${beginMs / 1000}s" dur=".44s"/>`
+  const pulse = (start: number) => {
+    const duration = repeat ? ROUTE_LOOP_MS : 340
+    const marks = repeat ? [0, 100, 340, duration] : [0, 100, duration]
+    return `<animate attributeName="opacity" values="0;.56;0${repeat ? ';0' : ''}" keyTimes="${keyTimes(duration, ...marks)}" calcMode="spline" keySplines="${FADE_EASE};${FADE_EASE}${repeat ? `;${LINEAR}` : ''}" ${timing(duration, start)}${repeatAttr}/>`
+  }
   const nodes = members.map(member => {
     const p = positions.get(member.name)!
     const sender = current?.agent === member.name
@@ -609,19 +623,20 @@ export function drawGraph(
     // A recipient lights up as the packet lands. The sender of a post that names nobody has no line to
     // show it, so its own outline answers instead.
     const arrival = moving && (recipient || (sender && current?.to.length === 0))
-      ? `<rect class="motion arrival" ${rect} opacity="0">${pulse(recipient ? 760 : 0)}</rect>`
+      ? `<rect class="motion arrival" ${rect} opacity="0">${pulse(recipient ? TRAVEL_MS - 34 : 0)}</rect>`
       : ''
     if (moving && sender && isCurrentBroadcast && !expandAll) {
       ripples.push(
         `<g transform="translate(${p.x.toFixed(1)} ${p.y.toFixed(1)})">` +
-        [0, 0.18, 0.36].map(delay =>
-          `<circle class="motion ripple" r="24" opacity="0">` +
-          (repeat
-            ? `<animate attributeName="r" values="24;154;154" keyTimes="0;.32;1" calcMode="spline" keySplines=".22 .61 .36 1;0 0 1 1" begin="${Math.round(delay * 1000) - phase}ms" dur="3.6s" repeatCount="indefinite"/>` +
-              `<animate attributeName="opacity" values=".48;0;0" keyTimes="0;.32;1" begin="${Math.round(delay * 1000) - phase}ms" dur="3.6s" repeatCount="indefinite"/>`
-            : `<animate attributeName="r" from="24" to="154" begin="${delay}s" dur="0.92s" calcMode="spline" keyTimes="0;1" keySplines=".22 .61 .36 1"/>` +
-              `<animate attributeName="opacity" from=".48" to="0" begin="${delay}s" dur="0.92s"/>`) +
-          '</circle>').join('') +
+        [0, 135, 270].map(delay => {
+          const duration = repeat ? ROUTE_LOOP_MS : TRAVEL_MS
+          const motionMarks = repeat ? [0, TRAVEL_MS, duration] : [0, duration]
+          const fadeMarks = repeat ? [0, 125, TRAVEL_MS, duration] : [0, 125, duration]
+          const attrs = `${timing(duration, delay)}${repeatAttr}`
+          return `<circle class="motion ripple" r="24" opacity="0">` +
+            `<animate attributeName="r" values="24;154${repeat ? ';154' : ''}" keyTimes="${keyTimes(duration, ...motionMarks)}" calcMode="spline" keySplines=".22 .61 .36 1${repeat ? `;${LINEAR}` : ''}" ${attrs}/>` +
+            `<animate attributeName="opacity" values="0;.4;0${repeat ? ';0' : ''}" keyTimes="${keyTimes(duration, ...fadeMarks)}" calcMode="spline" keySplines="${FADE_EASE};${FADE_EASE}${repeat ? `;${LINEAR}` : ''}" ${attrs}/></circle>`
+        }).join('') +
         '</g>',
       )
     }
@@ -666,9 +681,9 @@ export function drawGraph(
     (allPosts === 0 ? 'No @all posts yet' : `“@all N” on a member: its @all posts (${allPosts} in all), ${expandAll ? 'drawn as dashed arrows' : 'drawn by Expand @all'}`)
 
   const pingCss = repeat
-    ? `.p-ping{fill:none;stroke-width:1.4;transform-box:fill-box;transform-origin:center;animation:pp 2.6s cubic-bezier(.16,1,.3,1) -${phase % 2600}ms infinite}` +
+    ? `.p-ping{fill:none;stroke-width:1.4;transform-box:fill-box;transform-origin:center;animation:pp 3.2s ${easeOut} ${loopDelay(ms, 3200)} infinite}` +
       `.p-ping.working{stroke:var(--status-working)}.p-ping.coordinating{stroke:var(--status-coordinating)}` +
-      `@keyframes pp{0%{transform:scale(1);opacity:.6}78%,100%{transform:scale(2.35);opacity:0}}`
+      '@keyframes pp{0%{transform:scale(.9);opacity:0}14%{opacity:.45}78%,100%{transform:scale(2.05);opacity:0}}'
     : ''
   const open =
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height + LEGEND}" width="100%" height="100%" font-family="system-ui, sans-serif">` +
@@ -705,7 +720,10 @@ export function drawGraph(
       .presence-x{fill:none;stroke:var(--status-failed);stroke-width:1.6;stroke-linecap:round}
       ${['working', 'coordinating', 'waiting'].map(status => `.presence.${status}{fill:var(--status-${status});stroke:none}`).join('')}
       .reduced-route{display:none}
-      @media (prefers-reduced-motion: reduce){.motion,.motion-route{display:none}.reduced-route{display:inline}}
+      @media (prefers-reduced-motion: reduce){
+        .motion,.motion-route{display:none}.reduced-route{display:inline}
+        .history-edge,.edge,.tip,.pill{transition:none}
+      }
     </style>
     ` +
     `<g clip-path="url(#stage)">${ripples.join('')}</g>`

@@ -6,10 +6,10 @@ import type { Member, Post, Swarm, Tab } from '../types'
 import { COORDINATOR_READ, RUN, boardCalls, type ParsedBoardCall, runsNamed, scanShell, shellWords, substitutions, unwrap, wakeMessage, wakeSequence } from './command'
 import { actsAsAnother, commitsInSharedCheckout, normalizePath, resolveRealPath } from './guard'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, LATEST, SPECIALISTS, SWARM_AGENTS, familyOf, latestOf } from './models'
-import { END, KEPT, budgetOf, findAgent, ledger, memberNamed, mentions, parse, parsePosts, postFields, targets, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
+import { CONTEXT_STOP, END, KEPT, budgetOf, contextState, findAgent, heldAt, isWindingDown, ledger, memberNamed, mentions, parse, parsePosts, postFields, targets, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
 import { CLIP, bodyOf, chipped, clean, clip, compact, fenceAfter, hasQuestion, head, kindOf, openedText, verdictOf, type Fence } from './text'
-import { progressBar, semanticIcon, statusDot, statusInk, swarmEmblem, type BarTone, type EmblemState } from './palette'
-import { hiveArt, memberBee, toolMood, toolSummary, type Mood } from './hive'
+import { liveIndicator, memberAccents, progressBar, progressUnits, semanticIcon, statusDot, statusInk, swarmEmblem, type BarTone, type EmblemState } from './palette'
+import { MEMBER_BEE_SIZE, hiveArt, memberBee, toolMood, toolSummary, type Mood } from './hive'
 import { MIN_LABEL_PX, SVG_LIMIT, drawGraph, edgesOf, graphHeight, isBroadcast, labelPx, pairOf, visibleMembers } from './graph'
 
 const PANE = 'swarm'
@@ -61,25 +61,6 @@ const estimateRows = (text: string, columns: number) =>
   text.split('\n').reduce((sum, line) => sum + Math.max(1, Math.ceil(visualWidth(line) / columns)), 0)
 const TABS: Tab[] = ['board', 'attention', 'members', 'graph']
 const REPLAY_FRAME_MS = 1200
-const liveIndicator = (elapsed: number) => {
-  const ms = Number.isFinite(elapsed) && elapsed > 0 ? Math.floor(elapsed) : 0
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
-  <style>
-    svg{--status-working:#349962}
-    @media(prefers-color-scheme:dark){svg{--status-working:#4cc480}}
-    @supports(color:color(display-p3 1 0 0)){svg{--status-working:color(display-p3 .3224 .5918 .4028)}@media(prefers-color-scheme:dark){svg{--status-working:color(display-p3 .4333 .7586 .5248)}}}
-    .core{fill:var(--status-working)}
-    .breath{fill:var(--status-working);transform-box:fill-box;transform-origin:center;animation:breath 4s cubic-bezier(.16,1,.3,1) -${ms % 4000}ms infinite}
-    .breath2{fill:none;stroke:var(--status-working);stroke-width:1.1;transform-box:fill-box;transform-origin:center;animation:breath 4s cubic-bezier(.16,1,.3,1) -${(ms + 2000) % 4000}ms infinite}
-    @keyframes breath{0%{transform:scale(1);opacity:.44}78%,100%{transform:scale(2.15);opacity:0}}
-    @media (prefers-reduced-motion: reduce){.breath,.breath2{display:none}}
-  </style>
-  <circle class="breath" cx="8" cy="8" r="3.4"/>
-  <circle class="breath2" cx="8" cy="8" r="3.4"/>
-  <circle class="core" cx="8" cy="8" r="3.4"/>
-  <circle cx="7.1" cy="7.1" r=".85" fill="#fff" opacity=".36"/>
-</svg>`
-}
 
 function emblemStateOf(shown: Swarm): EmblemState {
   if (shown.dir === '') return 'idle'
@@ -150,7 +131,7 @@ let titleOpen = ''
 let routesListed = false
 let routePages = 1
 
-// One theme colour per member, by its place on the roster (never colliding with status hues).
+// Roster order picks the member's hue across the board and cards.
 const HUES = ['claude', 'suggestion', 'planMode', 'ide', 'merged', 'permission', 'remember', 'autoAccept'] as const
 
 let player: Timer | undefined
@@ -294,7 +275,7 @@ let ownedRoster: { dir: string; closed: boolean; members: Roster } | undefined
 let rosterMiss: { dir: string; stamp: string; ids: Set<string> } | undefined
 // The run this conversation drove until it closed: its members are still refused by name.
 let closedRun = ''
-// What /swarm:kill ended: its run, and the agents of the members it retired, whose hand-backs are dropped. While
+// What /swarm-kill ended: its run, and the agents of the members it retired, whose hand-backs are dropped. While
 // `killedRun` is set and no new /swarm:swarm came, the swarm skill's text is not given back to the conversation.
 let killedRun = ''
 let killedIds: ReadonlySet<string> = new Set()
@@ -322,6 +303,55 @@ const turnRuns = new Map<string, TurnOwner>()
 const turnWakes = new Map<string, string>()
 const wokenAgents = new Set<string>()
 let wakeNext = ''
+// The spend guards. `heldBy`: the context each member's last step read. `contextTold`: who was told of it, and at
+// which stage. `windingDown`: the run that passed WIND_DOWN of its budget, and `windTold` the members told so.
+const heldBy = new Map<string, number>()
+const contextTold = new Map<string, 'note' | 'stop'>()
+let windingDown = ''
+const windTold = new Set<string>()
+function forgetSpend(): void {
+  heldBy.clear()
+  contextTold.clear()
+  windTold.clear()
+  windingDown = ''
+}
+const memberOfAgent = (agentId: string) => {
+  const address = teammates.get(agentId)
+  return Object.entries(ownedRoster?.members ?? {}).find(([, member]) => member.id !== undefined && (member.id === agentId || member.id === address))
+}
+/**
+ * The refusal for a read-only member whose context passed the ceiling: its work is its report, and every further
+ * step would read the whole context again. The board tool and its final report stay open; a writer is only told
+ * (`spendNotes`), since a refused edit would leave its change half made.
+ */
+function contextCeiling(agentId: string, tool: string): string | undefined {
+  const held = heldBy.get(agentId) ?? 0
+  if (contextState(held) !== 'stop' || tool === BOARD_TOOL) return undefined
+  const found = memberOfAgent(agentId)
+  if (!found || !SPECIALISTS.includes(found[1].profile ?? '')) return undefined
+  if (contextTold.get(agentId) !== 'stop') {
+    contextTold.set(agentId, 'stop')
+    notesOwed.push(`@${found[0]} reached the context ceiling (${compact(held)} tokens, re-read at every step) and was told to report. Its report is partial: start a fresh member for what it lists as not covered, on a narrower scope.`)
+  }
+  return `Your context holds about ${compact(held)} tokens, past the ceiling of ${compact(CONTEXT_STOP)}: every further step reads all of it again, so this tool call was not run. Report now with the board tool: your findings, what you covered and what you did not cover. Then end your turn. The coordinator starts a fresh member for the rest.`
+}
+/** What a member is told once with a tool result: its context is getting dear, or the run is near its budget. */
+function spendNotes(agentId: string): string[] {
+  const notes: string[] = []
+  // Every agent's context is measured, but only a member of the open run driven here is told anything: an ordinary
+  // agent in a conversation with no run has no board to post on.
+  if (ownedRoster?.closed !== false || !memberOfAgent(agentId)) return notes
+  const held = heldBy.get(agentId) ?? 0
+  if (contextState(held) !== 'ok' && !contextTold.has(agentId)) {
+    contextTold.set(agentId, 'note')
+    notes.push(`Swarm: your context holds about ${compact(held)} tokens, and every step reads all of it again. Search and read slices, not whole files. Post what you have on the board as soon as it stands; at ${compact(CONTEXT_STOP)} a read-only member's tools stop and it must report.`)
+  }
+  if (windingDown !== '' && agentRuns.get(agentId) === windingDown && !windTold.has(agentId)) {
+    windTold.add(agentId)
+    notes.push('Swarm: the run has spent 80% of its token budget and pauses at 100%. Post what you have so far on the board now, saying what is covered and what is not; then go on only with what is cheap to finish.')
+  }
+  return notes
+}
 function rememberTurnRun(turnId: string, owner: TurnOwner): void {
   turnRuns.set(turnId, owner)
   if (turnRuns.size > TURNS_KEPT) turnRuns.delete(turnRuns.keys().next().value!)
@@ -438,7 +468,7 @@ const ROUTINE_GRACE_MS = 600_000
 // The coordinator's conversation at this size makes every further wake dear: the person is told once per run.
 const HEAVY_CONVERSATION = 180_000
 let owed = NONE
-const KILL_DROP = 'Swarm: a member retired by /swarm:kill reported back; it was not passed on.'
+const KILL_DROP = 'Swarm: a member retired by /swarm-kill reported back; it was not passed on.'
 // A task of this many characters is saved to a file, and this much of its start stays in the conversation.
 const TASK_CHARS = 16_000
 const TASK_HEAD = 4_000
@@ -503,6 +533,8 @@ async function submitHeld($: EngineInterface, text: string, failed: () => void):
 }
 type SpecialistWake = { name: string; id: string; seq: number; attempts: number; told: number; native: boolean }
 let specialistWakes: SpecialistWake[] = []
+// The posts a fresh specialist is expected to see when it reads the board at startup.
+const startupReads = new Map<string, { address: string; through: number }>()
 // Specialists owed a mention with no agent address on the roster: named in a relay notice, never the cause of one.
 let unaddressed: { name: string; seq: number }[] = []
 let relayRun = ''
@@ -513,7 +545,7 @@ const relayKey = (dir: string) => dir === relayRun && specialistWakes.length ? J
 const teammateName = (address: string) => address.split('@', 1)[0] || address
 // Each line carries the address to send to, so the relay costs no `wake` lookup first.
 const relayNotice = () => 'Relay these Swarm board wakes now with your own SendMessage tool, each to the recipient given, ' +
-  'with the message copied exactly. Swarm records accepted delivery automatically.\n' +
+  'with the message copied exactly. Swarm records accepted delivery automatically. Continue if a recipient already read the mention.\n' +
   specialistWakes.map(({ name, id, seq, native }) =>
     `@${name} (SendMessage to ${native ? `the bare teammate name ${JSON.stringify(teammateName(id))}` : JSON.stringify(id)}): ${wakeMessage(seq)}`,
   ).concat(unaddressed.map(({ name, seq }) =>
@@ -619,6 +651,7 @@ function resetMonitoring(): void {
   halted = undefined
   unaddressed = []
   specialistWakes = []
+  startupReads.clear()
   relayRun = relayHinted = relayPrompted = ''
 }
 
@@ -894,7 +927,7 @@ function runsHeldInit(command: string): boolean {
 async function initNotes($: EngineInterface): Promise<string[]> {
   const notes = sawSwarmCommand
     ? []
-    : [`Swarm: A run was made. If this turn did not start from /swarm:swarm, Read ${$.plugin.root}/skills/swarm/SKILL.md before going on: its rules are the current ones. Before you start a member, show the user the plan and name the token budget (default 3,000,000), or say that none is set.`]
+    : [`Swarm: A run was made. If this turn did not start from /swarm:swarm, Read ${$.plugin.root}/skills/swarm/SKILL.md before going on: its rules are the current ones. Before you start a member, show the user the plan and name the token budget the board's plan command allocates from the team (3,000,000 until one is registered), or say that none is set.`]
   const held = await $.session.usage().then(usage => usage.context.tokens ?? 0).catch(() => 0)
   // The desktop app starts a conversation in a worktree of its own and lets its tools edit files only there.
   const cwd = await $.session.cwd().catch(() => '')
@@ -1251,6 +1284,11 @@ async function deliver(
     // Claude skips the sending plugin's tool hooks in a plugin-origin wake,
     // even when the plugin calls SendMessage. These roles need a model-origin send.
     if (SPECIALISTS.includes(member.profile ?? '')) {
+      const startup = startupReads.get(`${dir}/${name}`)
+      if (startup?.address === id && seq <= startup.through) {
+        const status = findAgent(agents, id)?.status
+        if (status === 'pending' || status === 'running') continue
+      }
       results.relay.push({ name, id, seq, attempts: claim?.attempts ?? 0, told: member.told?.times ?? 0, native })
       continue
     }
@@ -1698,14 +1736,14 @@ async function released($: EngineInterface, dir: string): Promise<void> {
   await syncOwnedState($, dir, undefined, undefined, owner).catch(() => undefined)
 }
 
-const KILL_COMPACT = 'The user ended the Swarm run with /swarm:kill. Summarize this conversation for one assistant that ' +
+const KILL_COMPACT = 'The user ended the Swarm run with /swarm-kill. Summarize this conversation for one assistant that ' +
   'continues the user\'s work alone. Keep the user\'s request and every later instruction in their own words, what was ' +
   'changed in which files, what was verified and what was not, what is uncommitted, failures, and open decisions. Leave ' +
   'out the Swarm skill\'s rules, board commands, the roster, wakes and budget mechanics. Say that this conversation is ' +
   'no longer a Swarm coordinator: it runs no board command and starts no member unless the user starts a new run.'
 
 /**
- * /swarm:kill, answered in the command's place so no model turn starts: the board retires every member and closes
+ * /swarm-kill, answered in the command's place so no model turn starts: the board retires every member and closes
  * the run, the hooks let go of it as after a close, and the conversation is compacted between turns.
  */
 async function killRun($: EngineInterface, reason: string): Promise<{ text: string }> {
@@ -1919,7 +1957,10 @@ async function account(
 
 // A member of a paused or spent run is refused its next tool call, so a turn in flight ends there instead of
 // spending on. The coordinator is never refused: it has to report, raise the budget and resume.
-const MEMBER_PAUSED = 'This Swarm member has spent its own token budget, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped. The coordinator decides whether you go on.'
+// A pause is no retirement: what the member found so far is paid for, so its last report carries it. That report is
+// never refused (see the tool.call guard), or the host asks for it again and again at the member's full context.
+const HAND_BACK = 'Make no other tool call: end your turn now with your final report (SubagentHandback, if you were told to use it), saying where you stopped and everything you have found so far.'
+const MEMBER_PAUSED = `This Swarm member has spent its own token budget, so this tool call was not run. ${HAND_BACK} The coordinator decides whether you go on.`
 /** The refusal the roster alone settles, with no lookup that can fail: a retired member, or one paused on its own budget. */
 function stoppedMember(agentId: string): string | undefined {
   const address = teammates.get(agentId)
@@ -1932,7 +1973,7 @@ function stoppedMember(agentId: string): string | undefined {
 
 const OVER = 'This Swarm run is over and its conversation drives another run now, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped.'
 async function refusal($: EngineInterface, agentId: string | undefined): Promise<string | undefined> {
-  if (agentId === undefined) return isKillTurn ? 'The user ended the Swarm run with /swarm:kill. End your turn now, in one line.' : undefined
+  if (agentId === undefined) return isKillTurn ? 'The user ended the Swarm run with /swarm-kill. End your turn now, in one line.' : undefined
   const stopped = stoppedMember(agentId)
   if (stopped) return stopped
   const sEpoch = sessionEpoch
@@ -1983,7 +2024,7 @@ async function refusal($: EngineInterface, agentId: string | undefined): Promise
     if (sEpoch !== sessionEpoch || owner !== generation || isEnding) return undefined
     if (dir && active && dir !== active) return OVER
     if (dir !== halted?.dir) return undefined
-    return `This Swarm run is ${halted.why}, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped. The coordinator decides what happens when the run resumes.`
+    return `This Swarm run is ${halted.why}, so this tool call was not run. ${HAND_BACK} The coordinator decides what happens when the run resumes.`
   } catch {
     return undefined // a check that failed stops nobody's tools
   }
@@ -2410,7 +2451,7 @@ async function memberBoard($: EngineInterface, e: BoardInput & { agentId: string
   if (!closed && (paused || isSpent)) {
     const why = paused ? `paused (${paused})` : 'over its token budget'
     if (dir === await read($, run)) halted = { dir, why }
-    return { deny: `This Swarm run is ${why}, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped. The coordinator decides what happens when the run resumes.` }
+    return { deny: `This Swarm run is ${why}, so this tool call was not run. ${HAND_BACK} The coordinator decides what happens when the run resumes.` }
   }
   if (!closed && member.paused) return { deny: MEMBER_PAUSED }
   const { action } = e
@@ -2654,28 +2695,28 @@ function shortcut($: EngineInterface, e: Parameters<EngineInterface['ui']['resol
 }
 
 export const register: Register = on => {
-  // Keep stable SVG sources during a visit. On a remount, resume each loop
-  // at the phase it would have reached while its tab was away.
-  const clocks = new Map<string, { scene: string; view: string; start: number; offset: number }>()
-  function phase(slot: string, scene: string, view: string, now: number): number {
+  // Keep the SVG source stable while it is on screen. Only a different drawing or a remount needs a fresh offset.
+  const clocks = new Map<string, { scene: string; view: string; start: number; offset: number; visible: boolean }>()
+  function phase(slot: string, scene: string, view: string, now: number, restart = false): number {
     let clock = clocks.get(slot)
-    if (!clock || clock.scene !== scene) {
-      clock = { scene, view, start: now, offset: 0 }
+    if (!clock || clock.scene !== scene || restart) {
+      clock = { scene, view, start: now, offset: 0, visible: true }
       clocks.set(slot, clock)
-    } else if (clock.view !== view) {
-      const prev = clock.view.split('/')
-      const next = view.split('/')
-      if (clock.view.startsWith('graph/') && view.startsWith('graph/') && next[3] === 'true' && prev[3] !== 'true') {
-        clock.start = prev[2] === 'true' ? now - REPLAY_FRAME_MS : now
-      }
+    } else if (clock.view !== view || !clock.visible) {
       clock.view = view
       clock.offset = Math.max(0, now - clock.start)
+      clock.visible = true
     }
     return clock.offset
+  }
+  function hideMotion(slot: string): void {
+    const clock = clocks.get(slot)
+    if (clock) clock.visible = false
   }
 
   on('session.start', async ($, e, next) => {
     poller?.cancel()
+    clocks.clear()
     sessionEpoch++
     browseGen++
     resetMonitoring()
@@ -2686,6 +2727,7 @@ export const register: Register = on => {
     stepped.clear()
     turnRuns.clear()
     turnWakes.clear()
+    forgetSpend()
     wokenAgents.clear()
     wakeNext = ''
     retiredRuns.clear()
@@ -2785,8 +2827,12 @@ export const register: Register = on => {
     // A tool call in the main conversation means the coordinator is mid-turn, even when this
     // module loaded after that turn began (a restart, a reload) and never saw it start.
     if (e.agentId === undefined) isCoordinatorBusy = true
+    // A member's final report ends its run and spends nothing more: refused, the host demands it again each turn.
+    if (e.agentId !== undefined && (e.tool as string) === 'SubagentHandback') return next(e)
     const stopped = await refusal($, e.agentId)
     if (stopped) return { deny: stopped }
+    const ceiling = e.agentId === undefined ? undefined : contextCeiling(e.agentId, e.tool)
+    if (ceiling) return { deny: ceiling }
     const actor = e.agentId ?? 'coordinator'
     moods.delete(actor)
     moods.set(actor, toolMood(e.tool, e.tool === 'Bash' ? String(e.command) : ''))
@@ -2909,6 +2955,10 @@ export const register: Register = on => {
       }
     })
     let result = raw
+    if (e.agentId !== undefined && result.deny === undefined) {
+      const spend = spendNotes(e.agentId)
+      if (spend.length > 0) result = { ...result, context: [...(result.context ?? []), ...spend] }
+    }
     if (bgWarning && result.deny === undefined && result.isError === undefined) {
       bgWarnedRun = bgWarnedDir
       result = { ...result, context: [...(result.context ?? []), bgWarning] }
@@ -2962,7 +3012,7 @@ export const register: Register = on => {
       const stopped = stoppedMember(e.agentId)
       if (stopped) return { deny: stopped }
       if (halted && agentRuns.get(e.agentId) === halted.dir) {
-        return { deny: `This Swarm run is ${halted.why}, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped. The coordinator decides what happens when the run resumes.` }
+        return { deny: `This Swarm run is ${halted.why}, so this tool call was not run. ${HAND_BACK} The coordinator decides what happens when the run resumes.` }
       }
       // A check that failed or ran out of time lets no known member edit or run arbitrary Bash unchecked; only safe
       // own-member board commands pass so it can report.
@@ -2983,9 +3033,10 @@ export const register: Register = on => {
     if (!Number.isSafeInteger(seq) || e.agentId !== undefined || e.origin.kind !== 'model') return next(e)
     const dir = await read($, run)
     if (!dir) return { isDelivered: false, reason: 'No Swarm run is bound to this conversation.' }
-    const state = await $.fs.read(`${dir}/members.json`).then(text => JSON.parse(text) as BudgetState & {
+    const readState = () => $.fs.read(`${dir}/members.json`).then(text => JSON.parse(text) as BudgetState & {
       members: Roster; paused?: string; closed?: boolean
     }).catch(() => undefined)
+    const state = await readState()
     if (!state) return { isDelivered: false, reason: 'Swarm could not read the run state. Retry after checking the board.' }
     const native = state.members.coordinator?.backend === 'native'
     const matches = Object.entries(state.members).filter(([, member]) => member.id && !member.killed && !member.paused &&
@@ -2995,9 +3046,15 @@ export const register: Register = on => {
     if (!name || !member?.id || state.closed || state.paused || (budget > 0 && tokensUsed(state.usage?.tokens) >= budget)) {
       return { isDelivered: false, reason: 'The Swarm wake is no longer eligible.' }
     }
+    const alreadyRead = { isDelivered: false as const, reason: `@${name} already read through #${seq}.` }
+    if (member.last_read_seq >= seq) return alreadyRead
     const reserved = await boardCommand($, dir, ['claim', name, member.id, String(seq)]).catch(() => undefined)
     const token = reserved?.stdout.trim() ?? ''
     if (reserved?.exitCode !== 0 || !/^[a-f0-9]{32}$/.test(token)) {
+      if (reserved?.exitCode === 0 && token === '') {
+        const current = (await readState())?.members[name]
+        if (current?.id === member.id && current.last_read_seq >= seq) return alreadyRead
+      }
       return { isDelivered: false, reason: 'The Swarm wake is already handled or awaiting retry.' }
     }
     const sent = await next(e)
@@ -3252,6 +3309,15 @@ export const register: Register = on => {
         }
       }
       if (owned !== current && !(await bind($, owned))) return { deny: 'Swarm could not claim that run. Check that this conversation owns it.' }
+      const launchGeneration = generation
+      const startupThrough = SPECIALISTS.includes(member.profile ?? '')
+        ? parsePosts(await readBoard($, owned).catch(() => ''), state.members).at(-1)?.seq
+        : undefined
+      // The read can outlast a /swarm:kill, a close or a /clear: the run it was made for is no longer this one's to
+      // start anyone in. Refused here, before the agent exists, not noticed after it was launched.
+      if (launchGeneration !== generation || isEnding || killedRun === owned) {
+        return { deny: `The Swarm run changed while @${named} was starting (it was ended, closed or replaced), so the member was not started. Check the board before starting anyone.` }
+      }
       // The table decides, not the session's alias or the agent file: a family name becomes the newest model
       // of that family, and a call that names no model gets its type's default.
       const background = !e.isTeammate ? true : e.background
@@ -3273,6 +3339,7 @@ export const register: Register = on => {
           else sharedAgents.add(started.agentId)
         }
         const address = started.teammateId ?? started.agentId
+        if (launchGeneration === generation && startupThrough !== undefined) startupReads.set(key, { address, through: startupThrough })
         const startedArgs = ['started', named, address, member.id ?? '']
         if (hasIsolation || e.isTeammate) startedArgs.push(isIsolated ? 'isolated=1' : 'isolated=0')
         const recorded = await boardCommand($, owned, startedArgs).catch(() => undefined)
@@ -3322,6 +3389,7 @@ export const register: Register = on => {
       const spent = response.usage
       const now = await $.clock.now()
       if (sEpoch !== sessionEpoch || isEnding) return response
+      if (spent && e.agentId !== undefined) heldBy.set(e.agentId, heldAt(spent))
       const delta = spent ? stepped.charge(e.turnId, spent, e.index, e.agentId, now) : 0
       const turn = delta > 0 ? stepped.of(e.turnId) : undefined
       if (stepped.running > TURNS_KEPT) {
@@ -3337,6 +3405,11 @@ export const register: Register = on => {
           .catch(() => false as const)
           // One never sent is no longer pending under its own report: its turn's end charges it.
           .then(landed => { if (sEpoch === sessionEpoch && !isEnding && landed !== false) stepped.landed(turn, landed ?? 0, e.index) })
+        if (snapshot && !snapshot.isClosed && at === snapshot.dir && windingDown !== snapshot.dir && isWindingDown(tokensUsed(snapshot.tokens) + delta, snapshot.budget)) {
+          windingDown = snapshot.dir
+          windTold.clear()
+          notesOwed.push(`The run has spent 80% of its token budget of ${compact(snapshot.budget)} and pauses at 100%. Its members are being told to post what they have. Decide now what the rest is worth: narrow the remaining work, or ask the user about the budget before the pause.`)
+        }
         if (snapshot && !snapshot.isClosed && at === snapshot.dir && snapshot.budget > 0 && tokensUsed(snapshot.tokens) + delta >= snapshot.budget) {
           halted = { dir: snapshot.dir, why: `paused (token budget of ${compact(snapshot.budget)} spent)` }
         }
@@ -3479,6 +3552,7 @@ export const register: Register = on => {
     // No poll runs from here until the end is through: one in between would look the new session's run up under
     // the old session's id, and after an exit nothing is left to poll for.
     isEnding = true
+    clocks.clear()
     isRefreshOwed = false
     isPaneOpen = false
     sessionEpoch++
@@ -3496,6 +3570,7 @@ export const register: Register = on => {
     stepped.clear()
     turnRuns.clear()
     turnWakes.clear()
+    forgetSpend()
     wokenAgents.clear()
     wakeNext = ''
     retiredRuns.clear()
@@ -3542,15 +3617,12 @@ export const register: Register = on => {
   // as typed and inside the skill, and the coordinator re-reads its whole conversation on every step. Seen live: a
   // 370,000-character console log made a new run's first step cost 440,000 tokens and each later one 45,000. The
   // whole text goes to a file the coordinator reads from, and the task keeps its two ends, where the request is.
-  // The skill-named form waits for a running turn to end, as a skill command does; `swarm-kill` is registered to run
-  // at once, mid-turn included.
-  on('command.run', { command: 'swarm:kill' }, ($, e) => killRun($, e.args))
   on('command.run', { command: 'swarm-kill' }, ($, e) => killRun($, e.args))
   // A run that was killed gives the swarm skill's text back only to a new /swarm:swarm.
   on('skill.prompt', ($, e, next) => {
     if (e.pluginName !== $.plugin.name || !/^(?:swarm:)?(?:swarm|plan)$/.test(e.skill)) return next(e)
     if (killedRun && /^(?:swarm:)?swarm$/.test(e.skill)) {
-      return { text: 'The Swarm run of this conversation was ended with /swarm:kill: you are an ordinary assistant again, and run no board command and start no member unless the user starts a new run with /swarm:swarm.' }
+      return { text: 'The Swarm run of this conversation was ended with /swarm-kill: you are an ordinary assistant again, and run no board command and start no member unless the user starts a new run with /swarm:swarm.' }
     }
     if (/^(?:swarm:)?swarm$/.test(e.skill)) sawSwarmCommand = true
     // The command's own message holds a long task already: the skill's copy of it would be read twice at every step.
@@ -3622,6 +3694,7 @@ export const register: Register = on => {
   })
   on('ui.close', { id: PANE }, async ($, e, next) => {
     isPaneOpen = isWatched = false
+    for (const clock of clocks.values()) clock.visible = false
     const result = await next(e)
     talk = undefined  // nothing reads a conversation behind a closed pane
     await stop($)
@@ -3780,14 +3853,18 @@ export const register: Register = on => {
     }
     const shown = await shownSwarm($)
     const error = await read($, loadError)
+    const now = HeaderArt ? await $.clock.now() : 0
+    const slot = (part: string) => `${e.surface}:pane:${part}`
     if (e.props.placement === 'widget') {
       // Minimised: nothing of the pane is in view, so no live animation is started for it.
       isPaneOpen = false
+      for (const part of ['hive', 'budget', 'members', 'live', 'timeline', 'route']) hideMotion(slot(part))
       const active = shown.members.filter(member => member.status === 'working').length
       const coordinating = shown.members.filter(member => member.status === 'coordinating').length
+      const state = emblemStateOf(shown)
       return (
         <Box flexDirection="row" columnGap="xs" alignItems="center">
-          {HeaderArt && <HeaderArt source={swarmEmblem(emblemStateOf(shown))} alt="Swarm" width={16} height={16} />}
+          {HeaderArt && <HeaderArt source={swarmEmblem(state, phase(slot('widget'), shown.dir, state, now))} alt="Swarm" width={16} height={16} />}
           <Text weight="semibold">Swarm board</Text>
           {shown.dir === '' ? (
             <Text dimColor>No swarm</Text>
@@ -3806,17 +3883,17 @@ export const register: Register = on => {
         </Box>
       )
     }
+    hideMotion(slot('widget'))
     isPaneOpen = true
     // The run row's ends are read as the pane opens, so they are drawn as no control from the first look on.
     if (runEdge.dir !== shown.dir || runEdge.older === undefined || runEdge.newer === undefined) void learnEdges($, shown.dir)
     const current = await read($, tab)
-    const now = HeaderArt ? await $.clock.now() : 0
     const mood = shown.mood ?? 'sleep'
-    const hiveOffset = phase(e.surface + '-hive', shown.dir + '/' + mood, shown.dir ? 'header' : 'empty', now)
-    const latest = shown.posts.at(-1)?.seq
-    if (current !== 'graph' && clocks.get(e.surface + '-route')?.scene === shown.dir + '/' + latest) {
-      phase(e.surface + '-route', shown.dir + '/' + latest, current, now)
+    const hiveOffset = phase(slot('hive'), shown.dir, mood, now)
+    if (current !== 'graph' || shown.posts.length === 0) {
+      for (const part of ['route', 'live', 'timeline']) hideMotion(slot(part))
     }
+    if (current !== 'members') hideMotion(slot('members'))
     const memberOf = (name: string) => shown.members.find(member => member.name === name)
     const feedOf = async (name: string) => {
       talk = undefined
@@ -3832,6 +3909,7 @@ export const register: Register = on => {
     const rows = Math.max(8, (e.props.scroll?.bodyRows ?? e.viewport?.rows ?? 24) - 7)
 
     if (shown.dir === '') {
+      hideMotion(slot('budget'))
       return (
         <Box
           flexDirection="column"
@@ -3854,10 +3932,8 @@ export const register: Register = on => {
         .filter(m => ['waiting', 'not started', 'killed', 'closed'].includes(m.status))
         .map(m => m.name),
     )
-    const hueOf = (name: string) => {
-      const idx = shown.members.findIndex(m => m.name === name)
-      return idx < 0 ? 'subtle' : HUES[idx % HUES.length]!
-    }
+    const memberOrder = new Map(shown.members.map((member, idx) => [member.name, idx]))
+    const hueOf = (name: string) => HUES[(memberOrder.get(name) ?? -1) % HUES.length] ?? 'subtle'
     const inactiveToggle = (count: number) =>
       count === 0 && !hiding ? (
         <Text dimColor>No inactive members</Text>
@@ -4375,6 +4451,7 @@ export const register: Register = on => {
     } else if (current === 'members' && talk?.dir === shown.dir) {
       const open = talk
       const member = memberOf(open.name)
+      const memberOffset = phase(slot('members'), shown.dir, `talk/${open.name}`, now)
       // Filled from the newest row back, as the Board is, so what the agent does now is in view.
       let fitted = 0
       let used = 0
@@ -4413,7 +4490,7 @@ export const register: Register = on => {
           >
             <Button key="talk-back" plain label="‹ Members" onPress={() => closeTalk($)} />
             {HeaderArt && member && member.status !== 'closed' && (
-              <HeaderArt source={statusDot(member.status, hiveOffset)} alt={member.status} width={12} height={12} />
+              <HeaderArt source={statusDot(member.status, memberOffset)} alt=" " width={12} height={12} />
             )}
             <Text wrap="truncate-end">
               <Text weight="semibold" color={hueOf(open.name)}>@{open.name}</Text>
@@ -4440,10 +4517,17 @@ export const register: Register = on => {
         </Box>
       )
     } else if (current === 'members') {
-      const lastOf = (name: string) =>
-        [...shown.posts].reverse().find(post => post.agent === name)
+      const memberOffset = phase(slot('members'), shown.dir, 'cards', now)
+      const beeScale = columns < 34 ? 2 : columns < 52 ? 3 : 4
+      const beeWidth = MEMBER_BEE_SIZE.width * beeScale
+      const beeHeight = MEMBER_BEE_SIZE.height * beeScale
+      const isCompact = HeaderArt !== undefined && columns < 42
+      const unitSpace = isCompact ? '\u00a0' : ' '
       const card = (member: Member) => {
-        const last = lastOf(member.name)
+        const last = shown.posts.findLast(post => post.agent === member.name)
+        const hue = hueOf(member.name)
+        const accent = memberAccents[hue]
+        const motionOffset = memberOffset + (memberOrder.get(member.name) ?? 0) * 173
         const statusColor = statusInk(member.status)
         const isBroken = ['failed', 'unreachable', 'stopped'].includes(member.status)
         const plan = [
@@ -4455,43 +4539,66 @@ export const register: Register = on => {
         const canOpenTalk = member.role === 'coordinator' ? hasMainTalk : member.id !== undefined && member.status !== 'killed'
         const hasActions = canOpenTalk || member.posts > 0 || member.role === 'coordinator'
         const summaryLines = last ? bodyOf(last).split('\n').slice(0, kindOf(last.text) ? 2 : 1).filter(l => l.trim() !== '').join(' · ') : ''
+        const meta = [member.role === 'coordinator' ? '' : member.type, `${member.model} ${member.effort}`.trim()].filter(Boolean).join(' · ')
+        // Keep model details on their own line if the name and bee leave little room for them.
+        const identityWidth = visualWidth(member.name) + 3 + .8 * visualWidth(meta)
+        const stackIdentity = HeaderArt !== undefined && (isCompact || identityWidth > columns - Math.ceil(beeWidth / 8) - 2)
+        const memberSpend = spentBy(member)
+        const identity = (
+          <Text strikethrough={member.status === 'killed'} wrap="truncate-end">
+            <Text weight="semibold" color={hue}>@{member.name}</Text>
+            {!stackIdentity && meta && <Text dimColor>{`  ${meta}`}</Text>}
+          </Text>
+        )
+        const status = (
+          <Box flexDirection="row" alignItems={isCompact ? 'flex-start' : 'center'} columnGap="xs" minWidth={0}>
+            {member.status === 'closed' ? null : HeaderArt ? (
+              <Box flexShrink={0}>
+                <HeaderArt source={statusDot(member.status, motionOffset)} alt=" " width={12} height={isCompact ? 16 : 12} />
+              </Box>
+            ) : <Text color={statusColor}>{isBroken ? '!' : ['killed', 'not started'].includes(member.status) ? '○' : '●'}</Text>}
+            <Box flexShrink={1} minWidth={0}>
+              <Text tabular size={HeaderArt ? 'caption' : undefined} wrap={isCompact ? 'wrap' : 'truncate-end'}>
+                <Text dimColor>{`${member.status} ·${unitSpace}${counted(member.posts, 'post').replace(' ', unitSpace)}`}</Text>
+                {memberSpend > 0 && <Text dimColor>{` ·${unitSpace}${compact(memberSpend)}${unitSpace}tokens`}</Text>}
+                {member.unread > 0 && member.status !== 'killed' && (
+                  <Text weight="semibold" color="warning">{` ·${unitSpace}${member.unread}${unitSpace}unread`}</Text>
+                )}
+              </Text>
+            </Box>
+          </Box>
+        )
 
-        // Every card has the same rows in the same order, so a column of them can be scanned: who it is and
-        // what it runs on, then how it is doing, then what it waits for, owns and last said.
         return (
           <Box
             key={member.name}
             flexDirection="column"
             gap="xs"
             borderStyle="round"
-            borderColor={hueOf(member.name)}
-            borderDimColor
-            hover={{ borderDimColor: false }}
+            borderColor={HeaderArt ? accent : hue}
+            borderDimColor={!HeaderArt}
+            hover={HeaderArt ? undefined : { borderDimColor: false }}
             paddingX="sm"
             paddingY="xs"
           >
-            <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap="sm">
-              <Text strikethrough={member.status === 'killed'} wrap="truncate-end">
-                <Text weight="semibold" color={hueOf(member.name)}>@{member.name}</Text>
-                <Text dimColor>
-                  {`  ${[member.role === 'coordinator' ? '' : member.type, `${member.model} ${member.effort}`.trim()].filter(part => part !== '').join(' · ')}`}
-                </Text>
-              </Text>
-              {HeaderArt && (
-                <HeaderArt source={memberBee(hueOf(member.name), member.status, hiveOffset)} alt={`${member.name} bee`} width={24} height={16} />
-              )}
-            </Box>
-            <Box flexDirection="row" alignItems="center" columnGap="xs">
-              {member.status === 'closed' ? null : HeaderArt ? <HeaderArt source={statusDot(member.status, hiveOffset)} alt={member.status} width={12} height={12} /> :
-              <Text color={statusColor}>{isBroken ? '!' : ['killed', 'not started'].includes(member.status) ? '○' : '●'}</Text>}
-              <Text tabular wrap="truncate-end">
-                <Text dimColor>{`${member.status} · ${counted(member.posts, 'post')}`}</Text>
-                {spentBy(member) > 0 && <Text dimColor>{` · ${compact(spentBy(member))} tokens`}</Text>}
-                {member.unread > 0 && member.status !== 'killed' && (
-                  <Text weight="semibold" color="warning">{` · ${member.unread} unread`}</Text>
-                )}
-              </Text>
-            </Box>
+            {HeaderArt ? (
+              <Box flexDirection="row" alignItems="flex-start" columnGap="sm" minWidth={0}>
+                <Box flexDirection="column" gap="xs" flexGrow={1} flexShrink={1} minWidth={0}>
+                  {identity}
+                  {stackIdentity && meta && <Text size="caption" dimColor wrap="truncate-end">{meta}</Text>}
+                  {status}
+                </Box>
+                <Box key={`bee-${member.name}`} flexShrink={0}>
+                  <HeaderArt
+                    source={memberBee(accent, member.status, motionOffset)}
+                    alt=" "
+                    width={beeWidth}
+                    height={beeHeight}
+                  />
+                </Box>
+              </Box>
+            ) : identity}
+            {!HeaderArt && status}
             {member.detail !== '' && (
               <Text color={member.status === 'closed' ? undefined : isBroken || member.status === 'killed' ? 'error' : member.detail === 'reported ready' ? 'success' : 'warning'} wrap="truncate-end">{member.detail}</Text>
             )}
@@ -4502,7 +4609,7 @@ export const register: Register = on => {
               </Text>
             )}
             {hasActions && (
-              <Box flexDirection="row" gap="sm" flexWrap="wrap">
+              <Box flexDirection="row" columnGap="sm" rowGap="xs" flexWrap="wrap" alignItems="center">
                 {canOpenTalk && (
                   <Button key={`view-${member.name}`} plain dimColor hover={{ dimColor: false }} label="Open conversation" onPress={async () => { if (!(await viewAgent($, member))) await feedOf(member.name) }} />
                 )}
@@ -4536,15 +4643,13 @@ export const register: Register = on => {
       ]
       const visibleGroups = groups.filter(([, list]) => list.length > 0)
       body = (
-        <Box flexDirection="column" marginTop={1}>
+        <Box flexDirection="column" marginTop="sm" gap="sm">
           <Box flexDirection="row" justifyContent="flex-end">{inactiveToggle(inactive.size)}</Box>
           {visibleGroups.length === 0 && shown.members.length > 0 ? (
-            <Box marginTop={1}>
-              <Text dimColor>All members are inactive.</Text>
-            </Box>
+            <Text dimColor>All members are inactive.</Text>
           ) : (
             visibleGroups.map(([title, list]) => (
-              <Box key={title} flexDirection="column" gap={1} marginTop={1}>
+              <Box key={title} flexDirection="column" gap="sm">
                 <Text size="caption" weight="semibold" dimColor>{`${title} · ${list.length}`}</Text>
                 {[...list].sort(byName).map(card)}
               </Box>
@@ -4579,17 +4684,14 @@ export const register: Register = on => {
         name !== post.agent && !post.to.includes(name),
       )
       const hidden = new Set(hiding ? hideable : [])
-      // A closed, paused or looked-at run moves only while it is replayed.
+      // Incoming posts animate once on the live board. The latest route loops when playback is idle.
       const isLiveRun = !browsed && !shown.isClosed && !shown.isPaused
       const animate = playing || (isLiveRun && live && pulse === post.seq)
       const repeat = !playing && index === shown.posts.length - 1 && !animate
       const isExpanded = await read($, expandAll)
       const hasBroadcast = shown.posts.some(isBroadcast) || Object.keys(shown.earlierEdges ?? {}).some(edge => edge.endsWith('>@all'))
       const isLiveVisible = live && isLiveRun
-      const liveOffset = phase(e.surface + '-live', shown.dir, String(isLiveVisible), now)
-      const statusSig = live && repeat ? shown.members.map(m => `${m.name}:${m.status}`).join(',') : ''
-      const routeOffset = phase(e.surface + '-route', shown.dir + '/' + latest,
-        [current, post.seq, animate, repeat, isExpanded, statusSig, ...hidden].join('/'), now)
+      if (!isLiveVisible) hideMotion(slot('live'))
       const postKind = verdictOf(post)
       const time = postTime(post)
       const strippedGraphBody = chipped(post)
@@ -4597,10 +4699,21 @@ export const register: Register = on => {
       // Names drawn smaller than this are not read, so the routes are listed instead. The pane gives its width in
       // columns only: pixels are estimated from them.
       const isLegible = labelPx(columns, drawnMembers) >= MIN_LABEL_PX
+      const routeSlot = slot('route')
+      const mode = animate ? 'play' : repeat ? 'repeat' : 'still'
+      const drawing = JSON.stringify([live, isExpanded, [...hidden],
+        drawnMembers.map(m => [m.name, m.role, live ? m.status : '', m.depends])])
+      const routeOffset = isLegible
+        ? phase(routeSlot, `${shown.dir}/${post.seq}`, `${mode}/${drawing}`, now, animate && !clocks.get(routeSlot)?.view.startsWith('play/'))
+        : 0
       const graph = isLegible ? drawGraph(shown, post.seq, hidden, animate, live, repeat, routeOffset, isExpanded) : undefined
       // The host refuses a longer source, and the whole pane with it: such a graph is listed too.
       const source = graph?.svg !== undefined && graph.svg.length <= SVG_LIMIT ? graph.svg : undefined
+      if (source === undefined) hideMotion(routeSlot)
       const last = shown.posts.length - 1
+      const feedMembers = shown.members.filter(member => !hidden.has(member.name) && member.posts > 0)
+      const timelineRatio = (index + 1) / shown.posts.length
+      const timelineOffset = phase(slot('timeline'), shown.dir, `${progressUnits(timelineRatio)}/${playing}/${isLiveVisible}`, now)
       // A step that leads nowhere is text, not a control that does nothing.
       const step = (key: string, label: string, seq: number | undefined) => seq === undefined
         ? <Text key={key} dimColor>{label}</Text>
@@ -4621,7 +4734,7 @@ export const register: Register = on => {
             <Box flexDirection="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" columnGap="sm" rowGap="xs">
               {isLiveVisible ? (
                 <Box flexDirection="row" alignItems="center" gap="xs">
-                  <Svg key="live-indicator" source={liveIndicator(liveOffset)} alt="Live activity" width={16} height={16} />
+                  <Svg key="live-indicator" source={liveIndicator(phase(slot('live'), shown.dir, 'live', now))} alt="Live activity" width={16} height={16} />
                   <Text weight="semibold" color="success">Live</Text>
                 </Box>
               ) : (
@@ -4632,7 +4745,7 @@ export const register: Register = on => {
                   )}
                 </Box>
               )}
-              <Box flexDirection="row" gap="sm" alignItems="center">
+              <Box flexDirection="row" columnGap="sm" rowGap="xs" alignItems="center" flexWrap="wrap" minWidth={0}>
                 <Button
                   key="expand-all"
                   plain
@@ -4655,7 +4768,7 @@ export const register: Register = on => {
             </Box>
             {shown.posts.length > 1 && (
               <Svg
-                source={progressBar((index + 1) / shown.posts.length, isLiveVisible ? 'success' : 'accent', playing, liveOffset)}
+                source={progressBar(timelineRatio, isLiveVisible ? 'success' : 'accent', playing, timelineOffset)}
                 alt={`Timeline position ${index + 1} of ${shown.posts.length}`}
                 width={1024}
                 height={5}
@@ -4685,12 +4798,14 @@ export const register: Register = on => {
               onPress={() => { routesListed = !routesListed; routePages = 1; $.ui.invalidate('ui.render') }} />
           )}
           {source !== undefined && routesListed && <Box key="graph-route-list" flexDirection="column">{routeList(isExpanded, hidden, post.seq)}</Box>}
-          <Box key="graph-members" flexDirection="row" gap="sm" flexWrap="wrap" alignItems="center">
-            <Text size="caption" weight="semibold" dimColor>Feed of</Text>
-            {shown.members.filter(member => !hidden.has(member.name) && member.posts > 0).map(member => (
-              <Button key={`graph-feed-${member.name}`} plain label={`@${member.name}`} onPress={() => feedOf(member.name)} />
-            ))}
-          </Box>
+          {feedMembers.length > 0 && (
+            <Box key="graph-members" flexDirection="row" columnGap="sm" rowGap="xs" flexWrap="wrap" alignItems="center">
+              <Text size="caption" weight="semibold" dimColor>Feed of</Text>
+              {feedMembers.map(member => (
+                <Button key={`graph-feed-${member.name}`} plain label={`@${member.name}`} onPress={() => feedOf(member.name)} />
+              ))}
+            </Box>
+          )}
           <Box
             key="graph-post"
             flexDirection="column"
@@ -4765,6 +4880,7 @@ export const register: Register = on => {
     const budgetRatio = shown.budget > 0 ? total / shown.budget : 0
     const budgetTone: BarTone = budgetRatio >= 0.9 ? 'error' : budgetRatio >= 0.75 ? 'warning' : 'accent'
     const isHeaderLive = !browsed && !shown.isClosed && !shown.isPaused
+    const budgetOffset = phase(slot('budget'), shown.dir, `${progressUnits(budgetRatio)}/${budgetTone}/${isHeaderLive}`, now)
 
     return (
       <Box flexDirection="column">
@@ -4772,7 +4888,7 @@ export const register: Register = on => {
           {/* A narrow pane gives the title the hive's room. The host clamps no lines, so a title longer than two lines of
               its column is cut at a word, and the whole of it is one press away. */}
           {HeaderArt && <HeaderArt key="hive" source={hiveArt(mood, hiveOffset)} alt={`Swarm hive: ${shown.mood ?? 'sleep'}`} width={columns < 48 ? 56 : 88} height={columns < 48 ? 28 : 44} />}
-          <Box flexDirection="column" gap="xs" flexGrow={1} flexShrink={1}>
+          <Box flexDirection="column" gap="xs" flexGrow={1} flexShrink={1} minWidth={0}>
             <Text size="heading" weight="semibold" wrap="wrap">{isTitleCut && titleOpen !== shown.dir ? clip(shown.title, titleRoom) : shown.title}</Text>
             {isTitleCut && (
               <Button key="title-more" plain dimColor label={titleOpen === shown.dir ? 'Show less of the title' : 'Show the whole title'}
@@ -4788,7 +4904,7 @@ export const register: Register = on => {
             {HeaderArt && shown.budget > 0 && (
               <Box flexDirection="row" alignItems="center" columnGap="xs">
                 <HeaderArt
-                  source={progressBar(budgetRatio, budgetTone, isHeaderLive && total > 0, hiveOffset)}
+                  source={progressBar(budgetRatio, budgetTone, isHeaderLive && total > 0, budgetOffset)}
                   alt={`Token budget ${Math.min(100, Math.round(budgetRatio * 100))}%`}
                   width={120}
                   height={5}
@@ -4801,7 +4917,7 @@ export const register: Register = on => {
           </Box>
         </Box>
         {error && <Text color="warning">{error}</Text>}
-        <Box flexDirection="row" gap="sm" flexWrap="wrap" alignItems="center" marginTop="xs">
+        <Box flexDirection="row" columnGap="sm" rowGap="xs" flexWrap="wrap" alignItems="center" marginTop="xs">
           <Text dimColor>Run</Text>
           {/* At an end of the history the list showed, the step is text, as a replay step that leads nowhere is. */}
           {runEdge.dir === shown.dir && runEdge.older === false

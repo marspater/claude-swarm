@@ -7,7 +7,7 @@ export const compact = (tokens: number) =>
 // Code and URLs, where an @name or a ? is no mention and no question: a fence (closed by a run at least as long as
 // its opener, tildes at a line start), a code span, a URL up to its trailing punctuation. board.py holds the same
 // pattern as QUOTED; each is replaced by a space, so the words on either side stay apart.
-const QUOTED = /(`{3,})[\s\S]*?\1`*|^ {0,3}(~{3,})[\s\S]*?^ {0,3}\2~*|(`+)[^\n]*?\3|\w+:\/\/\S+?(?=[.,;:!)]*(?:\?(?=\s|$))?(?:\s|$))/gm
+const QUOTED = /(`{3,})[\s\S]*?\1`*|^ {0,3}(~{3,})[\s\S]*?^ {0,3}\2~*|(`+)[^\n]*?\3|(?<!\w)\w+:\/\/\S+?(?=[.,;:!)]*(?:\?(?=\s|$))?(?:\s|$))/gm
 export const unquoted = (text: string) => text.replace(QUOTED, ' ')
 // The board's QUESTION: a question mark that asks, in a run of them too ("sure??"), and none of `a ?? b`, `a?.b`,
 // `name?: type` or `c ? a : b`.

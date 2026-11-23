@@ -1,3 +1,18 @@
+import { easeInOut, easeOut, loopDelay } from './motion'
+
+// The card border and its SVG use the same accent in both themes. The host's theme tokens are resolved outside the SVG.
+export const memberAccents = {
+  claude: '#c26952',
+  suggestion: '#628fd2',
+  planMode: '#338f83',
+  ide: '#b87932',
+  merged: '#9176c3',
+  permission: '#bb6295',
+  remember: '#7985c9',
+  autoAccept: '#648d42',
+  subtle: '#858589',
+} as const
+
 // Desktop status colors use exact D65 Display P3 coordinates with WCAG-compliant light and dark themes.
 const colors = {
   coordinating: ['#ba5b3d', 'color(display-p3 .682353 .376471 .266667)', 'claude'],
@@ -29,24 +44,21 @@ export const statusCss =
   `@supports(color:color(display-p3 1 0 0)){svg{${variables(colors, 1)}}` +
   `@media(prefers-color-scheme:dark){svg{${variables(darkColors, 1)}}}}`
 
-const safeElapsed = (elapsed: number) => Number.isFinite(elapsed) && elapsed > 0 ? Math.floor(elapsed) : 0
-
 export function statusDot(status: string, elapsed = 0): string {
   const key = statusKey(status)
   const color = `var(--status-${key})`
-  const ms = safeElapsed(elapsed)
   const anim = key === 'working'
-    ? `.pulse{transform-box:fill-box;transform-origin:center;animation:sw-pulse 2.2s cubic-bezier(.16,1,.3,1) -${ms % 2200}ms infinite}` +
-      `@keyframes sw-pulse{0%{transform:scale(1);opacity:.48}75%,100%{transform:scale(1.85);opacity:0}}`
+    ? `.pulse{transform-box:fill-box;transform-origin:center;animation:sw-pulse 2.8s ${easeOut} ${loopDelay(elapsed, 2800)} infinite}` +
+      '@keyframes sw-pulse{0%{transform:scale(.9);opacity:0}14%{opacity:.36}82%,100%{transform:scale(1.8);opacity:0}}'
     : key === 'coordinating'
-      ? `.aura{transform-box:fill-box;transform-origin:center;animation:sw-aura 2.8s cubic-bezier(.42,0,.58,1) -${ms % 2800}ms infinite}` +
-        `@keyframes sw-aura{0%,100%{transform:scale(1);opacity:.22}50%{transform:scale(1.32);opacity:.04}}`
+      ? `.aura{transform-box:fill-box;transform-origin:center;animation:sw-aura 3.4s ${easeInOut} ${loopDelay(elapsed, 3400)} infinite}` +
+        '@keyframes sw-aura{0%,100%{transform:scale(1);opacity:.24}50%{transform:scale(1.2);opacity:.08}}'
       : key === 'waiting'
-        ? `.breathe{transform-box:fill-box;transform-origin:center;animation:sw-wait 3.2s cubic-bezier(.42,0,.58,1) -${ms % 3200}ms infinite}` +
-          `@keyframes sw-wait{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(.72);opacity:.45}}`
+        ? `.breathe{transform-box:fill-box;transform-origin:center;animation:sw-wait 3.6s ${easeInOut} ${loopDelay(elapsed, 3600)} infinite}` +
+          '@keyframes sw-wait{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(.8);opacity:.55}}'
         : key === 'failed'
-          ? `.alert{transform-box:fill-box;transform-origin:center;animation:sw-alert 2.4s ease-in-out -${ms % 2400}ms infinite}` +
-            `@keyframes sw-alert{0%,100%{opacity:.14}50%{opacity:.32}}`
+          ? `.alert{animation:sw-alert 3.2s ${easeInOut} ${loopDelay(elapsed, 3200)} infinite}` +
+            '@keyframes sw-alert{0%,100%{opacity:.12}50%{opacity:.27}}'
           : ''
   const reduced = anim ? '@media(prefers-reduced-motion:reduce){.pulse,.aura,.breathe,.alert{animation:none;opacity:0}.breathe{opacity:1}}' : ''
   const dot = key === 'working'
@@ -61,11 +73,26 @@ export function statusDot(status: string, elapsed = 0): string {
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><style>${statusCss}${anim}${reduced}</style>${dot}</svg>`
 }
 
+export function liveIndicator(elapsed: number): string {
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
+    <style>${statusCss}
+      .core{fill:var(--status-working)}
+      .breath{fill:none;stroke:var(--status-working);stroke-width:1.1;transform-box:fill-box;transform-origin:center;animation:breath 4s ${easeOut} ${loopDelay(elapsed, 4000)} infinite}
+      .breath2{animation-delay:${loopDelay(elapsed, 4000, 2000)}}
+      @keyframes breath{0%{transform:scale(.9);opacity:0}14%{opacity:.45}66%,100%{transform:scale(1.95);opacity:0}}
+      @media(prefers-reduced-motion:reduce){.breath{display:none}}
+    </style>
+    <circle class="breath" cx="8" cy="8" r="3.4"/>
+    <circle class="breath breath2" cx="8" cy="8" r="3.4"/>
+    <circle class="core" cx="8" cy="8" r="3.4"/>
+    <circle cx="7.1" cy="7.1" r=".85" fill="#fff" opacity=".34"/>
+  </svg>`
+}
+
 export type EmblemState = 'working' | 'coordinating' | 'paused' | 'attention' | 'idle' | 'closed'
 
 /** Compact geometric honeycomb emblem for chat buttons, banners, and the minimized widget. */
 export function swarmEmblem(state: EmblemState, elapsed = 0): string {
-  const ms = safeElapsed(elapsed)
   const tone = state === 'working' ? 'working'
     : state === 'coordinating' ? 'coordinating'
       : state === 'paused' || state === 'attention' ? 'waiting'
@@ -83,10 +110,10 @@ export function swarmEmblem(state: EmblemState, elapsed = 0): string {
     `.c-hi{fill:var(--cell-warm);fill-opacity:${state === 'closed' ? '.18' : '.42'};stroke:var(--cell-stroke);stroke-width:1.3;stroke-linejoin:round}` +
     `.dot{fill:var(--status-${tone})}` +
     (active
-      ? `.ring{fill:none;stroke:var(--status-${tone});stroke-width:1.15;transform-box:fill-box;transform-origin:center;animation:emb-ring 2.6s cubic-bezier(.16,1,.3,1) -${ms % 2600}ms infinite}` +
-        `.c-hi{animation:emb-glow 2.6s ease-in-out -${ms % 2600}ms infinite}` +
-        `@keyframes emb-ring{0%{transform:scale(.9);opacity:.6}80%,100%{transform:scale(1.36);opacity:0}}` +
-        `@keyframes emb-glow{0%,100%{fill-opacity:.32}50%{fill-opacity:.64}}` +
+      ? `.ring{fill:none;stroke:var(--status-${tone});stroke-width:1.15;transform-box:fill-box;transform-origin:center;animation:emb-ring 3.4s ${easeOut} ${loopDelay(elapsed, 3400)} infinite}` +
+        `.c-hi{animation:emb-glow 3.4s ${easeInOut} ${loopDelay(elapsed, 3400)} infinite}` +
+        '@keyframes emb-ring{0%{transform:scale(.92);opacity:0}16%{opacity:.46}80%,100%{transform:scale(1.26);opacity:0}}' +
+        '@keyframes emb-glow{0%,100%{fill-opacity:.34}50%{fill-opacity:.58}}' +
         `@media(prefers-reduced-motion:reduce){.ring{display:none}.c-hi{animation:none}}`
       : '')
   const badge = state === 'attention'
@@ -102,11 +129,13 @@ export function swarmEmblem(state: EmblemState, elapsed = 0): string {
 
 export type BarTone = 'accent' | 'success' | 'warning' | 'error'
 
+export const progressUnits = (ratio: number) => Number.isFinite(ratio) ? Math.round(2000 * Math.max(0, Math.min(1, ratio))) / 10 : 0
+
 /** Sleek rounded progress bar with optional shimmer for token budgets and replay scrubbers. */
 export function progressBar(ratio: number, tone: BarTone = 'accent', animate = false, elapsed = 0): string {
-  const clamped = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0
-  const fillW = clamped <= 0 ? 0 : Math.max(6, Math.round(clamped * 200))
-  const ms = safeElapsed(elapsed)
+  const fillW = progressUnits(ratio)
+  const glowing = animate && fillW > 12
+  const shineW = Math.round(Math.max(20, Math.min(54, fillW * .52)))
   const lightTone: Record<BarTone, readonly [string, string, ...string[]]> = {
     accent: ['#235fc4', 'color(display-p3 .2033 .3675 .7427)'],
     success: colors.working,
@@ -123,17 +152,17 @@ export function progressBar(ratio: number, tone: BarTone = 'accent', animate = f
     `svg{--track:#e5e7eb;--fill:${lightTone[tone][0]}}` +
     `@media(prefers-color-scheme:dark){svg{--track:#33363b;--fill:${darkTone[tone][0]}}}` +
     `@supports(color:color(display-p3 1 0 0)){svg{--fill:${lightTone[tone][1]}}@media(prefers-color-scheme:dark){svg{--fill:${darkTone[tone][1]}}}}` +
-    (animate && fillW > 12
-      ? `.shimmer{animation:sw-shim 2.4s cubic-bezier(.4,0,.2,1) -${ms % 2400}ms infinite}` +
-        `@keyframes sw-shim{0%{transform:translateX(-60px);opacity:0}20%{opacity:.55}80%{opacity:.55}100%{transform:translateX(220px);opacity:0}}` +
+    (glowing
+      ? `.shimmer{animation:sw-shim 3.1s linear ${loopDelay(elapsed, 3100)} infinite}` +
+        `@keyframes sw-shim{0%{transform:translateX(-${shineW}px);opacity:0}16%{opacity:.65}52%{opacity:.5}68%,100%{transform:translateX(${fillW}px);opacity:0}}` +
         `@media(prefers-reduced-motion:reduce){.shimmer{display:none}}`
       : '')
-  const defs = animate && fillW > 12
+  const defs = glowing
     ? `<defs><clipPath id="bf"><rect x="0" y="0" width="${fillW}" height="6" rx="3"/></clipPath>` +
       `<linearGradient id="sg" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#fff" stop-opacity="0"/><stop offset="50%" stop-color="#fff" stop-opacity=".55"/><stop offset="100%" stop-color="#fff" stop-opacity="0"/></linearGradient></defs>`
     : ''
-  const shimmer = animate && fillW > 12
-    ? `<g clip-path="url(#bf)"><rect class="shimmer" x="0" y="0" width="52" height="6" fill="url(#sg)"/></g>`
+  const shimmer = glowing
+    ? `<g clip-path="url(#bf)"><rect class="shimmer" x="0" y="0" width="${shineW}" height="6" fill="url(#sg)"/></g>`
     : ''
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 6" preserveAspectRatio="none"><style>${style}</style>${defs}` +
     `<rect x="0" y="0" width="200" height="6" rx="3" fill="var(--track)"/>` +

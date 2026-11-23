@@ -5,7 +5,7 @@ tools: Read, Grep, Glob, LSP, mcp__swarm__board
 skills:
   - swarm:investigating
 model: claude-opus-5-5
-effort: high
+effort: medium
 color: orange
 background: true
 ---

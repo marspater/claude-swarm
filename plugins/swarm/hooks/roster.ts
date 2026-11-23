@@ -29,6 +29,20 @@ export function tokensUsed(tokens?: Record<string, unknown> | null): number {
   return Object.values(tokens ?? {}).reduce<number>((sum, count) => sum + positive(count), 0)
 }
 
+// A member's context is read again by every step it takes, so a long read-only sweep costs with the square of its
+// length. Seen live: three investigators grew from 23k to 290k tokens in 34 steps and spent a 3M budget with nothing
+// posted. Past NOTE a member is told once; past STOP a read-only member may only report.
+// ponytail: fixed thresholds; make them a run limit (`context=`) if a run needs a longer-lived specialist.
+export const CONTEXT_NOTE = 150_000
+export const CONTEXT_STOP = 200_000
+/** What one model step read to answer: the context its member holds now. */
+export const heldAt = (spent: { input_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } | undefined) =>
+  positive(spent?.input_tokens) + positive(spent?.cache_creation_input_tokens) + positive(spent?.cache_read_input_tokens)
+export const contextState = (held: number): 'ok' | 'note' | 'stop' => held >= CONTEXT_STOP ? 'stop' : held >= CONTEXT_NOTE ? 'note' : 'ok'
+// A run this far into its budget tells its members to post what they have: at the pause itself nothing more is paid for.
+export const WIND_DOWN = 0.8
+export const isWindingDown = (used: number, budget: number) => budget > 0 && used >= budget * WIND_DOWN
+
 // What a model step reports it spent, and what that is charged against a budget as it is billed: fresh tokens whole,
 // cached reads at a tenth.
 type Spent = { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number }

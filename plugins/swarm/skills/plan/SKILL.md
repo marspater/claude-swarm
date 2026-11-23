@@ -34,5 +34,5 @@ Type defaults (model, effort): worker Sonnet, medium; verifier Sonnet, medium (O
 1. The verdict first: a swarm, or "one agent is enough" with the reason, when the task is one file, one question, a change that fits in a sentence, or one problem whose parts must change together. For that verdict, stop after the reason.
 2. A table of the smallest team: member, type, model and effort, what it owns (paths), what it waits for.
 3. The checks the verifier would run, taken from the repository's instructions where they exist, and whether the run is shared (one checkout, owners that do not overlap) or isolated (a worktree per writer, when writers would break each other's build).
-4. A rough cost, as an estimate from measured runs: about 0.4 to 1.1 million charged tokens per worker's piece, 0.3 to 1.3 million for a verifier, about 0.3 million for the coordinator in a fresh conversation, against the default budget of 3,000,000.
+4. A rough cost, as an estimate from measured runs: about 0.4 to 1.1 million charged tokens per worker's piece, 0.3 to 1.3 million for a verifier, about 0.3 million for the coordinator in a fresh conversation, against the budget the board allocates from the registered team (`BOARD plan` prints it; 3,000,000 before that).
 5. One line: start it with `/swarm:swarm` and the same task, in this conversation, so the plan is reused.

@@ -2134,6 +2134,61 @@ class BoardRegressions(unittest.TestCase):
         run(d, "post", "v", "@coordinator checking")
         assert not self.items(d, "loop")
 
+    def test_the_budget_is_allocated_from_the_planned_team_until_the_first_member_starts(self):
+        d = self.init_run()
+        def saved(run_dir=None):
+            with open(os.path.join(run_dir or d, "members.json"), encoding="utf-8") as f:
+                return json.load(f)
+        assert saved()["limits"] == {"budget": "3000000"}  # the bound before anyone is registered
+        run(d, "member", "scout", "profile=investigator", "writes=0", "owns=why the retry fails", "size=s")
+        run(d, "member", "fixer", "owns=src", "size=l")
+        run(d, "member", "checker", "role=verifier")
+        # 500k*0.5 + 700k*2 + 600k = 2.25M; coordinator 300k + 3*40k; reserve 20% of the shares
+        state = saved()
+        assert [state["members"][n]["alloc"] for n in ("scout", "fixer", "checker")] == [250000, 1400000, 600000], state
+        assert state["limits"]["budget"] == str(2250000 + 420000 + 450000), state
+        plan = run(d, "plan")
+        assert "budget: 3,120,000 tokens, allocated from this team: @scout 250,000, @fixer 1,400,000, @checker 600,000, coordinator 420,000, reserve 450,000" in plan, plan
+        run(d, "member", "scout", "effort=high")  # effort counts, and a size that is none is refused
+        assert saved()["members"]["scout"]["alloc"] == 375000
+        run(d, "member", "scout", "size=huge", ok=False)
+        # the first start fixes it: a member added afterwards raises nothing, but gets a share to be stopped at
+        run(d, "member", "scout", "id=scout-address")
+        fixed = saved()["limits"]["budget"]
+        run(d, "member", "extra", "owns=docs", "size=l")
+        state = saved()
+        assert state["limits"]["budget"] == fixed and state["members"]["extra"]["alloc"] == 1400000, state
+        assert state["members"]["scout"]["alloc"] == 375000, state  # a share already given is kept
+        assert "over budget: this team is estimated at 4,990,000 tokens, the budget is 3,270,000." in run(d, "plan")
+        assert "fixed since the first member started" in run(d, "plan")
+        # a replacement takes the piece and its share; a member is stopped alone at 1.5 times its share
+        run(d, "replace", "scout", "scout-2")
+        assert saved()["members"]["scout-2"]["alloc"] == 375000 and saved()["limits"]["budget"] == fixed
+        run(d, "member", "scout-2", "id=scout-2-address")
+        key = hashlib.sha256(b"swarm-agent:scout-2-address").hexdigest()
+        assert "member_paused" not in json.loads(run(d, "account", "1" * 64, key, "562499"))
+        assert json.loads(run(d, "account", "2" * 64, key, "1"))["member_paused"] == "scout-2"
+        # a team estimated past what the board allocates is said so: the cap supplies no tokens
+        big = self.init_run("big")
+        for name in ("a", "b", "c", "d"):
+            run(big, "member", name, "owns=src/" + name, "size=l", "effort=high")
+        run(big, "member", "v", "role=verifier")
+        plan = run(big, "plan")
+        assert saved(big)["limits"]["budget"] == "8000000", saved(big)
+        assert "over budget: this team is estimated at 11,300,000 tokens, the budget is 8,000,000." in plan, plan
+        # the user's word ends the allocation, before a start too
+        other = self.init_run("named")
+        run(other, "limit", "budget=900000")
+        run(other, "member", "w", "owns=src")
+        named = saved(other)
+        assert named["limits"]["budget"] == "900000" and "alloc" not in named["members"]["w"], named
+        # their figure stands, and a team estimated over it is said so with the plan, costliest piece first
+        plan = run(other, "plan")
+        assert "allocated from this team" not in plan
+        assert "over budget: this team is estimated at 1,180,000 tokens, the budget is 900,000." in plan and "Costliest: @w 700,000" in plan, plan
+        run(other, "member", "w", "size=s")
+        assert "over budget" not in run(other, "plan")
+
     def test_export_writes_a_report_and_changes_nothing(self):
         d = self.init_run()
         run(d, "member", "w", "owns=a|b")
@@ -2420,6 +2475,15 @@ class BoardRegressions(unittest.TestCase):
         run(d, "post", "a", "@b which printer?")
         run(d, "post", "b", "@a re: #1 the regex one")
         assert [item["seq"] for item in self.items(d, "question")] == [2]
+
+    def test_a_long_unbroken_token_is_read_for_questions_in_linear_time(self):
+        # Quadratic before: 12,000 characters took 0.1 s, so this took most of a minute.
+        sys.path.insert(0, os.path.dirname(BOARD))
+        import board  # noqa: E402
+        started = time.monotonic()
+        assert board.QUOTED.sub(" ", "x" * 300_000 + " is that so?").endswith(" is that so?")
+        assert board.asks("x" * 300_000 + " is that so?")
+        assert time.monotonic() - started < 2
 
     def test_parity_vectors_match_the_board(self):
         sys.path.insert(0, os.path.dirname(BOARD))

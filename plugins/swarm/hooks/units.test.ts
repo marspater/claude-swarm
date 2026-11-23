@@ -6,7 +6,7 @@ import { actsAsAnother, commitsInSharedCheckout } from './guard'
 import { BOARD_ACTIONS, hiveArt, memberBee, toolMood, toolSummary } from './hive'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, SWARM_AGENTS, familyOf, latestOf } from './models'
 import { progressBar, semanticIcon, statusCss, statusDot, statusKey, swarmEmblem } from './palette'
-import { END, budgetOf, detailOf, findAgent, ledger, mentions, parse, parsePosts, postFields, statusOf, targets, tokensUsed } from './roster'
+import { END, budgetOf, contextState, detailOf, heldAt, isWindingDown, findAgent, ledger, mentions, parse, parsePosts, postFields, statusOf, targets, tokensUsed } from './roster'
 import { bodyOf, chipped, clean, clip, compact, fenceAfter, hasQuestion, head, kindOf, openedText, stripKind, unquoted, verdictOf } from './text'
 
 const post = (text: string, to: string[] = []): Post => ({ seq: 1, agent: 'parser', to, text, time: '2026-11-16T14:03:22+0100' })
@@ -761,6 +761,21 @@ test('an ended turn the board still owes an answer for outlasts settled ones', (
   expect(book.owed().map(([turnId]) => turnId)).toEqual(['a'])
 })
 
+test('a member is told of its context at 150k and a read-only one stopped at 200k, and a run winds down at 80% of its budget', () => {
+  // the investigator seen live: step 14 read 147k and wrote 11k, step 20 read 195k and wrote 13k
+  expect(heldAt({ input_tokens: 2, cache_creation_input_tokens: 11_332, cache_read_input_tokens: 147_269 })).toBe(158_603)
+  expect([heldAt(undefined), heldAt({ input_tokens: -5, cache_read_input_tokens: Number.NaN })]).toEqual([0, 0])
+  expect([0, 149_999, 150_000, 199_999, 200_000, 290_000].map(contextState)).toEqual(['ok', 'ok', 'note', 'note', 'stop', 'stop'])
+  expect([isWindingDown(2_399_999, 3_000_000), isWindingDown(2_400_000, 3_000_000), isWindingDown(5, 0)]).toEqual([false, true, false])
+})
+
+test('a long unbroken token is read for questions in linear time', () => {
+  // Quadratic before, as in board.py: a scheme was tried from every letter of the token.
+  const started = performance.now()
+  expect([unquoted(`${'x'.repeat(300_000)} is that so?`).endsWith(' is that so?'), hasQuestion(`${'x'.repeat(300_000)} is that so?`)]).toEqual([true, true])
+  expect(performance.now() - started).toBeLessThan(2000)
+})
+
 test('the usage detail follows each charge: each step for itself, and at the end what the board does not hold yet', () => {
   const book = ledger()
   const step = { input_tokens: 3, output_tokens: 4, cache_creation_input_tokens: 5, cache_read_input_tokens: 100 }
@@ -1070,7 +1085,12 @@ test('visual polish: animated emblems, progress bars, semantic icons, status dot
 
   // Hive art uses smooth animations + soft radial aura when active, none when sleeping
   expect(hiveArt('build', 400)).toContain('radialGradient id="hg"')
-  expect(hiveArt('sleep', 400)).not.toContain('radialGradient')
+  const asleep = hiveArt('sleep', 400)
+  expect(asleep).not.toContain('radialGradient')
+  expect(asleep).toContain('translate(30 8)"><path class="sleep-mark"')
+  expect(asleep).toContain('translate(38 5)"><path class="sleep-mark sleep-mark-small"')
+  expect(asleep).toContain('prefers-reduced-motion:no-preference')
+  expect(asleep).not.toContain('prop-echo')
   expect(hiveArt('verify', 400)).toContain('var(--ok)')
 
   // Graph SVG emits live presence pulse & comet tail only in live repeat mode, never indefinite in replay
@@ -1095,6 +1115,10 @@ test('visual polish: animated emblems, progress bars, semantic icons, status dot
   expect(replayGraph).toContain('packet-tail')
   expect(replayGraph).not.toContain('indefinite')
   expect(replayGraph).not.toContain('p-ping')
+  const remounted = graphSvg(sample, 1, new Set(), true, false, false, 370)
+  expect(remounted).toContain('animateMotion begin="-370ms" dur="0.84s"')
+  expect(remounted).toContain('stroke-dashoffset" from="102" to="0" begin="-370ms" dur="0.84s"')
+  expect(remounted).toContain('begin="436ms" dur="0.34s"')
 
   // Graph SVG legend reflects @all post counts and Expand @all toggle state
   expect(graphSvg(sample, 1, new Set(), false, true, false, 0, false)).toContain('no @all posts yet')
@@ -1103,15 +1127,23 @@ test('visual polish: animated emblems, progress bars, semantic icons, status dot
   expect(graphSvg(withAll, 2, new Set(), false, true, false, 0, false)).toContain('@all posts, drawn by Expand @all')
   expect(graphSvg(withAll, 2, new Set(), false, true, false, 0, true)).toContain('@all posts, drawn as dashed arrows')
   expect(graphSvg(withAll, 1, new Set(), false, false, false, 0, false)).toContain('no @all posts yet')
+})
 
-  // Member pixel-art bees match card hues, animate when active, and stay static when idle
-  for (const hue of ['claude', 'suggestion', 'planMode', 'ide', 'merged', 'permission', 'remember', 'autoAccept', 'subtle']) {
-    const activeBee = memberBee(hue, 'working', 300)
-    expect(activeBee).toContain('shape-rendering="crispEdges"')
-    expect(activeBee).toContain('@keyframes flutter')
-    expect(activeBee).not.toContain('NaN')
-    const idleBee = memberBee(hue, 'waiting', 300)
-    expect(idleBee).not.toContain('@keyframes flutter')
-    expect(idleBee).not.toContain('@keyframes bob')
+test('member bees keep their wings, antennae, and striped body in place across statuses', () => {
+  const accent = '#628fd2'
+  const outline = (svg: string) => svg.match(/<path class="(?:bee-body|bee-antennae|bee-band|wing-front|wing-back)"[^>]+>/g)
+  const active = memberBee(accent, 'working', 300)
+  expect(active).toContain(`class="bee-body" fill="${accent}"`)
+  expect(active).toContain('viewBox="0 0 16 10"')
+  expect(active).toContain('shape-rendering="crispEdges"')
+  expect(active).toContain('@media(prefers-reduced-motion:no-preference)')
+  expect(active).toContain('@keyframes flutter')
+  expect(active).not.toContain('transform:')
+  expect(outline(active)).toHaveLength(6)
+  expect(outline(memberBee(accent, 'coordinating'))).toEqual(outline(active))
+  for (const status of ['waiting', 'not started', 'failed', 'unreachable', 'stopped', 'closed', 'killed']) {
+    const resting = memberBee(accent, status, 300)
+    expect(outline(resting)).toEqual(outline(active))
+    expect(resting).not.toContain('@keyframes flutter')
   }
 })

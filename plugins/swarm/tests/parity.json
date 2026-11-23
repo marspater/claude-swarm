@@ -1070,6 +1070,30 @@
   {
    "text": "a\u2028~~~\nq?\u2028~~~ b",
    "expect": "a\u2028  b"
+  },
+  {
+   "text": "xhttp://a.b/c?d=1 rest",
+   "expect": "  rest"
+  },
+  {
+   "text": "`a`http://h/p?q rest?",
+   "expect": "   rest?"
+  },
+  {
+   "text": "see http://a.b/c?x. and ftp://h/f?y",
+   "expect": "see  . and  "
+  },
+  {
+   "text": "a_b9://host/path?q=1, then",
+   "expect": " , then"
+  },
+  {
+   "text": "word://",
+   "expect": "word://"
+  },
+  {
+   "text": "http://a.b://c?d e",
+   "expect": "  e"
   }
  ],
  "question": [
@@ -1353,5 +1377,5 @@
   }
  ],
  "actions": ["account", "adopt", "agent-run", "attention", "bind", "claim", "close", "confirm", "export", "init", "kill", "limit", "locate", "member", "pause", "plan", "post", "prune", "read", "ready", "rearm", "replace", "restore", "resume", "retry", "revise", "show", "started", "status", "sync", "tail", "wake", "woke"],
- "defaults": {"worker": ["sonnet", "medium"], "verifier": ["sonnet", "medium"], "explorer": ["haiku", "medium"], "investigator": ["opus", "high"], "architect": ["fable", "high"], "designer": ["opus", "high"]}
+ "defaults": {"worker": ["sonnet", "medium"], "verifier": ["sonnet", "medium"], "explorer": ["haiku", "medium"], "investigator": ["opus", "medium"], "architect": ["fable", "high"], "designer": ["opus", "high"]}
 }
