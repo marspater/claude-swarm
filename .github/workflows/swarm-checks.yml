@@ -1,0 +1,51 @@
+name: Swarm checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python engine
+    runs-on: macos-15
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: plugins/swarm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python3 -B -m unittest discover -s tests -p 'test_*.py'
+
+  plugin:
+    name: Plugin validation and host tests
+    runs-on: macos-15
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: plugins/swarm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.5'
+      - run: npm install --global @anthropic-ai/claude-code@2.1.330
+      - run: bun test hooks/units.test.ts hooks/graph.test.tsx
+      - name: Validate the plugin and type-check its hooks
+        shell: bash
+        run: |
+          report="$RUNNER_TEMP/swarm-plugin-validation.log"
+          claude plugin validate --strict . 2>&1 | tee "$report"
+          if grep -qi 'not type-checked' "$report"; then
+            exit 1
+          fi
+      - run: claude plugin test .

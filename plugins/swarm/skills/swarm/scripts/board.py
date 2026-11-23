@@ -922,9 +922,8 @@ def unanswered(members, posts):
     pending = {}
     for post in posts:
         text = post["text"]
-        if post.get("kind") or REPORT_WORD.match(text):
-            continue
-        asking = asks(text)
+        report = post.get("kind") or REPORT_WORD.match(text)
+        asking = not report and asks(text)
         text = QUOTED.sub(" ", text)  # `re #99` in a code span cites nothing
         sender = post["agent"]
         responder = successor(sender, members)
@@ -932,7 +931,7 @@ def unanswered(members, posts):
         cited = [seq for run in re.findall(r"\bre(?:\s+|\s*:\s*)((?:#[0-9]+(?:\s*(?:,|and|&)?\s*))+)", text, re.IGNORECASE)
                  for seq in re.findall(r"#([0-9]+)", run)]
         # A bare "#7" cites too, but only a question put to the poster: "@regions Thanks #7" answers it.
-        named = re.findall(r"(?<![A-Za-z0-9_&])#([0-9]+)", text)
+        named = [] if report or cited else re.findall(r"(?<![A-Za-z0-9_&])#([0-9]+)", text)
         # Only a citation settles: a post that cites nothing may be about anything, and the asker still waits. It
         # settles by the question's number, whoever the post reaches, so a bare `re #7` closes it and wakes nobody.
         # The asker withdraws its own question the same way, and the coordinator's ruling settles it for everyone it
@@ -2101,6 +2100,15 @@ def main(argv):
                 through = readiness(members, posts)
                 freed = [n for n, entry in team_of(members).items()
                          if name in soft(entry) and n not in through and not unmet(entry, members, through)]
+                old_members = {**members, name: previous}
+                old_ready = readiness(old_members, posts)
+                workers = {w for w, e in team_of(members).items() if e.get("role") == "worker" and e.get("consult") != "1"}
+                if workers and workers <= through.keys() and any(
+                    e.get("role") == "worker" and e.get("consult") != "1" and w not in old_ready
+                    for w, e in team_of(old_members).items()
+                ):
+                    freed.extend(n for n, entry in team_of(members).items() if entry.get("role") == "verifier")
+                freed = list(dict.fromkeys(freed))
                 if freed:
                     return post_message(COORDINATOR, "%s @%s was retired and reports nothing. Go on without it (if you merged its commit, rebuild without it), and name in "
                                         "your report what is missing for that." % (" ".join("@" + n for n in freed), name),
@@ -2860,8 +2868,19 @@ def main(argv):
         elif cmd == "show":
             as_json = "--json" in args
             rest = [a for a in args if a != "--json"]
+            if as_json and len(rest) == 1 and re.fullmatch(r"--before=[1-9][0-9]{0,8}", rest[0]):
+                stop = min(len(posts), int(rest[0].partition("=")[2]) - 1)
+                page, size = [], 0
+                for post in reversed(posts[max(0, stop - 12):stop]):
+                    line = json.dumps(post, ensure_ascii=False)
+                    size += len(line.encode("utf-8")) + 1
+                    if page and size > 60_000:
+                        break
+                    page.append(line)
+                print("\n".join(reversed(page)))
+                return
             if len(rest) > 1 or (as_json and not (rest and re.fullmatch(r"--post=[0-9]{1,9}", rest[0]))):
-                sys.exit("show takes a member name or --post=N [--json]")
+                sys.exit("show takes a member name, --post=N [--json], or --before=N --json")
             who = rest[0].lstrip("@").lower() if rest else None
             if who and not re.fullmatch(r"--post=[0-9]{1,9}", who) and who not in members:
                 sys.exit("show takes a member name or --post=N; members: %s" % " ".join("@" + n for n in members))

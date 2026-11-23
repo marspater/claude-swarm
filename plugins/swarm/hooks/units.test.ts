@@ -1203,3 +1203,35 @@ test('a fenced report wakes nobody it names, whatever tildes it holds', () => {
   expect(targets(`@coordinator HAND-BACK: put here.\n${fenced(report)}`, members, 'api')).toEqual(['coordinator'])
   expect(fenced('plain')).toBe('~~~\nplain\n~~~')
 })
+
+test('guard handles ambiguous commands, parent repositories and arithmetic shifts', async () => {
+  const $ = mockGuardEngine()
+  for (const command of [
+    'git -C .. commit -m x',
+    '$(echo git commit -am x)',
+    'eval "$(echo git commit -am x)"',
+    'python3 -c "git commit"',
+    'git fast-import', 'git quiltimport',
+    'GIT_CONFIG_GLOBAL=/tmp/config git publish',
+    'git -c include.path=/tmp/config publish',
+    'printf config > /tmp/gitconfig; git publish',
+    'echo $[1<<2]\ngit commit -m x',
+  ]) expect(await commitsInSharedCheckout($, command, '/project/sub'), command).toBe(true)
+  const member = { role: 'worker' as const, last_read_seq: 0 }
+  expect(actsAsAnother('python3 /p/board.py DIR post parser "I checked board*.py"', 'parser', member)).toBeUndefined()
+  expect(substitutions('echo $[$(printf 1)]')).toEqual(['printf 1'])
+  expect(actsAsAnother('B=/p/board.py; python3 "$B" DIR close', 'parser', member)).toBeDefined()
+  expect(actsAsAnother('echo $[1<<2]\npython3 /p/board.py DIR close', 'parser', member)).toBeDefined()
+  expect(waitsOnLooseMatch('while pkill -0 -f "build -x"; do sleep 1; done')).toBe(true)
+  expect(waitsOnLooseMatch('while pgrep --full "build -x"; do sleep 1; done')).toBe(true)
+  expect(waitsOnLooseMatch("printf '%s\\n' pgrep -f build; sleep 1")).toBe(false)
+  expect(waitsOnLooseMatch('while timeout 2 /usr/bin/pgrep -f build; do sleep 1; done')).toBe(true)
+  const roots = {
+    fs: { stat: async (path: string) => ({ realPath: path }) },
+    process: { run: async (args: string[]) => ({
+      exitCode: 0, stdout: args[2] === '/repo/sandbox' ? '/repo/sandbox\n' : '/repo\n',
+    }) },
+  } as never
+  expect(await commitsInSharedCheckout(roots, 'git -C ../sandbox commit', '/repo/app')).toBe(false)
+  expect(await commitsInSharedCheckout(roots, 'git -C ../sibling commit', '/repo/app')).toBe(true)
+})

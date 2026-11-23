@@ -1086,17 +1086,51 @@ class VerifyRegressions(unittest.TestCase):
             landed(gate, cand)
             assert g("show", "--name-only", "--format=", "HEAD") == "new.txt"
 
-            # A commit hook that changes what is committed: the commit is made, and the command says it is not what passed.
-            hook = proj / ".git" / "hooks" / "pre-commit"
-            hook.write_text("#!/bin/sh\necho hooked > new.txt\ngit add new.txt\n")
+            # A hook can reject the commit or change its private index, but it cannot land those changes.
+            g("config", "core.hooksPath", ".commit-hooks")
+            hook = proj / ".commit-hooks" / "pre-commit"
+            hook.parent.mkdir()
+            (proj / ".git" / "info").mkdir(exist_ok=True)
+            (proj / ".git" / "info" / "exclude").write_text("/.commit-hooks/\n")
+            hook.write_text("echo hooked > new.txt\ngit add new.txt\n")
             hook.chmod(0o755)
             (proj / "new.txt").write_text("newer\n")
             gate, cand = verified("grep -qx newer new.txt")
             line = next(line for line in run(*gate, "accept", cand).splitlines() if line.startswith("Commit with: "))
             changed = subprocess.run(line[len("Commit with: "):].replace("<message>", "land"), shell=True, cwd=proj,
                                      capture_output=True, text=True)
-            assert changed.returncode and "its files differ from the verified ones" in changed.stderr, changed.stderr
-            assert g("show", "HEAD:new.txt") == "hooked"
+            assert changed.returncode and "changed the verified Git tree" in changed.stderr, changed.stderr
+            assert g("show", "HEAD:new.txt") == "unix"
+            assert g("diff", "--cached", "--name-only") == ""
+
+            # An independent Git process can use the real index while the hook blocks. Its staging is preserved.
+            (proj / "new.txt").write_text("newer\n")
+            hook.write_text("#!/bin/sh\ntouch .swarm/hook-started\nwhile ! test -f .swarm/hook-release; do sleep .05; done\n")
+            gate, cand = verified("grep -qx newer new.txt")
+            run(*gate, "accept", cand)
+            run(sys.executable, SCRIPTS / "board.py", gate[2], "read", "coordinator")
+            run(sys.executable, SCRIPTS / "board.py", gate[2], "close")
+            import time
+            before = g("rev-parse", "HEAD")
+            with subprocess.Popen([*gate, "commit", cand, "-m", "land"], cwd=proj,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+                deadline = time.monotonic() + 5
+                try:
+                    while not (proj / ".swarm" / "hook-started").exists() and time.monotonic() < deadline:
+                        time.sleep(0.025)
+                    assert (proj / ".swarm" / "hook-started").exists()
+                    g("add", "new.txt")
+                    # Force a different staged tree without changing any verified working-tree file.
+                    g("update-index", "--chmod=+x", "new.txt")
+                finally:
+                    (proj / ".swarm" / "hook-release").touch()
+                _, error = process.communicate(timeout=10)
+                assert process.returncode and "the Git index or HEAD changed" in error, error
+            assert g("rev-parse", "HEAD") == before
+            assert g("diff", "--cached", "--summary") == "mode change 100644 => 100755 new.txt"
+            g("reset", "-q", "--", "new.txt")
+            assert "COMMITTED" in run(*gate, "commit", cand, "-m", "land after close")
+            assert g("show", "HEAD:new.txt") == "newer" and g("status", "--porcelain") == ""
 
     def test_the_printed_staging_command_stages_exactly_what_was_verified(self):
         import re
@@ -1172,6 +1206,67 @@ class VerifyRegressions(unittest.TestCase):
         cand = json.loads(run(*gate, "prepare", "shared", "--check", check))["candidate"]
         run(*post, "post", "v", "@coordinator " + run(*gate, "test", cand, "v").splitlines()[-1])
         return gate, cand, Path(board)
+
+    def test_shared_commit_round_trips_even_files_that_clean_to_the_parent_blob(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g = self._init_git(proj)
+            (proj / ".gitattributes").write_text("file.txt filter=swarm-test\n")
+            g("add", ".gitattributes")
+            g("commit", "-m", "Configure fixture")
+            g("config", "filter.swarm-test.clean", "head -c 2")
+            (proj / "file.txt").write_text("v1 plus tested bytes")
+            gate, cand, _ = self._verified(proj, "grep -qx 'v1 plus tested bytes' file.txt")
+            run(*gate, "accept", cand)
+            refused = subprocess.run([*gate, "commit", cand, "-m", "land"], capture_output=True, text=True)
+            assert refused.returncode and "would not bring back file.txt" in refused.stderr, refused.stderr
+            assert g("show", "HEAD:file.txt") == "v1"
+            g("config", "filter.swarm-test.smudge", "printf 'v1 plus tested bytes'")
+            assert "Nothing to commit" in run(*gate, "commit", cand, "-m", "land")
+
+    def test_publication_reports_landed_commit_and_recovers_only_the_original_index(self):
+        sys.path.insert(0, str(SCRIPTS))
+        self.addCleanup(sys.path.remove, str(SCRIPTS))
+        import verify
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g = self._init_git(proj)
+            g("branch", "other")
+            (proj / "file.txt").write_text("verified contents\n")
+            gate, cand, board = self._verified(proj, "grep -qx 'verified contents' file.txt")
+            run(*gate, "accept", cand)
+            original = (proj / ".git/index").read_bytes()
+            real_replace, real_git = os.replace, verify.git
+
+            def replace(src, dest):
+                if Path(src).name == "index.lock" and Path(dest) == proj / ".git/index":
+                    raise OSError("injected index publication failure")
+                return real_replace(src, dest)
+
+            def git_at_publication(root, *args, **kwargs):
+                if args[0] == "update-ref":
+                    # Both branches start at the same commit. A supported checkout switch needs the index lock.
+                    switched = subprocess.run(["git", "-C", str(root), "switch", "other"], capture_output=True, text=True)
+                    assert switched.returncode and "index.lock" in switched.stderr, switched.stderr
+                return real_git(root, *args, **kwargs)
+
+            with mock.patch.object(verify.os, "replace", side_effect=replace), \
+                 mock.patch.object(verify, "git", side_effect=git_at_publication):
+                with self.assertRaisesRegex(ValueError, r"commit [a-f0-9]+ landed[\s\S]*recover-index"):
+                    verify.commit(board, proj, cand, "land")
+            revision = g("rev-parse", "HEAD")
+            assert g("branch", "--show-current") == "main"
+            assert g("show", "HEAD:file.txt") == "verified contents"
+            assert (proj / ".git/index").read_bytes() == original
+            (proj / "later.txt").write_text("keep my staging")
+            g("add", "later.txt")
+            result = subprocess.run([*gate, "recover-index", cand], capture_output=True, text=True)
+            assert result.returncode and "index changed since publication" in result.stderr, result.stderr
+            assert g("show", ":later.txt") == "keep my staging"
+            (proj / ".git/index").write_bytes(original)
+            assert f"RECOVERED INDEX {revision}" in run(*gate, "recover-index", cand)
+            assert g("diff", "--cached", "--name-only") == ""
 
     def test_shared_accept_refuses_changes_inside_a_submodule(self):
         with tempfile.TemporaryDirectory() as t_sub, tempfile.TemporaryDirectory() as t:
@@ -1691,17 +1786,64 @@ class VerifyRegressions(unittest.TestCase):
             (proj / "app.txt").write_text("ok")
             env = dict(os.environ, SWARM_VERIFY_TIMEOUT="0.5")
             _, cand, board, result = self._checked(proj, "echo before; echo also >&2; sleep 30", env=env)
-            assert result.returncode and "verification command timed out after 0.5s" in result.stderr, result.stderr
+            assert result.returncode and "timed out after 0.5s" in result.stderr, result.stderr
             log = board / "checks" / f"{cand['candidate']}-attempt01-check01.log"
             assert log.read_text() == "before\nalso\n"
             assert "Timed out after 0.5s in " in result.stdout and f"2 lines (12 bytes) of output, log: {log}" in result.stdout
             assert "before\nalso\n(the last 2 of 2 lines; " in result.stdout, result.stdout
 
+    def test_a_timeout_reports_earlier_failures_and_runs_the_next_check(self):
+        with tempfile.TemporaryDirectory() as t:
+            env = dict(os.environ, SWARM_VERIFY_TIMEOUT="0.2")
+            _, _, _, result = self._checked(Path(t).resolve(), "exit 7", "sleep 15", "echo ran-after-timeout", env=env)
+            assert result.returncode and "exit 7; sleep 15 (timed out after 0.2s)" in result.stderr, result.stderr
+            assert "Exit 0" in result.stdout and result.stdout.count("ran-after-timeout") == 2, result.stdout
+
+    def test_output_is_bounded_and_an_overrun_is_a_failure(self):
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import verify
+            from unittest import mock
+            with tempfile.TemporaryDirectory() as t, tempfile.TemporaryFile() as output:
+                with mock.patch.object(verify, "MAX_CHECK_OUTPUT", 1 << 20):
+                    with self.assertRaises(verify.CheckOutputLimit):
+                        verify.run_check("head -c 2097152 /dev/zero", t, 10, output)
+                assert output.tell() == 1 << 20
+        finally:
+            sys.path.remove(str(SCRIPTS))
+
+    def test_background_logging_does_not_extend_a_completed_check(self):
+        sys.path.insert(0, str(SCRIPTS))
+        self.addCleanup(sys.path.remove, str(SCRIPTS))
+        import verify
+        with tempfile.TemporaryDirectory() as t, tempfile.TemporaryFile() as output:
+            assert verify.run_check("yes background & printf 'foreground\\n'; exit 0", t, 0.5, output) == 0
+            output.seek(0)
+            assert b"foreground\n" in output.read()
+
+    def test_checks_report_untracked_outputs_and_can_write_to_the_output_directory(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            self._init_git(proj)
+            _, _, _, result = self._checked(proj, "touch coverage.xml")
+            assert result.returncode and "new untracked files: coverage.xml" in result.stderr, result.stderr
+            assert "SWARM_VERIFY_OUTPUT_DIR" in result.stderr
+            (proj / "coverage.xml").unlink()
+            _, _, _, result = self._checked(proj, 'touch "$SWARM_VERIFY_OUTPUT_DIR/coverage.xml"')
+            assert result.returncode == 0, result.stderr
+            assert not (proj / "coverage.xml").exists()
+
     def test_logs_change_nothing_verification_records_or_accepts(self):
         with tempfile.TemporaryDirectory() as t:
             proj = Path(t).resolve()
             g = self._init_git(proj)
-            (proj / "file.txt").write_text("v2")
+            source = proj / "file.txt"
+            mtime = source.stat().st_mtime_ns
+            source.write_text("v2")
+            g("config", "core.trustctime", "false")
+            # A same-size edit at the index timestamp must trigger Git's content check when using a private index.
+            os.utime(source, ns=(mtime, mtime))
+            os.utime(proj / ".git/index", ns=(mtime, mtime))
             board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "logs", "init", "Logs"))
             post = [sys.executable, SCRIPTS / "board.py", board]
             gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
@@ -1775,6 +1917,7 @@ class DiffHygiene(unittest.TestCase):
             for setting in (("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")):
                 g("config", *setting)
             for name, content in files.items():
+                (proj / name).parent.mkdir(parents=True, exist_ok=True)
                 (proj / name).write_text(content)
             g("add", ".")
             g("commit", "-m", "init")
@@ -1865,6 +2008,9 @@ class DiffHygiene(unittest.TestCase):
             refused = self._prepare(py, gone, mode=mode)
             assert refused.returncode and 'app.py:1 still refers to "helper"' in refused.stderr, (mode, refused.stderr)
         assert self._prepare(py, gone, "REMOVED: helper").returncode == 0
+        spaced = self._prepare({"mod dir/lib.py": py["lib.py"], "mod dir/app.py": py["app.py"]},
+                               {"mod dir/lib.py": gone["lib.py"]}, mode="shared")
+        assert spaced.returncode and 'mod dir/app.py:1 still refers to "helper"' in spaced.stderr, spaced.stderr
         # The coordinator's own override wakes no worker, and stays on the record for the verifier and the export.
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -2101,6 +2247,15 @@ class BaselineDiff(unittest.TestCase):
         return subprocess.run([*gate, "test", cand, "v"], capture_output=True, text=True), cand, Path(board)
 
     OLD = 'echo "in $(pwd)"\necho "FAILED tests/test_old.py::test_a - assert 1 == 2"\necho "1 failed, 3 passed in 0.52s"\nexit 1\n'
+
+    def test_baseline_replays_only_completed_checks_before_a_timeout(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"SWARM_VERIFY_TIMEOUT": "0.5"}):
+            result, _, board = self._test(self.OLD, self.OLD + "# candidate\n", "--baseline-diff",
+                                         checks=("sh check.sh", "sleep 5", "echo 'FAILED later::check'; exit 1"))
+        assert result.returncode and "timed out" in result.stderr, result.stderr
+        assert "Waived" in result.stdout
+        assert [log.name.split("-")[-2] for log in (board / "checks").glob("*-base.log")] == ["check01"]
 
     def test_a_failure_the_base_already_has_is_waived_and_said(self):
         # The same failure: the checkout's path, the duration and the count of passing tests are no part of it.

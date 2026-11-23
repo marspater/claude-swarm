@@ -1270,6 +1270,8 @@ test('concurrent starts reserve a member once and a recorded agent is resumed ra
 
 test('Attention opens a post outside the recent window and a missing board clears the preview', async ($, on) => {
   const run = '/project/.swarm/history'
+  const olderPage = gate()
+  let delayPage = false
   let current = 'history'
   const board = Array.from({ length: 302 }, (_, i) => JSON.stringify({
     seq: i + 1, text: i === 0 ? 'Original question still open?' : 'Routine update.', agent: 'worker', time: '', to: ['coordinator'],
@@ -1286,10 +1288,14 @@ test('Attention opens a post outside the recent window and a missing board clear
     requested.push(e.path)
     return { value: e.path.endsWith('/current') ? current : e.path === `${run}/board.jsonl` ? board : ROSTER }
   })
-  on('process.run', (_, e) => ({ value: {
+  on('process.run', async (_, e) => {
+    if (delayPage && e.argv[3] === 'show' && e.argv[4] === '--before=3') await olderPage.wait()
+    return { value: {
     exitCode: 0, stderr: '', isStdoutTruncated: false, isStderrTruncated: false,
-    stdout: e.argv[3] === 'attention' ? JSON.stringify({ items: [{ kind: 'question', member: 'coordinator', seq: 1, text: 'Open question' }], members: {} }) : '',
-  } }))
+    stdout: e.argv[3] === 'attention' ? JSON.stringify({ items: [{ kind: 'question', member: 'coordinator', seq: 1, text: 'Open question' }], members: {} })
+      : e.argv[3] === 'show' && e.argv[4] === '--before=3' ? board.split('\n').slice(0, 2).join('\n') : '',
+    } }
+  })
   const clock = mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
   await clock.advance(2000)
@@ -1306,6 +1312,20 @@ test('Attention opens a post outside the recent window and a missing board clear
   expect((await ui.findAll({ type: 'Markdown' })).length).toBe(100)
   expect(await ui.find({ type: 'Text', text: /^Showing the newest 100 of 300\. Narrow the filter/ })).toBeDefined()
   expect(await ui.find({ key: 'earlier-posts' })).toBeUndefined()
+  await ui.press({ key: 'history-page' })
+  expect(await ui.find({ type: 'Markdown', text: /Original question still open/ })).toBeDefined()
+  expect((await ui.findAll({ type: 'Markdown' })).length).toBe(2)
+  await ui.press({ key: 'history-latest' })
+  expect(await ui.find({ type: 'Markdown', text: /Original question still open/ })).toBeUndefined()
+  delayPage = true
+  const pendingPage = ui.press({ key: 'history-page' })
+  await olderPage.held
+  await ui.press({ key: 'tab-attention' })
+  await ui.press({ key: 'attention-open-question-coordinator-1' })
+  olderPage.open()
+  await pendingPage
+  expect(await ui.find({ key: 'history-latest' })).toBeUndefined()
+  expect(await ui.find({ type: 'Markdown', text: /Original question still open/ })).toBeDefined()
   current = '../other-workspace'
   await clock.advance(2000)
   expect(await ui.find({ type: 'Text', text: /could not read the board/ })).toBeDefined()
@@ -2059,6 +2079,41 @@ test('a bind still waiting for the board when /clear fires does not bring the ol
   // the conversation that follows /clear owns nothing until it binds for itself
   await read()
   expect(binds()).toBe(2)
+})
+
+test('a delayed restoration cannot take ownership from a newer binding', async ($, on) => {
+  const restoration = gate()
+  const previous = '/project/.swarm/previous-20261122-100000'
+  const { answer, board } = owning(on, { board: () => '', roster: () => ROSTER })
+  const placed: string[] = []
+  const killed: string[] = []
+  on('ui.place', (_, e) => { placed.push(e.id); return { value: { isPlaced: true, requestId: e.id } } })
+  on('process.run', async (_, e) => {
+    if (e.argv[3] === 'restore') {
+      await restoration.wait()
+      return answer(previous)
+    }
+    if (e.argv[3] === 'kill') {
+      killed.push(e.argv[2]!)
+      return answer('already closed\n')
+    }
+    return answer(board(e))
+  })
+  on('agent.list', () => ({ value: [] }))
+  on('tool.call', () => ({ result: {} }))
+  mock.clock(on)
+  const starting = $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await restoration.held
+  try {
+    await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+    expect(placed).toHaveLength(1)
+  } finally {
+    restoration.open()
+  }
+  await starting
+  expect(placed).toHaveLength(1)
+  await killCommand($)
+  expect(killed).toEqual([OWNED])
 })
 
 test('the pane pauses, resumes and answers attention items on the board itself, only for the run this conversation drives', async ($, on) => {
@@ -4393,7 +4448,7 @@ for (const members of [18, 24]) test(`audit: a dense graph of ${members} never h
       expect(String(graph?.props.source)).toMatch(new RegExp(`<path class="route(?: motion-route)?" d="[^"]*" pathLength="100"[^>]*><title>${from} to ${to} · \\d+ mentions?</title>`))
       expect(String(graph?.props.source)).toContain('class="legend"')
       // expanded, there are more routes than one drawing holds, and the pane says how many it left out
-      if (stage === 'expanded') expect(await ui.find({ type: 'Text', text: /^\d+ quieter routes? not drawn/ })).toBeDefined()
+      if (stage === 'expanded') expect(await ui.find({ type: 'Text', text: /^\d+ quieter routes? not drawn/ }), 'expanded omission count').toBeDefined()
       if (stage === 'collapsed') await ui.press({ key: 'expand-all' })
     }
     await ui.unmount()
@@ -4401,9 +4456,9 @@ for (const members of [18, 24]) test(`audit: a dense graph of ${members} never h
     const narrow = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, bodyColumns: 30 } })
     await narrow.press({ key: 'tab-graph' })
     expect((await narrow.findAll({ type: 'Svg' })).find(svg => String(svg.props.alt).startsWith('Post '))).toBeUndefined()
-    expect(await narrow.find({ type: 'Text', text: /too narrow to draw this graph legibly/ })).toBeDefined()
-    expect(await narrow.find({ type: 'Text', text: /@worker-\d+ → @/ })).toBeDefined()
-    expect(await narrow.find({ type: 'Text', text: /^… and \d+ more$/ })).toBeDefined()
+    expect(await narrow.find({ type: 'Text', text: /too narrow to draw this graph legibly/ }), 'narrow explanation').toBeDefined()
+    expect((await narrow.findAll({ type: 'Text' })).map(item => item.text).join(' '), 'narrow routes').toMatch(/@(?:coordinator|worker-\d+) → @/)
+    expect(await narrow.find({ type: 'Text', text: /^… and \d+ more$/ }), 'narrow remaining count').toBeDefined()
     await narrow.unmount()
   }
 })
@@ -5169,9 +5224,11 @@ test('guard: every common wrapper is read through, or refused for sure when it c
     "trap 'git commit -m x' EXIT", '. <(echo "git commit -m x")', 'source <(echo "git commit -m x")', "bash <(echo 'git commit -m x')"]) {
     expect(await deny(command), command).toContain(REFUSED)
   }
-  // what only a report or a variable that names no commit says is not read as one
+  // A dynamically named board script is refused because its identity cannot be checked.
+  expect(await deny(`B="python3 /p/board.py ${OWNED}"; $B ready alice <<'EOF'\nNo git commit was run.\nEOF`)).toBeDefined()
+  // What only a report or a variable that names no commit says is not read as one.
   for (const command of [
-    `B="python3 /p/board.py ${OWNED}"; $B ready alice <<'EOF'\nNo git commit was run.\nEOF`, `$PY /p/board.py ${OWNED} post alice "git diff is clean, I am done"`,
+    `$PY /p/board.py ${OWNED} post alice "git diff is clean, I am done"`,
     "trap 'rm -f /tmp/x' EXIT", '. ./env.sh && git status',
   ]) expect(await deny(command), command).toBeUndefined()
 })
@@ -6130,7 +6187,7 @@ test('a coordinator turn that ends while /swarm-kill gathers its diagnostics is 
 
 /** A run this conversation drives, whose board's kill retires every member and prints each one's agent. */
 function killable(on: On, members: Record<string, Record<string, unknown>>, rosterFails = (_state: Record<string, unknown>) => false,
-  more: { hold?: (path: string, state: Record<string, unknown>) => Promise<void> | undefined; read?: (path: string) => string | undefined; failsAfterClosing?: boolean; compact?: () => unknown; lsofFails?: boolean } = {}) {
+  more: { hold?: (path: string, state: Record<string, unknown>) => Promise<void> | undefined; read?: (path: string) => string | undefined; failsAfterClosing?: boolean; compact?: () => unknown; lsofFails?: boolean; stopped?: string[]; afterClosing?: () => Promise<void> } = {}) {
   const state: Record<string, unknown> = { title: 'Kill swarm', members: { coordinator: { role: 'coordinator', last_read_seq: 1 }, ...members } }
   const fixture = owning(on, {
     board: () => posts({ agent: 'coordinator', to: Object.keys(members), text: 'BRIEF' }),
@@ -6138,19 +6195,25 @@ function killable(on: On, members: Record<string, Record<string, unknown>>, rost
     hold: path => more.hold?.(path, state),
     read: more.read,
   })
-  on('process.run', (_, e) => {
+  on('process.run', async (_, e) => {
     if (e.argv[0] === 'lsof' && more.lsofFails) return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     if (e.argv[3] !== 'kill') return fixture.answer(fixture.board(e))
     fixture.board(e)
+    const retired = Object.entries(state.members as Record<string, Record<string, unknown>>)
+      .filter(([name, member]) => name !== 'coordinator' && !member.killed)
+    if (state.closed && retired.length === 0) return fixture.answer('already closed\n')
     state.closed = true
     state.killed = 'killed by the user'
-    const retired = Object.entries(state.members as Record<string, Record<string, unknown>>).filter(([name]) => name !== 'coordinator')
     for (const [, member] of retired) member.killed = '1'
+    await more.afterClosing?.()
     // the roster is saved, then appending the SHUTDOWN post fails: no ids are printed
     if (more.failsAfterClosing) return { value: { exitCode: 1, stdout: '', stderr: 'OSError: disk full', isStdoutTruncated: false, isStderrTruncated: false } }
-    return fixture.answer(`killed: ${retired.length} member(s) retired, run closed\n${retired.map(([name, member]) => `@${name} ${String(member.id)}\n`).join('')}`)
+    return fixture.answer(`killed: ${retired.length} member(s) retired, run closed\n${retired.filter(([, member]) => member.id).map(([name, member]) => `@${name} ${String(member.id)}\n`).join('')}`)
   })
-  on('tool.call', () => ({ result: {} }))
+  on('tool.call', (_, e) => {
+    if (e.tool === 'TaskStop' && e.task_id) more.stopped?.push(e.task_id)
+    return { result: {} }
+  })
   const compacted: (string | undefined)[] = []
   on('session.compact', (_, e) => {
     compacted.push(e.instructions)
@@ -6268,6 +6331,119 @@ const settle = async (clock: Awaited<ReturnType<typeof mock.clock>>, $: Engine) 
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'c0', reason: 'answer' })
   await clock.advance(2000)
 }
+
+test('an agent returned after the run was killed is stopped and never registered', async ($, on) => {
+  const spawn = gate()
+  const stopped: string[] = []
+  const { seen } = killable(on, { alice: { role: 'worker', paths: 'src', last_read_seq: 1 } }, undefined, { stopped })
+  on('agent.list', () => ({ value: [] }))
+  on('agent.spawn', async (_, e) => {
+    await spawn.wait()
+    return { model: e.model ?? 'opus', agentId: 'late-agent' }
+  })
+  const clock = mock.clock(on)
+  await settle(clock, $)
+  const starting = $.agent.spawn({ tool_use_id: 'late', prompt: 'Read your brief.', description: '@alice: work',
+    subagentType: 'swarm:worker', provider: { plugin: 'swarm', tier: 'core' }, parentModel: 'opus', background: true, fork: false })
+  await spawn.held
+  await killCommand($)
+  spawn.open()
+  expect((await starting).agentId).toBeUndefined()
+  expect(stopped).toEqual(['late-agent'])
+  expect(seen.commands.some(command => command.startsWith('started '))).toBe(false)
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/src/file', agentId: 'late-agent' })).deny).toContain('retired')
+})
+
+test('two first starts can join the same run while an assignment check waits', async ($, on) => {
+  const waiting = gate()
+  let holdList = false
+  const members = { coordinator: { role: 'coordinator' }, a: { role: 'worker' }, b: { role: 'worker' } }
+  const { answer, board, seen } = owning(on, { board: () => '', roster: () => JSON.stringify({ members }) })
+  on('process.run', (_, e) => answer(e.argv[3] === 'locate' ? OWNED : board(e)))
+  on('agent.list', async () => {
+    if (holdList) { holdList = false; await waiting.wait() }
+    return { value: [] }
+  })
+  on('agent.spawn', (_, e) => ({ model: 'sonnet', agentId: e.tool_use_id }))
+  mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  const spawn = (name: string) => $.agent.spawn({ tool_use_id: name, description: `@${name}: work`,
+    prompt: 'Read your brief.', subagentType: 'swarm:worker', provider: { plugin: 'swarm', tier: 'core' },
+    parentModel: 'sonnet', background: true, fork: false })
+  holdList = true
+  const later = spawn('b')
+  await waiting.held
+  try {
+    expect((await spawn('a')).agentId).toBe('a')
+  } finally {
+    waiting.open()
+  }
+  expect((await later).agentId).toBe('b')
+  expect(seen.commands.filter(command => command.startsWith('started '))).toEqual(['started a a ', 'started b b '])
+})
+
+for (const writeLanded of [false, true]) test(`a failed start acknowledgement keeps only an agent whose address was saved (${writeLanded})`, async ($, on) => {
+  const stopped: string[] = []
+  const worker = { role: 'worker', id: '', killed: '' }
+  const { answer, board } = owning(on, { board: () => '', roster: () => JSON.stringify({
+    members: { coordinator: { role: 'coordinator' }, alice: worker },
+  }) })
+  on('process.run', (_, e) => {
+    if (e.argv[3] === 'started') {
+      if (writeLanded) worker.id = 'new-agent'
+      else worker.killed = '1'
+      return { value: { exitCode: 1, stdout: '', stderr: 'board write interrupted', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    return answer(board(e))
+  })
+  on('agent.list', () => ({ value: [] }))
+  on('agent.spawn', () => ({ model: 'sonnet', agentId: 'new-agent' }))
+  on('tool.call', (_, e) => {
+    if (e.tool === 'TaskStop' && e.task_id) stopped.push(e.task_id)
+    return { result: {} }
+  })
+  const clock = mock.clock(on)
+  await settle(clock, $)
+  const result = await $.agent.spawn({ tool_use_id: 'new', description: '@alice: work', prompt: 'Read your brief.',
+    subagentType: 'swarm:worker', provider: { plugin: 'swarm', tier: 'core' }, parentModel: 'sonnet',
+    background: true, fork: false })
+  expect(result.agentId).toBe(writeLanded ? 'new-agent' : undefined)
+  expect(stopped).toEqual(writeLanded ? [] : ['new-agent'])
+})
+
+test('a repeated kill neither refuses the current turn nor compacts it again', async ($, on) => {
+  const { compacted } = killable(on, { alice: { role: 'worker', id: 'alice-1', last_read_seq: 1 } })
+  on('agent.list', () => ({ value: [] }))
+  const clock = mock.clock(on)
+  await settle(clock, $)
+  await killCommand($)
+  await clock.advance(100)
+  await $.turn.start({ text: 'Continue', turnId: 'c1' })
+  expect((await killCommand($)).text).toContain('already closed')
+  expect((await toolCall($, { tool: 'Read', file_path: '/project/src/file' })).deny).toBeUndefined()
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'c1' })
+  await clock.advance(100)
+  expect(compacted.length).toBe(1)
+})
+
+test('kill finishes after turn accounting has already released the same run', async ($, on) => {
+  const closed = gate()
+  const { compacted } = killable(on, { alice: { role: 'worker', id: 'alice-1', last_read_seq: 1 } },
+    undefined, { afterClosing: closed.wait })
+  on('agent.list', () => ({ value: [] }))
+  const clock = mock.clock(on)
+  await settle(clock, $)
+  await $.turn.start({ text: 'Work', turnId: 'charged' })
+  const killing = killCommand($)
+  await closed.held
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'charged',
+    usage: { model: 'm', input_tokens: 10, output_tokens: 3, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } })
+  closed.open()
+  expect((await killing).text).toContain('1 member(s) retired')
+  expect((await handedBack($, 'alice-1')).drop).toBeDefined()
+  await clock.advance(100)
+  expect(compacted).toHaveLength(1)
+})
 
 test('/swarm-kill refuses the agents its board named before it reads the roster', async ($, on) => {
   const roster = gate()
@@ -6544,8 +6720,16 @@ test('spend guards: a read-only member past the context ceiling may only report,
   }
   const mirrored: (string | undefined)[] = []
   let postFails = false
+  let ready = ''
+  const symlinks: Record<string, string> = {
+    '/project/.swarm': '/data/runs',
+    '/project/.swarm/tasks/brief.md': '/data/runs/tasks/brief.md',
+    '/project/.swarm/tasks/linked.ts': '/project/src/linked.ts',
+  }
+  on('fs.stat', (_, e) => symlinks[e.path] ? { value: { realPath: symlinks[e.path] } as never } : { deny: 'unavailable' })
   const { seen, answer, board } = owning(on, {
-    board: () => posts({ agent: 'coordinator', to: ['scout', 'builder'], text: '@scout @builder BRIEF' }),
+    board: () => posts({ agent: 'coordinator', to: ['scout', 'builder'], text: '@scout @builder BRIEF' },
+      ...(ready ? [{ agent: 'scout', to: ['coordinator'], text: ready }] : [])),
     roster: () => JSON.stringify(state),
   })
   on('process.run', (_, e) => {
@@ -6615,6 +6799,16 @@ test('spend guards: a read-only member past the context ceiling may only report,
   await $.prompt.submit({ text: `Another Claude session sent a message:\n<agent-message from="scout-1">\n[Subagent hand-back] ${long}</agent-message>`, origin: { kind: 'peer' }, wait: false })
   expect(mirrored.slice(1).map(text => [text?.includes('part 1 of 2'), text?.includes('part 2 of 2'), text?.includes('TAIL-FINDING')])).toEqual([[true, false, false], [false, true, true]])
   expect([seen.prompts.at(-1)?.includes('whole, in posts #7, #7'), seen.prompts.at(-1)?.includes('TAIL-FINDING')]).toEqual([true, false])
+  ready = `READY\n${findings}`
+  state.members.scout.last_read_seq = 2
+  await $.prompt.submit({ text: `<agent-message from="scout-1">\n[Subagent hand-back] ${findings}</agent-message>`, origin: { kind: 'peer' }, turnId: 'c0', wait: false })
+  expect(mirrored.length).toBe(3)
+  expect(seen.prompts.at(-1)).toContain('@scout reported on the board in post #2')
+  expect(seen.prompts.at(-1)).not.toContain('ST1 restoreBackup')
+  ready = 'Status update. Still investigating.'
+  await $.prompt.submit({ text: `<agent-message from="scout-1">\n[Subagent hand-back] ${findings}</agent-message>`, origin: { kind: 'peer' }, turnId: 'c0', wait: false })
+  expect(mirrored).toHaveLength(4)
+  expect(mirrored.at(-1)).toContain(findings.trim())
   // an agent that is no member of the run is measured but told nothing: it has no board to post on
   await step('outsider', 'o', 0, 210_000)
   const stranger = await grep('outsider')
@@ -6633,6 +6827,8 @@ test('spend guards: a read-only member past the context ceiling may only report,
   expect((await look('/project/src/c.ts')).deny).toContain('third or later repository lookup in one turn')
   expect((await toolCall($, { tool: 'Grep', pattern: 'x' } as never)).deny).toContain('ask its author on the board')
   expect((await look('.swarm/sweep-20261123-120000/members.json')).deny).toBeUndefined()
+  expect((await look('/project/.swarm/tasks/brief.md')).deny).toBeUndefined()
+  expect((await look('/project/.swarm/tasks/linked.ts')).deny).toContain('third or later repository lookup')
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'c1' })
   await $.turn.start({ text: 'again', turnId: 'c2' })
   expect((await look('/project/src/c.ts')).deny).toBeUndefined()

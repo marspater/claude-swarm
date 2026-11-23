@@ -1629,7 +1629,8 @@ class BoardRegressions(unittest.TestCase):
     def test_prune_dry_run_matches_a_real_prune_for_integration_worktrees(self):
         git = lambda *a: subprocess.run(["git", "-C", self.root, *a], check=True, capture_output=True)
         git("init", "-q")
-        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+            "commit", "-q", "--allow-empty", "-m", "x")
         d = self.init_run()
         run(d, "close")
         wt = os.path.join(d, "integration-abc")
@@ -1644,7 +1645,8 @@ class BoardRegressions(unittest.TestCase):
     def test_prune_removes_only_clean_recorded_baseline_worktrees(self):
         git = lambda *a: subprocess.run(["git", "-C", self.root, *a], check=True, capture_output=True)
         git("init", "-q")
-        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+            "commit", "-q", "--allow-empty", "-m", "x")
         d = self.init_run()
         # A manually created baseline-* worktree with uncommitted edits inside an open run must never be removed.
         manual = os.path.join(d, "baseline-manual-comparison")
@@ -2550,8 +2552,45 @@ class BoardRegressions(unittest.TestCase):
         run(d, "member", "b")
         run(d, "post", "a", "@b which parser?")
         run(d, "post", "a", "@b which printer?")
-        run(d, "post", "b", "@a re: #1 the regex one")
+        run(d, "post", "b", "@a re: #1 the regex one. The build number was #2.")
         assert [item["seq"] for item in self.items(d, "question")] == [2]
+
+    def test_a_ready_answers_the_question_it_explicitly_cites(self):
+        d = self.init_run()
+        run(d, "member", "a")
+        run(d, "member", "b")
+        run(d, "post", "a", "@b which parser?")
+        run(d, "post", "a", "@b which printer?")
+        run(d, "ready", "b", stdin="re #1 the regex parser. This also relates to #2.")
+        assert [item["seq"] for item in self.items(d, "question")] == [2]
+
+    def test_history_pages_are_exclusive_and_ordered(self):
+        d = self.init_run()
+        for n in range(1, 15):
+            run(d, "post", "coordinator", f"Post {n}")
+        page = run(d, "show", "--before=15", "--json").splitlines()
+        assert [json.loads(line)["seq"] for line in page] == list(range(3, 15))
+        earlier = run(d, "show", "--before=3", "--json").splitlines()
+        assert [json.loads(line)["seq"] for line in earlier] == [1, 2]
+
+    def test_retiring_the_last_unready_worker_notifies_the_verifier(self):
+        d = self.init_run()
+        run(d, "member", "a")
+        run(d, "member", "b")
+        run(d, "member", "v", "role=verifier", "id=verifier-agent")
+        run(d, "ready", "a", stdin="my part is ready")
+        run(d, "read", "v")
+        run(d, "member", "b", "killed=1")
+        assert "v " in run(d, "wake")
+        assert "was retired" in run(d, "read", "v")
+
+    def test_retiring_every_worker_does_not_send_the_verifier_an_empty_candidate(self):
+        d = self.init_run()
+        run(d, "member", "a")
+        run(d, "member", "v", "role=verifier", "id=verifier-agent")
+        run(d, "member", "a", "killed=1")
+        assert "v " not in run(d, "wake")
+        assert "was retired" not in run(d, "read", "v")
 
     def test_a_long_unbroken_token_is_read_for_questions_in_linear_time(self):
         # Quadratic before: 12,000 characters took 0.1 s, so this took most of a minute.

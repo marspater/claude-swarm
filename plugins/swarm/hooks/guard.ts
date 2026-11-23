@@ -84,18 +84,30 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
   const cwd = await resolveRealPath($, checkout)
   const directoryAfter = (current: string | undefined, path?: string) => {
     // A path the shell expands (`$PWD`, `~`, a glob) leads where this cannot tell: it may be the checkout.
-    if (path === undefined || /[$`~*?[{]/.test(path)) return undefined
+    if (path === undefined || path === '_' || /[$`~*?[{]/.test(path)) return undefined
     if (!path || path === '.' || path === './') return current
     if (path.startsWith('/')) return normalizePath(path)
     return current && normalizePath(`${current}/${path}`)
   }
-  // A folder under .claude/worktrees counts as an isolated worktree only when git made it one: a plain
-  // folder there resolves to the main repository, so a commit from it lands in the shared checkout.
-  // A folder that cannot be told (`cd -`, `popd`) may be the checkout, so a commit from it is refused.
+  const roots = new Map<string, Promise<string | undefined>>()
+  const checkoutRoot = (dir: string) => {
+    const found = roots.get(dir) ?? $.process.run(['git', '-C', dir, 'rev-parse', '--show-toplevel'], { timeoutMs: 5000 })
+      .then(result => {
+        const root = result.stdout.replace(/\r?\n$/, '')
+        return result.exitCode === 0 && root.startsWith('/') ? resolveRealPath($, root) : undefined
+      }, () => undefined)
+    roots.set(dir, found)
+    return found
+  }
   const insideCheckout = async (given: string | undefined) => {
     if (given === undefined) return true
     const dir = await resolveRealPath($, given)
-    if (dir !== cwd && !dir.startsWith(`${cwd}/`)) return false
+    if (dir === cwd) return true
+    const [root, target] = await Promise.all([checkoutRoot(cwd), checkoutRoot(dir)])
+    if (root && target) return root === target
+    if (root) return dir === root || dir.startsWith(`${root}/`)
+    if (!dir.startsWith(`${cwd}/`)) return cwd.startsWith(`${dir}/`)
+    // If Git cannot answer, preserve the linked-worktree fallback inside the project.
     const name = /^\/\.claude\/worktrees\/([^/]+)/.exec(dir.slice(cwd.length))?.[1]
     if (name === undefined) return true
     const link = await $.fs.read(`${cwd}/.claude/worktrees/${name}/.git`).catch(() => '')
@@ -108,7 +120,7 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
   // A repository named by GIT_DIR or GIT_WORK_TREE anywhere in the command (an export, a declare, a prefix) cannot
   // be told from the folder: every commit in it is refused. Config given in the environment may define aliases.
   const isNamedElsewhere = /\bGIT_(?:DIR|WORK_TREE)=/.test(command)
-  const isConfiguredElsewhere = /\bGIT_CONFIG_(?:COUNT|PARAMETERS|KEY_\d+|VALUE_\d+)=/.test(command)
+  const isConfiguredElsewhere = /\b(?:GIT_CONFIG_(?:COUNT|PARAMETERS|KEY_\d+|VALUE_\d+|GLOBAL|SYSTEM)|HOME|XDG_CONFIG_HOME)=/.test(command) || /\bgit\s+(?:[^\n;]*\s)?-c\s+include(?:If\.[^=]+)?\.path=/i.test(command) || /\bgit\s+config\b/.test(command) || />\s*[^\s;|&]*(?:config|\.gitconfig)\b/i.test(command)
   // What the command's own assignments give its variables (`C='git commit -m x'`), read off its statements, not off
   // heredoc bodies or comments: a variable one of them names may stand for a commit.
   const values = new Map<string, string[]>()
@@ -124,6 +136,7 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
   // Words this cannot read (a variable, a substitution, a placeholder) that may stand for a commit: one of the words
   // beside them names one, or a variable among them was given one.
   const mayCommit = (words: readonly string[]) => words.some(word => COMMITTING.includes(word)) || viaVariable(words.join(' '))
+  const namesDirectCommit = new RegExp(`\\bgit\\s+(?:${COMMITTING.join('|')})\\b`)
   // Aliases the command itself sets with `git config alias.<name> <value>`, and the functions it defines.
   const aliases = new Map<string, string>()
   const functions = new Set<string>()
@@ -288,7 +301,10 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
     const end = (ok: Dirs, failed: Dirs = here): End => ({ hit: false, ok, failed })
     if (name === undefined) return end(here, here)
     // A command named by a variable, a substitution or a placeholder (`$GIT commit`, `{}` under xargs) is any command.
-    if (/[$`{}*?]/.test(words[at]!) || words[at] === '_') return mayCommit(words.slice(at)) || (fromStdin && NAMES_COMMIT.test(command)) ? HIT : end(here)
+    if (/[$`{}*?]/.test(words[at]!) || words[at] === '_') {
+      return mayCommit(words.slice(at)) || (fromStdin && NAMES_COMMIT.test(command)) ||
+        (words[at] === '_' && namesDirectCommit.test(command)) ? HIT : end(here)
+    }
     if (!isChild && (name === 'cd' || name === 'pushd' || name === 'popd')) {
       // `cd -`, `cd` alone and `popd` go somewhere this cannot follow.
       const to = name === 'popd' ? undefined : args.find(arg => arg !== '--' && !/^-[LPe@]+$/.test(arg))
@@ -317,7 +333,7 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
     }
     if (name === 'eval') {
       // eval runs its words in this shell: a cd there moves it. Words a variable fills in may be any command.
-      if (/[$`]/.test(args.join(' ')) && mayCommit(args)) return HIT
+      if ((/[$`]/.test(args.join(' ')) || args.includes('_')) && (mayCommit(args) || NAMES_COMMIT.test(command))) return HIT
       const ran = await run(args.join(' '), from, depth + 1)
       return ran.hit ? HIT : isChild ? end(here) : ran
     }
@@ -356,6 +372,9 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
     // A command this does not know (or a strict wrapper whose flag could not be read) that runs git or a shell after
     // it is a commit when it names one, when its shell script commits, or when its further words come from its input.
     if (!INERT.has(name)) {
+      if (/^(?:python\d*|perl|node|ruby|osascript|su|tmux)$/.test(name) &&
+          (name === 'tmux' || args.some(arg => /^-[A-Za-z]*[ce]/.test(arg))) &&
+          args.some(arg => /\bgit\s+(?:commit|commit-tree|fast-import|quiltimport)\b/.test(arg))) return HIT
       if ((unreadWrapper || RUNNERS.has(name)) && NAMES_COMMIT.test(words.slice(at).join(' '))) return HIT
       const runsGit = words.slice(at + 1).some(word => /^git(?:-.+)?$/.test(word.replace(/^.*\//, '')))
       if (runsGit && (fromStdin || NAMES_COMMIT.test(words.slice(at).join(' ')))) return HIT
@@ -598,44 +617,85 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
 
 // pgrep's options that take a value of their own: the word after one is no pattern and no flag.
 const PGREP_VALUED = /^-[A-Za-z]*[dFgGPstuU]$/
+const assignment = /^([A-Za-z_]\w*)=([\s\S]*)$/
+const variableWord = /^\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})$/
+
+function possibleCommands(command: string) {
+  const statements = scriptsRun(command).flatMap(script => scanShell(script).map(statement => ({
+    ...statement, script, words: withoutRedirects(shellWords(unwrap(statement.text).text)).words,
+  })))
+  const variables = new Map<string, string>()
+  for (const { words } of statements) {
+    for (const word of words[0] === 'export' ? words.slice(1) : words) {
+      const match = assignment.exec(word)
+      if (!match) break
+      variables.set(match[1]!, match[2]!)
+    }
+  }
+  return { statements, expand: (word: string) => {
+    const match = variableWord.exec(word)
+    return match ? variables.get(match[1] ?? match[2]!) ?? word : word
+  } }
+}
+
+function executableIndex(words: readonly string[]): number {
+  let at = 0
+  while (at < words.length) {
+    const name = words[at]!.replace(/^.*\//, '')
+    if (assignment.test(words[at]!)) { at++; continue }
+    const wrapper = PREFIXES.get(name)
+    if (!wrapper || wrapper.joins) break
+    for (at++; words[at]?.startsWith('-');) {
+      const flag = words[at++]!
+      if (flag === '--') break
+      if (flag.startsWith('--')) {
+        if (wrapper.long?.[flag.slice(2)] === true) at++
+        continue
+      }
+      const valueAt = [...flag.slice(1)].findIndex(ch => wrapper.valued.includes(ch))
+      if (valueAt >= 0 && valueAt + 2 === flag.length) at++
+    }
+    at += wrapper.operands ?? 0
+  }
+  return at
+}
+
 /**
  * Whether a command waits (a loop or a sleep) on a `pgrep -f` that is not exact (`-x`). Such a pattern matches any
  * command line that contains it, so a wait for `xcodebuild` never ends while an `xcodebuildmcp` server runs.
  * Read off the words of every script the command runs. A wait is a `sleep` run as a command or a statement that
  * opens a loop, not the word in an argument. `-f` counts wherever it stands; `-x` only before the pattern, so one in
- * the pattern, in a comment or in a later command excuses nothing. A pgrep the words do not show (a variable, an
- * alias) is read off the raw text: over-refusing costs one retry, a missed wait costs minutes.
+ * the pattern, in a comment or in a later command excuses nothing.
  */
 export function waitsOnLooseMatch(command: string): boolean {
   if (!/\b(?:sleep|while|until)\b/.test(command)) return false
   let waits = false
   let loose = false
-  let parsed = 0
-  for (const script of scriptsRun(command)) {
-    for (const { text } of scanShell(script)) {
-      const words = withoutRedirects(shellWords(unwrap(text).text)).words
-      if (words[0] === 'sleep' || /^\s*(?:while|until)\b/.test(text)) waits = true
-      for (let at = words.indexOf('pgrep'); at >= 0; at = words.indexOf('pgrep', at + 1)) {
-        parsed++
-        let full = false
-        let exact = false
-        let isPatternSeen = false
-        for (let i = at + 1; i < words.length && !words[i]!.startsWith('#'); i++) {
-          const word = words[i]!
-          if (!/^-./.test(word)) {
-            isPatternSeen = true
-            continue
-          }
-          const flags = word === '--full' ? 'f' : word === '--exact' ? 'x' : word.startsWith('--') ? '' : word.slice(1)
-          if (flags.includes('f')) full = true
-          if (flags.includes('x') && !isPatternSeen) exact = true
-          if (PGREP_VALUED.test(word)) i++
+  const { statements, expand } = possibleCommands(command)
+  for (const { text, words } of statements) {
+    const at = executableIndex(words)
+    const name = expand(words[at] ?? '').replace(/^.*\//, '')
+    if (name === 'sleep' || /^\s*(?:while|until)\b/.test(text)) waits = true
+    if (name === 'pgrep' || name === 'pkill') {
+      let full = false
+      let exact = false
+      let isPatternSeen = false
+      for (let i = at + 1; i < words.length && !words[i]!.startsWith('#'); i++) {
+        const word = words[i]!
+        if (word === '--') break
+        if (isPatternSeen || !/^-./.test(word)) {
+          isPatternSeen = true
+          continue
         }
-        if (full && !exact) loose = true
+        const flags = word === '--full' ? 'f' : word === '--exact' ? 'x' : word.startsWith('--') ? '' : word.slice(1)
+        if (flags.includes('f')) full = true
+        if (flags.includes('x') && !isPatternSeen) exact = true
+        if (PGREP_VALUED.test(word) || /^--(?:delimiter|pidfile|pgroup|group|session|terminal|euid|uid)$/.test(word)) i++
       }
+      if (full && !exact) loose = true
     }
   }
-  return parsed === 0 ? /\bpgrep\b[^;|&)\n]*\s-[A-Za-z]*f/.test(command) : waits && loose
+  return waits && loose
 }
 
 // The board commands a member may type in Bash: reading, and its own posts and reports, as the board tool takes
@@ -650,51 +710,62 @@ const MEMBER_OWN = new Set(['read', 'post', 'ready', 'revise', 'sync'])
 export function actsAsAnother(command: string, name: string, member: Roster[string]): string | undefined {
   const isVerifier = member.role === 'verifier'
   const unread = (script: string) => `a ${script} command is checked only when its subcommand and name are typed plainly: no wrapper, variable or substitution in them`
-  for (const script of scriptsRun(command)) {
-    for (const { text, unread: isUnread } of scanShell(script)) {
-      // A substitution that never closes runs what this cannot list.
-      if (isUnread && /\b(?:board|verify)\.py\b/.test(script)) return unread(/\bboard\.py\b/.test(script) ? 'board' : 'verify')
-      const words = shellWords(unwrap(text).text)
-      const call = boardCalls(text)[0]
-      // A board command typed plainly, run so that more may follow it (`python3 -i`), runs what this cannot read.
-      if (call && launches(words, 'board.py', command) === 'other') return unread('board')
-      if (call) {
-        if (MEMBER_READS.has(call.action)) continue
-        const own = MEMBER_OWN.has(call.action) && !(isVerifier && call.action !== 'read' && call.action !== 'post')
-        const named = withoutRedirects(shellWords(call.rest)).words.slice(1).find(word => !word.startsWith('-'))?.replace(/^@/, '').toLowerCase()
-        if (!own) return `the board's ${call.action} is the coordinator's${isVerifier && MEMBER_OWN.has(call.action) ? ', and a verifier reports with post' : ''}`
-        if (named !== name) return `the board's ${call.action} names @${named ?? '?'}, and @${name} acts only as itself`
-      } else if (launches(words, 'board.py', command)) return unread('board')
-      const verify = launches(words, 'verify.py', command)
-      if (!verify) continue
-      const cleanWords = withoutRedirects(words).words
-      const at = cleanWords.findIndex(word => /(?:^|\/)verify\.py$/.test(word))
-      // Run some other way (python -c, a module, a program from its input), its words are not the ones it gets.
-      if (verify === 'other' || at < 0) return unread('verify')
-      const action = cleanWords.slice(at + 3).find(word => !word.startsWith('-'))
-      if (action === undefined || !['prepare', 'test', 'accept', 'commit'].includes(action)) return unread('verify')
-      // A verifier tests a candidate under its own name; preparing, accepting and committing candidates is the coordinator's.
-      let tester: string | undefined
-      if (action === 'test') {
-        const positionals: string[] = []
-        for (let i = cleanWords.indexOf(action, at + 3) + 1; i < cleanWords.length; i++) {
-          const word = cleanWords[i]!
-          if (word === '--') {
-            positionals.push(...cleanWords.slice(i + 1))
-            break
-          }
-          if (word === '--timeout') {
-            i++
-            continue
-          }
-          if (word.startsWith('-')) continue
-          positionals.push(word)
-        }
-        tester = positionals[1]
-      }
-      if (!isVerifier || action !== 'test') return `verify.py ${action} is ${action === 'test' ? "a verifier's" : "the coordinator's"}`
-      if (tester?.replace(/^@/, '').toLowerCase() !== name) return `verify.py test names @${tester ?? '?'}, and @${name} tests only as itself`
+  const { statements, expand } = possibleCommands(command)
+  for (const { text, script, unread: isUnread } of statements) {
+    // A substitution that never closes runs what this cannot list.
+    if (isUnread && /\b(?:board|verify)\.py\b/.test(script)) return unread(/\bboard\.py\b/.test(script) ? 'board' : 'verify')
+    const words = shellWords(unwrap(text).text)
+    const call = boardCalls(text)[0]
+    const atCommand = executableIndex(words)
+    for (const target of ['board', 'verify']) {
+      const file = `${target}.py`
+      if (launches(words, file, command)) continue
+      const glob = new RegExp(`(?:^|/)${target}[*?\\[][^/\\s]*$`)
+      const expanded = words.flatMap((word, index) => {
+        const value = expand(word)
+        if (index === atCommand && value !== word && /\s/.test(value)) return shellWords(value)
+        return glob.test(value) ? file : value
+      })
+      if (launches(expanded, file)) return unread(target)
     }
+    // A board command typed plainly, run so that more may follow it (`python3 -i`), runs what this cannot read.
+    if (call && launches(words, 'board.py', command) === 'other') return unread('board')
+    if (call) {
+      if (MEMBER_READS.has(call.action)) continue
+      const own = MEMBER_OWN.has(call.action) && !(isVerifier && call.action !== 'read' && call.action !== 'post')
+      const named = withoutRedirects(shellWords(call.rest)).words.slice(1).find(word => !word.startsWith('-'))?.replace(/^@/, '').toLowerCase()
+      if (!own) return `the board's ${call.action} is the coordinator's${isVerifier && MEMBER_OWN.has(call.action) ? ', and a verifier reports with post' : ''}`
+      if (named !== name) return `the board's ${call.action} names @${named ?? '?'}, and @${name} acts only as itself`
+    } else if (launches(words, 'board.py', command)) return unread('board')
+    const verify = launches(words, 'verify.py', command)
+    if (!verify) continue
+    const cleanWords = withoutRedirects(words).words
+    const at = cleanWords.findIndex(word => /(?:^|\/)verify\.py$/.test(word))
+    // Run some other way (python -c, a module, a program from its input), its words are not the ones it gets.
+    if (verify === 'other' || at < 0) return unread('verify')
+    const action = cleanWords.slice(at + 3).find(word => !word.startsWith('-'))
+    if (action === undefined || !['prepare', 'test', 'accept', 'commit', 'recover-index'].includes(action)) return unread('verify')
+    // A verifier tests a candidate under its own name; preparing, accepting and committing candidates is the coordinator's.
+    let tester: string | undefined
+    if (action === 'test') {
+      const positionals: string[] = []
+      for (let i = cleanWords.indexOf(action, at + 3) + 1; i < cleanWords.length; i++) {
+        const word = cleanWords[i]!
+        if (word === '--') {
+          positionals.push(...cleanWords.slice(i + 1))
+          break
+        }
+        if (word === '--timeout') {
+          i++
+          continue
+        }
+        if (word.startsWith('-')) continue
+        positionals.push(word)
+      }
+      tester = positionals[1]
+    }
+    if (!isVerifier || action !== 'test') return `verify.py ${action} is ${action === 'test' ? "a verifier's" : "the coordinator's"}`
+    if (tester?.replace(/^@/, '').toLowerCase() !== name) return `verify.py test names @${tester ?? '?'}, and @${name} tests only as itself`
   }
   return undefined
 }

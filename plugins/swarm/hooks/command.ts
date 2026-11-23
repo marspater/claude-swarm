@@ -229,6 +229,8 @@ const parenEnd = (command: string, from: number): number => {
       const nl = command.indexOf('\n', j)
       if (nl < 0) return -1
       j = nl - 1
+    } else if (ch === '$' && command[j + 1] === '[' && command.indexOf(']', j + 2) >= 0) {
+      j = command.indexOf(']', j + 2)
     } else if (ch === '<' && command[j + 1] === '<') {
       if (command[j + 2] === '<') j += 2
       else {
@@ -348,8 +350,8 @@ export function scanShell(command: string): Statement[] {
     return to
   }
   // An arithmetic expression runs the substitutions inside it; its `<<` is a shift, not a heredoc.
-  const arithmetic = (from: number, bodyStart: number, end: number) => {
-    for (const s of scanShell(command.slice(bodyStart, end - 1).replace(/<</g, '  '))) {
+  const arithmetic = (from: number, bodyStart: number, bodyEnd: number, end: number) => {
+    for (const s of scanShell(command.slice(bodyStart, bodyEnd).replace(/<</g, '  '))) {
       inner.push(...(s.inner ?? []))
       if (s.unread) unread = true
     }
@@ -365,11 +367,18 @@ export function scanShell(command: string): Statement[] {
       if (ch === "'") quote = undefined
       continue
     }
+    if (ch === '$' && command[i + 1] === '[') {
+      const end = command.indexOf(']', i + 2)
+      if (end >= 0) {
+        i = arithmetic(i, i + 2, end, end)
+        continue
+      }
+    }
     // A substitution runs its commands inside double quotes too.
     if (ch === '$' && command[i + 1] === '(' && command[i + 2] === '(') {
       const end = arithEnd(command, i + 1)
       if (end > 0) {
-        i = arithmetic(i, i + 3, end)
+        i = arithmetic(i, i + 3, end - 1, end)
         continue
       }
     }
@@ -474,7 +483,7 @@ export function scanShell(command: string): Statement[] {
     if (ch === '(' && command[i + 1] === '(') {
       const end = arithEnd(command, i)
       if (end > 0) {
-        i = arithmetic(i, i + 2, end)
+        i = arithmetic(i, i + 2, end - 1, end)
         continue
       }
     }
@@ -652,7 +661,7 @@ export function substitutions(command: string): string[] {
 }
 
 // The git commands that make a commit. `stash`, `reset`, `checkout` and their like make none.
-export const COMMITTING = ['commit', 'commit-tree', 'merge', 'cherry-pick', 'revert', 'am', 'rebase', 'pull', 'filter-branch', 'subtree']
+export const COMMITTING = ['commit', 'commit-tree', 'merge', 'cherry-pick', 'revert', 'am', 'rebase', 'pull', 'filter-branch', 'subtree', 'fast-import', 'quiltimport']
 // Per git command that may make none: its options that take a value, read with it so a value is never read as an
 // option (`-X ignore-space-change` holds no -n): short ones (`-Xours`, `-X ours`), short ones whose value is only
 // ever attached (`-S`, `-Skey`), and long ones (`--strategy=ours`, `--strategy ours`). `stops`: the long options that

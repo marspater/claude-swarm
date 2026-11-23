@@ -108,6 +108,8 @@ const expandAll = atom({ plugin: 'swarm', key: 'expandAll' } as const, false)
 // The seq of the one long post shown in full; 0 for none.
 const expanded = atom({ plugin: 'swarm', key: 'expanded' } as const, 0)
 const inspected = atom({ plugin: 'swarm', key: 'inspected' } as const, null as Post | null)
+const history = atom({ plugin: 'swarm', key: 'history' } as const, null as { dir: string; posts: Post[] } | null)
+let boardNavigation = 0
 // The READY whose commit's diff is open under it and that diff as git printed it, after a first line that says
 // what it covers; seq 0 for none.
 const NO_DIFF = { seq: 0, text: '' }
@@ -259,6 +261,7 @@ let isPaneOpen = false
 let isWatched = false
 let poller: Timer | undefined
 let generation = 0
+let ownedPath = ''
 let sessionEpoch = 0
 let browseGen = 0
 const agentRuns = new Map<string, string>()
@@ -374,12 +377,23 @@ function withHeld(detail: string, agentId: string | undefined): string {
   return detail && held ? `${detail},${held}` : detail
 }
 let coordinatorReads = 0
-function coordinatorRead(tool: string, target: string, root: string): { deny?: string } {
+async function coordinatorRead($: EngineInterface, tool: string, target: string): Promise<{ deny?: string }> {
   const roster = ownedRoster
   if (!['Read', 'Grep', 'Glob'].includes(tool) || !roster || roster.closed || halted) return {}
   if (!Object.entries(roster.members).some(([name, member]) => name !== 'coordinator' && Boolean(member.id) && member.killed !== '1')) return {}
   // The run's own folder and the plugin's skills are the coordinator's to read.
-  if (/(^|\/)\.swarm\//.test(target) || (root !== '' && target.startsWith(root))) return {}
+  if (target) {
+    const cwd = await $.session.cwd()
+    const [path, boardRoot, pluginRoot] = await Promise.all([
+      resolveRealPath($, target.startsWith('/') ? target : `${cwd}/${target}`),
+      resolveRealPath($, `${cwd}/.swarm`),
+      $.plugin.root ? resolveRealPath($, $.plugin.root) : '',
+    ])
+    const requested = normalizePath(path)
+    const within = (folder: string) => requested === folder || requested.startsWith(`${folder}/`)
+    if (ownedRoster !== roster) return {}
+    if (within(boardRoot) || (pluginRoot && within(pluginRoot))) return {}
+  }
   coordinatorReads++
   if (coordinatorReads > COORDINATOR_READS) {
     return { deny: `Swarm: this is a third or later repository lookup in one turn, so it was not run. What you read stays in your context and is read again at every wake of the run. Judge a report by the evidence its post cites; for more, ask its author on the board, or give the question to a member (an explorer for "where is it").` }
@@ -429,7 +443,16 @@ function teammateOf($: EngineInterface, id: string, agent?: AgentInfo): string |
   if (agent?.teammateId) learnTeammate($, id, agent.teammateId)
   return agent?.teammateId ?? teammates.get(id)
 }
-const pendingStarts = new Set<string>()
+const pendingStarts = new Map<string, symbol>()
+const cancelledSpawns = new Set<string>()
+async function retireLateSpawn($: EngineInterface, id: string, teammate?: string): Promise<void> {
+  cancelledSpawns.add(id)
+  if (teammate) killedIds = new Set([...killedIds, teammate])
+  // Keep the built-in stop call separate from the overloads for every installed MCP tool.
+  await ($.tool.call as unknown as (input: { tool: 'TaskStop'; task_id: string }) => Promise<ToolCallResult>)(
+    { tool: 'TaskStop', task_id: id },
+  ).catch(() => undefined)
+}
 const spawnEfforts = new Map<string, string | undefined>()
 const spawnIsolations = new Map<string, string | undefined>()
 const sharedAgents = new Set<string>()
@@ -655,6 +678,7 @@ function dropRunPending(dir: string): void {
 }
 
 function resetMonitoring(): void {
+  ownedPath = ''
   retired = new Set()
   memberPaused = new Set()
   headNoted = ''
@@ -697,8 +721,7 @@ function boardCommand($: EngineInterface, directory: string, args: string[], std
 
 // A read over 4 MiB is refused, and a long run's board grows past that. The board's own `tail` then gives the
 // newest posts, so the pane and the stall check keep working; the wakes also ask the board what is owed (`owedBeforeTail`).
-// ponytail: posts older than the tail drop out of the pane and the graph, and the coordinator is not reminded of an
-// unread mention that old (the board's own UNREAD line on its next post still is); page through the file if that matters.
+// The graph uses the recent window. The Board tab can load earlier pages by post number.
 async function readBoard($: EngineInterface, dir: string): Promise<string> {
   const stat = await $.fs.stat(`${dir}/board.jsonl`).catch(() => undefined)
   if (stat && boardStat && boardStat.dir === dir && boardStat.size === stat.size && boardStat.mtimeMs === stat.mtimeMs) {
@@ -792,11 +815,12 @@ const parseDescribedName = (desc: string | undefined) =>
 // Binds the run this session saved, if any: at a start, and on the first poll after /clear or a resume.
 async function restore($: EngineInterface, cwd: string): Promise<void> {
   const sEpoch = sessionEpoch
+  const owner = generation
   try {
     const restored = await boardCommand($, `${cwd}/.swarm`, ['restore', await lookupKey($)])
     if (sEpoch !== sessionEpoch || isEnding) return
     const dir = restored.stdout.trim()
-    if (restored.exitCode === 0 && RUN.test(dir)) await own($, dir)
+    if (restored.exitCode === 0 && RUN.test(dir)) await own($, dir, owner)
   } catch {
     // A project without a board still starts normally.
   }
@@ -876,26 +900,38 @@ async function syncOwnedState(
 }
 
 // Makes `dir` this conversation's run and offers its pane in the chat.
-async function own($: EngineInterface, dir: string): Promise<void> {
+let ownershipWrites: Promise<unknown> = Promise.resolve()
+function withOwnership<T>(write: () => Promise<T>): Promise<T> {
+  const pending = ownershipWrites.then(write)
+  ownershipWrites = pending.catch(() => undefined)
+  return pending
+}
+
+async function own($: EngineInterface, dir: string, restoreGeneration?: number): Promise<void> {
   const sEpoch = sessionEpoch
-  const current = await read($, run)
-  if (sEpoch !== sessionEpoch || isEnding) return
-  if (current !== dir) {
-    resetMonitoring()
-    strangers.clear()
-  }
-  const owner = generation
-  closedRun = ''
-  // The ids a kill retired stay: a late hand-back from an earlier run's member is still dropped. Another run's
-  // members are judged by its own roster, and an old kill's owed compaction would take away the new run's rules.
-  if (dir !== killedRun) {
-    killedRun = ''
-    killConfirmed.clear()
-    owedCompaction = undefined
-  }
-  hadRun = true
-  await update($, run, () => dir)
-  if (sEpoch !== sessionEpoch || isEnding) return
+  const valid = () => sEpoch === sessionEpoch && !isEnding
+  const owner = await withOwnership(async () => {
+    const current = await read($, run)
+    if (!valid() || (restoreGeneration !== undefined && restoreGeneration !== generation)) return undefined
+    if (current !== dir) {
+      resetMonitoring()
+      strangers.clear()
+    }
+    closedRun = ''
+    // Keep retired ids for late hand-backs. An earlier kill's owed compaction must not take away the new run's rules.
+    if (dir !== killedRun) {
+      killedRun = ''
+      killConfirmed.clear()
+      owedCompaction = undefined
+      isKillTurn = false
+    }
+    hadRun = true
+    const owner = generation
+    await update($, run, value => valid() && owner === generation ? dir : value)
+    if (valid() && owner === generation) ownedPath = dir
+    return owner
+  })
+  if (owner === undefined || !valid() || owner !== generation) return
   // A resumed conversation gets the row again, since placed rows are not saved; a closed run does not.
   const state = await $.fs.read(`${dir}/members.json`)
     .then(text => JSON.parse(text) as { closed?: boolean; paused?: string; members?: Roster } & BudgetState)
@@ -907,7 +943,7 @@ async function own($: EngineInterface, dir: string): Promise<void> {
   const isClosed = state?.closed === true
   if (!isClosed) await $.ui.place({ id: openerOf(dir) }).catch(() => undefined)
   // The desktop app queues /swarm-board typed while the coordinator works, so a run opens its own pane once.
-  if (!isClosed && opened !== dir && sEpoch === sessionEpoch && !isEnding) {
+  if (!isClosed && opened !== dir && valid() && owner === generation) {
     opened = dir
     await openBoard($).catch(() => undefined)
   }
@@ -1126,9 +1162,6 @@ async function memberCall($: EngineInterface, call: MemberCall, activeDir: strin
     if (spoof) {
       return { deny: `The board refused this command: ${spoof}. Nothing in it ran, whatever was chained before the board command included: run that part again on its own. Use the board tool, which acts as you, or the board command under your own name.` }
     }
-    if (waitsOnLooseMatch(command)) {
-      return { deny: 'Nothing ran: this command waits on `pgrep -f`, which matches every command line that contains the pattern (a server named xcodebuildmcp matches `xcodebuild`), so the wait may never end. Match the process name exactly with `pgrep -x NAME`, or wait on the PID of a process you started.' }
-    }
     if (isShared && await commitsInSharedCheckout($, command, checkout)) {
       return { deny: `Shared-checkout writers must not run \`git commit\`: leave your edits in the working tree and report via \`BOARD ready ${memberName}\`.` }
     }
@@ -1141,8 +1174,14 @@ async function memberCall($: EngineInterface, call: MemberCall, activeDir: strin
 
 // Six members started at once ask for the same run at once: they share one answer.
 const binding = new Map<string, Promise<boolean>>()
+let bindingWrites: Promise<unknown> = Promise.resolve()
 function bind($: EngineInterface, dir: string): Promise<boolean> {
-  const pending = binding.get(dir) ?? bindOnce($, dir).finally(() => binding.delete(dir))
+  const existing = binding.get(dir)
+  if (existing) return existing
+  const epoch = sessionEpoch
+  const pending = bindingWrites.then(() => epoch === sessionEpoch && !isEnding && bindOnce($, dir))
+    .finally(() => { if (binding.get(dir) === pending) binding.delete(dir) })
+  bindingWrites = pending.catch(() => undefined)
   binding.set(dir, pending)
   return pending
 }
@@ -1724,22 +1763,37 @@ const HANDBACK_MIN = 400
 const HANDBACK_PART = 11_000
 async function mirrorHandback($: EngineInterface, e: { text: string; origin: { kind: string } }): Promise<string | undefined> {
   const roster = ownedRoster
-  if (e.origin.kind !== 'peer' || !roster || roster.closed || snapshot?.dir !== roster.dir) return undefined
+  if (e.origin.kind !== 'peer' || !roster || roster.closed) return undefined
   const found = /<agent-message from="([^"]+)">\s*\[Subagent hand-back\]\s*([\s\S]*?)\s*<\/agent-message>/.exec(e.text)
   const body = found?.[2] ?? ''
-  if (!found || body.length < HANDBACK_MIN) return undefined
+  if (!found) return undefined
   const from = found[1]!
+  const owner = generation
+  if (roster.dir !== await read($, run)) return undefined
+  const [fresh, board] = await Promise.all([
+    $.fs.read(`${roster.dir}/members.json`).then(text => JSON.parse(text) as { closed?: boolean; members?: Roster }),
+    readBoard($, roster.dir),
+  ])
+  if (!fresh.members || fresh.closed || owner !== generation || isEnding) return undefined
   const address = teammates.get(from)
-  const entry = Object.entries(roster.members).find(([name, m]) => name !== 'coordinator' && m.id && m.killed !== '1' && (m.id === from || m.id === address))
-  if (!entry || roster.dir !== await read($, run)) return undefined
+  const entry = Object.entries(fresh.members).find(([name, m]) => name !== 'coordinator' && m.id && m.killed !== '1' && (m.id === from || m.id === address))
+  if (!entry) return undefined
   const [name, member] = entry
-  const newest = snapshot.posts.findLast(post => post.agent === name)?.seq ?? 0
-  if (newest > Number(member.last_nudged_seq ?? 0) && newest > member.last_read_seq) return undefined
+  const newest = parsePosts(board, fresh.members).findLast(post => post.agent === name)
+  if (newest && newest.seq > Number(member.last_nudged_seq ?? 0)) {
+    const compactBody = body.replace(/\s+/g, ' ').trim()
+    if (compactBody && body.length >= HANDBACK_MIN && newest.text.replace(/\s+/g, ' ').includes(compactBody)) {
+      return e.text.replace(body, `@${name} reported on the board in post #${newest.seq}.`)
+    }
+    if (newest.seq > member.last_read_seq) return undefined
+  }
+  if (body.length < HANDBACK_MIN) return undefined
   // A post holds 12,000 characters: a longer report goes up in parts, and the pointer replaces it only once every
   // part is saved. A part the board did not take leaves the coordinator the report itself.
   const parts = Math.ceil(body.length / HANDBACK_PART)
   const seqs: string[] = []
   for (let part = 0; part < parts; part++) {
+    if (owner !== generation || isEnding) return undefined
     const posted = await boardCommand($, roster.dir, ['post', name],
       `@coordinator HAND-BACK${parts > 1 ? ` (part ${part + 1} of ${parts})` : ''}: @${name}'s turn ended with this report in no board post, so Swarm put it here.\n${fenced(body.slice(part * HANDBACK_PART, (part + 1) * HANDBACK_PART))}`)
     const seq = /posted #(\d+)/.exec(posted.stdout)?.[1]
@@ -1802,13 +1856,17 @@ async function repeatsBoard($: EngineInterface, e: { text: string; origin: { kin
 
 /** A closed run stops being the one this conversation drives: nothing is woken or charged, its members stay refused. */
 async function released($: EngineInterface, dir: string): Promise<void> {
-  if (dir !== await read($, run)) return
-  closedRun = dir
-  dropRunPending(dir)
-  resetMonitoring()
-  // Read under this generation: a run bound while the roster is read keeps its own guard state.
-  const owner = generation
-  await update($, run, () => '')
+  const epoch = sessionEpoch
+  const owner = await withOwnership(async () => {
+    if (dir !== await read($, run) || epoch !== sessionEpoch || isEnding) return undefined
+    closedRun = dir
+    dropRunPending(dir)
+    resetMonitoring()
+    const owner = generation
+    await update($, run, value => generation === owner && epoch === sessionEpoch && value === dir ? '' : value)
+    return owner
+  })
+  if (owner === undefined || epoch !== sessionEpoch || owner !== generation) return
   // Its members are still refused by name: a retired one, a commit, an edit outside its paths.
   await syncOwnedState($, dir, undefined, undefined, owner).catch(() => undefined)
 }
@@ -1843,6 +1901,7 @@ async function killRun($: EngineInterface, reason: string): Promise<{ text: stri
   const landedMidTurn = isCoordinatorBusy
   const turnsEnded = coordinatorTurnsEnded
   const sEpoch = sessionEpoch
+  const owner = generation
   const dir = await read($, run) || closedRun
   if (!dir) return { text: 'No Swarm run is driven from this conversation, so there is nothing to kill.' }
   const result = await boardCommand($, dir, ['kill', ...(reason.trim() ? [reason.trim()] : [])])
@@ -1851,9 +1910,10 @@ async function killRun($: EngineInterface, reason: string): Promise<{ text: stri
   // The board can close the run and fail after it (the SHUTDOWN post not appended): a roster closed by a kill is one.
   const committed = result.exitCode === 0 ? undefined : await readRoster().then(state => state.closed && state.killed ? state : undefined, () => undefined)
   if (result.exitCode !== 0 && !committed) return { text: `Swarm: the board's kill failed: ${clean(result.stderr).trim() || 'it gave no answer'}` }
+  if (result.exitCode === 0 && /^already closed\s*$/m.test(result.stdout)) return { text: 'The Swarm run was already closed.' }
   // Every write of kill state is this session's alone: one that began since (/clear) is left as it is. The board's
   // kill stands either way.
-  const isOurs = () => sEpoch === sessionEpoch
+  const isOurs = () => sEpoch === sessionEpoch && !isEnding && (owner === generation || closedRun === dir)
   if (!isOurs()) return { text: 'The Swarm run is closed.' }
   // At once, with no await since the board answered: a tool call the coordinator makes while the diagnostics run is
   // refused, unless the turn the kill landed in has ended meanwhile.
@@ -1881,9 +1941,7 @@ async function killRun($: EngineInterface, reason: string): Promise<{ text: stri
   retire([])
   if (isOurs()) await released($, dir)
   if (isOurs()) $.clock.after(0, () => void refresh($))
-  const lines = [/^already closed/m.test(result.stdout)
-    ? 'The Swarm run was already closed.'
-    : `The Swarm run is closed: ${/^killed: (\d+)/m.exec(result.stdout)?.[1] ?? members.length} member(s) retired.`]
+  const lines = [`The Swarm run is closed: ${/^killed: (\d+)/m.exec(result.stdout)?.[1] ?? members.length} member(s) retired.`]
   const live = await $.agent.list().catch((): AgentInfo[] => { unread.push('the agent list'); return [] })
   retire(live)
   const running = members.filter(([, m]) => ['running', 'pending', 'waiting'].includes(findAgent(live, m.id)?.status ?? ''))
@@ -2059,7 +2117,7 @@ function stoppedMember(agentId: string, reporting = false): string | undefined {
   const address = teammates.get(agentId)
   const has = (ids: ReadonlySet<string>) => ids.has(agentId) || (address !== undefined && ids.has(address))
   // A member that was replaced or removed may still be mid-turn: it builds and edits beside the team that took over.
-  if (has(retired) || has(killConfirmed)) return 'This Swarm member has been retired, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped.'
+  if (has(cancelledSpawns) || has(retired) || has(killConfirmed)) return 'This Swarm member has been retired, so this tool call was not run. Make no more tool calls: end your turn now with one line saying where you stopped.'
   // A paused member's report is what the pause must not lose: `reporting` lets that one board action through.
   if (has(memberPaused) && !reporting) return MEMBER_PAUSED
   return undefined
@@ -2151,12 +2209,14 @@ async function coordinatorNotes<R extends ToolCallResult>($: EngineInterface, ca
         const calledDir = RUN.test(c.dir) ? await resolveRunDir($, c.dir) : c.dir
         if (calledDir === dir) {
           owed = NONE
+          owedSeqs = []
           break
         }
       }
     }
     for (const c of isCut ? [] : calls) {
-      if (c.action !== 'show' || c.piped || !RUN.test(c.dir) || await resolveRunDir($, c.dir) !== dir) continue
+      if (c.action !== 'show' || c.piped || /(?:^|\s)--before=/.test(c.rest) ||
+        !RUN.test(c.dir) || await resolveRunDir($, c.dir) !== dir) continue
       // One post, the whole board, or one member's posts: only what was printed counts as seen.
       const one = /--post=(\d+)/.exec(c.rest)
       // The member named, if any: a flag or a redirection (`show 2>&1`) names none.
@@ -2912,6 +2972,8 @@ export const register: Register = on => {
   ))
 
   on('tool.call', async ($, e, next) => {
+    // A plugin-issued stop is part of retiring a late spawn, including during the coordinator's kill turn.
+    if (e.tool === 'TaskStop' && typeof e.task_id === 'string' && cancelledSpawns.has(e.task_id)) return next(e)
     // A tool call in the main conversation means the coordinator is mid-turn, even when this
     // module loaded after that turn began (a restart, a reload) and never saw it start.
     if (e.agentId === undefined) isCoordinatorBusy = true
@@ -2927,7 +2989,7 @@ export const register: Register = on => {
     const ceiling = e.agentId === undefined ? undefined : contextCeiling(e.agentId, e.tool)
     if (ceiling) return { deny: ceiling }
     const lookup = e.agentId === undefined
-      ? coordinatorRead(e.tool, String((e as { file_path?: unknown; path?: unknown }).file_path ?? (e as { path?: unknown }).path ?? ''), $.plugin.root)
+      ? await coordinatorRead($, e.tool, String((e as { file_path?: unknown; path?: unknown }).file_path ?? (e as { path?: unknown }).path ?? ''))
       : {}
     if (lookup.deny) return { deny: lookup.deny }
     const actor = e.agentId ?? 'coordinator'
@@ -2940,6 +3002,9 @@ export const register: Register = on => {
     }
     // The board command(s) this call runs, if any: each run folder and subcommand.
     const command = e.tool === 'Bash' ? String(e.command) : ''
+    if (command && waitsOnLooseMatch(command) && await read($, run)) {
+      return { deny: 'Nothing ran: this command waits on a loose process match, which can match unrelated command lines. Match the process name exactly with `pgrep -x NAME`, or wait on the PID of a process you started.' }
+    }
     const calls = e.tool === 'Bash' ? boardCalls(command) : []
     const isCoordinatorBg = e.agentId === undefined && (e.tool === 'Monitor' || (e.tool === 'Bash' && e.run_in_background === true))
     const isMemberGuard = e.agentId !== undefined && (e.tool === 'Edit' || e.tool === 'Write' || e.tool === 'NotebookEdit' || e.tool === 'Bash')
@@ -3166,6 +3231,8 @@ export const register: Register = on => {
 
   on('agent.spawn', async ($, e, next) => {
     if (!SWARM_AGENTS.has(e.subagentType)) return next(e)
+    const epoch = sessionEpoch
+    let requestedUnder = generation
     const named = parseDescribedName(e.description)
     type RunState = {
       title?: string
@@ -3174,6 +3241,15 @@ export const register: Register = on => {
       paused?: string
     } & BudgetState
     const stateOf = async (dir: string) => JSON.parse(await $.fs.read(`${dir}/members.json`)) as RunState
+    const recordedAddress = async (dir: string, args: string[], current: () => boolean) => {
+      const result = await boardCommand($, dir, args).catch(() => undefined)
+      if (!current()) return false
+      if (result?.exitCode === 0) return true
+      const saved = await stateOf(dir).catch(() => undefined)
+      const member = memberNamed(saved?.members ?? {}, args[1])
+      return current() && !!saved && !saved.closed && !!member && !member.killed && member.id === args[2] &&
+        (args[4] === undefined || args[4] === `isolated=${member.isolated}`)
+    }
     const activeRun = await read($, run)
     const current = activeRun || closedRun
     const running = e.resume ? findAgent(await $.agent.list(), e.resume.agentId) : undefined
@@ -3233,6 +3309,19 @@ export const register: Register = on => {
       }
       return { deny: NO_RUN_AGENT }
     }
+    const liveAgents = e.resume ? [] : await $.agent.list().catch(() => [])
+    if (!e.resume && requestedUnder !== generation) {
+      // Another first start may have bound the run selected by both requests.
+      const joined = await withOwnership(async () => ({ dir: ownedPath, generation }))
+      if (current === owned || joined.dir !== owned) {
+        return { deny: 'The Swarm run changed before the agent could start.' }
+      }
+      state = await stateOf(owned).catch(() => undefined)
+      if (!state || joined.generation !== generation || epoch !== sessionEpoch || isEnding || killedRun === owned) {
+        return { deny: 'The Swarm run changed before the agent could start.' }
+      }
+      requestedUnder = joined.generation
+    }
     // A closed run starts nobody: its own members are told so, any other swarm: agent that it drives no run.
     if (state.closed) {
       return resumedRun || memberNamed(state.members, named)
@@ -3261,10 +3350,20 @@ export const register: Register = on => {
         running?.type === `swarm:${resumed.profile || resumed.role || 'worker'}`
       // A swarm: agent the roster does not know is no member: it is not resumed into the run, nor outside it.
       if (!entry && !isUnrecorded) return { deny: 'This agent is no member of this Swarm run, so it is not resumed: a swarm: agent runs only as a member its coordinator registered. Use a general-purpose or Explore agent for other work.' }
+      if (epoch !== sessionEpoch || requestedUnder !== generation || isEnding || killedRun === owned) {
+        return { deny: 'The Swarm run changed before the agent could resume.' }
+      }
       const again = await next(e)
       if (again.agentId) {
-        agentRuns.set(again.agentId, owned)
-        if (again.teammateId) learnTeammate($, again.agentId, again.teammateId)
+        const fresh = await stateOf(owned).catch(() => undefined)
+        const currentEntry = entry
+          ? Object.values(fresh?.members ?? {}).find(member => member.id === entry.id)
+          : memberNamed(fresh?.members ?? {}, named)
+        if (epoch !== sessionEpoch || requestedUnder !== generation || isEnding || killedRun === owned ||
+          !fresh || fresh.closed || !currentEntry || currentEntry.killed || (isUnrecorded && currentEntry.id)) {
+          await retireLateSpawn($, again.agentId, again.teammateId)
+          return { model: again.model }
+        }
       }
       if (isUnrecorded && named && again.agentId) {
         const hasIsolation = spawnIsolations.has(e.tool_use_id)
@@ -3275,13 +3374,20 @@ export const register: Register = on => {
             hasIsolation || e.isTeammate || state.members.coordinator?.backend === 'native'
             ? '0'
             : undefined
-        if (iso === '1') isolatedAgents.add(again.agentId)
-        else if (iso === '0') sharedAgents.add(again.agentId)
         const startedArgs = ['started', named, again.teammateId ?? again.agentId, '']
         if (iso !== undefined) startedArgs.push(`isolated=${iso}`)
-        const recorded = await boardCommand($, owned, startedArgs).catch(() => undefined)
-        if (recorded?.exitCode !== 0) $.ui.toast(`Swarm could not record @${named}'s agent address, so it cannot be woken. Record it with the board's member command: id=${again.teammateId ?? again.agentId}`)
+        if (!(await recordedAddress(owned, startedArgs, () =>
+          epoch === sessionEpoch && requestedUnder === generation && !isEnding && killedRun !== owned))) {
+          await retireLateSpawn($, again.agentId, again.teammateId)
+          return { model: again.model }
+        }
+        if (iso === '1') isolatedAgents.add(again.agentId)
+        else if (iso === '0') sharedAgents.add(again.agentId)
         rosterMiss = undefined
+      }
+      if (again.agentId) {
+        agentRuns.set(again.agentId, owned)
+        if (again.teammateId) learnTeammate($, again.agentId, again.teammateId)
       }
       return again
     }
@@ -3305,7 +3411,6 @@ export const register: Register = on => {
       return { deny: `@${named} is paused (${member.paused}). Raise it with the board's member ${named} budget=<tokens>, then resume ${named}, before starting it.` }
     }
     // A replacement is not started beside the member it replaces (transitively) or beside a killed member with overlapping paths.
-    const liveAgents = await $.agent.list().catch(() => [])
     const queue = [named]
     const visited = new Set([named])
     const predecessors: Array<[string, Roster[string]]> = []
@@ -3397,22 +3502,29 @@ export const register: Register = on => {
     }
     const key = `${owned}/${named}`
     if (pendingStarts.has(key)) return { deny: `@${named} is already starting.` }
-    pendingStarts.add(key)
+    const pending = Symbol(key)
+    pendingStarts.set(key, pending)
     try {
       if (member.id) {
-        const existing = findAgent(await $.agent.list(), member.id)
+        const existing = findAgent(liveAgents, member.id)
         if (!existing || (existing.status !== 'killed' && existing.status !== 'failed')) {
           return { deny: `@${named} already has an agent. Resume it with SendMessage or replace its assignment.` }
         }
       }
-      if (owned !== current && !(await bind($, owned))) return { deny: 'Swarm could not claim that run. Check that this conversation owns it.' }
+      if (epoch !== sessionEpoch || requestedUnder !== generation || isEnding || killedRun === owned) {
+        return { deny: 'The Swarm run changed before the agent could start.' }
+      }
+      if (owned !== current && ownedPath !== owned && !(await bind($, owned))) {
+        return { deny: 'Swarm could not claim that run. Check that this conversation owns it.' }
+      }
       const launchGeneration = generation
       const startupThrough = SPECIALISTS.includes(member.profile ?? '')
         ? parsePosts(await readBoard($, owned).catch(() => ''), state.members).at(-1)?.seq
         : undefined
       // The read can outlast a /swarm:kill, a close or a /clear: the run it was made for is no longer this one's to
       // start anyone in. Refused here, before the agent exists, not noticed after it was launched.
-      if (launchGeneration !== generation || isEnding || killedRun === owned) {
+      const launchIsCurrent = () => epoch === sessionEpoch && launchGeneration === generation && !isEnding && killedRun !== owned
+      if (!launchIsCurrent()) {
         return { deny: `The Swarm run changed while @${named} was starting (it was ended, closed or replaced), so the member was not started. Check the board before starting anyone.` }
       }
       // The table decides, not the session's alias or the agent file: a family name becomes the newest model
@@ -3424,28 +3536,36 @@ export const register: Register = on => {
           : e,
       )
       if (started.agentId) {
+        const fresh = launchIsCurrent() ? await stateOf(owned).catch(() => undefined) : undefined
+        const assignment = memberNamed(fresh?.members ?? {}, named)
+        if (!launchIsCurrent() || !fresh || fresh.closed || !assignment || assignment.killed || assignment.id !== member.id) {
+          await retireLateSpawn($, started.agentId, started.teammateId)
+          return { model: started.model }
+        }
+        const hasIsolation = spawnIsolations.has(e.tool_use_id)
+        const isIsolated = hasIsolation && !e.isTeammate && spawnIsolations.get(e.tool_use_id) === 'worktree'
+        const address = started.teammateId ?? started.agentId
+        const startedArgs = ['started', named, address, member.id ?? '']
+        if (hasIsolation || e.isTeammate) startedArgs.push(isIsolated ? 'isolated=1' : 'isolated=0')
+        if (!(await recordedAddress(owned, startedArgs, launchIsCurrent))) {
+          await retireLateSpawn($, started.agentId, started.teammateId)
+          return { model: started.model }
+        }
         strangers.delete(started.agentId)
         if (started.teammateId) strangers.delete(started.teammateId)
         agentRuns.set(started.agentId, owned)
         rosterMiss = undefined
         if (started.teammateId) learnTeammate($, started.agentId, started.teammateId)
-        const hasIsolation = spawnIsolations.has(e.tool_use_id)
-        const isIsolated = hasIsolation && !e.isTeammate && spawnIsolations.get(e.tool_use_id) === 'worktree'
         if (hasIsolation || e.isTeammate) {
           if (isIsolated) isolatedAgents.add(started.agentId)
           else sharedAgents.add(started.agentId)
         }
-        const address = started.teammateId ?? started.agentId
-        if (launchGeneration === generation && startupThrough !== undefined) startupReads.set(key, { address, through: startupThrough })
-        const startedArgs = ['started', named, address, member.id ?? '']
-        if (hasIsolation || e.isTeammate) startedArgs.push(isIsolated ? 'isolated=1' : 'isolated=0')
-        const recorded = await boardCommand($, owned, startedArgs).catch(() => undefined)
-        if (recorded?.exitCode !== 0) $.ui.toast(`Swarm could not record @${named}'s agent address, so it cannot be woken. Record it with the board's member command: id=${address}`)
+        if (startupThrough !== undefined) startupReads.set(key, { address, through: startupThrough })
         $.clock.after(0, () => void refresh($))
       }
       return started
     } finally {
-      pendingStarts.delete(key)
+      if (pendingStarts.get(key) === pending) pendingStarts.delete(key)
     }
   }).catch((_, e, next) => {
     // The roster, the limits, the budget and a pause are enforced here: a check that failed or ran out of time starts nobody.
@@ -3746,6 +3866,7 @@ export const register: Register = on => {
     // Seen live: a background member's last words arrive as a peer message framed `<agent-message from="ID">`, and
     // its task notification follows. Settled first, with no file read: a retired agent is dropped while the kill runs.
     const from = senderOf(e)
+    if (from !== undefined && cancelledSpawns.has(from)) return { drop: KILL_DROP }
     if (from !== undefined && killedIds.has(from)) {
       // A teammate's address can come back in a later run: a live member of the run driven now by that id is heard.
       // Not the killed run itself, whose retirements stand until another run is owned.
@@ -3841,7 +3962,7 @@ export const register: Register = on => {
     const offset = phase(`${e.surface}:shortcut`, shown.dir, emblemStateOf(shown), await $.clock.now().catch(() => 0))
     return <Box flexDirection="row" columnGap={2}>
       {shortcut($, e, textCount(findKey(peers[0]?.tree, 'crab-text')) === 1, shown, offset, true)}
-      <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>{crab}</Box>
+      <Box flexDirection="column" flexGrow={1} flexShrink={1}>{crab}</Box>
     </Box>
   })
 
@@ -4088,6 +4209,7 @@ export const register: Register = on => {
     const tokens = shown.tokens
     const total = tokensUsed(tokens)
     const openPost = async (seq: number) => {
+      const navigation = ++boardNavigation
       let older: Post | undefined
       if (!shown.posts.some(post => post.seq === seq)) {
         try {
@@ -4133,7 +4255,9 @@ export const register: Register = on => {
       }
       await stop($)
       await stopLive($)
+      if (navigation !== boardNavigation) return
       if ((await read($, inspected)) !== (older ?? null)) await update($, inspected, () => older ?? null)
+      await update($, history, () => null)
       if ((await read($, query)) !== '') await update($, query, () => '')  // a filter left on the Board would hide the post
       if (await read($, latestOnly)) await update($, latestOnly, () => false)
       if ((await read($, earlier)) !== 0) await update($, earlier, () => 0)
@@ -4194,7 +4318,29 @@ export const register: Register = on => {
       const rawQuery = await read($, query)
       const wanted = rawQuery.trim().toLowerCase()
       const inspectedPost = await read($, inspected)
-      const available = inspectedPost && !shown.posts.some(post => post.seq === inspectedPost.seq) ? [inspectedPost, ...shown.posts] : shown.posts
+      const historical = await read($, history)
+      const page = historical?.dir === shown.dir ? historical.posts : undefined
+      const available = page ?? (inspectedPost && !shown.posts.some(post => post.seq === inspectedPost.seq)
+        ? [inspectedPost, ...shown.posts] : shown.posts)
+      const before = (page ?? shown.posts)[0]?.seq ?? 1
+      const historyControls = (page || before > 1) && (
+        <Box flexDirection="row" flexWrap="wrap" gap="sm">
+          {page && <Text dimColor>{`Posts #${before}–#${page.at(-1)?.seq} of ${shown.total ?? shown.posts.length}`}</Text>}
+          {page && <Button key="history-latest" plain label="Back to latest posts" onPress={() => {
+            boardNavigation++
+            return update($, history, () => null)
+          }} />}
+          {before > 1 && <Button key="history-page" plain label={page ? 'Older posts' : 'Browse older posts'} onPress={async () => {
+            const navigation = ++boardNavigation
+            const loaded = await boardCommand($, shown.dir, ['show', `--before=${before}`, '--json']).catch(() => undefined)
+            if ((await shownSwarm($)).dir !== shown.dir || navigation !== boardNavigation) return
+            const posts = loaded?.exitCode === 0 && !loaded.isStdoutTruncated ? parsePosts(loaded.stdout, {}) : []
+            if (!posts.length) { $.ui.toast('Could not load earlier board posts.'); return }
+            await update($, history, current => navigation === boardNavigation ? { dir: shown.dir, posts } : current)
+            await update($, expanded, current => navigation === boardNavigation ? 0 : current)
+          }} />}
+        </Box>
+      )
       const terms = (wanted.match(/(?:kind:)?not\s+(?:passed|verified)(?!\S)|\S+/g) ?? []).map(t => t.replace(/\s+/g, ' '))
       // Whom a post is for: the members it reached, and the names it mentions. `all` and a group are only ever
       // in the text: `to` holds the members they stood for.
@@ -4275,9 +4421,10 @@ export const register: Register = on => {
           {isSearchable && search}
         </Box>
       )
-      const selected = !collapsed && open > 0 ? matching.find(post => post.seq === open) : undefined
+      const selected = (!collapsed || page) && open > 0 ? matching.find(post => post.seq === open) : undefined
       // Opens one post whole, or closes it again.
       const toggle = async (seq: number) => {
+        boardNavigation++
         const nextSeq = open === seq ? 0 : seq
         await update($, expanded, () => nextSeq)
         if (inspectedPost && inspectedPost.seq !== nextSeq) await update($, inspected, () => null)
@@ -4296,7 +4443,7 @@ export const register: Register = on => {
       }
       // A drawing over 100,000 characters is refused, and a post costs up to its clip and its frame: so many are drawn at once.
       const DRAWN = 100
-      const visible = matching.slice(collapsed && terms.length === 0 ? -1 : -Math.min(DRAWN, Math.max(1, fitted.length + more)))
+      const visible = page ? matching : matching.slice(collapsed && terms.length === 0 ? -1 : -Math.min(DRAWN, Math.max(1, fitted.length + more)))
       const isFull = visible.length >= DRAWN
       if (selected && !visible.some(post => post.seq === open)) {
         visible.unshift(selected)
@@ -4306,6 +4453,7 @@ export const register: Register = on => {
         visible.length === 0 ? (
           <Box flexDirection="column" gap="sm">
             {bar(shown.posts.length > 0)}
+            {historyControls}
             <Box flexDirection="column" gap="xs" marginTop={compose || shown.posts.length > 0 ? undefined : 'sm'} borderStyle="round" borderColor={browsed?.boardUnavailable ? 'warning' : 'subtle'} borderDimColor paddingX="sm" paddingY="xs">
               <Box flexDirection="row" alignItems="flex-start" columnGap="xs" minWidth={0}>
                 {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon(browsed?.boardUnavailable ? 'warn' : 'info')} alt={browsed?.boardUnavailable ? 'Unavailable' : 'Info'} width={12} height={16} /></Box>}
@@ -4319,7 +4467,8 @@ export const register: Register = on => {
         ) : (
           <Box flexDirection="column" gap="sm">
             {bar(true)}
-            {terms.length === 0 && shown.posts.length > 1 && (
+            {historyControls}
+            {!page && terms.length === 0 && shown.posts.length > 1 && (
               <Button
                 key="collapse-history"
                 plain
@@ -4328,8 +4477,8 @@ export const register: Register = on => {
                 onPress={() => update($, latestOnly, value => !value)}
               />
             )}
-            {(!collapsed || terms.length > 0) && older === 0 && (shown.total ?? 0) > shown.posts.length && (
-              <Text dimColor>{`The pane keeps the newest ${shown.posts.length} of ${shown.total} posts. Earlier ones are on the board: show`}</Text>
+            {!page && before > 1 && (
+              <Text dimColor>{`Recent view · ${shown.posts.length} of ${shown.total ?? shown.posts.at(-1)?.seq} posts`}</Text>
             )}
             {(!collapsed || terms.length > 0) && older > 0 && isFull && (
               <Text dimColor>{`Showing the newest ${visible.length} of ${matching.length}. Narrow the filter to reach earlier posts.`}</Text>

@@ -2,7 +2,9 @@
 """Prepare, test and accept one candidate covering every worker in a Swarm run, or test a partial one early."""
 import argparse
 from contextlib import contextmanager
+import errno
 import fcntl
+import filecmp
 import hashlib
 import json
 import math
@@ -10,8 +12,8 @@ import os
 from pathlib import Path
 import posixpath
 import re
+import selectors
 import shlex
-import shutil
 import signal
 import stat
 import subprocess
@@ -70,14 +72,14 @@ def in_worktree(name, worktrees):
     return any(parts[:len(w)] == w for w in worktrees)
 
 
-def git(path, *args, optional=False, index=None):
+def git(path, *args, optional=False, index=None, data=None):
     try:
         # Git translates its messages; toplevel() reads one, so they are asked for untranslated.
         env = clean_env()
         env["LC_ALL"] = "C"
         if index:  # an index of the caller's own, the repository's left as it is
             env["GIT_INDEX_FILE"] = index
-        result = subprocess.run(["git", "-C", str(path), *args], capture_output=True, env=env)
+        result = subprocess.run(["git", "-C", str(path), *args], capture_output=True, env=env, input=data)
     except FileNotFoundError:
         if optional:
             return None
@@ -276,10 +278,10 @@ def verification_lock(directory):
         yield
 
 
-def inputs(run, mode, subset=None):
+def inputs(run, mode, subset=None, *, allow_closed=False):
     """The READY post and commit of every contributing worker, or of the workers SUBSET names for a partial candidate."""
     state, posts = load(run)
-    if state.get("closed"):
+    if state.get("closed") and not allow_closed:
         raise ValueError("the run is closed")
     members = state["members"]
     ready = readiness(members, posts)
@@ -364,14 +366,15 @@ def is_run_data(name, run_data):
     return name.rstrip(b"/").split(b"/")[:len(run_data)] == run_data
 
 
-def pending_changes(project, run_data=None, codes=False):
+def pending_changes(project, run_data=None, codes=False, *, git_index=None):
     """Paths git reports as changed or untracked, other than Swarm's own run data: the project's .swarm folder, or
     RUN_DATA for a checkout whose top folder is not the run's project. With CODES, (XY, path) pairs of git's status."""
     found = repository(project)
     if found is None:
         raise ValueError("not a git repository")
     skip = not_source(found, run_data)
-    entries = git(project, "status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=none").split(b"\0")
+    entries = git(project, "--no-optional-locks", "status", "--porcelain", "-z", "--untracked-files=all",
+                  "--ignore-submodules=none", index=git_index).split(b"\0")
     pending, index = [], 0
     while index < len(entries):
         entry = entries[index]
@@ -421,7 +424,8 @@ def declared(*texts):
     found = {"REWRITE": set(), "REFORMAT": set(), "REMOVED": set(), "NEWLINE": set()}
 
     def bare(value):
-        return value.strip("`'\"").removeprefix("./").rstrip(",;.:)`'\"")
+        value = value.strip("`'\"")
+        return (value[2:] if value.startswith("./") else value).rstrip(",;.:)`'\"")
     for text in texts:
         # A declaration stands at the start of a line of the report itself: one inside a pasted log declares nothing.
         for kind, value in DECLARED.findall(unfenced(text)):
@@ -608,9 +612,10 @@ def removed_public_symbols(diff, moved=None):
     MOVED, when given, with the files it left."""
     removed, added, old, new = {}, {}, "", ""
     for line in diff.split("\n"):
-        if header := re.fullmatch(r"--- (?:a/(.+)|/dev/null)", line):
+        # An unquoted Git patch header ends in a tab when its path has spaces.
+        if header := re.fullmatch(r"--- (?:a/([^\t]+)\t?|/dev/null)", line):
             old = header[1] or ""
-        elif header := re.fullmatch(r"\+\+\+ (?:b/(.+)|/dev/null)", line):
+        elif header := re.fullmatch(r"\+\+\+ (?:b/([^\t]+)\t?|/dev/null)", line):
             new = header[1] or ""
         elif line.startswith("-") and old:
             if symbol := defined_symbol(old, line[1:]):
@@ -788,13 +793,13 @@ def check_hygiene(run, root, base, commit, recorded, skip, allowed=()):
                          "newline:<path> or removed:<symbol>: the candidate records it and the verifier reports it" % "\n- ".join(issues))
 
 
-def check_current(run, candidate):
+def check_current(run, candidate, *, allow_closed=False):
     """Raise unless a passing candidate still describes the reports and the sources it ran on."""
     if not candidate.get("accepted"):
         return check_inputs(run, candidate)
     # Accepted: its checkout may be gone, and the project itself now holds what was tested.
     project = Path(candidate["project"])
-    recorded = inputs(run, candidate["mode"], subset_of(candidate))
+    recorded = inputs(run, candidate["mode"], subset_of(candidate), allow_closed=allow_closed)
     check_checks_field(run, candidate, recorded)
     if candidate["inputs"] != recorded:
         raise ValueError("worker readiness changed after acceptance")
@@ -931,10 +936,53 @@ def prepare(run, project, mode, checks, onto=None, subset=None, baseline=False, 
                       "digest": candidate["digest"], "partial": candidate["partial"]}))
 
 
-def run_check(command, cwd, timeout, output=None):
-    """One check in its own process group: whatever it started ends with it, on a timeout or an interruption too.
-    OUTPUT, an open file, takes its stdout and stderr together; the check writes to it directly, so nothing is held
-    in memory and what it printed before it was killed is there too."""
+DEFAULT_CHECK_TIMEOUT = 900
+DEFAULT_ATTEMPT_TIMEOUT = 3600
+MAX_CHECK_OUTPUT = 16 << 20
+
+
+class CheckOutputLimit(ValueError):
+    pass
+
+
+def check_output(process, command, timeout, output):
+    deadline = None if timeout is None else time.monotonic() + timeout
+    remaining_bytes = MAX_CHECK_OUTPUT
+    fd = process.stdout.fileno()
+    with selectors.DefaultSelector() as events:
+        events.register(process.stdout, selectors.EVENT_READ)
+        while process.poll() is None:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(command, timeout)
+            if not events.select(0.05 if deadline is None else max(0, min(0.05, deadline - time.monotonic()))):
+                continue
+            if process.poll() is not None:
+                break
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                process.wait(timeout=None if deadline is None else max(0, deadline - time.monotonic()))
+                break
+            output.write(chunk[:remaining_bytes])
+            remaining_bytes -= len(chunk)
+            if remaining_bytes < 0:
+                raise CheckOutputLimit(f"output exceeded {MAX_CHECK_OUTPUT >> 20} MiB")
+    cleanup(process)
+    # Pipes can still contain the shell's final output, or be held open by a detached helper.
+    os.set_blocking(fd, False)
+    while remaining_bytes:
+        try:
+            chunk = os.read(fd, min(65536, remaining_bytes))
+        except BlockingIOError:
+            break
+        if not chunk:
+            break
+        output.write(chunk)
+        remaining_bytes -= len(chunk)
+    return process.returncode
+
+
+def run_check(command, cwd, timeout, output=None, *, output_dir=None):
+    """Run a check in its own process group, streaming combined output to a bounded log when supplied."""
     def interrupted(number, _frame):
         raise SystemExit(128 + number)
 
@@ -944,9 +992,15 @@ def run_check(command, cwd, timeout, output=None):
     previous[signal.SIGINT] = signal.getsignal(signal.SIGINT)  # cleanup ignores it; the finally restores it
     process = None
     try:
-        process = subprocess.Popen(["/bin/sh", "-c", command], cwd=cwd, stdin=subprocess.DEVNULL, stdout=output,
+        env = clean_env()
+        if output_dir is not None:
+            env["SWARM_VERIFY_OUTPUT_DIR"] = str(output_dir)
+        process = subprocess.Popen(["/bin/sh", "-c", command], cwd=cwd, stdin=subprocess.DEVNULL,
+                                   stdout=None if output is None else subprocess.PIPE,
                                    stderr=None if output is None else subprocess.STDOUT,
-                                   env=clean_env(), start_new_session=True)
+                                   env=env, start_new_session=True)
+        if output is not None:
+            return check_output(process, command, timeout, output)
         returncode = process.wait(timeout=timeout)
         cleanup(process)  # what it left in the background ends with it too
         return returncode
@@ -955,6 +1009,8 @@ def run_check(command, cwd, timeout, output=None):
             cleanup(process)
         raise
     finally:
+        if process is not None and process.stdout is not None:
+            process.stdout.close()
         for number, handler in previous.items():
             signal.signal(number, handler)
 
@@ -1035,7 +1091,8 @@ def excerpt(log, count, lines, limit):
     with log.open("rb") as file:
         start = max(0, file.seek(0, os.SEEK_END) - limit)
         file.seek(start)
-        window = file.read().removesuffix(b"\n").split(b"\n") if count else []
+        tail = file.read()
+        window = (tail[:-1] if tail.endswith(b"\n") else tail).split(b"\n") if count else []
     kept = window[-lines:]
     if start and len(kept) == len(window):  # its first line began before the window
         if len(kept) > 1:
@@ -1164,13 +1221,14 @@ def record_baseline(run, name, add=True):
             pass
 
 
-def same_on_base(run, project, candidate, ran, timeout):
+def same_on_base(run, project, candidate, ran, timeout, deadline, candidate_output):
     """{index in RAN: (whether that failed check fails on the candidate's base in the same way, why)}. RAN is every
     check as it ended here: (command, exit code, log). The base runs them once, in order, up to the last one in
     question, so what an earlier check sets up is there on both sides. The same exit code is not enough: the candidate
     may hold the old failure and a new one, so only identical failure output is waived, and a check with unstable or
     no output stays failed. Once a check ends or prints otherwise on the base the two runs are no longer set up alike,
     and nothing after it is waived."""
+    ran = ran[:next((index for index, (_, code, _) in enumerate(ran) if code is None), len(ran))]
     verdicts = {}
     for index, (_, returncode, log) in enumerate(ran):
         if not returncode:
@@ -1191,13 +1249,15 @@ def same_on_base(run, project, candidate, ran, timeout):
         why = "the candidate changes %s, so the base runs with other dependencies" % ", ".join(inputs)
         return {**verdicts, **dict.fromkeys(asked, (False, why))}
     short, diverged = candidate["base"][:12], None
-    with tempfile.TemporaryDirectory(dir=run, prefix=f"baseline-{candidate['candidate']}-") as base_dir:
+    with tempfile.TemporaryDirectory(dir=run, prefix=f"baseline-{candidate['candidate']}-") as base_dir, \
+         tempfile.TemporaryDirectory(dir=run, prefix="baseline-output-") as output_dir:
         baseline = Path(base_dir)
         record_baseline(run, baseline.name, add=True)
         try:
             git(project, "worktree", "add", "--detach", str(baseline), candidate["base"])
             work = baseline / Path(candidate["path"]).relative_to(candidate["worktree"])
-            roots = [str(Path(candidate["worktree"])), str(Path(candidate["worktree"]).resolve()), str(baseline), str(baseline.resolve())]
+            roots = [str(Path(candidate["worktree"])), str(Path(candidate["worktree"]).resolve()),
+                     str(baseline), str(baseline.resolve()), str(candidate_output), output_dir]
 
             def printed(path):
                 return None if path.stat().st_size > COMPARED_BYTES else normalized_failure(path.read_bytes().decode(errors="replace"), roots)
@@ -1210,8 +1270,11 @@ def same_on_base(run, project, candidate, ran, timeout):
                 base_log = log.with_name(log.stem + "-base.log")
                 try:
                     with base_log.open("wb") as output:
-                        on_base = run_check(command, work, timeout, output)
-                except subprocess.TimeoutExpired:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise subprocess.TimeoutExpired(command, 0)
+                        on_base = run_check(command, work, min(timeout, remaining), output, output_dir=output_dir)
+                except (subprocess.TimeoutExpired, CheckOutputLimit):
                     on_base = None
                 here, there = printed(log), printed(base_log)
                 if on_base != returncode or here is None or here != there:
@@ -1246,25 +1309,35 @@ def same_on_base(run, project, candidate, ran, timeout):
     return verdicts
 
 
+def positive_timeout(raw, name):
+    try:
+        timeout = float(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a positive number") from None
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(f"{name} must be a positive number")
+    return timeout
+
+
+def untracked_sources(project):
+    found = repository(project)
+    if found is None:
+        return set()
+    skip = not_source(found)
+    return {name for name in git(found[0], "ls-files", "-z", "--others", "--exclude-standard").split(b"\0")
+            if name and not in_worktree(name, skip)}
+
+
 def test_candidate(run, project, identifier, verifier, timeout_arg=None):
     verifier = verifier.lstrip("@").lower()
-    if timeout_arg is not None:
-        raw_timeout = timeout_arg.strip()
-        source_name = "--timeout"
-        if not raw_timeout:
-            raise ValueError("--timeout must be a positive number")
-    else:
-        raw_timeout = os.environ.get("SWARM_VERIFY_TIMEOUT", "").strip()
-        source_name = "SWARM_VERIFY_TIMEOUT"
-    if raw_timeout:
-        try:
-            timeout = float(raw_timeout)
-        except ValueError:
-            raise ValueError(f"{source_name} must be a positive number") from None
-        if not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError(f"{source_name} must be a positive number")
-    else:
-        timeout = None
+    timeout = (positive_timeout(timeout_arg, "--timeout") if timeout_arg is not None else positive_timeout(
+        os.environ.get("SWARM_VERIFY_TIMEOUT", "").strip() or str(DEFAULT_CHECK_TIMEOUT), "SWARM_VERIFY_TIMEOUT"))
+    attempt_timeout = positive_timeout(
+        os.environ.get("SWARM_VERIFY_ATTEMPT_TIMEOUT", "").strip() or str(max(DEFAULT_ATTEMPT_TIMEOUT, timeout)),
+        "SWARM_VERIFY_ATTEMPT_TIMEOUT")
+    deadline = time.monotonic() + attempt_timeout
+    timing = os.environ.get("SWARM_VERIFY_TIMINGS") == "1"
+    started_attempt = time.monotonic()
 
     attempt = uuid.uuid4().hex
     with board_lock(run):
@@ -1289,49 +1362,69 @@ def test_candidate(run, project, identifier, verifier, timeout_arg=None):
         state["members"][verifier]["tested"] = identifier
         save(run, state)
 
+    work = Path(candidate["path"])
+    untracked_before = untracked_sources(work) if candidate["checks"] else set()
+    started_checks = time.monotonic()
+    if timing:
+        print(f"Verification setup and source validation: {started_checks - started_attempt:.2f}s")
     # Under the run folder, so inside the project's .swarm folder: never in the candidate's checkout, where the
     # fingerprint would read them, and never staged by `commit`. An earlier attempt's logs stay.
     logs = run / "checks"
     logs.mkdir(exist_ok=True)
     number = reserve(logs, identifier) if candidate["checks"] else None
-    failed, waived, ran = [], [], []
+    output_dir = run / "check-output" / f"{identifier}-attempt{number:02d}" if number is not None else None
+    if output_dir is not None:
+        output_dir.mkdir(parents=True)
+    failed, waived, ran, aborted = [], [], [], {}
     for index, command in enumerate(candidate["checks"], 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            failed.extend(f"{skipped} (not run: attempt deadline reached)" for skipped in candidate["checks"][index - 1:])
+            break
         print(f"$ {command}", flush=True)
         log = logs / log_name(identifier, number, index)
         started = time.monotonic()
         try:
             with log.open("wb") as output:
-                returncode = run_check(command, candidate["path"], timeout, output)
+                returncode = run_check(command, candidate["path"], min(timeout, remaining), output, output_dir=output_dir)
         except subprocess.TimeoutExpired:
             returncode = None
+            aborted[index - 1] = f"timed out after {timeout:g}s" if timeout <= remaining else "timed out at the attempt deadline"
+        except CheckOutputLimit as error:
+            returncode = None
+            aborted[index - 1] = str(error)
         elapsed, size, count = time.monotonic() - started, log.stat().st_size, lines_in(log)
-        shown, tail = excerpt(log, count, *(
+        shown_lines, tail = excerpt(log, count, *(
             (FAIL_LINES, FAIL_BYTES) if returncode != 0 else
             (WHOLE_LINES, WHOLE_BYTES) if count <= WHOLE_LINES and size <= WHOLE_BYTES else (PASS_LINES, PASS_BYTES)))
         print("%s in %.1fs, %d lines (%d bytes) of output, log: %s" % (
-            f"Timed out after {timeout}s" if returncode is None else f"Exit {returncode}", elapsed, count, size, log),
+            aborted[index - 1].capitalize() if returncode is None else f"Exit {returncode}", elapsed, count, size, log),
             flush=True)
         if tail:
             # As bytes: the output may hold what the terminal's encoding cannot.
             sys.stdout.buffer.write(tail.encode() + b"\n")
             sys.stdout.buffer.flush()
         if returncode != 0:
-            print(f"(the last {shown} of {count} lines; Grep the log for the rest, then Read the lines you need: {log})",
+            print(f"(the last {shown_lines} of {count} lines; Grep the log for the rest, then Read the lines you need: {log})",
                   flush=True)
-        if returncode is None:
-            raise ValueError(f"verification command timed out after {timeout}s: {command}")
         ran.append((command, returncode, log))
     # The base is asked only once every check has run here: its replay of the earlier checks may write what a later
     # check reads outside the checkout. Once for the attempt, however many checks failed.
-    verdicts = same_on_base(run, project, candidate, ran, timeout) if candidate.get("baseline") else {}
+    verdicts = (same_on_base(run, project, candidate, ran, timeout, deadline, output_dir)
+                if candidate.get("baseline") else {})
     for index, (command, returncode, log) in enumerate(ran):
-        if index in verdicts:
+        if index in aborted:
+            failed.append(f"{command} ({aborted[index]})")
+        elif index in verdicts:
             same, why = verdicts[index]
             print("$ %s\n%s: %s" % (command, "Waived, as no failure of the candidate's" if same else "Not waived", why),
                   flush=True)
             (waived if same else failed).append(command)
         elif returncode:
             failed.append(command)
+    started_validation = time.monotonic()
+    if timing:
+        print(f"Verification checks and baseline replay: {started_validation - started_checks:.2f}s")
     if failed:
         # Every check ran: a cycle that stops at the first failure hides the rest until the next candidate.
         raise ValueError("verification failed: " + "; ".join(failed))
@@ -1341,6 +1434,14 @@ def test_candidate(run, project, identifier, verifier, timeout_arg=None):
         if candidate.get("attempt") != attempt:
             raise ValueError("the verification attempt was withdrawn or superseded")
         active_verifier(run, verifier)
+        if candidate["checks"]:
+            created = sorted(untracked_sources(work) - untracked_before)
+            if created:
+                names = ", ".join(shown(os.fsdecode(name)) for name in created[:8])
+                more = f" and {len(created) - 8} more" if len(created) > 8 else ""
+                raise ValueError(f"verification checks left new untracked files: {names}{more}. "
+                                 "Remove the generated files. Prepare a candidate with checks that write to "
+                                 "$SWARM_VERIFY_OUTPUT_DIR or clean up before exit, or add a targeted ignore rule.")
         check_inputs(run, candidate)
         if exact is not None and source_digest(Path(candidate["path"])) != exact:
             raise ValueError("the checks changed files in the candidate's checkout (a submodule they filled in or emptied?), "
@@ -1349,6 +1450,8 @@ def test_candidate(run, project, identifier, verifier, timeout_arg=None):
         if waived:
             candidate["waived"] = waived
         save_candidate(run, candidate)
+    if timing:
+        print(f"Verification final source validation: {time.monotonic() - started_validation:.2f}s")
     if waived:
         print("Failing on the base in the same way, and so waived; name each in your report: " + "; ".join(waived))
     if candidate.get("allowed"):
@@ -1446,72 +1549,231 @@ def landing(run, project, identifier):
         shlex.quote(os.path.abspath(__file__)), shlex.quote(str(run)), shlex.quote(str(project)), identifier)
 
 
-def commit(run, project, identifier, message):
-    """The one commit after a shared acceptance, made of exactly what passed: staged here, compared with the pass, and
-    committed, so nothing edited between a printed `git add` and the commit can go in unread."""
-    with board_lock(run):
-        candidate = candidate_for(run, project, identifier)
-        if candidate["mode"] == "isolated":
-            raise ValueError("an isolated candidate's commits are in the checkout once it is accepted: there is nothing to commit")
-        if not candidate.get("accepted"):
-            raise ValueError("this candidate is not accepted: run `accept` first")
+def ref_state(root):
+    parent = git(root, "rev-parse", "-q", "--verify", "HEAD", optional=True)
+    branch = git(root, "symbolic-ref", "--quiet", "HEAD", optional=True)
+    return ((parent or b"").decode().strip(), os.fsdecode(branch).rstrip("\n") if branch else "HEAD")
+
+
+def index_snapshot(path):
+    try:
+        with path.open("rb") as index:
+            return index.read(), os.fstat(index.fileno()).st_mtime_ns
+    except FileNotFoundError:
+        return None
+
+
+def index_digest(snapshot):
+    return hashlib.sha256(snapshot[0]).hexdigest() if snapshot is not None else None
+
+
+def publish_index(root, live, original, private, parent, ref, revision, recovery=None):
+    # Respect Git's index lock. A concurrently staged change takes precedence over publishing our staging area.
+    lock = live.with_name(live.name + ".lock")
+    try:
+        locked = lock.open("xb")
+    except FileExistsError:
+        raise ValueError("the Git index is locked by another operation; retry after it finishes") from None
+    published = False
+    try:
+        with locked:
+            locked.write(Path(private).read_bytes())
+        if index_snapshot(live) != original or ref_state(root) != (parent, ref):
+            raise ValueError("the Git index or HEAD changed during the commit; inspect it and retry")
+        if revision:
+            atomic_write(recovery, json.dumps({"revision": revision, "parent": parent, "ref": ref, "index": index_digest(original)}))
+            args = ("--no-deref",) if ref == "HEAD" else ()
+            try:
+                git(root, "update-ref", "-m", "commit: verified Swarm candidate", *args,
+                    ref, revision, parent or "0" * len(revision))
+            except ValueError:
+                recovery.unlink(missing_ok=True)
+                raise
+        try:
+            os.replace(lock, live)
+        except OSError as error:
+            if revision:
+                raise ValueError(f"commit {revision} landed on {ref}, but the Git index could not be updated: {error}") from error
+            raise
+        published = True
+        if recovery is not None:
+            recovery.unlink(missing_ok=True)
+    finally:
+        if not published:
+            lock.unlink(missing_ok=True)
+
+
+def commit_hook(root, name, *args, index=None):
+    # rev-parse respects core.hooksPath and linked worktrees, including on Git versions without `git hook run`.
+    path = git(root, "rev-parse", "--path-format=absolute", "--git-path", f"hooks/{name}")
+    hook = Path(os.fsdecode(path.rstrip(b"\n")))
+    if not hook.is_file() or not os.access(hook, os.X_OK):
+        return
+    env = clean_env()
+    if index is not None:
+        env["GIT_INDEX_FILE"] = index
+        env["GIT_EDITOR"] = ":"
+    command = [str(hook), *args]
+    try:
+        result = subprocess.run(command, cwd=root, capture_output=True, env=env)
+    except OSError as error:
+        if error.errno != errno.ENOEXEC:
+            raise
+        result = subprocess.run(["/bin/sh", *command], cwd=root, capture_output=True, env=env)
+    if result.returncode:
+        detail = os.fsdecode(result.stderr or result.stdout).strip()
+        raise ValueError(f"{name} hook exited {result.returncode}" + (f": {detail}" if detail else ""))
+
+
+def pending_commit_hooks(root, private, scratch, message):
+    msg = Path(scratch) / "COMMIT_EDITMSG"
+    msg.write_bytes(git(root, "stripspace", data=os.fsencode(message + "\n")))
+    commit_hook(root, "pre-commit", index=private)
+    commit_hook(root, "prepare-commit-msg", str(msg), "message", index=private)
+    commit_hook(root, "commit-msg", str(msg), index=private)
+    msg.write_bytes(git(root, "stripspace", data=msg.read_bytes()))
+    if not msg.stat().st_size:
+        raise ValueError("the commit message is empty")
+    return msg
+
+
+def recovery_file(run, identifier):
+    return run / f"commit-recovery-{identifier}.json"
+
+
+def recover_index(run, project, identifier):
+    with board_lock(run), tempfile.TemporaryDirectory() as scratch:
+        candidate_for(run, project, identifier)
+        recovery = recovery_file(run, identifier)
+        if not recovery.is_file():
+            raise ValueError("there is no pending index recovery for this candidate")
+        record = json.loads(recovery.read_text(encoding="utf-8"))
         found = repository(project)
         if found is None:
-            raise ValueError("the project is not a Git repository, so there is nothing to commit")
-        check_current(run, candidate)
-        landing_guards(found)
-        # Built in an index of its own and checked there, then put in the repository's: whatever was staged before,
-        # the commit takes this tree and no other.
-        skip = not_source(found)
-        live = git(found[0], "rev-parse", "--path-format=absolute", "--git-path", "index").decode().strip()
-        with tempfile.TemporaryDirectory() as scratch:
+            raise ValueError("the project is no longer a Git repository")
+        root, _ = found
+        revision, ref = record["revision"], record["ref"]
+        current = ref_state(root)
+        if current == (record["parent"], ref):
+            recovery.unlink()
+            print("HEAD is at the original parent. No index recovery was needed.")
+            return
+        if current != (revision, ref):
+            raise ValueError("HEAD moved since publication; inspect the index before changing it")
+        live = Path(os.fsdecode(git(root, "rev-parse", "--path-format=absolute", "--git-path", "index").rstrip(b"\n")))
+        original = index_snapshot(live)
+        private = os.path.join(scratch, "index")
+        if index_digest(original) != record["index"]:
+            # Publication may already have installed the index before the process stopped.
+            if git(root, "diff", "--cached", "--quiet", revision, optional=True) is None:
+                raise ValueError("the index changed since publication; inspect the staged changes before changing it")
+            recovery.unlink()
+        else:
+            git(root, "-c", "core.splitIndex=false", "read-tree", revision, index=private)
+            publish_index(root, live, original, private, revision, ref, None, recovery)
+    print(f"RECOVERED INDEX {revision}")
+
+
+def commit(run, project, identifier, message):
+    """Land the immutable verified tree, and publish its index only after the ref update succeeds."""
+    with tempfile.TemporaryDirectory() as scratch:
+        with board_lock(run):
+            candidate = candidate_for(run, project, identifier)
+            if candidate["mode"] == "isolated":
+                raise ValueError("an isolated candidate's commits are in the checkout once it is accepted: there is nothing to commit")
+            if not candidate.get("accepted"):
+                raise ValueError("this candidate is not accepted: run `accept` first")
+            recovery = recovery_file(run, identifier)
+            if recovery.exists():
+                raise ValueError(f"a commit may already have landed; run `recover-index {identifier}` for this run")
+            found = repository(project)
+            if found is None:
+                raise ValueError("the project is not a Git repository, so there is nothing to commit")
+            root = found[0]
+            parent, ref = ref_state(root)
+            for marker in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "sequencer"):
+                path = git(root, "rev-parse", "--path-format=absolute", "--git-path", marker)
+                if Path(os.fsdecode(path.rstrip(b"\n"))).exists():
+                    raise ValueError("finish the Git operation already in progress before committing")
+            check_current(run, candidate, allow_closed=True)
+            landing_guards(found)
+            skip = not_source(found)
+            live = Path(os.fsdecode(git(root, "rev-parse", "--path-format=absolute", "--git-path", "index").rstrip(b"\n")))
+            original = index_snapshot(live)
             private = os.path.join(scratch, "index")
-            if os.path.exists(live):
-                shutil.copy2(live, private)
-            git(found[0], "add", "-A", "--", *stage_paths(skip), index=private)
-            tree = git(found[0], "write-tree", index=private).decode().strip()
-            names = [name for name in git(found[0], "diff", "--cached", "--name-only", "--no-renames", "-z", index=private)
+            if original is not None:
+                data, mtime = original
+                Path(private).write_bytes(data)
+                # Git uses this timestamp to recheck files written within the index's timestamp resolution.
+                os.utime(private, ns=(mtime, mtime))
+            git(root, "-c", "core.splitIndex=false", "add", "-A", "--", *stage_paths(skip), index=private)
+            tree = git(root, "write-tree", index=private).decode().strip()
+            names = [name for name in git(root, "diff", "--cached", "--name-only", "--no-renames", "-z", index=private)
                      .split(b"\0") if name]
             modes = dict((entry.partition(b"\t")[2], entry.split()[0]) for entry in
-                         git(found[0], "ls-files", "-s", "-z", index=private).split(b"\0") if entry)
-        unread = [shown(os.fsdecode(name)) for name in names if in_worktree(name, skip)]
-        if unread:
-            raise ValueError("the commit would hold %s, which is Swarm's run data or a linked worktree and no source"
-                             % ", ".join(unread[:5]))
-        # What Git stores is the file as its filters and line-ending rules convert it: a file a fresh checkout would
-        # not bring back as the checks read it was never tested in the form the commit holds.
-        turned = []
-        for name in names:
-            if modes.get(name) not in (b"100644", b"100755"):
-                continue
-            back = git(found[0], "cat-file", "--filters", "%s:%s" % (tree, os.fsdecode(name)), optional=True)
+                         git(root, "ls-files", "-s", "-z", index=private).split(b"\0") if entry)
+            unread = [shown(os.fsdecode(name)) for name in names if in_worktree(name, skip)]
+            if unread:
+                raise ValueError("the commit would hold %s, which is Swarm's run data or a linked worktree and no source"
+                                 % ", ".join(unread[:5]))
+            # What Git stores is the file as its filters and line-ending rules convert it: a file a fresh checkout would
+            # not bring back as the checks read it was never tested in the form the commit holds.
+            checkout = Path(scratch) / "checkout"
+            checkout.mkdir()
+            git(root, "checkout-index", "--all", f"--prefix={checkout}/", index=private)
+            turned = []
+            for name, mode in modes.items():
+                if in_worktree(name, skip) or mode not in (b"100644", b"100755"):
+                    continue
+                path = os.fsdecode(name)
+                source, restored = root / path, checkout / path
+                try:
+                    same = filecmp.cmp(source, restored, shallow=False)
+                except FileNotFoundError:
+                    # A sparse checkout omits these paths from both the source and the private checkout.
+                    same = not source.exists() and not restored.exists()
+                if not same:
+                    turned.append(shown(path))
+            if turned:
+                raise ValueError("a fresh checkout of the commit would not bring back %s as the checks read it (a line-ending "
+                                 "or filter rule converts it one way only). Fix the file or its .gitattributes rule, then "
+                                 "prepare and test a new candidate" % ", ".join(turned[:5]))
+            left = [shown(os.fsdecode(path)) for code, path in pending_changes(project, codes=True, git_index=private)
+                    if code[1:] != b" "]
+            if left:
+                raise ValueError("staging left %s apart from the index, so the commit would not hold the verified files; "
+                                 "prepare and test a new candidate" % ", ".join(left[:5]))
+            if source_digest(project) != candidate["digest"]:
+                raise ValueError("source files changed after acceptance")
+            if tree == (git(root, "rev-parse", "-q", "--verify", "HEAD^{tree}", optional=True) or b"").decode().strip():
+                publish_index(root, live, original, private, parent, ref, None)
+                print("Nothing to commit: HEAD already holds the verified files")
+                return
+        # Release the board lock for hooks and signing, which can block on a build or user input.
+        msg = pending_commit_hooks(root, private, scratch, message)
+        if git(root, "write-tree", index=private).decode().strip() != tree:
+            raise ValueError("a commit hook changed the verified Git tree; no commit was made")
+        signing = git(root, "config", "--bool", "--get", "commit.gpgsign", optional=True) == b"true\n"
+        revision = git(root, "commit-tree", tree, *(("-p", parent) if parent else ()),
+                       *(("-S",) if signing else ()), "-F", str(msg)).decode().strip()
+        # The hooks ran outside the board lock. Check the acceptance and source again before the ref update.
+        with board_lock(run):
+            if candidate_for(run, project, identifier) != candidate:
+                raise ValueError("the accepted candidate changed during the commit")
+            check_current(run, candidate, allow_closed=True)
             try:
-                same = back is not None and (found[0] / os.fsdecode(name)).read_bytes() == back
-            except OSError:
-                same = False
-            if not same:
-                turned.append(shown(os.fsdecode(name)))
-        if turned:
-            raise ValueError("a fresh checkout of the commit would not bring back %s as the checks read it (a line-ending "
-                             "or filter rule converts it one way only). Fix the file or its .gitattributes rule, then "
-                             "prepare and test a new candidate" % ", ".join(turned[:5]))
-        git(found[0], "read-tree", tree)
-        left = [shown(os.fsdecode(path)) for code, path in pending_changes(project, codes=True) if code[1:] != b" "]
-        if left:
-            raise ValueError("staging left %s apart from the index, so the commit would not hold the verified files; "
-                             "prepare and test a new candidate" % ", ".join(left[:5]))
-        if source_digest(project) != candidate["digest"]:
-            raise ValueError("source files changed after acceptance")
-        if tree == (git(found[0], "rev-parse", "-q", "--verify", "HEAD^{tree}", optional=True) or b"").decode().strip():
-            print("Nothing to commit: HEAD already holds the verified files")
-            return
-    # Outside the board's lock: a commit hook may build and test for minutes.
-    out = git(found[0], "commit", "-m", message)
-    sys.stdout.write(os.fsdecode(out))
-    if git(found[0], "rev-parse", "HEAD^{tree}").decode().strip() != tree:
-        raise ValueError("the commit was made, but its files differ from the verified ones: a commit hook changed them, "
-                         "or the index changed while it ran. Inspect it with `git show --stat HEAD`")
-    print("COMMITTED %s %s" % (identifier, git(found[0], "rev-parse", "HEAD").decode().strip()))
+                publish_index(root, live, original, private, parent, ref, revision, recovery)
+            except ValueError as error:
+                if not recovery.is_file():
+                    raise
+                command = shlex.join([sys.executable, os.path.abspath(__file__), str(run), str(project),
+                                      "recover-index", identifier])
+                raise ValueError(f"{error}\nRecover the index with: {command}") from error
+        print(f"COMMITTED {identifier} {revision}", flush=True)
+        try:
+            commit_hook(root, "post-commit")
+        except (OSError, ValueError) as error:
+            print(f"Post-commit hook failed: {error}", file=sys.stderr)
 
 
 def accept(run, project, identifier):
@@ -1640,6 +1902,7 @@ def main():
     landed = actions.add_parser("commit", allow_abbrev=False)
     landed.add_argument("candidate")
     landed.add_argument("-m", "--message", required=True)
+    actions.add_parser("recover-index", allow_abbrev=False).add_argument("candidate")
     args = parser.parse_args()
     project = args.project.resolve(strict=True)
     run = args.run.resolve(strict=True)
@@ -1675,6 +1938,8 @@ def main():
             if not args.message.strip():
                 raise ValueError("the commit needs a message")
             commit(run, project, args.candidate, args.message)
+        elif args.action == "recover-index":
+            recover_index(run, project, args.candidate)
         else:
             accept(run, project, args.candidate)
 
