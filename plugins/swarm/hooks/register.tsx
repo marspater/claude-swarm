@@ -647,6 +647,8 @@ let silentTold = new Set<string>()
 // What the coordinator is owed with its next tool call, none of it worth a wake: a silent member, a HEAD that moved
 // under a shared-checkout writer, a post the person made in its name from the pane.
 let notesOwed: string[] = []
+// The run and family whose advisor note was given: said once, not at every member's start.
+let advisorNoted = ''
 // Members that spent their own token budget, told once each as a paused run is: with the next tool call, or a prompt when idle.
 let memberPausesOwed: { name: string; read: number }[] = []
 // Each read of the owned roster, numbered as it begins.
@@ -785,6 +787,7 @@ function resetMonitoring(): void {
   silentSince = new Map()
   silentTold = new Set()
   notesOwed = []
+  advisorNoted = ''
   memberPausesOwed = []
   memberPausesTold = new Set()
   budgetPauseNotifiedFor = ''
@@ -4156,13 +4159,16 @@ export const register: Register = on => {
       if (allowed && !allowed.includes(kind) && !allowed.includes(named)) {
         return { deny: `This run allows ${runsOn} only for: ${allowed.join(', ') || 'none'}. Register @${named} with another model= and pass that model on the Agent call.` }
       }
-      // A read that fails starts nobody, as every check here: this hook's own catch refuses the start.
-      // Asked only of a run that limits a family at all: no other can bar an advisor.
+      // The session's advisor is the user's own setting, and a member inherits it: a run that keeps members off its
+      // family says so once and starts them. Its tokens are charged to the run under `advisor`, so the budget holds
+      // them. Seen live: refused instead, the start sent the coordinator to the user, `/advisor off` did not change
+      // the saved setting this reads, and no member of the run could ever start.
       const isLimited = Object.keys(LATEST).some(family => state.limits !== undefined && Object.hasOwn(state.limits, family))
-      const barred = isLimited ? advisorBarred(state.limits, await $.settings.read({ key: 'advisorModel' }), kind, named) : undefined
-      if (barred) {
-        logEvent($, owned, 'refused', { member: named, why: `advisor on ${barred.family}, which the run's limits keep it off` })
-        return { deny: `This run allows ${barred.family} only for: ${barred.allowed.join(', ') || 'none'}, and this session's advisor answers on ${barred.family}. @${named} would inherit that advisor, and nothing can refuse an advisor call once a member runs. Start no member. Tell the user the limit and the advisor conflict, and ask which holds: they turn the advisor off for this session (/advisor off), or they lift the limit on ${barred.family}. Then start the team.` }
+      const barred = isLimited ? advisorBarred(state.limits, await $.settings.read({ key: 'advisorModel' }).catch(() => undefined), kind, named) : undefined
+      if (barred && advisorNoted !== `${owned}:${barred.family}`) {
+        advisorNoted = `${owned}:${barred.family}`
+        logEvent($, owned, 'advisor-limit', { member: named, family: barred.family })
+        notesOwed.push(`This run keeps members off ${barred.family}, and this session's advisor answers on ${barred.family}. Members may still consult it: that is the user's own setting, and its tokens count against the run's budget under "advisor". Start the team as planned; mention it to the user in your summary, and change no setting of theirs.`)
       }
       // The roster's model, or the type's default when it names none: a model passed only on the
       // Agent call would otherwise skip the plan the user saw and the board's rules for the type.

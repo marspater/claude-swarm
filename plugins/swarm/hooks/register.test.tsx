@@ -2744,13 +2744,16 @@ test('agent.spawn handles model=inherit, exact older IDs, spawnEfforts, parallel
   }
   // `opus=none` is enforced even for a member literally named `none`
   expect((await $.agent.spawn({ ...base, description: '@none: test', model: 'opus' })).deny).toContain('allows opus only for: none')
-  // Seen live (2026-11-25): `fable=none`, and two Sonnet workers consulted the session's Fable advisor. A member
-  // inherits the advisor and no hook can refuse its calls, so a family the run keeps it off bars the start itself.
+  // The session's advisor answers on a family the run keeps members off. It is the user's own setting: the member
+  // starts, and the coordinator is told once. Seen live (2026-11-25): refused instead, no member could ever start.
   advisor = 'opus'
-  const barred = (await $.agent.spawn({ ...base, description: '@w1: test' })).deny
-  expect(barred).toContain('this session\'s advisor answers on opus')
-  expect(barred).toContain('/advisor off')
-  expect(spawned).toHaveLength(0)
+  const started = await $.agent.spawn({ ...base, description: '@w1: test' })
+  expect([started.deny, started.agentId]).toEqual([undefined, 'id-1'])
+  await $.agent.spawn({ ...base, description: '@w2: test' })
+  const told = async () => (await toolCall($, { tool: 'Read', file_path: '/project/a.ts' })).context?.join('\n') ?? ''
+  expect((await told()).match(/this session's advisor answers on opus/g)).toHaveLength(1)
+  expect(await told()).not.toContain('advisor answers on')
+  spawned.length = 0
   advisor = 'haiku'  // a family the run does not limit
   // `model=inherit` rewrites to parentModel and `background: true` when !isTeammate
   expect((await $.agent.spawn({ ...base, description: '@inh: test' })).agentId).toBe('id-1')
