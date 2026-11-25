@@ -1006,19 +1006,30 @@ def prepare(run, project, mode, checks, onto=None, subset=None, baseline=False, 
             # The same files, checks and reports of the same workers as the candidate on the table: a READY that
             # changed nothing it holds (a follow-up worker's, or a second one racing the first) makes no new candidate,
             # so a pass that stands is not thrown away and the verifier is not sent to test the same thing twice.
-            same = ("mode", "project", "base", "onto", "checks", "no_checks", "baseline", "partial")
-            if mode == "isolated":
-                # Both fingerprints hold the commit, and a merge made again is a new commit of the same files: the
-                # tree says whether they are the same, and the checkout the pass was tested in must still be there, as prepared.
-                def tree(commit):
-                    return isinstance(commit, str) and git(project, "rev-parse", "--verify", "-q", commit + "^{tree}", optional=True)
+            # `branch` too: acceptance lands on the branch recorded, and refuses a checkout that left it.
+            same = ("mode", "project", "base", "onto", "branch", "checks", "no_checks", "baseline", "partial")
 
-                unchanged = (isinstance(previous, dict) and (tree(previous.get("commit")) or None) == tree(commit)
-                             and Path(str(previous.get("path"))).is_dir()
-                             and source_digest(Path(previous["path"]), pointers=True) == previous.get("digest"))
-            else:
-                unchanged = isinstance(previous, dict) and all(previous.get(key) == candidate[key] for key in ("digest", "exact"))
-            if (keep_standing and unchanged and isinstance(previous.get("candidate"), str)
+            def unchanged():
+                """Whether the candidate on the table holds the same files and `test` would still take its checkout.
+                Asked only to keep it standing: a checkout that cannot be fingerprinted is not the same, and must
+                not stop the prepare that replaces it. Seen in an audit: a pipe in the old checkout did."""
+                if not isinstance(previous, dict):
+                    return False
+                if mode != "isolated":
+                    return all(previous.get(key) == candidate[key] for key in ("digest", "exact"))
+                # Both fingerprints hold the commit, and a merge made again is a new commit of the same files: the
+                # tree says whether they are the same, and the checkout the pass was tested in must be as prepared.
+                def tree(revision):
+                    return isinstance(revision, str) and git(project, "rev-parse", "--verify", "-q", revision + "^{tree}", optional=True)
+                try:
+                    old = Path(str(previous.get("path")))
+                    return ((tree(previous.get("commit")) or None) == tree(commit) and old.is_dir()
+                            and source_digest(old, pointers=True) == previous.get("digest")
+                            and source_digest(old) == previous.get("exact"))
+                except (ValueError, OSError):
+                    return False
+
+            if (keep_standing and unchanged() and isinstance(previous.get("candidate"), str)
                     and all(previous.get(key) == candidate[key] for key in same)
                     and previous.get("allowed", []) == candidate.get("allowed", [])
                     and isinstance(previous.get("members"), list) and previous.get("inputs") == {
@@ -1087,8 +1098,94 @@ def remove_checkout(project, path, commit=None):
     candidate's own. True once it is gone."""
     held = git(path, "status", "--porcelain", "--ignored", "--untracked-files=all", "--ignore-submodules=none",
                optional=True)
-    return (held == b"" and not holds_commits(path, commit)
-            and git(project, "worktree", "remove", str(path), optional=True) is not None)
+    return held == b"" and remove_worktree(project, path, commit)
+
+
+def remove_worktree(project, path, commit=None):
+    """Keep HEAD locked while checking for local commits and removing the checkout. False when it was kept."""
+    admin = git(path, "rev-parse", "--absolute-git-dir", optional=True)
+    if not admin:
+        return False
+    lock = Path(os.fsdecode(admin.rstrip(b"\n"))) / "HEAD.lock"
+    if lock.parent.parent.name != "worktrees":
+        return False  # no worktree of its own any more: that Git folder is the project's, and its HEAD the user's
+    try:
+        os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    except OSError:  # held by a git command at work there, or left by one: nothing is removed under it
+        return False
+    try:
+        return not holds_commits(path, commit) and discard_worktree(project, path)
+    finally:
+        try:
+            lock.unlink()  # gone with the checkout when it was removed
+        except OSError:
+            pass
+
+
+def discard_worktree(project, path):
+    """Move the checkout aside, then remove only tracked leaves and empty directories. Git's recursive removal
+    would delete an ignored file created after the last status check, even without --force."""
+    try:
+        scratch = Path(tempfile.mkdtemp(prefix=".worktree-removal-", dir=path.parent))
+    except OSError:
+        return False
+    parked = scratch / "checkout"
+    if git(project, "worktree", "move", str(path), str(parked), optional=True) is None:
+        try:
+            scratch.rmdir()
+        except OSError as error:
+            print(f"Worktree cleanup left files at {scratch}: {error}", file=sys.stderr)
+        return False
+    backup_root = scratch / "tracked"
+    saved, removed = [], False
+
+    def scan_failed(error):
+        raise error
+
+    try:
+        if git(parked, "status", "--porcelain", "--ignored", "--untracked-files=all", "--ignore-submodules=none",
+               optional=True) != b"":
+            return False
+        indexed = git(parked, "ls-files", "-z", optional=True)
+        if indexed is None:
+            return False
+        tracked = {os.fsdecode(name) for name in indexed.split(b"\0") if name} | {".git"}
+        for folder, dirs, files in os.walk(parked, topdown=False, onerror=scan_failed):
+            directory = Path(folder)
+            for name in [*files, *(name for name in dirs if (directory / name).is_symlink())]:
+                leaf = directory / name
+                relative = leaf.relative_to(parked)
+                if relative.as_posix() not in tracked:
+                    return False
+                backup = backup_root / relative
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                leaf.rename(backup)
+                saved.append((leaf, backup))
+            # This also refuses files created after os.walk listed the directory.
+            directory.rmdir()
+        # The registered path has already been removed without recursion. Git only discards its metadata.
+        removed = git(project, "worktree", "remove", str(parked), optional=True) is not None
+        return removed and not os.path.lexists(path)
+    except OSError:
+        return False
+    finally:
+        try:
+            if removed:
+                for _, backup in saved:
+                    backup.unlink()
+            else:
+                parked.mkdir(exist_ok=True)
+                for leaf, backup in reversed(saved):
+                    leaf.parent.mkdir(parents=True, exist_ok=True)
+                    os.link(backup, leaf, follow_symlinks=False)
+                    backup.unlink()
+                if git(project, "worktree", "move", str(parked), str(path), optional=True) is None:
+                    raise OSError("Git could not restore the checkout to its original path")
+            for folder, _, _ in os.walk(backup_root, topdown=False):
+                Path(folder).rmdir()
+            scratch.rmdir()
+        except OSError as error:
+            print(f"Worktree cleanup left files at {scratch}: {error}", file=sys.stderr)
 
 
 def holds_commits(path, commit=None):
@@ -1519,7 +1616,9 @@ def test_candidate(run, project, identifier, verifier, timeout_arg=None):
             raise ValueError("this candidate was accepted; prepare a new candidate to test again")
         check_inputs(run, candidate)  # before anything is cleared: a test that cannot run voids nothing
         passed_by = candidate.get("verified_by")
-        if passed_by and passed_by != verifier:
+        holder = load_state(run)["members"].get(passed_by, {}) if passed_by else {}
+        # Only a pass acceptance would take: a retired verifier's is none, and its successor tests the candidate anew.
+        if passed_by and passed_by != verifier and holder.get("role") == "verifier" and not holder.get("killed"):
             # Every verifier is sent the same candidate. A second test would take the pass from the verifier that
             # earned it before that one has posted its line, which the board then refuses as no longer its own.
             print(f"Candidate {identifier} already passed: @{passed_by} verified it, and nothing it holds has changed since. "

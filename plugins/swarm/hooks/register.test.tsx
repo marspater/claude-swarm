@@ -2066,6 +2066,7 @@ test('an advisor charge whose response was lost is not charged again under the n
   })
   const clock = mock.clock(on)
   const advisorCharges: number[] = []
+  let isCutShort = false
   on('process.run', (_, e) => {
     const stdout = board(e)
     if (e.argv[3] !== 'account') return answer(stdout)
@@ -2078,6 +2079,7 @@ test('an advisor charge whose response was lost is not charged again under the n
     row[0]! += 1
     counts.forEach((count, index) => { row[index + 1]! += count })
     advisorCharges.push(amount)
+    if (isCutShort) return answer('{"title": "Demo sw')  // saved, and the answer reached the hook cut short
     return advisorCharges.length === 1 ? { value: { ...answer('').value, exitCode: 1 } }
       : answer(JSON.stringify({ title: state.title, total: 0, budget: 0, paused: false }))
   })
@@ -2116,6 +2118,14 @@ test('an advisor charge whose response was lost is not charged again under the n
   advisorInput = 150
   await step(5)
   expect(advisorCharges).toEqual([advisorCharges[0]!, advisorCharges[0]! / 2])
+  // An answer that cannot be parsed confirms nothing either: the roster is asked, and the same tokens are not taken twice.
+  isCutShort = true
+  advisorInput = 200
+  await step(6)
+  isCutShort = false
+  await step(7)
+  await step(8)
+  expect(advisorCharges).toHaveLength(3)
 })
 
 test('advisor tokens the roster already holds are not charged again by the first step after a reload', async ($, on) => {
@@ -2734,13 +2744,16 @@ test('agent.spawn handles model=inherit, exact older IDs, spawnEfforts, parallel
   }
   // `opus=none` is enforced even for a member literally named `none`
   expect((await $.agent.spawn({ ...base, description: '@none: test', model: 'opus' })).deny).toContain('allows opus only for: none')
-  // Seen live (2026-11-25): `fable=none`, and two Sonnet workers consulted the session's Fable advisor. A member
-  // inherits the advisor and no hook can refuse its calls, so a family the run keeps it off bars the start itself.
+  // The session's advisor answers on a family the run keeps members off. It is the user's own setting: the member
+  // starts, and the coordinator is told once. Seen live (2026-11-25): refused instead, no member could ever start.
   advisor = 'opus'
-  const barred = (await $.agent.spawn({ ...base, description: '@w1: test' })).deny
-  expect(barred).toContain('this session\'s advisor answers on opus')
-  expect(barred).toContain('/advisor off')
-  expect(spawned).toHaveLength(0)
+  const started = await $.agent.spawn({ ...base, description: '@w1: test' })
+  expect([started.deny, started.agentId]).toEqual([undefined, 'id-1'])
+  await $.agent.spawn({ ...base, description: '@w2: test' })
+  const told = async () => (await toolCall($, { tool: 'Read', file_path: '/project/a.ts' })).context?.join('\n') ?? ''
+  expect((await told()).match(/this session's advisor answers on opus/g)).toHaveLength(1)
+  expect(await told()).not.toContain('advisor answers on')
+  spawned.length = 0
   advisor = 'haiku'  // a family the run does not limit
   // `model=inherit` rewrites to parentModel and `background: true` when !isTeammate
   expect((await $.agent.spawn({ ...base, description: '@inh: test' })).agentId).toBe('id-1')
@@ -3306,33 +3319,69 @@ test('a mention older than the tail of a large board is still delivered', async 
 test('a mention of the coordinator older than the tail of a large board still prompts it', async ($, on) => {
   const state = {
     title: 'Demo swarm',
-    members: { coordinator: { role: 'coordinator', last_read_seq: 5 }, parser: { role: 'worker', id: 'a1', last_read_seq: 2000 } },
+    members: { coordinator: { role: 'coordinator', last_read_seq: 4 }, parser: { role: 'worker', id: 'a1', last_read_seq: 2000 } },
   }
-  const tail = JSON.stringify({ seq: 2000, agent: 'coordinator', to: [], text: 'a later note for nobody', time: '2026-11-16T14:03:22+0100' }) + '\n'
+  const line = (seq: number, to: string[], text: string) => JSON.stringify({ seq, agent: 'parser', to, text, time: '2026-11-16T14:03:22+0100' }) + '\n'
+  // The tail the pane reads starts long after #5 and #7, which ask the coordinator something; #2000 addresses it too.
+  const tail = line(1999, [], 'a note for nobody') + line(2000, ['coordinator'], '@coordinator one more thing')
   const { seen, answer, board } = owning(on, { board: () => tail, roster: () => JSON.stringify(state) })
   on('fs.stat', () => ({ value: { size: 5_000_000, mtimeMs: 1 } as never }))
-  // The board counts over the whole journal: #7 asks the coordinator something, and the tail starts long after it.
-  const report_ = { text: '' }
-  report_.text = JSON.stringify({ items: [{ kind: 'question', member: 'parser', seq: 7, text: '@parser asks: which file?' }], members: {}, sent: {}, unread: { coordinator: 1 }, unread_through: { coordinator: 7 } })
+  // The board counts over the whole journal.
+  const report = (seqs: number[]) => JSON.stringify({ items: [], members: {}, sent: {}, unread: { coordinator: seqs.length }, unread_seqs: { coordinator: seqs } })
+  let owedSeqs = [5, 7, 2000]
   on('process.run', (_, e) => {
     const stdout = board(e)
     const action = e.argv[3]
-    return answer(action === 'tail' ? tail : action === 'attention' ? report_.text : stdout)
+    return answer(action === 'tail' ? tail : action === 'attention' ? report(owedSeqs) : stdout)
   })
   on('agent.list', () => ({ value: [{ id: 'a1', description: '@parser', type: 'swarm:worker', status: 'idle' }] as never }))
   on('tool.call', () => ({ result: {} }))
   const clock = mock.clock(on)
+  const prompts = () => seen.prompts.filter(text => text.includes('Unread board mentions'))
+  const wait = async () => { for (let waited = 0; waited < 16_000; waited += 2000) await clock.advance(2000) }
 
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
   await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  // It views the newest one, and the oldest, each on its own: neither read moves its cursor, and #7 is still owed.
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" show --post=2000` })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" show --post=5` })
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'c', reason: 'answer' })
-  for (let waited = 0; waited < 16_000; waited += 2000) await clock.advance(2000)
-  expect(seen.prompts.filter(text => text.includes('Unread board mentions'))).toHaveLength(1)
+  await wait()
+  expect(prompts()).toHaveLength(1)
+  expect(prompts()[0]).toContain('from #7 on')
   // Read, the board names none, and nothing more is asked.
   state.members.coordinator.last_read_seq = 2000
-  report_.text = JSON.stringify({ items: [], members: {}, sent: {}, unread: {}, unread_through: {} })
-  for (let waited = 0; waited < 16_000; waited += 2000) await clock.advance(2000)
-  expect(seen.prompts.filter(text => text.includes('Unread board mentions'))).toHaveLength(1)
+  owedSeqs = []
+  await wait()
+  expect(prompts()).toHaveLength(1)
+})
+
+test('attention is asked again on a timer while a pass waits to be accepted, and only then', async ($, on) => {
+  const { seen, answer, board } = owning(on, { board: () => posts({ agent: 'coordinator', to: ['parser'], text: '@parser BRIEF' }), roster: () => ROSTER })
+  let isStanding = true
+  on('process.run', (_, e) => {
+    const stdout = board(e)
+    return answer(e.argv[3] === 'attention' ? JSON.stringify({ items: [], members: {}, sent: {}, unread: {}, ...(isStanding ? { standing: true } : {}) }) : stdout)
+  })
+  on('agent.list', () => ({ value: [] }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  const asked = () => seen.commands.filter(command => command === 'attention --json').length
+  const wait = async (ms: number) => { for (let waited = 0; waited < ms; waited += 2000) await clock.advance(2000) }
+
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const first = asked()
+  expect(first).toBeGreaterThan(0)
+  // No post and no roster change: an edit to a source file is seen only by asking the board again.
+  await wait(20_000)
+  expect(asked()).toBe(first + 1)
+  isStanding = false
+  await wait(20_000)
+  const settled = asked()
+  await wait(40_000)
+  expect(asked()).toBe(settled)
 })
 
 test('a retired member that is still mid-turn has its tool calls refused, and its replacement does not', async ($, on) => {
