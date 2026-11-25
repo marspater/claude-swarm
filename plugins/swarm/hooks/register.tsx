@@ -1625,7 +1625,8 @@ async function refresh($: EngineInterface): Promise<void> {
       const report = await reportOf($, dir)
       if (epoch !== generation || isEnding) return
       lastReport = report ? { dir, report } : undefined
-      attentionRetry = report ? 0 : now + 10_000
+      // A pass that waits to be accepted is judged again on a timer: an edit to a source file changes no board.
+      attentionRetry = report ? (report.standing ? now + 15_000 : 0) : now + 10_000
       full = parse(dir, board, rosterText, agents, Infinity, report, coordinating)
       full.mood = moodOf(full, agents)
       const next = { ...full, posts: full.posts.slice(-KEPT), earlierEdges: earlierEdgesOf(full.posts, full.posts.slice(-KEPT), report?.edges, report?.through), attentionUnavailable: !report }
@@ -1707,8 +1708,11 @@ async function refresh($: EngineInterface): Promise<void> {
     // Only the tail of a large board is read, and a mention older than it is in no post here: the board, which counts
     // over the whole journal, names the newest one. Seen in an audit: Attention showed the question and no prompt came.
     const tailFrom = full.posts[0]?.seq ?? 1
-    const beforeTail = owned && !state.closed && tailFrom > 1 && lastReport?.dir === dir ? lastReport.report.unread_through?.coordinator ?? 0 : 0
-    const unreadSeqs = [...(beforeTail > 0 && beforeTail < tailFrom ? [beforeTail] : []), ...unread.map(post => post.seq)]
+    // Each of them, less the ones it was shown, as for the tail's: with the newest alone, viewing that one hid the rest.
+    const beforeTail = owned && !state.closed && tailFrom > 1 && lastReport?.dir === dir
+      ? (lastReport.report.unread_seqs?.coordinator ?? []).filter(seq => seq < tailFrom && seq > shownPosts.through && !shownPosts.posts.has(seq))
+      : []
+    const unreadSeqs = [...beforeTail, ...unread.map(post => post.seq)]
     const last = unreadSeqs.at(-1) ?? 0
     const firstPending = unreadSeqs.find(seq => seq > prompted)
     const since = firstPending !== undefined && owedSeqs.includes(firstPending) && owed.last > prompted
@@ -1720,7 +1724,7 @@ async function refresh($: EngineInterface): Promise<void> {
     // coalesce while other members still work.
     const hasActiveDependent = (sender: string) => Object.entries(state.members).some(([name, m]) =>
       name !== 'coordinator' && !m.killed && (m.depends ?? '').split(',').map(d => d.trim()).includes(sender))
-    isOwedRoutine = !full.attentionUnavailable && unread.length > 0 && unread.every(post => {
+    isOwedRoutine = !full.attentionUnavailable && beforeTail.length === 0 && unread.length > 0 && unread.every(post => {
       const label = kindOf(post.text)?.label
       // A hand-back Swarm put on the board is a turn's closing words: read with the next wake, as a READY is.
       const isHandback = post.text.startsWith(HANDBACK_POST)
@@ -2320,7 +2324,7 @@ async function advised(
   }
   const owed = owedOf(spent, advisorTaken.get(agentId))
   if (owed.amount <= 0) return
-  const taken = await account($, turnId, `${turnId}:${index}:advisor`, agentId, owed.amount, owner, expectedEpoch, owed.detail, spent.model, 'advisor')
+  const taken = await account($, turnId, `${turnId}:${index}:advisor`, agentId, owed.amount, owner, expectedEpoch, owed.detail, spent.model, 'advisor').catch(() => false as const)
   // Unconfirmed, the board may still have saved it: the roster is asked again before the next charge, as after a
   // reload. Charged from memory, a lost response had the same tokens taken twice, under the next step's report.
   if (typeof taken === 'number') advisorTaken.set(agentId, spent)
@@ -2393,7 +2397,15 @@ async function account(
   const result = await boardCommand($, dir, ['account', turn, actor, String(amount), ...(detail ? [`${wake}:${detail}`, ...label] : [])])
   if (result.exitCode !== 0 || result.stdout.trim() === '') return false
   if (expectedEpoch !== sessionEpoch || isEnding) return amount
-  const entry = JSON.parse(result.stdout) as { title: string; total: number; budget: number; paused: boolean; member_paused?: unknown; accepted?: number }
+  // An answer cut short is no confirmation, and the board may have saved the charge: asked again under the same
+  // report, which the board counts once. Thrown instead, the advisor's next step charged the same tokens anew.
+  let entry: { title: string; total: number; budget: number; paused: boolean; member_paused?: unknown; accepted?: number }
+  try {
+    if (result.isStdoutTruncated) return false
+    entry = JSON.parse(result.stdout) as typeof entry
+  } catch {
+    return false
+  }
   const accepted = entry.accepted ?? amount
   const pausedName = typeof entry.member_paused === 'string' ? entry.member_paused : ''
   if (pausedName && dir === await read($, run)) {
