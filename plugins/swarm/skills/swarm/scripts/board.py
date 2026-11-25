@@ -844,15 +844,14 @@ def stale_pass(d, candidate, closed=False):
     return None
 
 
-STALE_CHECK_S = 10
-UNREAD_LISTED = 50
+STALE_CHECK_S = 30
 
 
 def recent_stale_pass(d, candidate, count):
     """stale_pass for attention, which every board change asks: the answer is kept beside the run for STALE_CHECK_S
-    while the candidate, its attempt and the number of posts are the same, since it reads every source file. The pane asks again every 15 s while a pass stands (`standing` in the report).
-    shortcut: an edit no post reports shows up to STALE_CHECK_S + 15 s late in the pane; `accept` and a VERIFIED
-    post always check anew. Upgrade to a stat-based fingerprint if that delay is ever felt."""
+    while the candidate, its attempt and the number of posts are the same, since it reads every source file.
+    shortcut: an edit no post reports shows up to STALE_CHECK_S late here; `accept` and a VERIFIED post always check
+    anew. Upgrade to a stat-based fingerprint if that delay is ever felt."""
     key, path = [candidate.get("candidate"), candidate.get("attempt"), count], os.path.join(d, ".stale-pass.json")
     try:
         with open(path, encoding="utf-8") as f:
@@ -1489,16 +1488,10 @@ def attention(state, posts, d=None):
                 candidate = json.load(f)
         except (OSError, ValueError):
             pass
-    standing = False
-    if isinstance(candidate, dict) and candidate.get("verified_by") and candidate.get("accepted"):
-        # An accepted pass is settled, as `close` and `export` read it: the commit that lands it, and the work after
-        # it, are no change to what was tested. Seen in an audit: accepting brought a false stale alert back.
-        pass
-    elif (isinstance(candidate, dict) and candidate.get("verified_by") and not candidate.get("partial")
-            and not state.get("closed")):
+    if (isinstance(candidate, dict) and candidate.get("verified_by") and not candidate.get("accepted")
+            and not candidate.get("partial") and not state.get("closed")):
         # A pass on the table is judged as acceptance judges it, not by the posts after it. Seen in an audit: a
         # follow-up worker's READY that changed no file was called stale, and a file edited with no report was not.
-        standing = True
         why = recent_stale_pass(d, candidate, len(posts))
         if why:
             items.append({"kind": "stale", "member": candidate["verified_by"], "seq": verified[-1]["seq"] if verified else 0,
@@ -1532,22 +1525,16 @@ def attention(state, posts, d=None):
                    "paused": bool(member.get("paused")), "heavy": not closed and heavy(name, member, posts)}
             for name, member in members.items() if name != COORDINATOR}
     # Counted over the whole journal: the pane reads only the newest posts of a board past its read limit.
-    sent, unread, owed_seqs = {}, {}, {}
+    sent, unread, through = {}, {}, {}
     for post in posts:
         sent[post["agent"]] = sent.get(post["agent"], 0) + 1
         for name in post.get("to", []):
             seen = members[name].get("last_read_seq") if isinstance(members.get(name), dict) else None
             if isinstance(seen, int) and post["seq"] > seen:
                 unread[name] = unread.get(name, 0) + 1
-                if len(owed_seqs.setdefault(name, [])) < UNREAD_LISTED:
-                    owed_seqs[name].append(post["seq"])
-    report = {"items": items, "members": view, "sent": sent, "unread": unread,
-              # Each one's oldest unread posts by number: the pane prompts the coordinator for those older than its tail,
-              # less the ones it was shown. One number would not do: that one may be the post it viewed.
-              "unread_seqs": owed_seqs}
-    if standing:
-        report["standing"] = True  # a pass waits to be accepted: the pane asks again, as an edit changes no board
-    return report
+                through[name] = post["seq"]
+    # `unread_through` is each one's newest unread post: the pane prompts the coordinator for one older than its tail.
+    return {"items": items, "members": view, "sent": sent, "unread": unread, "unread_through": through}
 
 
 ROUTES_MAX_BYTES = 1_000_000
@@ -1851,7 +1838,7 @@ def prune(root, args):
                             print("kept %s: worktree has uncommitted changes, or untracked or ignored files" % path)
                         elif verify.holds_commits(path, made.get(name)):
                             print("kept %s: it holds commits no branch has. Put a branch on them, or reset it, to remove it" % path)
-                        elif would or verify.remove_worktree(project, verify.Path(path), made.get(name)):
+                        elif would or verify.git(project, "worktree", "remove", path, optional=True) is not None:
                             print("%sremove worktree %s" % (would, path))
                             gone.add(os.path.realpath(path))
                             remaining_baselines.discard(name)
@@ -2291,10 +2278,6 @@ def main(argv):
             plan = planned(d)
             if not plan:
                 return None
-            # The failure on record as this starts, by its token: the only one a success here settles. One recorded
-            # while the lock is let go below is a newer plan's. Seen in an audit: an older dispatch erased it.
-            found = state.get("owed_dispatch")
-            prior = found.get("token") if isinstance(found, dict) and found.get("failed") else None
             fcntl.flock(lock, fcntl.LOCK_UN)
             run_dir = os.path.abspath(d)
             project = os.path.dirname(os.path.dirname(run_dir))
@@ -2333,8 +2316,7 @@ def main(argv):
                           % (made.get("candidate"), current))
                     return "done"
             verifiers = [name for name, entry in members.items() if entry.get("role") == "verifier" and not entry.get("killed")]
-            if (made and prior and isinstance(state.get("owed_dispatch"), dict) and state["owed_dispatch"].get("failed")
-                    and state["owed_dispatch"].get("token") == prior):
+            if made and isinstance(state.get("owed_dispatch"), dict) and state["owed_dispatch"].get("failed"):
                 # A failure nobody waits on any more, and the plan has prepared since, whoever's step ran it.
                 state.pop("owed_dispatch")
                 save(d, state)
@@ -2380,10 +2362,6 @@ def main(argv):
                     print("planned: the step that completes the team prepares this candidate and posts its test command "
                           "to the verifier. Nothing is prepared yet (%s)" % why.replace("verification: ", ""))
                 return None
-            if planned(d) != plan:
-                # The plan was replaced while this one was prepared: its failure is of a plan that is no longer the
-                # run's, and the newer plan's own dispatch says how that one went.
-                return None
             failure["why"] = why
             if author == COORDINATOR:
                 # The coordinator's own command reads this; a waiter's output nobody reads, so its caller keeps the
@@ -2394,12 +2372,6 @@ def main(argv):
                 told = [COORDINATOR, *(n for n in targets(why, members, sender=author) if n not in (author, COORDINATOR))]
                 post_message(author, "@coordinator The planned candidate could not be prepared after this READY:\n" + why, told)
                 print("the planned candidate could not be prepared: " + why)
-            if not waiter:
-                # Kept where attention shows it, whoever's step ran the plan; the waiter keeps its own, by its token.
-                # Seen in an audit: after the READY that completed the team, only a post said a candidate was owed.
-                state["owed_dispatch"] = {"token": uuid.uuid4().hex, "author": author,
-                                          "failed": why or "the planned candidate could not be prepared"}
-                save(d, state)
             return "failed"
 
         failure = {"why": ""}
@@ -2662,7 +2634,12 @@ def main(argv):
                     state.pop("owed_dispatch")
                     save(d, state)
                 if outcome == "failed":
-                    sys.exit(1)  # run_plan recorded it for attention; the command that asked for it fails too
+                    # Kept where attention shows it, and the command fails. Seen in an audit: the failure was printed,
+                    # the command exited 0, and nothing on the board said a candidate was owed.
+                    state["owed_dispatch"] = {"token": uuid.uuid4().hex, "author": COORDINATOR,
+                                              "failed": failure["why"] or "the planned candidate could not be prepared"}
+                    save(d, state)
+                    sys.exit(1)
 
         elif cmd == "limit":
             raising = "--raise" in args
