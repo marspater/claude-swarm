@@ -8193,7 +8193,8 @@ test('Bugs 3, 4, 10 & UX layout: pane-close, openBoard reopen preserving state, 
   const composeInput = await ui.find({ type: 'Input', key: 'board-compose' })
   expect(composeInput?.props.placeholder).toBe('Post to board as coordinator')
 
-  // Bug 4: openBoard closes + reopens with focus:true when PANE is already open, preserving replay state via isReopening
+  // Bug 4: opening the board while it is open is one open with focus, never a close first (the reopen is the
+  // suspect for a desktop tab named "Plugin" whose close mark did nothing). The replay position is untouched
   await ui.press({ key: 'tab-graph' })
   await ui.press({ key: 'replay-back' })
   expect(await ui.find({ type: 'Text', text: /Post 1 of 2/ })).toBeDefined()
@@ -8207,7 +8208,7 @@ test('Bugs 3, 4, 10 & UX layout: pane-close, openBoard reopen preserving state, 
   })
   await clock.advance(60)
   await reopen
-  expect(closedIds).toEqual(['swarm'])
+  expect(closedIds).toEqual([])
   expect(opened).toEqual([{ id: 'swarm', title: 'Swarm Board', focus: true }])
   // Replay position was preserved across the synthetic close
   await ui.redraw(PANE.props)

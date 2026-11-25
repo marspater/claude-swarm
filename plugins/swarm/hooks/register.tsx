@@ -883,23 +883,11 @@ function textCount(node: unknown): number {
 const openerOf = (dir: string) =>
   OPENER + dir.slice(dir.lastIndexOf('/') + 1).replace(/[^A-Za-z0-9_-]/g, '_').slice(-50)
 
-// Set while openBoard closes and reopens an already-open pane so on('ui.close') preserves live UI state.
-let isReopening = false
-
-async function openBoard($: EngineInterface) {
-  if (isReopening) return
-  const panes = await $.ui.panes().catch(() => [])
-  if (panes.some(p => p.id === PANE)) {
-    isReopening = true
-    try {
-      await $.ui.close({ id: PANE }).catch(() => undefined)
-      await $.clock.sleep(50)
-      return await $.ui.open({ id: PANE, title: TITLE, focus: true })
-    } finally {
-      isReopening = false
-    }
-  }
-  return await $.ui.open({ id: PANE, title: TITLE, focus: true })
+// One open, whether or not the pane is up: the host gives an open id its title and the focus again, never a second
+// pane. It used to close the pane first and reopen it. Seen 2026-11-25 with that in place: a desktop tab named
+// "Plugin" whose close mark did nothing while the pane's own Close button worked. The reopen is the suspect, not proven.
+function openBoard($: EngineInterface) {
+  return $.ui.open({ id: PANE, title: TITLE, focus: true })
 }
 
 
@@ -3540,7 +3528,7 @@ export const register: Register = on => {
     spawnIsolations.clear()
     sharedAgents.clear()
     isolatedAgents.clear()
-    isCoordinatorBusy = isEnding = isRefreshOwed = isPaneOpen = isWatched = isReopening = false
+    isCoordinatorBusy = isEnding = isRefreshOwed = isPaneOpen = isWatched = false
     activeCoordinatorTurnId = undefined
     // A start that follows no session.end (a reload) still opens its run's pane and reads its state anew.
     opened = closedRun = titleOpen = ''
@@ -4616,7 +4604,6 @@ export const register: Register = on => {
     return result
   })
   on('ui.close', { id: PANE }, async ($, e, next) => {
-    if (isReopening) return next(e)
     isPaneOpen = isWatched = false
     for (const clock of clocks.values()) clock.visible = false
     clearHeldStatuses()
