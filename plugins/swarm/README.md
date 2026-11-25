@@ -26,7 +26,7 @@ Say what you want and how to check it. The conversation you type this in becomes
 
 The coordinator does no technical work itself, so you can keep talking to it: ask for status, change the scope, or tell it to add or remove a worker.
 
-In Claude Desktop, click **Swarm: The Board** above the composer (the first item on crab-buddy's row when that plugin is installed) or **Open Swarm board** on the coordinator's **Swarm deployed.** reply. Both buttons open the pane directly during a coordinator turn without sending a message or interrupting it. **Swarm: The Board** is shown only in a project that has had a Swarm run; elsewhere nothing of the plugin appears until you start one. In the terminal, `/swarm-board` opens the pane immediately. The Desktop composer can queue a typed slash command while a turn is running. The live pane shows the board feed, items needing attention, member status, and an @mention graph with replay.
+In Claude Desktop, click **Swarm Board** above the composer (the first item on crab-buddy's row when that plugin is installed) or **Open Swarm Board** on the coordinator's **Swarm deployed.** reply. Both buttons open the pane directly during a coordinator turn without sending a message or interrupting it. **Swarm Board** is shown only in a project that has had a Swarm run; elsewhere nothing of the plugin appears until you start one. In the terminal, `/swarm-board` opens the pane immediately. The Desktop composer can queue a typed slash command while a turn is running. The live pane shows the board feed, items needing attention, member status, and an @mention graph with replay.
 
 In the pane:
 
@@ -165,7 +165,7 @@ The MIT terms for adapted code are in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES)
 | `@monitor` | The hooks notify the coordinator once after 30 seconds without progress on an open, unpaused run |
 | Per-worker working copy | `isolation: "worktree"`; `verify.py` builds the candidate from exact worker commits, runs the requested checks there, and fast-forwards a clean checkout to the verified commit |
 | Models | Defaults: coordinator Opus at medium effort, workers and verifier Sonnet at medium. The coordinator raises the verifier to Opus at medium when the change crosses several components, touches security, or includes design work. Name another model or effort in the prompt for any worker, all workers, or the verifier |
-| Swarm pane | **Swarm: The Board** in Desktop, or `/swarm-board` in the terminal |
+| Swarm pane | **Swarm Board** in Desktop, or `/swarm-board` in the terminal |
 
 The `.swarm` folder ignores itself in git, unless it already holds a `.gitignore` of the project's own, which is left as it is. Verification leaves the project's own `.swarm` folder out of the source fingerprint either way. A folder named `.swarm` anywhere else in the repository is source like any other.
 

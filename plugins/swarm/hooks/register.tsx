@@ -5,9 +5,9 @@ import type { AgentInfo, EngineInterface, Register, SessionMessage, Timer, ToolC
 import type { Member, Post, Swarm, Tab } from '../types'
 import { COORDINATOR_READ, RUN, boardCalls, type ParsedBoardCall, runsNamed, scanShell, shellWords, splitShellSegments, substitutions, unwrap, wakeMessage, wakeSequence, withoutRedirects } from './command'
 import { actsAsAnother, blocksRelativeBoardLimit, commitsInSharedCheckout, hasHiddenBoardLimit, normalizePath, resolveRealPath, waitsOnLooseMatch } from './guard'
-import { DEFAULT_EFFORT, DEFAULT_MODEL, LATEST, SPECIALISTS, SWARM_AGENTS, familyOf, latestOf, sizedEffort } from './models'
-import { CONTEXT_EARLY, CONTEXT_STOP, END, KEPT, budgetOf, contextState, findAgent, heldAt, isWindingDown, ledger, memberNamed, mentions, parse, parsePosts, postFields, targets, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
-import { CLIP, bodyOf, chipped, clean, clip, compact, fenceAfter, fenced, figuresIn, hasQuestion, head, kindOf, openedText, repeatsPosts, verdictOf, type Fence } from './text'
+import { DEFAULT_EFFORT, DEFAULT_MODEL, LATEST, SPECIALISTS, SWARM_AGENTS, advisorBarred, familyOf, latestOf, sizedEffort } from './models'
+import { CONTEXT_EARLY, CONTEXT_STOP, END, KEPT, advisorSpent, budgetOf, contextState, findAgent, heldAt, isWindingDown, ledger, memberNamed, mentions, owedOf, parse, parsePosts, postFields, targets, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
+import { CLIP, bodyOf, chipped, clean, clip, compact, fenceAfter, fenced, figuresIn, hasQuestion, head, kindOf, openedText, pointsAt, repeatsPosts, verdictOf, type Fence } from './text'
 import { hairlineDivider, liveIndicator, memberAccents, progressBar, progressUnits, semanticIcon, statusDot, statusInk, swarmEmblem, type BarTone, type EmblemState } from './palette'
 import { MEMBER_BEE_SIZE, hiveArt, memberBee, toolMood, toolSummary, type Mood } from './hive'
 import { MIN_LABEL_PX, SVG_LIMIT, drawGraph, earlierEdgesOf, edgesOf, graphHeight, isBroadcast, labelPx, pairOf, visibleMembers } from './graph'
@@ -72,7 +72,7 @@ const inactiveOf = (members: Swarm['members']) =>
 // Every new graph source reloads the host's sandboxed frame, and members report statuses many times a second.
 // The live graph takes new statuses with a new frame (another post, or play turning into the loop), or once
 // STATUS_SETTLE_MS passed since it last took them with no packet in flight; a trailing redraw takes what was held.
-const STATUS_SETTLE_MS = REPLAY_FRAME_MS
+const STATUS_SETTLE_MS = 2600
 let heldStatuses: { frame: string; at: number; statuses: Map<string, string> } | undefined
 let statusTimer: Timer | undefined
 
@@ -80,6 +80,13 @@ function clearHeldStatuses(): void {
   statusTimer?.cancel()
   statusTimer = undefined
   heldStatuses = undefined
+}
+
+// Cached drawGraph() result so interacting with Show more, List the routes, or Feed of returns the exact same
+// SVG source & alt and Desktop's reconciler preserves the sandboxed <iframe> via isEqualNode with zero reload.
+let graphCache: { key: string; graph: ReturnType<typeof drawGraph>; source: string | undefined } | undefined
+function clearGraphCache(): void {
+  graphCache = undefined
 }
 
 function settledStatuses($: EngineInterface, shown: Swarm, frame: string, isMoving: boolean, now: number): Swarm {
@@ -227,11 +234,16 @@ function scheduleLiveFrame($: EngineInterface): void {
       if (livePlayer !== timer) return
       const next = posts.find(post => post.seq > current)
       if (next === undefined) {
-        await stopLive($)
+        // Already on the latest post: keep livePulse steady in unified play-loop mode without reloading the iframe.
+        livePlayer = undefined
         return
       }
       await update($, livePulse, () => next.seq)
-      if (livePlayer === timer) scheduleLiveFrame($)
+      if (livePlayer === timer) {
+        // Only schedule another step when a newer post is still queued behind `next`.
+        if (posts.some(post => post.seq > next.seq)) scheduleLiveFrame($)
+        else livePlayer = undefined
+      }
     } catch {
       // A read or update that failed ends this animation, in a teardown or not: the next post starts another.
       if (livePlayer === timer) livePlayer = undefined
@@ -783,6 +795,7 @@ function resetMonitoring(): void {
   relayRun = relayHinted = relayPrompted = ''
   windingDown = ''
   windTold.clear()
+  clearGraphCache()
 }
 
 function boardCommand($: EngineInterface, directory: string, args: string[], stdin?: string) {
@@ -870,8 +883,23 @@ function textCount(node: unknown): number {
 const openerOf = (dir: string) =>
   OPENER + dir.slice(dir.lastIndexOf('/') + 1).replace(/[^A-Za-z0-9_-]/g, '_').slice(-50)
 
-function openBoard($: EngineInterface) {
-  return $.ui.open({ id: PANE, title: TITLE })
+// Set while openBoard closes and reopens an already-open pane so on('ui.close') preserves live UI state.
+let isReopening = false
+
+async function openBoard($: EngineInterface) {
+  if (isReopening) return
+  const panes = await $.ui.panes().catch(() => [])
+  if (panes.some(p => p.id === PANE)) {
+    isReopening = true
+    try {
+      await $.ui.close({ id: PANE }).catch(() => undefined)
+      await $.clock.sleep(50)
+      return await $.ui.open({ id: PANE, title: TITLE, focus: true })
+    } finally {
+      isReopening = false
+    }
+  }
+  return await $.ui.open({ id: PANE, title: TITLE, focus: true })
 }
 
 
@@ -1630,12 +1658,21 @@ async function refresh($: EngineInterface): Promise<void> {
         await update($, earlier, () => 0)
         await update($, query, () => '')
       } else if (!browsed && isPaneOpen && livePlayer === undefined && await read($, tab) === 'graph' && await read($, replay) === 0) {
-        const firstNew = next.posts.find(post => post.seq > lastPost)
-        if (firstNew) {
-          await update($, livePulse, () => firstNew.seq)
-          // The session may have ended or the pane closed while the pulse was stored: no timer is started behind them.
-          if (epoch === generation && !isEnding && isPaneOpen && livePlayer === undefined) scheduleLiveFrame($)
-          else if (livePlayer === undefined) await update($, livePulse, () => 0)
+        if (next.isClosed || next.isPaused) {
+          await stopLive($)
+        } else {
+          const firstNew = next.posts.find(post => post.seq > lastPost)
+          if (firstNew) {
+            await update($, livePulse, () => firstNew.seq)
+            // The session may have ended or the pane closed while the pulse was stored: no timer is started behind them.
+            // Only schedule live stepping when a newer post is queued behind `firstNew`; a single latest post renders
+            // directly in unified play-loop mode without a second iframe reload.
+            if (epoch === generation && !isEnding && isPaneOpen && livePlayer === undefined) {
+              if (next.posts.some(post => post.seq > firstNew.seq)) scheduleLiveFrame($)
+            } else if (livePlayer === undefined) {
+              await update($, livePulse, () => 0)
+            }
+          }
         }
       }
       if (epoch !== generation || isEnding) return
@@ -1893,6 +1930,8 @@ async function mirrorHandback($: EngineInterface, e: { text: string; origin: { k
     if (compactBody && report.length >= HANDBACK_MIN && newest.text.replace(/\s+/g, ' ').includes(compactBody)) {
       return { quiet, text: e.text.replace(body, () => `@${name} reported on the board in post #${newest.seq}.`) }
     }
+    // A last line that only points at that post is no report of its own, however short: nothing of it goes up.
+    if (pointsAt([newest], report)) return { quiet, text: e.text.replace(body, () => `@${name} reported on the board in post #${newest.seq}.`) }
     // A turn that ended on its own report has said it, even once the member read that post back: closing words that
     // repeat the report are not posted again. Seen live: a READY read back after an UNREAD note went up a second time
     // as a hand-back. Words the report does not hold are news (work done after it), and are posted as before.
@@ -1963,7 +2002,7 @@ async function repeatsBoard($: EngineInterface, e: { text: string; origin: { kin
   // Only what the member's posts since its wake already say: a hand-back with news is heard, whatever came before it.
   // Seen live: a READY, then a hand-back with a new build failure, dropped because the READY was there.
   const handedBack = HANDBACK.exec(e.text)
-  if (kind === 'peer' && (!handedBack || !repeatsPosts(since.map(post => post.text), unframed(handedBack[2]!)))) return false
+  if (kind === 'peer' && (!handedBack || !(pointsAt(since, unframed(handedBack[2]!)) || repeatsPosts(since.map(post => post.text), unframed(handedBack[2]!))))) return false
   const key = `${roster.dir}\n${name}`
   const used = boardDrops.get(key)
   // Only a post newer than its last wake, and one turn's end per post: a member that read its wake and posted
@@ -2237,6 +2276,58 @@ function forgetKills(): void {
   userFigures.clear()  // the budget one conversation's user named is not another's
 }
 
+/** One line of the run's debug log (`events.jsonl`), which `export` prints as the summary's timeline. Never awaited. */
+function logEvent($: EngineInterface, dir: string | undefined, kind: string, fields: Record<string, unknown>): void {
+  if (dir) void boardCommand($, dir, ['event', kind, JSON.stringify(fields).slice(0, 3900)]).catch(() => undefined)
+}
+
+// The agents that consulted the session's advisor, what the board has taken of its tokens, and the queue that charges them.
+const advisorUsers = new Set<string>()
+const advisorTaken = new Map<string, ReturnType<typeof advisorSpent>>()
+let advising: Promise<unknown> = Promise.resolve()
+/**
+ * A member's advisor calls, put in the debug log and charged to the run. The advisor answers on its own model inside
+ * the member's step, whose usage holds the member's tokens alone, so the advisor's are read off the agent's own
+ * per-model usage and charged under the `advisor` wake. Seen live: 117k input and 18k output tokens of a Fable
+ * advisor in a run limited to Sonnet, none of them in its budget or its summary. An agent that consulted once is
+ * looked at again on its later steps: the usage of a call may reach the agent's total after the step that made it.
+ */
+async function advised(
+  $: EngineInterface, turnId: string, index: number, agentId: string,
+  consults: readonly { startedAt: number; endedAt?: number }[], ownModel: string, owner: TurnOwner, expectedEpoch: number,
+): Promise<void> {
+  const [setting, agents] = await Promise.all([
+    $.settings.read({ key: 'advisorModel' }).catch(() => undefined),
+    $.agent.list().catch((): AgentInfo[] => []),
+  ])
+  if (expectedEpoch !== sessionEpoch || isEnding) return
+  const model = typeof setting === 'string' ? latestOf(setting.trim()) ?? '' : ''
+  const dir = typeof owner === 'string' ? owner : agentRuns.get(agentId)
+  const member = memberOfAgent(agentId)?.[0] ?? agentId
+  for (const use of consults) {
+    logEvent($, dir, 'advisor', {
+      member, model,
+      ...(use.endedAt === undefined ? { error: 'the response ended before the advisor answered' } : { seconds: Math.round((use.endedAt - use.startedAt) / 100) / 10 }),
+    })
+  }
+  // A host whose agents carry no `usage` counts no advisor tokens: the calls are still logged.
+  const agent = agents.find(one => one.id === agentId)
+  const perModel = (agent as { usage?: Parameters<typeof advisorSpent>[0] } | undefined)?.usage
+  const spent = advisorSpent(perModel, familyOf(model), familyOf(ownModel), familyOf)
+  if (!advisorTaken.has(agentId) && dir) {
+    // The agent's total goes on over a reload of these hooks, which forgets what was charged: the roster has it.
+    const actor = await digest(`swarm-agent:${teammateOf($, agentId, agent) ?? agentId}`)
+    const row = await $.fs.read(`${dir}/members.json`)
+      .then(text => (JSON.parse(text) as { usage?: { detail?: Record<string, Record<string, number[]>> } }).usage?.detail?.[actor]?.advisor)
+    if (expectedEpoch !== sessionEpoch || isEnding) return
+    advisorTaken.set(agentId, { input_tokens: row?.[1] ?? 0, cache_creation_input_tokens: row?.[2] ?? 0, cache_read_input_tokens: row?.[3] ?? 0, output_tokens: row?.[4] ?? 0, model: '' })
+  }
+  const owed = owedOf(spent, advisorTaken.get(agentId))
+  if (owed.amount <= 0) return
+  const taken = await account($, turnId, `${turnId}:${index}:advisor`, agentId, owed.amount, owner, expectedEpoch, owed.detail, spent.model, 'advisor')
+  if (typeof taken === 'number') advisorTaken.set(agentId, spent)
+}
+
 // Charges `amount` tokens to the actor's run under `report`, a name the board records once: a model step
 // (`<turn>:<index>`) as it answers, and a turn's end (`<turn>`) for what no step reported. False when the board
 // did not take it, so it is retried under the same report; undefined when it was never sent (nothing to charge, or no
@@ -2250,6 +2341,8 @@ async function account(
   owner: TurnOwner,
   expectedEpoch: number,
   detail = '',
+  model = '',
+  wakeAs = '',
 ): Promise<number | false | undefined> {
   const at = typeof owner === 'string' ? owner : undefined
   const isCurrent = () => expectedEpoch === sessionEpoch && !isEnding && (at !== undefined || owner === generation)
@@ -2295,8 +2388,10 @@ async function account(
     address ? digest(`swarm-agent:${address}`) : Promise.resolve('coordinator'),
   ])
   if (expectedEpoch !== sessionEpoch || isEnding) return undefined
-  const wake = turnWakes.get(turnId) ?? (agentId ? 'wake' : 'user')
-  const result = await boardCommand($, dir, ['account', turn, actor, String(amount), ...(detail ? [`${wake}:${detail}`] : [])])
+  const wake = wakeAs || (turnWakes.get(turnId) ?? (agentId ? 'wake' : 'user'))
+  // The model is a label on the charge: one the board would refuse is left off, never the reason the charge fails.
+  const label = /^[A-Za-z0-9._:@/[\]-]{1,100}$/.test(model) ? [model] : []
+  const result = await boardCommand($, dir, ['account', turn, actor, String(amount), ...(detail ? [`${wake}:${detail}`, ...label] : [])])
   if (result.exitCode !== 0 || result.stdout.trim() === '') return false
   if (expectedEpoch !== sessionEpoch || isEnding) return amount
   const entry = JSON.parse(result.stdout) as { title: string; total: number; budget: number; paused: boolean; member_paused?: unknown; accepted?: number }
@@ -3137,15 +3232,277 @@ function shortcut($: EngineInterface, e: Parameters<EngineInterface['ui']['resol
   )
 }
 
+type RichRenderEvent = Extract<Parameters<EngineInterface['ui']['resolve']>[0], { surface: 'desktop' | 'vscode' | 'mobile' }>
+type AnyRenderEvent = Parameters<EngineInterface['ui']['resolve']>[0]
+
+function GraphControls(
+  $: EngineInterface,
+  e: RichRenderEvent,
+  props: {
+    shown: Swarm
+    isLiveVisible: boolean
+    live: boolean
+    browsed: boolean
+    index: number
+    last: number
+    playing: boolean
+    isExpanded: boolean
+    hasBroadcast: boolean
+    liveOffset: number
+    timelineRatio: number
+    timelineBarWidth: number
+    timelineOffset: number
+    inactiveControl: ReturnType<typeof shortcut>
+  },
+) {
+  const { Box, Text, Button, Svg } = $.ui.resolve(e)
+  const { shown, isLiveVisible, live, browsed: isBrowsed, index, last, playing, isExpanded, hasBroadcast, liveOffset, timelineRatio, timelineBarWidth, timelineOffset, inactiveControl } = props
+  // A step that leads nowhere is text, not a control that does nothing.
+  const step = (key: string, label: string, seq: number | undefined) => seq === undefined
+    ? <Text key={key} dimColor>{label}</Text>
+    : <Button key={key} plain onPress={() => seek($, seq)}>{label}</Button>
+  return (
+    <Box
+      key="graph-controls"
+      flexDirection="column"
+      gap="xs"
+      borderStyle="round"
+      borderColor="subtle"
+      borderDimColor
+      hover={{ borderDimColor: false }}
+      paddingX="sm"
+      paddingY="xs"
+      minWidth={0}
+    >
+      <Box flexDirection="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" columnGap="sm" rowGap="xs" minWidth={0}>
+        {isLiveVisible ? (
+          <Box flexDirection="row" alignItems="center" gap="xs">
+            <Box flexShrink={0}><Svg key="live-indicator" source={liveIndicator(liveOffset)} alt="Live activity" width={16} height={16} /></Box>
+            <Text weight="semibold" color="success">Live</Text>
+          </Box>
+        ) : (
+          <Box flexDirection="row" alignItems="center" gap="sm">
+            <Text dimColor={!shown.isPaused || shown.isClosed || !live} color={live && shown.isPaused && !shown.isClosed ? 'warning' : undefined} weight={live && shown.isPaused && !shown.isClosed ? 'medium' : undefined} tabular>
+              {live ? (shown.isPaused && !shown.isClosed ? 'Paused' : 'Latest post') : `Post ${index + 1} of ${shown.posts.length}`}
+            </Text>
+            {!live && (
+              <Button key="replay-live" plain label={shown.isClosed || isBrowsed ? 'Latest' : 'Go live'} onPress={() => seek($, 0)} />
+            )}
+          </Box>
+        )}
+        <Box flexDirection="row" columnGap="sm" rowGap="xs" alignItems="center" flexWrap="wrap" minWidth={0}>
+          {hasBroadcast ? (
+            <Button
+              key="expand-all"
+              plain
+              dimColor={!isExpanded}
+              label={isExpanded ? 'Collapse @all' : 'Expand @all'}
+              onPress={() => update($, expandAll, isOn => !isOn)}
+            />
+          ) : (
+            <Text key="expand-all" dimColor>Expand @all</Text>
+          )}
+          {inactiveControl}
+        </Box>
+      </Box>
+      <Box flexDirection="row" gap="xs" alignItems="center" flexWrap="wrap" minWidth={0}>
+        <Text size="caption" weight="semibold" dimColor>Replay</Text>
+        {step('replay-first', 'First', index > 0 ? shown.posts[0]!.seq : undefined)}
+        {step('replay-back', '‹ Prev', index > 0 ? shown.posts[index - 1]!.seq : undefined)}
+        {last > 0
+          ? <Button key="replay-play" variant={playing ? 'primary' : 'secondary'} label={playing ? 'Pause' : 'Play'} onPress={() => play($)} />
+          : <Text key="replay-play" dimColor>Play</Text>}
+        {step('replay-next', 'Next ›', index < last ? shown.posts[index + 1]!.seq : undefined)}
+        {step('replay-last', 'Last', index < last ? shown.posts[last]!.seq : undefined)}
+      </Box>
+      {shown.posts.length > 1 && (
+        <Svg
+          source={progressBar(timelineRatio, isLiveVisible ? 'success' : 'accent', playing, timelineOffset, timelineBarWidth)}
+          alt={`Timeline position ${index + 1} of ${shown.posts.length}`}
+          width={timelineBarWidth}
+          height={6}
+        />
+      )}
+    </Box>
+  )
+}
+
+function GraphCanvas(
+  $: EngineInterface,
+  e: RichRenderEvent,
+  props: {
+    source: string | undefined
+    isLegible: boolean
+    post: Post
+    columns: number
+    drawnMembers: Swarm['members']
+    hiddenRoutes: number
+    legendHeight?: number
+    fallbackRoutes: ReturnType<typeof shortcut>
+  },
+) {
+  const { Box, Text, Svg } = $.ui.resolve(e)
+  const { source, isLegible, post, columns, drawnMembers, hiddenRoutes, legendHeight, fallbackRoutes } = props
+  if (source === undefined) {
+    return (
+      <Box key="route-list" flexDirection="column" gap="xs" minWidth={0}>
+        <Text dimColor>{isLegible ? 'Too many routes to draw at once, so they are listed.' : 'The pane is too narrow to draw this graph legibly, so its routes are listed.'}</Text>
+        {fallbackRoutes}
+      </Box>
+    )
+  }
+  return (
+    <Box flexDirection="column" gap="sm" minWidth={0}>
+      <Svg
+        key="message-routes"
+        source={source}
+        width={1024}
+        height={graphHeight(columns, drawnMembers, legendHeight)}
+        alt={`Post ${post.seq} · @${post.agent}${post.to.length ? ` to ${post.to.map(name => `@${name}`).join(', ')}` : ' · no mentions'}. A mention graph of ${counted(drawnMembers.length, 'member')}: List the routes below for each one in words.`}
+        isInteractive
+      />
+      {hiddenRoutes > 0 && (
+        <Text size="caption" dimColor>{`${counted(hiddenRoutes, 'quieter route')} not drawn: one drawing holds only so many.`}</Text>
+      )}
+    </Box>
+  )
+}
+
+function GraphRouteList(
+  $: EngineInterface,
+  e: RichRenderEvent,
+  props: {
+    listed: boolean
+    onToggle: () => void
+    content: ReturnType<typeof shortcut>
+  },
+) {
+  const { Box, Button } = $.ui.resolve(e)
+  const { listed, onToggle, content } = props
+  return (
+    <Box flexDirection="column" gap="sm" minWidth={0}>
+      {/* The host reads a drawing's alt and nothing inside it: the routes in words are one press away, in reach of the keyboard. */}
+      <Button
+        key="graph-routes"
+        plain
+        dimColor
+        label={listed ? 'Hide the route list' : 'List the routes'}
+        onPress={onToggle}
+      />
+      {listed && <Box key="graph-route-list" flexDirection="column" minWidth={0}>{content}</Box>}
+    </Box>
+  )
+}
+
+function GraphMembersStrip(
+  $: EngineInterface,
+  e: AnyRenderEvent,
+  props: {
+    members: Swarm['members']
+    hueOf: (name: string) => (typeof HUES)[number] | 'subtle'
+    onFeed: (name: string) => Promise<void>
+  },
+) {
+  const { Box, Text, Button } = $.ui.resolve(e)
+  const { members, hueOf, onFeed } = props
+  if (members.length === 0) return null
+  return (
+    <Box key="graph-members" flexDirection="row" columnGap="sm" rowGap="xs" flexWrap="wrap" alignItems="center" minWidth={0}>
+      <Text size="caption" weight="semibold" dimColor>Feed of</Text>
+      {members.map(member => (
+        <Box key={`graph-feed-wrap-${member.name}`} flexDirection="row" alignItems="center" columnGap="xs">
+          <Text color={hueOf(member.name)}>●</Text>
+          <Button key={`graph-feed-${member.name}`} plain label={`@${member.name}`} onPress={() => onFeed(member.name)} />
+        </Box>
+      ))}
+    </Box>
+  )
+}
+
+function GraphPostCard(
+  $: EngineInterface,
+  e: RichRenderEvent,
+  props: {
+    post: Post
+    postKind: ReturnType<typeof verdictOf>
+    time: string
+    detailsOpen: boolean
+    strippedGraphBody: string
+    graphPostBody: string
+    hue: (typeof HUES)[number] | 'subtle'
+    onOpenAgent: () => Promise<void>
+    onToggleDetails: () => Promise<void>
+  },
+) {
+  const { Box, Text, Button, Markdown, Svg } = $.ui.resolve(e)
+  const { post, postKind, time, detailsOpen, strippedGraphBody, graphPostBody, hue, onOpenAgent, onToggleDetails } = props
+  return (
+    <Box
+      key="graph-post"
+      flexDirection="column"
+      gap="xs"
+      borderStyle="round"
+      borderColor={postKind?.color ?? 'subtle'}
+      borderDimColor
+      hover={{ borderDimColor: false }}
+      paddingX="sm"
+      paddingY="xs"
+      minWidth={0}
+    >
+      <Box flexDirection="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" columnGap="sm" minWidth={0}>
+        <Box flexDirection="row" alignItems="center" columnGap="xs" flexWrap="wrap" minWidth={0}>
+          <Text color={hue}>●</Text>
+          <Button
+            key="graph-post-agent"
+            plain
+            label={`@${post.agent}`}
+            onPress={onOpenAgent}
+          />
+          <Text dimColor>{post.to.length ? `→ ${(detailsOpen ? post.to : post.to.slice(0, 2)).map(name => `@${name}`).join(' ')}` : '· no mentions'}</Text>
+          {post.to.length > 2 && !(detailsOpen && strippedGraphBody.length > CLIP) && (
+            <Button key="graph-post-recipients" plain dimColor label={detailsOpen ? 'Show fewer' : `+${post.to.length - 2} more`} onPress={onToggleDetails} />
+          )}
+          {postKind !== undefined && (
+            <Box flexDirection="row" alignItems="center" columnGap="xs">
+              <Box flexShrink={0}><Svg source={semanticIcon(verdictIconOf(postKind.label))} alt={postKind.label} width={12} height={12} /></Box>
+              <Text size="caption" weight="semibold" color={postKind.color}>{postKind.covered?.length ? `${postKind.label} · ${postKind.covered.map(name => `@${name}`).join(' ')}` : postKind.label}</Text>
+            </Box>
+          )}
+        </Box>
+        <Text size="caption" dimColor tabular>{`#${post.seq}${time ? ` · ${time}` : ''}`}</Text>
+      </Box>
+      {detailsOpen && postKind?.covered && (
+        <Text size="caption" color="warning">{`Partial pass of ${postKind.covered.map(name => `@${name}`).join(', ') || 'some workers'}: their pieces only, not the run's pass.`}</Text>
+      )}
+      {graphPostBody !== '' && (
+        <Box flexShrink={1} minWidth={0}>
+          <Markdown text={formatMarkdown(graphPostBody)} />
+        </Box>
+      )}
+      {strippedGraphBody.length > CLIP && (
+        <Button
+          key="graph-post-details"
+          plain
+          dimColor
+          label={detailsOpen ? '▴ Show less' : '▾ Show more'}
+          onPress={onToggleDetails}
+        />
+      )}
+    </Box>
+  )
+}
+
 export const register: Register = on => {
   // Keep the SVG source stable while it is on screen. Only a different drawing or a remount needs a fresh offset.
+  // Non-interactive <img> animations (hiveArt, liveIndicator) pass continuous=true so Desktop's full-sibling redraws
+  // resume mid-cycle at `now - clock.start` instead of restarting from 0ms.
   const clocks = new Map<string, { scene: string; view: string; start: number; offset: number; visible: boolean }>()
-  function phase(slot: string, scene: string, view: string, now: number, restart = false): number {
+  function phase(slot: string, scene: string, view: string, now: number, restart = false, continuous = false): number {
     let clock = clocks.get(slot)
     if (!clock || clock.scene !== scene || restart) {
       clock = { scene, view, start: now, offset: 0, visible: true }
       clocks.set(slot, clock)
-    } else if (clock.view !== view || !clock.visible) {
+    } else if (continuous || clock.view !== view || !clock.visible) {
       clock.view = view
       clock.offset = Math.max(0, now - clock.start)
       clock.visible = true
@@ -3183,7 +3540,7 @@ export const register: Register = on => {
     spawnIsolations.clear()
     sharedAgents.clear()
     isolatedAgents.clear()
-    isCoordinatorBusy = isEnding = isRefreshOwed = isPaneOpen = isWatched = false
+    isCoordinatorBusy = isEnding = isRefreshOwed = isPaneOpen = isWatched = isReopening = false
     activeCoordinatorTurnId = undefined
     // A start that follows no session.end (a reload) still opens its run's pane and reads its state anew.
     opened = closedRun = titleOpen = ''
@@ -3788,6 +4145,14 @@ export const register: Register = on => {
       if (allowed && !allowed.includes(kind) && !allowed.includes(named)) {
         return { deny: `This run allows ${runsOn} only for: ${allowed.join(', ') || 'none'}. Register @${named} with another model= and pass that model on the Agent call.` }
       }
+      // A read that fails starts nobody, as every check here: this hook's own catch refuses the start.
+      // Asked only of a run that limits a family at all: no other can bar an advisor.
+      const isLimited = Object.keys(LATEST).some(family => state.limits !== undefined && Object.hasOwn(state.limits, family))
+      const barred = isLimited ? advisorBarred(state.limits, await $.settings.read({ key: 'advisorModel' }), kind, named) : undefined
+      if (barred) {
+        logEvent($, owned, 'refused', { member: named, why: `advisor on ${barred.family}, which the run's limits keep it off` })
+        return { deny: `This run allows ${barred.family} only for: ${barred.allowed.join(', ') || 'none'}, and this session's advisor answers on ${barred.family}. @${named} would inherit that advisor, and nothing can refuse an advisor call once a member runs. Start no member. Tell the user the limit and the advisor conflict, and ask which holds: they turn the advisor off for this session (/advisor off), or they lift the limit on ${barred.family}. Then start the team.` }
+      }
       // The roster's model, or the type's default when it names none: a model passed only on the
       // Agent call would otherwise skip the plan the user saw and the board's rules for the type.
       if (memberModel === 'inherit' && e.model !== undefined && e.model !== 'inherit' && familyOf(e.parentModel) !== runsOn) {
@@ -3928,7 +4293,7 @@ export const register: Register = on => {
         turn.landing = turn.landing
           .then(() => at === undefined ? undefined : account($, e.turnId, `${e.turnId}:${e.index}`, e.agentId, delta, at, sEpoch,
             // A member's step also says what context it read: the board keeps it, to refuse a wake that would only pay for it again.
-            withHeld(stepped.detail(turn, e.index), e.agentId)))
+            withHeld(stepped.detail(turn, e.index), e.agentId), spent.model))
           .catch(() => false as const)
           // One never sent is no longer pending under its own report: its turn's end charges it.
           .then(landed => { if (sEpoch === sessionEpoch && !isEnding && landed !== false) stepped.landed(turn, landed ?? 0, e.index) })
@@ -3941,6 +4306,13 @@ export const register: Register = on => {
         if (snapshot && !snapshot.isClosed && at === snapshot.dir && snapshot.budget > 0 && tokensUsed(snapshot.tokens) + delta >= snapshot.budget) {
           halted = { dir: snapshot.dir, why: `paused (token budget of ${compact(snapshot.budget)} spent)` }
         }
+      }
+      const consults = (response.serverToolUses ?? []).filter(use => use.name === 'advisor')
+      if (e.agentId !== undefined && (consults.length > 0 || advisorUsers.has(e.agentId))) {
+        const agentId = e.agentId
+        advisorUsers.add(agentId)
+        // One at a time: two steps that read the same total would each charge the same tokens.
+        advising = advising.then(() => advised($, e.turnId, e.index, agentId, consults, spent?.model ?? '', owner ?? rGen, sEpoch)).catch(() => undefined)
       }
     } catch {
       // A usage failure must not change the response.
@@ -4180,8 +4552,16 @@ export const register: Register = on => {
         Object.values(now.members).some(member => member.id === from && member.killed !== '1')
       if (!isLive) return { drop: KILL_DROP }
     }
-    if (await repeatsBoard($, e).catch(() => false)) return { drop: 'Swarm: a member handed back while others still work; the board holds what it left.' }
+    const sender = senderOf(e)
+    const handing = { member: sender ? memberOfAgent(sender)?.[0] ?? sender : '', origin: e.origin.kind }
+    if (await repeatsBoard($, e).catch(() => false)) {
+      logEvent($, ownedRoster?.dir, 'turn-end', { ...handing, outcome: 'dropped: the board holds what it said' })
+      return { drop: 'Swarm: a member handed back while others still work; the board holds what it left.' }
+    }
     const mirrored = await mirrorHandback($, e).catch(() => undefined)
+    if (sender && ownedRoster && !ownedRoster.closed) {
+      logEvent($, ownedRoster.dir, 'turn-end', { ...handing, outcome: mirrored?.quiet ? 'dropped: no turn of the coordinator\'s needed' : mirrored ? 'passed to the coordinator as a pointer' : 'passed to the coordinator' })
+    }
     if (mirrored?.quiet) return { drop: 'Swarm: a member handed back while others still work; its report is on the board.' }
     if (mirrored) e = { ...e, text: mirrored.text }
     // A member's hand-back or task notification that starts the coordinator's next turn is that turn's wake, not the
@@ -4236,6 +4616,7 @@ export const register: Register = on => {
     return result
   })
   on('ui.close', { id: PANE }, async ($, e, next) => {
+    if (isReopening) return next(e)
     isPaneOpen = isWatched = false
     for (const clock of clocks.values()) clock.visible = false
     clearHeldStatuses()
@@ -4405,7 +4786,7 @@ export const register: Register = on => {
                 )}
               </Text>
             ) : (
-              <Text size="caption" dimColor wrap="truncate-end">Open the Swarm board</Text>
+              <Text size="caption" dimColor wrap="truncate-end">Open Swarm Board</Text>
             )}
           </Box>
         </Box>
@@ -4472,9 +4853,9 @@ export const register: Register = on => {
     const columns = Math.max(20, e.props.bodyColumns ?? 40)
     const tabView = current === 'members' && talk?.dir === shown.dir ? `members/talk/${talk.name}` : current
     const mood = shown.mood ?? 'sleep'
-    // Desktop reloads pane <Svg> images when the tab view changes: include tabView so the hive resumes at its
-    // live wall-clock phase instead of restarting from 0ms on every tab switch, while staying stable during polls.
-    const hiveOffset = phase(slot('hive'), shown.dir, `${shown.dir ? 'header' : 'empty'}/${mood}/${tabView}/${columns < 48 ? 's' : 'l'}`, now)
+    // Desktop recreates non-interactive <Svg> <img> siblings on every Pane render: continuous=true advances
+    // hiveOffset to live wall-clock `now - clock.start` so recreated hive artwork resumes mid-animation.
+    const hiveOffset = phase(slot('hive'), shown.dir, `${shown.dir ? 'header' : 'empty'}/${mood}/${tabView}/${columns < 48 ? 's' : 'l'}`, now, false, true)
     if (current !== 'graph' || shown.posts.length === 0) {
       for (const part of ['route', 'live', 'timeline']) hideMotion(slot(part))
     }
@@ -4720,14 +5101,16 @@ export const register: Register = on => {
         ? available
         : available.filter(post => terms.every(term => matchesTerm(post, term)))
       const search = (
-        <Box flexDirection="row" alignItems="center" columnGap="sm" rowGap="xs" flexWrap="wrap">
-          <Input
-            key="board-search"
-            placeholder="Filter: text, @name, from:, to:, kind:"
-            value={rawQuery}
-            submitLabel="Filter"
-            onSubmit={value => update($, query, () => value.trim())}
-          />
+        <Box flexDirection="row" alignItems="center" columnGap="sm" rowGap="xs" flexWrap="wrap" flexGrow={1} flexShrink={1} minWidth={0}>
+          <Box flexGrow={1} flexShrink={1} minWidth={0}>
+            <Input
+              key="board-search"
+              placeholder="Filter: text, @name, from:, to:, kind:"
+              value={rawQuery}
+              submitLabel="Filter"
+              onSubmit={value => update($, query, () => value.trim())}
+            />
+          </Box>
           {terms.length > 0 && (
             <Button key="board-search-clear" plain label={`Clear filter (${matching.length} of ${available.length})`} onPress={() => update($, query, () => '')} />
           )}
@@ -4735,9 +5118,10 @@ export const register: Register = on => {
       )
       // The person posts in the coordinator's name, and the coordinator is told with its next tool call.
       const compose = isDriven && (
+        <Box flexGrow={1} flexShrink={1} minWidth={0}>
           <Input
             key="board-compose"
-            placeholder="Post to the board as the coordinator"
+            placeholder="Post to board as coordinator"
             value=""
             submitLabel="Post"
             onSubmit={async value => {
@@ -4760,10 +5144,11 @@ export const register: Register = on => {
               await refresh($)
             }}
           />
+        </Box>
       )
       // Posting and filtering share one row, and the filter wraps under the post field where the pane is too narrow.
       const bar = (isSearchable: boolean) => (compose || isSearchable) && (
-        <Box flexDirection="row" alignItems="center" columnGap="sm" rowGap="xs" flexWrap="wrap" marginTop="sm">
+        <Box flexDirection="row" alignItems="center" columnGap="sm" rowGap="xs" flexWrap="wrap" marginTop="sm" minWidth={0}>
           {compose}
           {isSearchable && search}
         </Box>
@@ -4798,10 +5183,10 @@ export const register: Register = on => {
       const older = matching.length - visible.length
       body =
         visible.length === 0 ? (
-          <Box flexDirection="column" gap="sm">
+          <Box flexDirection="column" gap="sm" minWidth={0}>
             {bar(shown.posts.length > 0)}
             {historyControls}
-            <Box flexDirection="column" gap="xs" marginTop={compose || shown.posts.length > 0 ? undefined : 'sm'} borderStyle="round" borderColor={browsed?.boardUnavailable ? 'warning' : 'subtle'} borderDimColor paddingX="sm" paddingY="xs">
+            <Box flexDirection="column" gap="xs" marginTop={compose || shown.posts.length > 0 ? undefined : 'sm'} borderStyle="round" borderColor={browsed?.boardUnavailable ? 'warning' : 'subtle'} borderDimColor paddingX="sm" paddingY="xs" minWidth={0}>
               <Box flexDirection="row" alignItems="center" columnGap="xs" minWidth={0}>
                 {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon(browsed?.boardUnavailable ? 'warn' : 'info')} alt={browsed?.boardUnavailable ? 'Unavailable' : 'Info'} width={12} height={12} /></Box>}
                 <Box flexShrink={1} minWidth={0}>
@@ -4812,7 +5197,7 @@ export const register: Register = on => {
             </Box>
           </Box>
         ) : (
-          <Box flexDirection="column" gap="sm">
+          <Box flexDirection="column" gap="sm" minWidth={0}>
             {bar(true)}
             {historyControls}
             {!page && before > 1 && (
@@ -4865,10 +5250,11 @@ export const register: Register = on => {
                   hover={{ borderDimColor: false }}
                   paddingX="sm"
                   paddingY="xs"
+                  minWidth={0}
                 >
                   {isInspected && <Text size="caption" color="warning">Pinned from attention</Text>}
-                  <Box flexDirection="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" columnGap="sm">
-                    <Box flexDirection="row" alignItems="center" columnGap="xs" flexWrap="wrap">
+                  <Box flexDirection="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" columnGap="sm" minWidth={0}>
+                    <Box flexDirection="row" alignItems="center" columnGap="xs" flexWrap="wrap" minWidth={0}>
                       <Text color={hueOf(post.agent)}>●</Text>
                       <Button
                         key={`agent-${post.seq}`}
@@ -4895,9 +5281,17 @@ export const register: Register = on => {
                   {isOpen && kind?.covered && (
                     <Text size="caption" color="warning">{`Partial pass of ${kind.covered.map(name => `@${name}`).join(', ') || 'some workers'}: their pieces only, not the run's pass.`}</Text>
                   )}
-                  {postText !== '' && <Markdown text={formatMarkdown(postText)} />}
+                  {postText !== '' && (
+                    <Box flexShrink={1} minWidth={0}>
+                      <Markdown text={formatMarkdown(postText)} />
+                    </Box>
+                  )}
                   {isDiffOpen && diffParts(openDiff.text)[0] !== '' && <Text key={`diff-scope-${post.seq}`} size="caption" dimColor>{diffParts(openDiff.text)[0]}</Text>}
-                  {isDiffOpen && <Markdown key={`diff-text-${post.seq}`} text={diffParts(openDiff.text)[1]!} />}
+                  {isDiffOpen && (
+                    <Box flexShrink={1} minWidth={0}>
+                      <Markdown key={`diff-text-${post.seq}`} text={diffParts(openDiff.text)[1]!} />
+                    </Box>
+                  )}
                   {(hasMore || canViewGraph || isInspected || revision !== undefined) && (
                     <Box flexDirection="row" gap="sm" flexWrap="wrap">
                       {isInspected && (
@@ -4960,7 +5354,7 @@ export const register: Register = on => {
       // The live run's report is read again on the next poll; a browsed run's only on Retry.
       const isAttentionIssue = Boolean(shown.attentionUnavailable || browsed?.boardUnavailable)
       body = shown.attention.length === 0 ? (
-        <Box flexDirection="column" gap="xs" marginTop="sm" borderStyle="round" borderColor={isAttentionIssue ? 'warning' : 'subtle'} borderDimColor paddingX="sm" paddingY="xs">
+        <Box flexDirection="column" gap="xs" marginTop="sm" borderStyle="round" borderColor={isAttentionIssue ? 'warning' : 'subtle'} borderDimColor paddingX="sm" paddingY="xs" minWidth={0}>
           <Box flexDirection="row" alignItems="center" columnGap="xs" minWidth={0}>
             {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon(isAttentionIssue ? 'warn' : 'pass')} alt={isAttentionIssue ? 'Unavailable' : 'All clear'} width={12} height={12} /></Box>}
             <Box flexShrink={1} minWidth={0}>
@@ -5001,6 +5395,7 @@ export const register: Register = on => {
               hover={{ borderDimColor: false }}
               paddingX="sm"
               paddingY="xs"
+              minWidth={0}
             >
               <Box flexDirection="row" alignItems="flex-start" columnGap="xs" minWidth={0}>
                 {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon(attentionIconOf(item.kind, itemTone))} alt={formatAttentionKind(item.kind)} width={12} height={12} /></Box>}
@@ -5112,14 +5507,18 @@ export const register: Register = on => {
       const draw = (row: TalkRow, index: number) => row.kind === 'tools' ? (
         <Text key={`talk-${index}`} size="caption" dimColor>{row.text}</Text>
       ) : row.kind === 'prompt' ? (
-        <Box key={`talk-${index}`} flexDirection="column" gap="xs" borderStyle="round" borderColor="subtle" borderDimColor paddingX="sm" paddingY="xs">
+        <Box key={`talk-${index}`} flexDirection="column" gap="xs" borderStyle="round" borderColor="subtle" borderDimColor paddingX="sm" paddingY="xs" minWidth={0}>
           <Text size="caption" weight="semibold" dimColor>{index === 0 ? 'Prompt' : 'Message'}</Text>
-          <Markdown text={formatMarkdown(row.text)} />
+          <Box flexShrink={1} minWidth={0}>
+            <Markdown text={formatMarkdown(row.text)} />
+          </Box>
         </Box>
       ) : (
-        <Box key={`talk-${index}`} flexDirection="column" gap="xs">
+        <Box key={`talk-${index}`} flexDirection="column" gap="xs" minWidth={0}>
           <Text size="caption" weight="semibold" color={hueOf(open.name)}>@{open.name}</Text>
-          <Markdown text={formatMarkdown(row.text)} />
+          <Box flexShrink={1} minWidth={0}>
+            <Markdown text={formatMarkdown(row.text)} />
+          </Box>
         </Box>
       )
       body = (
@@ -5263,6 +5662,7 @@ export const register: Register = on => {
             hover={{ borderDimColor: false }}
             paddingX="sm"
             paddingY="xs"
+            minWidth={0}
           >
             {HeaderArt ? (
               <Box flexDirection="row" alignItems="flex-start" columnGap="sm" minWidth={0}>
@@ -5271,7 +5671,7 @@ export const register: Register = on => {
                   {stackIdentity && meta && <Text size="caption" dimColor wrap="truncate-end">{meta}</Text>}
                   {status}
                 </Box>
-                <Box key={`bee-${member.name}`} flexShrink={0} paddingTop="md" paddingRight="sm">
+                <Box key={`bee-${member.name}`} flexShrink={0} paddingTop="xs" paddingRight="sm">
                   <HeaderArt
                     source={memberBee(accent, member.status, motionOffset, member.name, memberPaused)}
                     alt={`Bee for ${member.name}`}
@@ -5373,7 +5773,6 @@ export const register: Register = on => {
       )
     } else if (e.surface !== 'terminal') {
       // the terminal has no Svg: it keeps the list below
-      const { Svg } = $.ui.resolve(e)
       const selected = await read($, replay)
       const playing = await read($, isPlaying)
       const pulse = await read($, livePulse)
@@ -5386,14 +5785,18 @@ export const register: Register = on => {
         ...Object.keys(shown.earlierEdges ?? {}).flatMap(edge => pairOf(edge) ?? [edge.split('>')[0] ?? '']),
         ...shown.posts.slice(0, index + 1).flatMap(entry => [entry.agent, ...entry.to]),
       ])
-      // Incoming posts animate once on the live board. The latest route loops when playback is idle on a live run.
+      // Incoming posts animate once on the live board; a live post with no newer post queued renders directly in
+      // unified play-loop mode (animate + repeat) to avoid a second iframe reload. At the latest post outside active
+      // playback, repeat stays on across live, closed, paused, and browsed runs so breathing loops stay active.
       const isLiveRun = !browsed && !shown.isClosed && !shown.isPaused
-      const animate = playing || (isLiveRun && live && pulse === post.seq)
-      const repeat = isLiveRun && !playing && index === shown.posts.length - 1 && !animate
-      const mode = animate ? 'play' : repeat ? 'repeat' : 'still'
+      const isLatest = index === shown.posts.length - 1
+      const isLivePulse = isLiveRun && live && pulse === post.seq
+      const animate = playing || isLivePulse
+      const repeat = (!playing && isLatest && !animate) || (!playing && isLatest && isLivePulse)
+      const mode = animate && repeat ? 'play-loop' : animate ? 'play' : repeat ? 'repeat' : 'still'
       const isLiveVisible = live && isLiveRun
       if (!isLiveVisible) clearHeldStatuses()
-      const graphSwarm = isLiveVisible ? settledStatuses($, shown, `${slot('route')}/${shown.dir}/${post.seq}/${mode}`, animate, now) : shown
+      const graphSwarm = isLiveVisible ? settledStatuses($, shown, `${slot('route')}/${shown.dir}/${post.seq}/${mode}`, animate && !repeat, now) : shown
       const hideable = [...(graphSwarm === shown ? inactive : inactiveOf(graphSwarm.members))].filter(name =>
         memberOf(name)?.role !== 'coordinator' && (participants === undefined || participants.has(name)) &&
         name !== post.agent && !post.to.includes(name),
@@ -5414,165 +5817,78 @@ export const register: Register = on => {
       const drawing = JSON.stringify([live, isExpanded, Boolean(shown.isPaused), shown.isClosed, [...hidden],
         drawnMembers.map(m => [m.name, m.role, live ? m.status : '', m.depends])])
       const routeOffset = isLegible
-        ? phase(routeSlot, `${shown.dir}/${post.seq}`, `${mode}/${drawing}`, now, animate && !clocks.get(routeSlot)?.view.startsWith('play/'))
+        ? phase(routeSlot, `${shown.dir}/${post.seq}`, `${mode}/${drawing}`, now, animate && !clocks.get(routeSlot)?.view.startsWith('play'))
         : 0
-      const graph = isLegible ? drawGraph(graphSwarm, post.seq, hidden, animate, live, repeat, routeOffset, isExpanded) : undefined
-      // The host refuses a longer source, and the whole pane with it: such a graph is listed too.
-      const source = graph?.svg !== undefined && byteLength(graph.svg) <= SVG_LIMIT ? graph.svg : undefined
+      const graphKey = `${shown.dir}\0${post.seq}\0${mode}\0${drawing}\0${routeOffset}\0${shown.posts.length}\0${shown.total ?? 0}\0${Object.keys(shown.earlierEdges ?? {}).length}\0${post.agent}\0${post.to.join(',')}`
+      let graph: ReturnType<typeof drawGraph> | undefined
+      let source: string | undefined
+      if (isLegible) {
+        if (graphCache?.key === graphKey) {
+          graph = graphCache.graph
+          source = graphCache.source
+        } else {
+          graph = drawGraph(graphSwarm, post.seq, hidden, animate, live, repeat, routeOffset, isExpanded)
+          // The host refuses a longer source, and the whole pane with it: such a graph is listed too.
+          source = graph.svg !== undefined && byteLength(graph.svg) <= SVG_LIMIT ? graph.svg : undefined
+          graphCache = { key: graphKey, graph, source }
+        }
+      }
       if (source === undefined) hideMotion(routeSlot)
       const last = shown.posts.length - 1
       const feedMembers = shown.members.filter(member => !hidden.has(member.name) && member.posts > 0)
       const timelineRatio = (index + 1) / shown.posts.length
       const timelineBarWidth = Math.max(160, Math.min(600, columns * 8))
       const timelineOffset = phase(slot('timeline'), shown.dir, `${progressUnits(timelineRatio)}/${playing}/${isLiveVisible}/${timelineBarWidth}`, now)
-      // A step that leads nowhere is text, not a control that does nothing.
-      const step = (key: string, label: string, seq: number | undefined) => seq === undefined
-        ? <Text key={key} dimColor>{label}</Text>
-        : <Button key={key} plain onPress={() => seek($, seq)}>{label}</Button>
+      const liveOffset = isLiveVisible ? phase(slot('live'), shown.dir, 'live', now, false, true) : 0
       body = (
-        <Box flexDirection="column" marginTop="sm" gap="sm">
-          <Box
-            key="graph-controls"
-            flexDirection="column"
-            gap="xs"
-            borderStyle="round"
-            borderColor="subtle"
-            borderDimColor
-            hover={{ borderDimColor: false }}
-            paddingX="sm"
-            paddingY="xs"
-          >
-            <Box flexDirection="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" columnGap="sm" rowGap="xs">
-              {isLiveVisible ? (
-                <Box flexDirection="row" alignItems="center" gap="xs">
-                  <Box flexShrink={0}><Svg key="live-indicator" source={liveIndicator(phase(slot('live'), shown.dir, 'live', now))} alt="Live activity" width={16} height={16} /></Box>
-                  <Text weight="semibold" color="success">Live</Text>
-                </Box>
-              ) : (
-                <Box flexDirection="row" alignItems="center" gap="sm">
-                  <Text dimColor={!shown.isPaused || shown.isClosed || !live} color={live && shown.isPaused && !shown.isClosed ? 'warning' : undefined} weight={live && shown.isPaused && !shown.isClosed ? 'medium' : undefined} tabular>
-                    {live ? (shown.isPaused && !shown.isClosed ? 'Paused' : 'Latest post') : `Post ${index + 1} of ${shown.posts.length}`}
-                  </Text>
-                  {!live && (
-                    <Button key="replay-live" plain label={shown.isClosed || browsed ? 'Latest' : 'Go live'} onPress={() => seek($, 0)} />
-                  )}
-                </Box>
-              )}
-              <Box flexDirection="row" columnGap="sm" rowGap="xs" alignItems="center" flexWrap="wrap" minWidth={0}>
-                {hasBroadcast ? (
-                  <Button
-                    key="expand-all"
-                    plain
-                    dimColor={!isExpanded}
-                    label={isExpanded ? 'Collapse @all' : 'Expand @all'}
-                    onPress={() => update($, expandAll, isOn => !isOn)}
-                  />
-                ) : (
-                  <Text key="expand-all" dimColor>Expand @all</Text>
-                )}
-                {inactiveToggle(hideable.length)}
-              </Box>
-            </Box>
-            <Box flexDirection="row" gap="xs" alignItems="center" flexWrap="wrap">
-              <Text size="caption" weight="semibold" dimColor>Replay</Text>
-              {step('replay-first', 'First', index > 0 ? shown.posts[0]!.seq : undefined)}
-              {step('replay-back', '‹ Prev', index > 0 ? shown.posts[index - 1]!.seq : undefined)}
-              {last > 0
-                ? <Button key="replay-play" variant={playing ? 'primary' : 'secondary'} label={playing ? 'Pause' : 'Play'} onPress={() => play($)} />
-                : <Text key="replay-play" dimColor>Play</Text>}
-              {step('replay-next', 'Next ›', index < last ? shown.posts[index + 1]!.seq : undefined)}
-              {step('replay-last', 'Last', index < last ? shown.posts[last]!.seq : undefined)}
-            </Box>
-            {shown.posts.length > 1 && (
-              <Svg
-                source={progressBar(timelineRatio, isLiveVisible ? 'success' : 'accent', playing, timelineOffset, timelineBarWidth)}
-                alt={`Timeline position ${index + 1} of ${shown.posts.length}`}
-                width={timelineBarWidth}
-                height={6}
-              />
-            )}
-          </Box>
-          {source !== undefined ? (
-            <Svg
-              key="message-routes" source={source}
-              width={1024}
-              height={graphHeight(columns, drawnMembers)}
-              alt={`Post ${post.seq} · @${post.agent}${post.to.length ? ` to ${post.to.map(name => `@${name}`).join(', ')}` : ' · no mentions'}. A mention graph of ${counted(drawnMembers.length, 'member')}: List the routes below for each one in words.`}
-              isInteractive
-            />
-          ) : (
-            <Box key="route-list" flexDirection="column" gap="xs">
-              <Text dimColor>{isLegible ? 'Too many routes to draw at once, so they are listed.' : 'The pane is too narrow to draw this graph legibly, so its routes are listed.'}</Text>
-              {routeList(isExpanded, hidden, post.seq)}
-            </Box>
-          )}
-          {source !== undefined && (graph?.hidden ?? 0) > 0 && (
-            <Text size="caption" dimColor>{`${counted(graph?.hidden ?? 0, 'quieter route')} not drawn: one drawing holds only so many.`}</Text>
-          )}
-          {/* The host reads a drawing's alt and nothing inside it: the routes in words are one press away, in reach of the keyboard. */}
-          {source !== undefined && (
-            <Button key="graph-routes" plain dimColor label={routesListed ? 'Hide the route list' : 'List the routes'}
-              onPress={() => { routesListed = !routesListed; routePages = 1; $.ui.invalidate('ui.render') }} />
-          )}
-          {source !== undefined && routesListed && <Box key="graph-route-list" flexDirection="column">{routeList(isExpanded, hidden, post.seq)}</Box>}
-          {feedMembers.length > 0 && (
-            <Box key="graph-members" flexDirection="row" columnGap="sm" rowGap="xs" flexWrap="wrap" alignItems="center">
-              <Text size="caption" weight="semibold" dimColor>Feed of</Text>
-              {feedMembers.map(member => (
-                <Box key={`graph-feed-wrap-${member.name}`} flexDirection="row" alignItems="center" columnGap="xs">
-                  <Text color={hueOf(member.name)}>●</Text>
-                  <Button key={`graph-feed-${member.name}`} plain label={`@${member.name}`} onPress={() => feedOf(member.name)} />
-                </Box>
-              ))}
-            </Box>
-          )}
-          <Box
-            key="graph-post"
-            flexDirection="column"
-            gap="xs"
-            borderStyle="round"
-            borderColor={postKind?.color ?? 'subtle'}
-            borderDimColor
-            hover={{ borderDimColor: false }}
-            paddingX="sm"
-            paddingY="xs"
-          >
-            <Box flexDirection="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" columnGap="sm">
-              <Box flexDirection="row" alignItems="center" columnGap="xs" flexWrap="wrap">
-                <Text color={hueOf(post.agent)}>●</Text>
-                <Button
-                  key="graph-post-agent"
-                  plain
-                  label={`@${post.agent}`}
-                  onPress={async () => { if (!(await viewAgent($, memberOf(post.agent)))) await feedOf(post.agent) }}
-                />
-                <Text dimColor>{post.to.length ? `→ ${(detailsOpen ? post.to : post.to.slice(0, 2)).map(name => `@${name}`).join(' ')}` : '· no mentions'}</Text>
-                {post.to.length > 2 && !(detailsOpen && strippedGraphBody.length > CLIP) && (
-                  <Button key="graph-post-recipients" plain dimColor label={detailsOpen ? 'Show fewer' : `+${post.to.length - 2} more`} onPress={() => update($, expanded, seq => seq === post.seq ? 0 : post.seq)} />
-                )}
-                {postKind !== undefined && (
-                  <Box flexDirection="row" alignItems="center" columnGap="xs">
-                    <Box flexShrink={0}><Svg source={semanticIcon(verdictIconOf(postKind.label))} alt={postKind.label} width={12} height={12} /></Box>
-                    <Text size="caption" weight="semibold" color={postKind.color}>{postKind.covered?.length ? `${postKind.label} · ${postKind.covered.map(name => `@${name}`).join(' ')}` : postKind.label}</Text>
-                  </Box>
-                )}
-              </Box>
-              <Text size="caption" dimColor tabular>{`#${post.seq}${time ? ` · ${time}` : ''}`}</Text>
-            </Box>
-            {detailsOpen && postKind?.covered && (
-              <Text size="caption" color="warning">{`Partial pass of ${postKind.covered.map(name => `@${name}`).join(', ') || 'some workers'}: their pieces only, not the run's pass.`}</Text>
-            )}
-            {graphPostBody !== '' && <Markdown text={formatMarkdown(graphPostBody)} />}
-            {strippedGraphBody.length > CLIP && (
-              <Button
-                key="graph-post-details"
-                plain
-                dimColor
-                label={detailsOpen ? '▴ Show less' : '▾ Show more'}
-                onPress={() => update($, expanded, seq => seq === post.seq ? 0 : post.seq)}
-              />
-            )}
-          </Box>
+        <Box flexDirection="column" marginTop="sm" gap="sm" minWidth={0}>
+          {GraphControls($, e, {
+            shown,
+            isLiveVisible,
+            live,
+            browsed: Boolean(browsed),
+            index,
+            last,
+            playing,
+            isExpanded,
+            hasBroadcast,
+            liveOffset,
+            timelineRatio,
+            timelineBarWidth,
+            timelineOffset,
+            inactiveControl: inactiveToggle(hideable.length),
+          })}
+          {GraphCanvas($, e, {
+            source,
+            isLegible,
+            post,
+            columns,
+            drawnMembers,
+            hiddenRoutes: graph?.hidden ?? 0,
+            legendHeight: graph?.legendHeight,
+            fallbackRoutes: routeList(isExpanded, hidden, post.seq),
+          })}
+          {source !== undefined && GraphRouteList($, e, {
+            listed: routesListed,
+            onToggle: () => { routesListed = !routesListed; routePages = 1; $.ui.invalidate('ui.render') },
+            content: routeList(isExpanded, hidden, post.seq),
+          })}
+          {GraphMembersStrip($, e, {
+            members: feedMembers,
+            hueOf,
+            onFeed: feedOf,
+          })}
+          {GraphPostCard($, e, {
+            post,
+            postKind,
+            time,
+            detailsOpen,
+            strippedGraphBody,
+            graphPostBody,
+            hue: hueOf(post.agent),
+            onOpenAgent: async () => { if (!(await viewAgent($, memberOf(post.agent)))) await feedOf(post.agent) },
+            onToggleDetails: () => update($, expanded, seq => seq === post.seq ? 0 : post.seq).then(() => undefined),
+          })}
         </Box>
       )
     } else {
@@ -5583,8 +5899,8 @@ export const register: Register = on => {
       const hiddenSet = new Set(hiding ? hideable : [])
       const feedMembers = shown.members.filter(member => !hiddenSet.has(member.name) && member.posts > 0)
       body = (
-        <Box flexDirection="column" marginTop="sm" gap="sm">
-          <Box flexDirection="row" columnGap="sm" rowGap="xs" alignItems="center" flexWrap="wrap">
+        <Box flexDirection="column" marginTop="sm" gap="sm" minWidth={0}>
+          <Box flexDirection="row" columnGap="sm" rowGap="xs" alignItems="center" flexWrap="wrap" minWidth={0}>
             {hasBroadcast ? (
               <Button
                 key="expand-all"
@@ -5599,17 +5915,11 @@ export const register: Register = on => {
             {inactiveToggle(hideable.length)}
           </Box>
           {routeList(isExpanded, hiddenSet)}
-          {feedMembers.length > 0 && (
-            <Box key="graph-members" flexDirection="row" columnGap="sm" rowGap="xs" flexWrap="wrap" alignItems="center">
-              <Text size="caption" weight="semibold" dimColor>Feed of</Text>
-              {feedMembers.map(member => (
-                <Box key={`graph-feed-wrap-${member.name}`} flexDirection="row" alignItems="center" columnGap="xs">
-                  <Text color={hueOf(member.name)}>●</Text>
-                  <Button key={`graph-feed-${member.name}`} plain label={`@${member.name}`} onPress={() => feedOf(member.name)} />
-                </Box>
-              ))}
-            </Box>
-          )}
+          {GraphMembersStrip($, e, {
+            members: feedMembers,
+            hueOf,
+            onFeed: feedOf,
+          })}
         </Box>
       )
     }
@@ -5624,15 +5934,16 @@ export const register: Register = on => {
     ].filter(Boolean).join(' · ')
 
     const budgetRatio = shown.budget > 0 ? total / shown.budget : 0
+    const budgetPercent = Math.round(budgetRatio * 100)
     const budgetTone: BarTone = budgetRatio >= 0.9 ? 'error' : budgetRatio >= 0.75 ? 'warning' : 'accent'
     const isHeaderLive = !browsed && !shown.isClosed && !shown.isPaused
     const budgetBarWidth = columns < 40 ? 80 : 120
     const dividerWidth = Math.max(160, Math.min(1024, columns * 8))
-    const budgetOffset = phase(slot('budget'), shown.dir, `${progressUnits(budgetRatio)}/${budgetTone}/${isHeaderLive}/${tabView}/${budgetBarWidth}`, now)
+    const budgetOffset = phase(slot('budget'), shown.dir, `${budgetPercent}/${budgetTone}/${isHeaderLive}/${tabView}/${budgetBarWidth}`, now)
 
     return (
-      <Box flexDirection="column">
-        <Box flexDirection="row" alignItems="center" columnGap="sm">
+      <Box flexDirection="column" minWidth={0}>
+        <Box flexDirection="row" alignItems="center" columnGap="sm" minWidth={0}>
           {/* A narrow pane gives the title the hive's room. The host clamps no lines, so a title longer than two lines of
               its column is cut at a word, and the whole of it is one press away. */}
           {HeaderArt && <Box flexShrink={0}><HeaderArt key="hive" source={hiveArt(mood, hiveOffset)} alt={`Swarm hive: ${shown.mood ?? 'sleep'}`} width={columns < 48 ? 56 : 88} height={columns < 48 ? 28 : 44} /></Box>}
@@ -5699,6 +6010,7 @@ export const register: Register = on => {
           )}
           {browsed && <Text weight="semibold" color="warning">Not the live run · read-only</Text>}
           {browsed && <Button key="run-live" plain label="Back to live run" onPress={() => browse($, 0)} />}
+          <Button key="pane-close" plain dimColor label="Close" onPress={() => void $.ui.close({ id: PANE }).catch(() => undefined)} />
         </Box>
         {HeaderArt && (
           <Box marginTop="xs">

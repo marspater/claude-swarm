@@ -1672,7 +1672,7 @@
    "expect": "VERIFIED"
   }
  ],
- "actions": ["account", "adopt", "agent-run", "attention", "bind", "claim", "close", "confirm", "dispatch", "export", "init", "kill", "limit", "locate", "member", "pause", "plan", "post", "prune", "read", "ready", "rearm", "replace", "restore", "resume", "retry", "revise", "show", "started", "status", "sync", "tail", "wake", "woke"],
+ "actions": ["account", "adopt", "agent-run", "attention", "bind", "claim", "close", "confirm", "dispatch", "event", "export", "init", "kill", "limit", "locate", "member", "pause", "plan", "post", "prune", "read", "ready", "rearm", "replace", "restore", "resume", "retry", "revise", "show", "started", "status", "sync", "tail", "wake", "woke"],
  "effort": [["worker", "", "medium"], ["worker", "s", "low"], ["worker", "l", "high"], ["investigator", "s", "low"], ["investigator", "l", "high"], ["architect", "s", "medium"], ["architect", "l", "high"], ["explorer", "s", "low"], ["verifier", "m", "medium"]],
  "defaults": {"worker": ["sonnet", "medium"], "verifier": ["sonnet", "medium"], "explorer": ["haiku", "medium"], "investigator": ["opus", "medium"], "architect": ["fable", "high"], "designer": ["opus", "high"]},
  "edges": [

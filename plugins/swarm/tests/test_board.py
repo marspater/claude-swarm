@@ -2342,6 +2342,69 @@ class BoardRegressions(unittest.TestCase):
         with open(os.path.join(d, "members.json"), "rb") as f:
             assert f.read() == before
 
+    def test_a_verdict_still_wakes_a_worker_whose_readiness_it_withdraws(self):
+        d = self.init_run()
+        run(d, "member", "a")
+        run(d, "member", "b")
+        run(d, "member", "c", "depends=b")
+        run(d, "member", "v", "role=verifier")
+        for name in ("a", "b", "c"):
+            run(d, "ready", name, stdin="done")
+        said = run(d, "post", "v", "@b NOT PASSED: the parser drops zeros\n@a @c: reviewed, both fine.")
+        with open(os.path.join(d, "board.jsonl"), encoding="utf-8") as f:
+            verdict = json.loads(f.read().splitlines()[-1])
+        # @c built on @b, so the verdict makes it unready and it hears; @a's report stands, so it sleeps on.
+        assert verdict["to"] == ["b", "c"] and "@a is not woken" in said, (verdict, said)
+
+    def test_the_debug_log_and_the_summary_name_models_and_the_advisor(self):
+        """Seen live: a run limited to Sonnet spent 135k tokens on a Fable advisor and ran its first turn on Opus, and
+        its summary showed three Sonnet rows. What ran, on what, and in what order is now in the run folder."""
+        d = self.init_run()
+        run(d, "member", "w", "id=agent-w")
+        key = hashlib.sha256(b"swarm-agent:agent-w").hexdigest()
+        run(d, "account", "%064x" % 1, "coordinator", "900", "user:100,700,1000,0", "claude-opus-5-5")
+        run(d, "account", "%064x" % 2, key, "500", "start:10,400,900,0,1310", "claude-sonnet-5-5")
+        run(d, "account", "%064x" % 3, key, "135640", "advisor:117096,0,0,18544", "claude-fable-5-2")
+        run(d, "account", "%064x" % 4, key, "1", "start:1,0,0,0", "no spaces allowed", ok=False)
+        run(d, "event", "advisor", json.dumps({"member": "w", "model": "claude-fable-5-2", "seconds": 198.4}))
+        run(d, "event", "advisor", json.dumps({"member": "w", "model": "claude-fable-5-2", "error": "no answer"}))
+        run(d, "event", "Bad Kind", "{}", ok=False)
+        run(d, "event", "advisor", "[1]", ok=False)
+        # A detail may name anything, a non-finite duration cannot stop the export, and a cut line costs only itself.
+        run(d, "event", "advisor", json.dumps({"member": "w", "d": "x", "seconds": 1e400}))
+        with open(os.path.join(d, "events.jsonl"), "a", encoding="utf-8") as f:
+            f.write('{"time": "cut by a cra')
+        run(d, "bind", "%064x" % 9)
+        run(d, "post", "coordinator", "@w BRIEF\nOwns: a")
+        with open(os.path.join(d, "events.jsonl"), encoding="utf-8") as f:
+            log = [json.loads(line) for line in f if line.strip() and not line.startswith('{"time": "cut')]
+        assert log[-1]["kind"] == "post" and "%064x" % 9 not in json.dumps(log), log[-3:]
+        kinds = [entry["kind"] for entry in log]
+        assert kinds.count("step") == 3 and kinds.count("advisor") == 3 and "post" in kinds and "command" in kinds, kinds
+        step = next(entry for entry in log if entry["kind"] == "step" and entry.get("wake") == "advisor")
+        assert step["actor"] == "w" and step["model"] == "claude-fable-5-2" and step["input"] == 117096, step
+        assert saved(d)["usage"]["tokens"][key] == 136140  # the advisor's tokens are the run's: the budget reads them
+        with open(run(d, "export").strip(), encoding="utf-8") as f:
+            report = f.read()
+        for part in ("| @coordinator | coordinator | claude-opus-5-5 |", "## Models", "| @w | claude-fable-5-2 | 1 |",
+                     "## Advisor", "| @w | 3 | 198 | 1 | claude-fable-5-2 | 117,096 | 18,544 | 135,640 |",
+                     "| @w | worker | advisor | 1 | 117,096 | 0 | 0 | 18,544 | 135,640 |",
+                     "| @coordinator | coordinator | user | 1 | 100 | 700 | 1,000 | 0 | 900 |",
+                     "## Timeline", "`post` seq=1, sender=coordinator", "holds 3 model step(s)"):
+            assert part in report, (part, report)
+        # A row an older version began has no charge on record for its first reports: it stays an estimate.
+        state = saved(d)
+        del state["usage"]["charged"]["coordinator"]
+        with open(os.path.join(d, "members.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        run(d, "account", "%064x" % 5, "coordinator", "10", "user:10,0,0,0")
+        with open(run(d, "export").strip(), encoding="utf-8") as f:
+            assert "| @coordinator | coordinator | user | 2 | 110 | 700 | 1,000 | 0 | ~910 |" in f.read()
+        # A member that restarts on a new address keeps its advisor's tokens in the summary: they are read by name.
+        run(d, "member", "w", "id=agent-w2")
+        with open(run(d, "export").strip(), encoding="utf-8") as f:
+            assert "| @w | 3 | 198 | 1 | claude-fable-5-2 | 117,096 | 18,544 | 135,640 |" in f.read()
+
     def test_a_partial_pass_clears_rework_only_for_its_workers(self):
         sys.path.insert(0, os.path.dirname(BOARD))
         import board  # noqa: E402

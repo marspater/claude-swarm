@@ -1,9 +1,7 @@
 ---
-name: swarm
-description: "Run a team of named worker agents that split one task, work on the pieces at the same time, and coordinate on one shared message board, with a verifier that reviews the diffs and runs the tests. For broad tasks that divide cleanly across separate files, packages or questions. Every worker is its own agent, so a swarm uses quota much faster than one conversation. Usage: /swarm:swarm <task, and how to check it>."
+description: "Run named worker agents in parallel on a shared board with a verifier for diffs and tests. Best for tasks that split cleanly across files or questions; uses quota faster. Usage: /swarm:swarm <task>"
 argument-hint: "[--native-teams (experimental)] <task, and how to check it>"
 disable-model-invocation: true
-model: opus
 effort: medium
 allowed-tools: mcp__swarm__board, Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/board.py *), Bash(python3 ${CLAUDE_PLUGIN_ROOT}/skills/swarm/scripts/board.py *), Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/verify.py *), Bash(python3 ${CLAUDE_PLUGIN_ROOT}/skills/swarm/scripts/verify.py *), Read(${CLAUDE_SKILL_DIR}/references/*), Read(${CLAUDE_PLUGIN_ROOT}/skills/swarm/references/*), Read(${CLAUDE_PLUGIN_ROOT}/agents/*)
 ---
@@ -16,7 +14,7 @@ $ARGUMENTS
 
 If no task is given above, ask the user what the swarm should do and stop.
 
-The coordinator runs on Opus at medium effort by default; if the user named another model or effort for the coordinator, tell them to switch this conversation's model or effort themselves, since a skill cannot change either once the turn has started.
+The coordinator runs on this conversation's own model, in this turn and every later one (this turn at medium effort); the run's summary names the model each step ran on. If the user named another model or effort for the coordinator, tell them to switch this conversation's model or effort themselves before the team starts, since a skill cannot change either.
 
 As coordinator, split the work, brief the workers, prepare the verification candidate, and report the result. Leave implementation and test execution to the workers and verifier. Carry the user's repository instructions into every brief, including any restriction on commit messages and attribution.
 
@@ -171,7 +169,7 @@ Before `init`, check that a swarm fits. When the task is one file, one question,
 
 7. **Check the registered agent addresses.** The hooks save each address after launch. If the hooks are unavailable or the address was not saved, record the one returned by the Agent call with `BOARD member <name> id=<agent id>`. Use `SendMessage` to resume an existing member.
 
-8. **Confirm deployment** once the team has started. Begin your reply with the plain line `Swarm deployed.` Claude Desktop uses that line to attach an **Open Swarm board** button to your reply. Give the team's name and each member's assignment. The user can also open the board from the **Swarm: The Board** button above the Desktop composer or with `/swarm-board` in the terminal. Then end your turn. You are called again when a member ends a turn.
+8. **Confirm deployment** once the team has started. Begin your reply with the plain line `Swarm deployed.` Claude Desktop uses that line to attach an **Open Swarm Board** button to your reply. Give the team's name and each member's assignment. The user can also open the board from the **Swarm Board** button above the Desktop composer or with `/swarm-board` in the terminal. Then end your turn. You are called again when a member ends a turn.
 
 ## Every time you are called
 

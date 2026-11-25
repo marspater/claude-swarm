@@ -4,6 +4,7 @@
 usage: board.py DIR init TITLE                    prints the run folder it created; use that as DIR from then on
        board.py DIR member NAME [key=value ...]   add or update (role= profile= writes= consult= group= depends= after= owns= paths= model= effort= size=<s|m|l> id= backend= isolated= budget=<tokens> killed=1)
        board.py DIR limit [--raise] [key=value ...]  set run limits (--raise to raise or lift the budget): max_workers= max_members= budget=<tokens> member_budget=<tokens> <model>=<types>
+       board.py DIR event KIND [JSON]                   add a line to the run's debug log, events.jsonl (the hooks' own)
        board.py DIR plan                          the team as a table: type, model, effort, dependencies, ownership
        board.py DIR attention [--json]            what needs someone: a paused run or member, unread posts, unanswered questions, findings to review, rework, disputed findings, heavy spend, loops, unstarted, unreachable, ignoring or blocked members, stale verification, conflicting commits
        board.py DIR retry NAME                    let delivery try an unreachable or unresponsive member again
@@ -53,6 +54,7 @@ import contextlib
 import hashlib
 import fcntl  # ponytail: POSIX only; swap in msvcrt.locking if Windows support is needed
 import json
+import math
 import os
 import re
 import shlex
@@ -171,7 +173,8 @@ ARG_COUNTS = {
     "replace": (2, None), "post": (1, None), "ready": (1, 2), "revise": (1, None),
     "confirm": (2, 2), "read": (1, 4), "show": (0, 2), "wake": (0, 0),
     "claim": (3, 3), "woke": (3, 3), "rearm": (2, None), "bind": (1, 1),
-    "pause": (0, None), "resume": (0, 1), "close": (0, 0), "kill": (0, None), "status": (0, 0), "account": (3, 4), "tail": (0, 1),
+    "pause": (0, None), "resume": (0, 1), "close": (0, 0), "kill": (0, None), "status": (0, 0), "account": (3, 5), "tail": (0, 1),
+    "event": (1, 2),
     "prune": (0, 2), "sync": (1, 2), "export": (0, 1),
 }
 READ_COMMANDS = {"show", "status", "plan", "attention", "wake", "export"}
@@ -189,6 +192,43 @@ def atomic_write(path, value):
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+
+
+EVENTS_FILE = "events.jsonl"
+# Commands polled or run many times a second by the pane, and the ones that record their own, richer event.
+UNLOGGED = {"tail", "wake", "show", "status", "plan", "attention", "account", "event", "locate", "agent-run", "restore"}
+# Their arguments are binding keys, claim tokens and agent addresses: the command is logged, its arguments are not.
+UNLOGGED_ARGS = {"bind", "adopt", "claim", "woke", "rearm", "started"}
+
+
+def event(d, kind, /, **fields):
+    """One line of the run's debug log: what happened and when, for whoever reads a run afterwards (`export` prints
+    it as the summary's timeline). Appended whole, under no lock, and never the reason a command fails."""
+    try:
+        if os.path.isfile(os.path.join(d, "members.json")):
+            line = json.dumps({"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "kind": kind, **fields})
+            with open(os.path.join(d, EVENTS_FILE), "a", encoding="utf-8") as f:
+                # On a line of its own even after a write a crash cut short: a blank line is skipped by the reader.
+                f.write("\n" + line + "\n")
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def events_of(d):
+    try:
+        with open(os.path.join(d, EVENTS_FILE), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    found = []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue  # a line cut by a crash
+        if isinstance(entry, dict) and isinstance(entry.get("kind"), str) and isinstance(entry.get("time"), str):
+            found.append(entry)
+    return found
 
 
 def save(d, state):
@@ -879,15 +919,23 @@ def answered(d, sender, first, members, posts):
     return None, None, None, None, False
 
 
-def in_play(d, name, members):
+def in_play(d, name, members, posts=()):
     """True when the candidate being tested or waiting to be accepted holds NAME's work: a change to that report
-    kills the candidate, so its verifier has to hear."""
+    kills the candidate, so its verifier has to hear. Not once a verifier's NOT PASSED on the board rejected NAME on
+    it and NAME has not reported since: that verdict killed the candidate already, and its author knows. Read off
+    POSTS, so only a verdict that reached the board counts, and a new READY ends it. Seen live: a verifier rejected a
+    candidate on review alone, and the worker's REVISE woke it, and the coordinator, to answer that they were waiting."""
     try:
         with open(os.path.join(d, "verification.json"), encoding="utf-8") as f:
             candidate = json.load(f)
     except (OSError, ValueError):
         return False
-    return isinstance(candidate, dict) and not candidate.get("accepted") and name in held(candidate, members)
+    if not (isinstance(candidate, dict) and not candidate.get("accepted") and name in held(candidate, members)):
+        return False
+    # A confirmed finding is a READY in the coordinator's name with the investigator as its subject, as readiness reads it.
+    reported = max((post["seq"] for post in posts if post.get("subject", post["agent"]) == name and post.get("kind") == "ready"), default=0)
+    return not any(post["seq"] > reported and post.get("candidate") == candidate.get("candidate")
+                   and name in rejected(post, members) for post in posts)
 
 
 def fork_point(repo, ref):
@@ -1600,6 +1648,10 @@ def account(d, args):
     detail = USAGE_DETAIL.fullmatch(args[3]) if len(args) > 3 else None
     if len(args) > 3 and not detail:
         sys.exit("invalid usage detail")
+    # The model that answered, by the id the API reported: a member's own, or its advisor's under the `advisor` wake.
+    model = args[4] if len(args) > 4 else ""
+    if model and not re.fullmatch(r"[A-Za-z0-9._:@/\[\]-]{1,100}", model):
+        sys.exit("invalid model id")
     if not BIND_KEY.fullmatch(turn) or (actor != COORDINATOR and not BIND_KEY.fullmatch(actor)):
         sys.exit("invalid usage key")
     if not re.fullmatch(r"[1-9][0-9]{0,15}", count):
@@ -1621,11 +1673,20 @@ def account(d, args):
         if detail:
             # Kept beside the weighted count, never in place of it: budgets and pauses read `tokens` alone.
             row = usage.setdefault("detail", {}).setdefault(actor, {}).setdefault(detail[1], [0] * len(DETAIL_COLUMNS))
+            # What the budget took for the row, as it took it: the raw counts weigh to it only within rounding. Kept
+            # only for a row counted this way from its first report: one begun by an older version stays an estimate.
+            took = usage.setdefault("charged", {}).setdefault(actor, {})
+            if row[0] == 0 or detail[1] in took:
+                took[detail[1]] = took.get(detail[1], 0) + turns[turn]
             row[:] = [had + more for had, more in zip(row, [1, *map(int, detail.groups()[1:5])])]
             if detail[6]:  # kept on the roster, so it outlasts the hooks' own memory of it across a restart
                 for member in state["members"].values():
                     if member.get("id") and usage_key(member) == actor:
                         member["held"] = int(detail[6])
+        if model:
+            # What each actor really ran on, counted in reports: the roster names a family, and the coordinator none.
+            ran = usage.setdefault("models", {}).setdefault(actor, {})
+            ran[model] = ran.get(model, 0) + 1
         # Only a retried report repeats a turn, and it does so at once: the oldest entries are never asked about again.
         for old in list(turns)[:-TURNS_KEPT]:
             del turns[old]
@@ -1646,6 +1707,11 @@ def account(d, args):
             result["member_paused"] = name
     if recorded or paused or "member_paused" in result:
         save(d, state)
+    if recorded:  # once the roster holds the charge: a retry after a failed save is this step's one line, not its second
+        name = next((n for n, m in state["members"].items() if n != COORDINATOR and m.get("id") and usage_key(m) == actor), actor)
+        event(d, "step", actor=name, charged=int(count), **({"model": model} if model else {}), **(dict(zip(
+            ("wake", "input", "cache_write", "cache_read", "output", "held"),
+            (detail[1], *(int(n) if n else None for n in detail.groups()[1:])))) if detail else {}))
     print(json.dumps(result))
 
 
@@ -1983,6 +2049,24 @@ def main(argv):
 
     private(d)  # a run made before runs were private is closed on its next command
 
+    if cmd == "event":
+        # The hooks' own entries in the debug log: a wake dropped, a hand-back put on the board, an advisor call.
+        if not re.fullmatch(r"[a-z][a-z-]{0,30}", args[0]):
+            sys.exit("an event kind is a lowercase word")
+        try:
+            fields = json.loads(args[1]) if len(args) > 1 else {}
+        except ValueError:
+            fields = None
+        if not isinstance(fields, dict) or len(args[1] if len(args) > 1 else "") > 4000:
+            sys.exit("an event's detail is one JSON object of at most 4,000 characters")
+        event(d, args[0], **{key: value for key, value in fields.items() if key not in {"time", "kind"}})
+        return
+    if cmd not in UNLOGGED:
+        # Every other command, as it was typed: the order things happened in is what a run's post-mortem needs first.
+        # Written before the board's lock is taken: what was asked and when, not the order the board applied it in.
+        event(d, "command", command=cmd, args=[] if cmd in UNLOGGED_ARGS else [
+            arg if len(arg) <= 160 else arg[:160] + "…" for arg in args[:8]])
+
     if cmd == "tail":
         # For a reader with a size limit (the pane reads at most 4 MiB): whole lines only, newest last. Takes no lock.
         if args and not re.fullmatch(r"[1-9][0-9]{0,8}", args[0]):
@@ -2037,7 +2121,7 @@ def main(argv):
                 sys.exit("unknown member @%s; members: %s" % (name, " ".join("@" + n for n in members)))
             return name
 
-        def post_message(sender, text, recipients, *, save_roster=False, **extra):
+        def post_message(sender, text, recipients, *, save_roster=False, told=True, **extra):
             post = {"seq": len(posts) + 1, "agent": sender, "text": text,
                     "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "to": recipients, **extra}
             if sender == COORDINATOR and (head := REPORT_WORD.match(text)) and head[1] == "BRIEF":
@@ -2067,7 +2151,12 @@ def main(argv):
             if save_roster or marked:
                 save(d, state)
             print("posted #%d -> %s" % (post["seq"], " ".join("@" + t for t in recipients) or "nobody"))
-            owed = unread(sender)
+            event(d, "post", seq=post["seq"], sender=sender, to=recipients,
+                  word=(REPORT_WORD.match(text) or [None, post.get("kind", "")])[1],
+                  **{key: post[key] for key in ("rejects", "candidate", "requests", "findings") if post.get(key)})
+            # Only to whoever ran the command. Seen live: a worker's `ready` posted the planned candidate in the
+            # coordinator's name, printed the coordinator's backlog, and the worker read the board again at 150k tokens.
+            owed = unread(sender) if told else []
             if owed:  # the one notice that reaches a member whatever started it and whatever hooks are loaded
                 print("UNREAD: %d post(s) address @%s from #%d on. Read them now: read %s"
                       % (len(owed), sender, owed[0], sender))
@@ -2207,11 +2296,12 @@ def main(argv):
                         paths = "path" if count == 1 else "paths"
                         comparison = f"Compared with {made['previous_candidate']}, {count} changed source {paths}{preview}. "
                     post_message(COORDINATOR, "%s CANDIDATE %s (path %s, digest %s), prepared from the run's plan now that "
-                                 "every worker is READY. %sReview every READY you have not answered against your brief, "
+                                 "every worker is READY. %sA NOT PASSED needs no word to the coordinator: the READY that answers it "
+                                 "prepares the next candidate. Review every READY you have not answered against your brief, "
                                  "then run exactly%s:\n%s %s" % (
                                      " ".join("@" + name for name in verifiers), made["candidate"], made["path"],
                                      made["digest"], comparison, last[1], command, last[0]), verifiers,
-                                 requests=made["candidate"])
+                                 requests=made["candidate"], told=author == COORDINATOR)
                 print("candidate %s was prepared from the run's plan%s" % (
                     made["candidate"], " and its test command posted to the verifier" if verifiers
                     else ". No verifier is registered: its test command is\n%s <verifier>" % command))
@@ -2439,7 +2529,7 @@ def main(argv):
             if (not member.get("killed") and assignment_scope(previous) != assignment_scope(member)
                     and latest_reports(posts).get(name, {}).get("kind") in {"ready", "finding"}):
                 recipients = [name] + [n for n, entry in team_of(members).items() if n != name and (
-                    name in dependencies(entry) or (entry.get("role") == "verifier" and in_play(d, name, members)))]
+                    name in dependencies(entry) or (entry.get("role") == "verifier" and in_play(d, name, members, posts)))]
                 what = ("Review your scope and report again." if member.get("role") == "worker" else
                         "You are a %s now: your earlier report is withdrawn, and a %s posts no READY." % (member["role"], member["role"]))
                 # It reaches the member ahead of the coordinator's own instruction. Seen live: a member ended its turn
@@ -2793,6 +2883,16 @@ def main(argv):
                         return standing is not None and (standing == was or (not sure and standing <= seen))
 
                     verdict["rejects"] = [name for name in verdict["rejects"] if answers(name)]
+            spared = []
+            if verdict.get("rejects"):
+                # A worker the verdict only mentions, its own report standing, has nothing to act on: it reads the
+                # post at its next wake. Seen live: "@core: both fixes pass" in a NOT PASSED for another worker woke
+                # @core at 130k tokens to answer that no change was asked of it.
+                # As the verdict leaves it: a worker that depends on a rejected one is no longer ready, and hears.
+                standing = readiness(members, [*posts, {"seq": len(posts) + 1, "agent": sender, "text": text, "to": recipients, **verdict}])
+                spared = [name for name in recipients if name not in verdict["rejects"] and name in standing
+                          and members[name].get("role") == "worker" and members[name].get("consult") != "1"]
+                recipients = [name for name in recipients if name not in spared]
             # The verifier's verdict on the candidate it was testing: a later verdict naming none no longer answers it.
             done = members[sender].get("tested") if members[sender].get("role") == "verifier" else None
             done = bool(done) and done in (answer, passed and passed.get("candidate"))
@@ -2843,6 +2943,11 @@ def main(argv):
             if verdict.get("partial"):
                 print("note: this pass is of a partial candidate holding %s. It is not the run's pass, and verify.py never "
                       "accepts it" % ", ".join("@" + name for name in verdict["members"]))
+            if spared:
+                print("note: %s not woken: this verdict rejects only %s. To ask something of a worker whose report "
+                      "stands, post to it apart from the verdict" % (
+                          " and ".join("@" + name for name in spared) + (" is" if len(spared) == 1 else " are"),
+                          ", ".join("@" + name for name in verdict["rejects"])))
             if given:
                 print("recorded: %s. The worker answers each id in its next READY; `%s: resolved` on a line of a post "
                       "of yours closes one" % (", ".join(given), given[0]))
@@ -2993,7 +3098,7 @@ def main(argv):
                     # as it would of a `revise`.
                     confirmed = sender in through
                     told = [COORDINATOR] + [name for name, entry in team_of(members).items() if confirmed and name != sender and (
-                        sender in dependencies(entry) or (entry.get("role") == "verifier" and in_play(d, sender, members)))]
+                        sender in dependencies(entry) or (entry.get("role") == "verifier" and in_play(d, sender, members, posts)))]
                     note = ("This replaces the finding confirmed before: work built on that one waits until the "
                             "coordinator confirms this one.\n" if confirmed else "")
                     post_message(sender, "FINDING awaiting coordinator review\n" + note + report, told, kind="finding")
@@ -3008,7 +3113,7 @@ def main(argv):
             recipients = [name for name, entry in members.items() if not entry.get("killed") and
                           name != sender and (name == COORDINATOR or (notify and (
                               (entry.get("role") == "verifier" and not is_consultant) or sender in dependencies(entry))))]
-            if cmd == "revise" and not in_play(d, sender, members):
+            if cmd == "revise" and not in_play(d, sender, members, posts):
                 # With no candidate that holds this member's work, a withdrawal costs nobody a turn: `prepare` refuses a
                 # member that is not ready, and the READY that follows tells who needs it. A candidate being tested or
                 # waiting to be accepted is another matter: it is dead from here on, so its verifier and the coordinator hear.
@@ -3579,26 +3684,69 @@ def main(argv):
                                                 if state.get("paused") else "open", len(posts)), "", "## Team", "",
                      "| Member | Type | Model | Effort | Owns | Ready | Tokens |", "| --- | --- | --- | --- | --- | --- | --- |"]
             authors = {post["agent"] for post in posts}
+            usage = state.get("usage", {})
+            ran = usage.get("models", {}) if isinstance(usage.get("models"), dict) else {}
+            # The coordinator is the conversation itself, on whatever model that was at each step: named from what
+            # its steps reported. Seen live: a summary of three Sonnet rows hid that the deploy turn ran on Opus.
+            lines.append("| %s |" % " | ".join(cell(v) for v in (
+                "@" + COORDINATOR, COORDINATOR, ", ".join(ran.get(COORDINATOR, {})) or "the conversation's", "", "the run",
+                "", f"{tokens.get(COORDINATOR, 0):,}")))
             for name, member in members.items():
                 if name != COORDINATOR:
                     # Seen live: members registered and never spawned read as unfinished work with a plain "no".
                     lines.append("| %s |" % " | ".join(cell(v) for v in (
                         "@" + name + (" (retired)" if member.get("killed") else " (paused)" if member.get("paused") else ""),
                         kind_of(member), model_of(member), effort_of(member), member.get("owns") or member.get("paths", ""),
-                        "yes" if name in ready else "no" if member.get("id") or name in authors else "not started",
+                        # A verifier reports no READY: its verdict is under Verification.
+                        "yes" if name in ready else "not started" if not (member.get("id") or name in authors)
+                        else "" if member.get("role") == "verifier" else "no",
                         f"{tokens.get(usage_key(member), 0):,}")))
             lines += ["", "Tokens: %s in all%s, %s of them the coordinator's." % (
                 f"{total:,}", " of a %s budget" % f"{budget:,}" if budget else "", f"{tokens.get(COORDINATOR, 0):,}"),
                 ""]
-            detail = state.get("usage", {}).get("detail", {})
+            detail = usage.get("detail", {})
+            keys = {name: COORDINATOR if name == COORDINATOR else usage_key(member) for name, member in members.items()}
             if detail:
-                # Unweighted, by what started the turn: the table that says which wakes are worth avoiding.
-                lines += ["## Usage", "", "| Member | Type | Wake | %s |" % " | ".join(DETAIL_COLUMNS), "| --- " * 8 + "|"]
+                # By what started the turn: the table that says which wakes are worth avoiding. `Charged` is what the
+                # budget took for the row; a run from before that was kept shows the raw counts weighed, marked `~`.
+                took = usage.get("charged", {}) if isinstance(usage.get("charged"), dict) else {}
+                lines += ["## Usage", "", "| Member | Type | Wake | %s | Charged |" % " | ".join(DETAIL_COLUMNS), "| --- " * 9 + "|"]
                 for name, member in members.items():
-                    key = COORDINATOR if name == COORDINATOR else usage_key(member)
-                    for wake, row in sorted(detail.get(key, {}).items()):
+                    for wake, row in sorted(detail.get(keys[name], {}).items()):
+                        exact = took.get(keys[name], {}).get(wake)
+                        charged = f"{exact:,}" if type(exact) is int else "~%s" % f"{row[1] + row[2] + row[4] + round(row[3] * 0.1):,}"
                         lines.append("| %s |" % " | ".join(cell(v) for v in (
-                            "@" + name, "coordinator" if name == COORDINATOR else kind_of(member), wake, *(f"{n:,}" for n in row))))
+                            "@" + name, "coordinator" if name == COORDINATOR else kind_of(member), wake,
+                            *(f"{n:,}" for n in row), charged)))
+                lines.append("")
+            if any(ran.get(key) for key in keys.values()):
+                lines += ["## Models", "", "Which model answered, by the id the API reported, and in how many reports.", "",
+                          "| Member | Model | Reports |", "| --- | --- | --- |"]
+                for name in members:
+                    for model, count in ran.get(keys[name], {}).items():
+                        lines.append("| %s |" % " | ".join(cell(v) for v in ("@" + name, model, count)))
+                lines.append("")
+            log = events_of(d)
+            consulted = [entry for entry in log if entry["kind"] == "advisor"]
+            # The advisor's charges by member name, off the log: a member that restarted on a new address keeps them.
+            paid = [entry for entry in log if entry["kind"] == "step" and entry.get("wake") == "advisor"]
+            if consulted or paid:
+                # The advisor answers on its own model, inside a member's step: no roster row and no family limit of the
+                # run's covers it unless it is counted and shown here.
+                lines += ["## Advisor", "", "| Member | Calls | Seconds | Failed | Model | Input | Output | Charged |",
+                          "| --- " * 8 + "|"]
+                for name in members:
+                    calls = [entry for entry in consulted if entry.get("member") == name]
+                    mine = [entry for entry in paid if entry.get("actor") == name]
+
+                    def advised(*fields):
+                        return sum(entry[field] for entry in mine for field in fields if type(entry.get(field)) is int)
+                    if calls or mine:
+                        lines.append("| %s |" % " | ".join(cell(v) for v in (
+                            "@" + name, len(calls), round(sum(c["seconds"] for c in calls if type(c.get("seconds")) in (int, float) and math.isfinite(c["seconds"]))),
+                            sum(1 for c in calls if c.get("error")),
+                            ", ".join(sorted({str(c["model"]) for c in calls if c.get("model")})),
+                            f"{advised('input', 'cache_write', 'cache_read'):,}", f"{advised('output'):,}", f"{advised('charged'):,}")))
                 lines.append("")
             lines += ["## Verification", ""]
             try:
@@ -3627,6 +3775,17 @@ def main(argv):
                 lines += ["### #%d %s @%s -> %s" % (p["seq"], p["time"].replace("T", " ")[:19], p["agent"],
                                                     " ".join("@" + t for t in p["to"]) or "-"), ""]
                 lines += ["> " + line if line else ">" for line in p["text"].split("\n")] + [""]
+            if log:
+                # Every board command, post, wake decision and advisor call in the order it happened. Model steps are
+                # left to the file: one line each there, with what the step read, wrote and held.
+                steps = sum(1 for entry in log if entry["kind"] == "step")
+                lines += ["## Timeline", "", "From `%s` in the run folder, which also holds %d model step(s), one a line." % (EVENTS_FILE, steps), ""]
+                for entry in log:
+                    if entry["kind"] != "step":
+                        rest = {key: value for key, value in entry.items() if key not in {"time", "kind"} and value not in ("", None, [])}
+                        lines.append("- %s `%s` %s" % (entry["time"][11:19], entry["kind"], cell(", ".join(
+                            "%s=%s" % (key, value if isinstance(value, (str, int, float)) else json.dumps(value)) for key, value in rest.items()))))
+                lines.append("")
             atomic_write(path, "\n".join(lines))
             print(path)
 

@@ -5,7 +5,7 @@ import { easeInOut, easeOut, hashSeed, loopDelay, pickVariant, seededPhase } fro
 export type Mood = NonNullable<Swarm['mood']>
 // The board's subcommands, as tests/parity.json lists them: a word after `board.py <folder>` that is none of these
 // names a file, not a board call.
-export const BOARD_ACTIONS = new Set(['init', 'member', 'limit', 'dispatch', 'plan', 'attention', 'retry', 'replace', 'post', 'read', 'show', 'ready', 'confirm',
+export const BOARD_ACTIONS = new Set(['init', 'event', 'member', 'limit', 'dispatch', 'plan', 'attention', 'retry', 'replace', 'post', 'read', 'show', 'ready', 'confirm',
   'revise', 'wake', 'claim', 'woke', 'rearm', 'pause', 'resume', 'bind', 'restore', 'adopt', 'locate', 'agent-run', 'started', 'close', 'kill',
   'account', 'status', 'prune', 'tail', 'sync', 'export'])
 /** The board subcommand a Bash command runs, if it runs one. */
@@ -66,29 +66,39 @@ const scenes: Record<SceneMood, [string, [number, number], [number, number]]> = 
 
 const HIVE_TOKENS =
   'svg{--wing:#4b8f91;--honey:#e8a848;--ink:#362218;--wax:#b46b46;--ok:#2d8a56;--spark:#f5cc66;--warn:#966919}' +
-  '@media(prefers-color-scheme:dark){svg{--wing:#99c8c8;--honey:#f2bd6a;--ink:#2e1d14;--wax:#c9835b;--ok:#4cc480;--spark:#fde08d;--warn:#e0ae4f}}' +
+  '@media(prefers-color-scheme:dark){svg:not([data-mode=light]){--wing:#99c8c8;--honey:#f2bd6a;--ink:#2e1d14;--wax:#c9835b;--ok:#4cc480;--spark:#fde08d;--warn:#e0ae4f}}' +
+  'svg[data-mode=dark]{--wing:#99c8c8;--honey:#f2bd6a;--ink:#2e1d14;--wax:#c9835b;--ok:#4cc480;--spark:#fde08d;--warn:#e0ae4f}' +
   '@supports(color:color(display-p3 1 0 0)){' +
   'svg{--wing:color(display-p3 .3602 .5544 .5647);--honey:color(display-p3 .8721 .6692 .3511);--ink:color(display-p3 .2003 .1367 .1005);--wax:color(display-p3 .6663 .4331 .3019);--ok:color(display-p3 .2864 .5337 .3551);--spark:color(display-p3 .9349 .8060 .4617);--warn:color(display-p3 .5620 .4192 .1691)}' +
-  '@media(prefers-color-scheme:dark){svg{--wing:color(display-p3 .6379 .7791 .7816);--honey:color(display-p3 .9166 .7493 .4652);--ink:color(display-p3 .1705 .1165 .0841);--wax:color(display-p3 .7489 .5259 .3836);--ok:color(display-p3 .4333 .7586 .5248);--spark:color(display-p3 .9733 .8825 .5954);--warn:color(display-p3 .8479 .6901 .3727)}}}'
+  '@media(prefers-color-scheme:dark){svg:not([data-mode=light]){--wing:color(display-p3 .6379 .7791 .7816);--honey:color(display-p3 .9166 .7493 .4652);--ink:color(display-p3 .1705 .1165 .0841);--wax:color(display-p3 .7489 .5259 .3836);--ok:color(display-p3 .4333 .7586 .5248);--spark:color(display-p3 .9733 .8825 .5954);--warn:color(display-p3 .8479 .6901 .3727)}}' +
+  'svg[data-mode=dark]{--wing:color(display-p3 .6379 .7791 .7816);--honey:color(display-p3 .9166 .7493 .4652);--ink:color(display-p3 .1705 .1165 .0841);--wax:color(display-p3 .7489 .5259 .3836);--ok:color(display-p3 .4333 .7586 .5248);--spark:color(display-p3 .9733 .8825 .5954);--warn:color(display-p3 .8479 .6901 .3727)}}'
 
 const BEE_TOKENS =
-  'svg{--wing-front:#5b989a;--wing-back:#4b8f91;--glint:#e5f4f4;--honey:#e8a848;--spark:#f5cc66;--stripe:#483328;--antennae:#78573e;--ink:#362218;' +
+  'svg{--wing-front:#5b989a;--wing-back:#4b8f91;--wing-edge:#3b7577;--glint:#edf8f8;--honey:#e8a848;--spark:#f7d26f;--stripe:#362218;--antennae:#4a3022;--ink:#2e1d14;' +
   '--warn:#966919;--err:#c54451;--stop:#b85334;--unreach:#9a5b7a;' +
-  '--retired-body:#74716c;--retired-band:#c9c2b6;--retired-stripe:#4f4a44;--retired-wing-f:#778182;--retired-wing-b:#656f70;--retired-ant:#5c5852;' +
-  '--brood-body:#8d8374;--brood-band:#d7bc83;--brood-wing-f:#6b8d8e;--brood-wing-b:#577c7e}' +
-  '@media(prefers-color-scheme:dark){svg{--wing-front:#b9dcdc;--wing-back:#99c8c8;--glint:#edfbf6;--honey:#f2bd6a;--spark:#fde08d;--stripe:#3e291e;--antennae:#d4b79c;--ink:#2e1d14;' +
+  '--retired-body:#827d77;--retired-honey:#b9b2a6;--retired-stripe:#47423c;--retired-wing-f:#889394;--retired-wing-b:#747f80;--retired-ant:#5c5852;--retired-ink:#272420;' +
+  '--brood-body:#968977;--brood-honey:#dfb96e;--brood-stripe:#4a3525;--brood-wing-f:#6b8d8e;--brood-wing-b:#577c7e}' +
+  '@media(prefers-color-scheme:dark){svg:not([data-mode=light]){--wing-front:#b9dcdc;--wing-back:#99c8c8;--wing-edge:#6fa7a8;--glint:#f2fcf9;--honey:#f2bd6a;--spark:#fde08d;--stripe:#2e1d14;--antennae:#d4b79c;--ink:#23150e;' +
   '--warn:#e0ae4f;--err:#eb6f7a;--stop:#ea8662;--unreach:#d68fb2;' +
-  '--retired-body:#9e9a93;--retired-band:#cfc9be;--retired-stripe:#4a453f;--retired-wing-f:#adb5b6;--retired-wing-b:#939c9d;--retired-ant:#78746d;' +
-  '--brood-body:#aba294;--brood-band:#e3c98f;--brood-wing-f:#a7c6c6;--brood-wing-b:#8db1b2}}' +
+  '--retired-body:#9e9a93;--retired-honey:#cfc9be;--retired-stripe:#423d37;--retired-wing-f:#b3bcbe;--retired-wing-b:#96a0a2;--retired-ant:#847f77;--retired-ink:#2c2824;' +
+  '--brood-body:#afa391;--brood-honey:#e5c882;--brood-stripe:#3a281b;--brood-wing-f:#a7c6c6;--brood-wing-b:#8db1b2}}' +
+  'svg[data-mode=dark]{--wing-front:#b9dcdc;--wing-back:#99c8c8;--wing-edge:#6fa7a8;--glint:#f2fcf9;--honey:#f2bd6a;--spark:#fde08d;--stripe:#2e1d14;--antennae:#d4b79c;--ink:#23150e;' +
+  '--warn:#e0ae4f;--err:#eb6f7a;--stop:#ea8662;--unreach:#d68fb2;' +
+  '--retired-body:#9e9a93;--retired-honey:#cfc9be;--retired-stripe:#423d37;--retired-wing-f:#b3bcbe;--retired-wing-b:#96a0a2;--retired-ant:#847f77;--retired-ink:#2c2824;' +
+  '--brood-body:#afa391;--brood-honey:#e5c882;--brood-stripe:#3a281b;--brood-wing-f:#a7c6c6;--brood-wing-b:#8db1b2}' +
   '@supports(color:color(display-p3 1 0 0)){' +
-  'svg{--wing-front:color(display-p3 .4125 .5900 .6001);--wing-back:color(display-p3 .3602 .5544 .5647);--glint:color(display-p3 .9089 .9550 .9558);--honey:color(display-p3 .8721 .6692 .3511);--spark:color(display-p3 .9349 .8060 .4617);--stripe:color(display-p3 .2698 .2033 .1634);--antennae:color(display-p3 .4510 .3464 .2576);--ink:color(display-p3 .2003 .1367 .1005);' +
+  'svg{--wing-front:color(display-p3 .4125 .5900 .6002);--wing-back:color(display-p3 .3602 .5544 .5647);--wing-edge:color(display-p3 .2882 .4534 .4633);--glint:color(display-p3 .9373 .9712 .9718);--honey:color(display-p3 .8721 .6692 .3511);--spark:color(display-p3 .9450 .8289 .4926);--stripe:color(display-p3 .2003 .1367 .1005);--antennae:color(display-p3 .2752 .1926 .1423);--ink:color(display-p3 .1705 .1165 .0841);' +
   '--warn:color(display-p3 .5620 .4192 .1691);--err:color(display-p3 .7149 .3024 .3294);--stop:color(display-p3 .6724 .3484 .2367);--unreach:color(display-p3 .5698 .3685 .4734);' +
-  '--retired-body:color(display-p3 .4529 .4435 .4255);--retired-band:color(display-p3 .7835 .7617 .7185);--retired-stripe:color(display-p3 .3065 .2909 .2692);--retired-wing-f:color(display-p3 .4740 .5046 .5088);--retired-wing-b:color(display-p3 .4034 .4341 .4382);--retired-ant:color(display-p3 .3569 .3412 .3176);' +
-  '--brood-body:color(display-p3 .5463 .5151 .4613);--brood-band:color(display-p3 .8257 .7411 .5416);--brood-wing-f:color(display-p3 .4470 .5492 .5545);--brood-wing-b:color(display-p3 .3722 .4823 .4914)}' +
-  '@media(prefers-color-scheme:dark){svg{--wing-front:color(display-p3 .7523 .8586 .8606);--wing-back:color(display-p3 .6379 .7791 .7816);--glint:color(display-p3 .9395 .9825 .9655);--honey:color(display-p3 .9166 .7493 .4652);--spark:color(display-p3 .9733 .8825 .5954);--stripe:color(display-p3 .2309 .1642 .1245);--antennae:color(display-p3 .8127 .7218 .6247);--ink:color(display-p3 .1705 .1165 .0841);' +
+  '--retired-body:color(display-p3 .5064 .4909 .4692);--retired-honey:color(display-p3 .7207 .6990 .6559);--retired-stripe:color(display-p3 .2751 .2595 .2379);--retired-wing-f:color(display-p3 .5413 .5751 .5793);--retired-wing-b:color(display-p3 .4629 .4967 .5009);--retired-ant:color(display-p3 .3569 .3412 .3176);--retired-ink:color(display-p3 .1509 .1416 .1272);' +
+  '--brood-body:color(display-p3 .5796 .5390 .4746);--brood-honey:color(display-p3 .8505 .7311 .4728);--brood-stripe:color(display-p3 .2776 .2112 .1542);--brood-wing-f:color(display-p3 .4470 .5492 .5545);--brood-wing-b:color(display-p3 .3722 .4823 .4914)}' +
+  '@media(prefers-color-scheme:dark){svg:not([data-mode=light]){--wing-front:color(display-p3 .7523 .8586 .8606);--wing-back:color(display-p3 .6379 .7791 .7816);--wing-edge:color(display-p3 .4838 .6491 .6555);--glint:color(display-p3 .9561 .9870 .9769);--honey:color(display-p3 .9166 .7493 .4652);--spark:color(display-p3 .9733 .8825 .5954);--stripe:color(display-p3 .1705 .1165 .0841);--antennae:color(display-p3 .8127 .7218 .6247);--ink:color(display-p3 .1291 .0847 .0593);' +
   '--warn:color(display-p3 .8479 .6901 .3727);--err:color(display-p3 .8606 .4629 .4877);--stop:color(display-p3 .8646 .5447 .4135);--unreach:color(display-p3 .7989 .5729 .6920);' +
-  '--retired-body:color(display-p3 .6169 .6044 .5792);--retired-band:color(display-p3 .8077 .7890 .7495);--retired-stripe:color(display-p3 .2868 .2713 .2496);--retired-wing-f:color(display-p3 .6842 .7088 .7128);--retired-wing-b:color(display-p3 .5830 .6106 .6147);--retired-ant:color(display-p3 .4784 .4627 .4353);' +
-  '--brood-body:color(display-p3 .6645 .6365 .5862);--brood-band:color(display-p3 .8733 .7919 .5886);--brood-wing-f:color(display-p3 .6786 .7728 .7745);--brood-wing-b:color(display-p3 .5813 .6900 .6955)}}}'
+  '--retired-body:color(display-p3 .6169 .6044 .5792);--retired-honey:color(display-p3 .8077 .7890 .7495);--retired-stripe:color(display-p3 .2555 .2399 .2183);--retired-wing-f:color(display-p3 .7084 .7361 .7438);--retired-wing-b:color(display-p3 .5954 .6262 .6340);--retired-ant:color(display-p3 .5142 .4987 .4700);--retired-ink:color(display-p3 .1699 .1574 .1430);' +
+  '--brood-body:color(display-p3 .6782 .6408 .5764);--brood-honey:color(display-p3 .8792 .7884 .5454);--brood-stripe:color(display-p3 .2168 .1597 .1134);--brood-wing-f:color(display-p3 .6786 .7728 .7745);--brood-wing-b:color(display-p3 .5813 .6900 .6955)}}' +
+  'svg[data-mode=dark]{--wing-front:color(display-p3 .7523 .8586 .8606);--wing-back:color(display-p3 .6379 .7791 .7816);--wing-edge:color(display-p3 .4838 .6491 .6555);--glint:color(display-p3 .9561 .9870 .9769);--honey:color(display-p3 .9166 .7493 .4652);--spark:color(display-p3 .9733 .8825 .5954);--stripe:color(display-p3 .1705 .1165 .0841);--antennae:color(display-p3 .8127 .7218 .6247);--ink:color(display-p3 .1291 .0847 .0593);' +
+  '--warn:color(display-p3 .8479 .6901 .3727);--err:color(display-p3 .8606 .4629 .4877);--stop:color(display-p3 .8646 .5447 .4135);--unreach:color(display-p3 .7989 .5729 .6920);' +
+  '--retired-body:color(display-p3 .6169 .6044 .5792);--retired-honey:color(display-p3 .8077 .7890 .7495);--retired-stripe:color(display-p3 .2555 .2399 .2183);--retired-wing-f:color(display-p3 .7084 .7361 .7438);--retired-wing-b:color(display-p3 .5954 .6262 .6340);--retired-ant:color(display-p3 .5142 .4987 .4700);--retired-ink:color(display-p3 .1699 .1574 .1430);' +
+  '--brood-body:color(display-p3 .6782 .6408 .5764);--brood-honey:color(display-p3 .8792 .7884 .5454);--brood-stripe:color(display-p3 .2168 .1597 .1134);--brood-wing-f:color(display-p3 .6786 .7728 .7745);--brood-wing-b:color(display-p3 .5813 .6900 .6955)}}'
 
 const wingFrames = '@keyframes flutter{0%,100%{transform:scaleY(1)}50%{transform:scaleY(.58)}}'
 const wings = (elapsed: number, duration: number, offset = 0) =>
@@ -114,15 +124,14 @@ function sleepMarks(elapsed: number, moodPhase: number): { style: string; art: s
   return {
     style:
       '.sleep-mark{fill:var(--wing);opacity:0;--peak:.9}.sleep-mark-small{--peak:.58}' +
-      '@media(prefers-reduced-motion:no-preference){' +
       `.sleep-mark{shape-rendering:auto;animation:doze ${duration}ms linear ${loopDelay(elapsed, duration, 460 + moodPhase)} infinite}` +
       `.sleep-mark-small{animation-delay:${loopDelay(elapsed, duration, 1760 + moodPhase)}}` +
       `.sleep-mark-left{animation-delay:${loopDelay(elapsed, duration, 2540 + moodPhase)}}` +
       `.bee{shape-rendering:auto;transform-box:fill-box;transform-origin:bottom center;animation:rest 4800ms ${easeInOut} ${loopDelay(elapsed, 4800, moodPhase)} infinite}` +
       `.right{animation-delay:${loopDelay(elapsed, 4800, 1370 + moodPhase)}}` +
-      '}' +
       '@keyframes doze{0%{opacity:0;transform:translate(0,0)}22%,62%{opacity:var(--peak)}100%{opacity:0;transform:translate(1px,-2px)}}' +
-      '@keyframes rest{0%,100%{transform:scaleY(1)}50%{transform:scaleY(.91)}}',
+      '@keyframes rest{0%,100%{transform:scaleY(1)}50%{transform:scaleY(.91)}}' +
+      '@media(prefers-reduced-motion:reduce){.sleep-mark,.bee{animation:none!important;shape-rendering:crispEdges}.sleep-mark{opacity:0}}',
     // Symmetric Zzz above the sleeping bees, clear of the skep (14..30) even at peak drift.
     art:
       '<g transform="translate(7 8)"><path class="sleep-mark sleep-mark-small sleep-mark-left" d="M0 0h3v1H0zM2 1h1v1H2zM1 2h1v1H1zM0 3h3v1H0z"/></g>' +
@@ -131,7 +140,7 @@ function sleepMarks(elapsed: number, moodPhase: number): { style: string; art: s
   }
 }
 
-export const MEMBER_BEE_SIZE = { width: 24, height: 15 } as const
+export const MEMBER_BEE_SIZE = { width: 24, height: 16 } as const
 
 type BeeStatus =
   | 'working'
@@ -146,7 +155,7 @@ type BeeStatus =
   | 'unreachable'
 
 type WingPose = 'spread' | 'folded' | 'drooped'
-type EyePose = 'open' | 'closed' | 'flat' | 'wince' | 'search'
+type EyePose = 'open' | 'sleep' | 'calm' | 'flat' | 'wince' | 'search' | 'retired'
 
 const KNOWN_STATUSES = new Set<BeeStatus>([
   'working', 'coordinating', 'waiting', 'not started', 'paused',
@@ -166,40 +175,43 @@ const VARIANT_COUNTS: Record<BeeStatus, number> = {
   unreachable: 3,
 }
 
-const WINGS: Record<WingPose, { left: string; glintL: string; right: string; glintR: string }> = {
-  spread: {
-    left: 'M5 5h3v1h1v2H8v1H6V8H5V7H4V6h1z',
-    glintL: 'M5 6h1v1H5z',
-    right: 'M16 5h3v1h1v1h-1v1h-1v1h-2V8h-1V6h1z',
-    glintR: 'M18 6h1v1h-1z',
-  },
-  folded: {
-    left: 'M5 7h3v1h1v2H7V9H6V8H5z',
-    glintL: 'M6 7h1v1H6z',
-    right: 'M16 7h3v1h-1v1h-1v1h-2V8h1z',
-    glintR: 'M17 7h1v1h-1z',
-  },
-  drooped: {
-    left: 'M4 8h4v1h1v2H6v-1H5V9H4z',
-    glintL: 'M5 8h1v1H5z',
-    right: 'M16 8h4v1h-1v1h-1v1h-3V9h1z',
-    glintR: 'M18 8h1v1h-1z',
-  },
-}
+const WING_LEFT =
+  '<path class="wing-front" fill="var(--wing-front)" fill-opacity=".86" stroke="var(--wing-edge)" stroke-width=".95" d="M20.2 14.3C17.8 9.7 11.4 7.5 8.8 10.3 7 12.3 9.4 16.1 15.2 16.1 17.8 16.1 19.6 15.3 20.2 14.3Z"/>' +
+  '<path class="wing-front" fill="var(--wing-front)" fill-opacity=".72" stroke="var(--wing-edge)" stroke-width=".85" d="M19.8 15.7C16.4 15.5 12 16.3 11.4 18.5 11 20 13.8 20.7 16.8 19.3 18.5 18.5 19.6 17 19.8 15.7Z"/>' +
+  '<path class="wing-glint" fill="var(--glint)" fill-opacity=".68" d="M10.8 11.1C12.4 9.7 15.6 10.3 17.6 12.3 15.4 11.3 12.8 11.1 10.8 11.9Z"/>'
+
+const WING_RIGHT =
+  '<path class="wing-back" fill="var(--wing-back)" fill-opacity=".86" stroke="var(--wing-edge)" stroke-width=".95" d="M27.8 14.3C30.2 9.7 36.6 7.5 39.2 10.3 41 12.3 38.6 16.1 32.8 16.1 30.2 16.1 28.4 15.3 27.8 14.3Z"/>' +
+  '<path class="wing-back" fill="var(--wing-back)" fill-opacity=".72" stroke="var(--wing-edge)" stroke-width=".85" d="M28.2 15.7C31.6 15.5 36 16.3 36.6 18.5 37 20 34.2 20.7 31.2 19.3 29.5 18.5 28.4 17 28.2 15.7Z"/>' +
+  '<path class="wing-glint wing-glint-back" fill="var(--glint)" fill-opacity=".68" d="M37.2 11.1C35.6 9.7 32.4 10.3 30.4 12.3 32.6 11.3 35.2 11.1 37.2 11.9Z"/>'
 
 const EYES: Record<EyePose, string> = {
-  open: 'M10 5h1v2h-1zM13 5h1v2h-1z',
-  closed: 'M9 6h2v1H9zM13 6h2v1h-2z',
-  flat: 'M10 6h1v1h-1zM13 6h1v1h-1z',
-  wince: 'M9 5h1v1H9zM10 6h1v1h-1zM9 7h1v1H9zM14 5h1v1h-1zM13 6h1v1h-1zM14 7h1v1h-1z',
-  search: 'M9 5h1v2h-1zM13 5h2v1h-2z',
+  open:
+    '<ellipse cx="22" cy="9.7" rx="1.05" ry="1.35" fill="var(--ink)"/>' +
+    '<ellipse cx="26" cy="9.7" rx="1.05" ry="1.35" fill="var(--ink)"/>' +
+    '<circle cx="21.6" cy="9.15" r=".45" fill="#fff"/>' +
+    '<circle cx="25.6" cy="9.15" r=".45" fill="#fff"/>' +
+    '<path d="M23.1 11.55Q24 12.25 24.9 11.55" fill="none" stroke="var(--ink)" stroke-width=".9" stroke-linecap="round"/>',
+  sleep:
+    '<path d="M20.8 9.6Q22 10.7 23.2 9.6M24.8 9.6Q26 10.7 27.2 9.6" fill="none" stroke="var(--ink)" stroke-width="1.15" stroke-linecap="round"/>' +
+    '<path d="M23.2 11.5Q24 12 24.8 11.5" fill="none" stroke="var(--ink)" stroke-width=".85" stroke-linecap="round"/>',
+  calm:
+    '<path d="M20.9 9.9Q22 10.4 23.1 9.9M24.9 9.9Q26 10.4 27.1 9.9" fill="none" stroke="var(--ink)" stroke-width="1.1" stroke-linecap="round"/>',
+  flat:
+    '<path d="M20.8 9.8H23.1M24.9 9.8H27.2" fill="none" stroke="var(--ink)" stroke-width="1.3" stroke-linecap="round"/>',
+  wince:
+    '<path d="M20.9 8.8L22.9 9.8 20.9 10.8M27.1 8.8L25.1 9.8 27.1 10.8" fill="none" stroke="var(--ink)" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/>',
+  search:
+    '<ellipse cx="22.3" cy="9.7" rx="1.15" ry="1.35" fill="var(--ink)"/>' +
+    '<ellipse cx="26.3" cy="9.7" rx=".95" ry="1.15" fill="var(--ink)"/>' +
+    '<circle cx="22.6" cy="9.2" r=".42" fill="#fff"/>' +
+    '<circle cx="26.5" cy="9.2" r=".38" fill="#fff"/>',
+  retired:
+    '<path d="M21.2 9.1L22.8 10.5M22.8 9.1L21.2 10.5M25.2 9.1L26.8 10.5M26.8 9.1L25.2 10.5" fill="none" stroke="var(--retired-ink)" stroke-width="1.15" stroke-linecap="round"/>',
 }
 
-const HEX_CELL = 'M12 1L22 4V11L12 14L2 11V4Z'
-const HEX_BADGE = 'M16 2L12 1L2 4V11L12 14L22 11V5'
-
 /**
- * Front-facing 24x15 pixel-art member bee with 3+ units clearance around (12, 8).
+ * Front-facing 48x32 vector member bee centered at (24, 16.5) across all 10 lifecycle states.
  * Deterministically picks one of 3–4 motion variants per status from `seed` and honors reduced motion.
  */
 export function memberBee(accent: `#${string}`, status: string, elapsed = 0, seed = '', isPaused = false): string {
@@ -216,421 +228,455 @@ export function memberBee(accent: `#${string}`, status: string, elapsed = 0, see
   const who = seed || accent
   const variant = pickVariant(who, VARIANT_COUNTS[effective])
   const jitter = (base: number) => Math.max(80, Math.round(base * (0.93 + (hashSeed(`${who}:${base}`) % 15) / 100)))
-  const delay = (dur: number, salt: string | number) => loopDelay(elapsed, dur, seededPhase(who, salt, dur))
+  const delay = (dur: number, salt: string | number, extraOffset = 0) =>
+    loopDelay(elapsed, dur, seededPhase(who, salt, dur) + extraOffset)
 
   const wingPose: WingPose =
-    effective === 'working' || effective === 'coordinating'
+    effective === 'working' || effective === 'coordinating' || effective === 'failed' || effective === 'unreachable'
       ? 'spread'
-      : effective === 'killed' || effective === 'stopped' || effective === 'failed' || effective === 'unreachable'
+      : effective === 'stopped' || effective === 'killed'
         ? 'drooped'
         : 'folded'
 
   const eyePose: EyePose =
-    effective === 'working' || effective === 'coordinating'
-      ? 'open'
-      : effective === 'stopped'
-        ? 'flat'
-        : effective === 'failed'
-          ? 'wince'
-          : effective === 'unreachable'
-            ? 'search'
-            : 'closed'
+    effective === 'working' || effective === 'coordinating' ? 'open'
+      : effective === 'waiting' || effective === 'closed' ? 'sleep'
+        : effective === 'not started' || effective === 'paused' ? 'calm'
+          : effective === 'stopped' ? 'flat'
+            : effective === 'failed' ? 'wince'
+              : effective === 'unreachable' ? 'search'
+                : 'retired'
 
-  let baseStyle = BEE_TOKENS + '.wing-glint{fill:var(--glint);opacity:.54}'
+  let baseStyle = BEE_TOKENS
   let motionStyle = ''
-  let defs = ''
+  let defs = '<clipPath id="ab"><path d="M18.2 18.7C18.2 15.9 20.8 14.9 24 14.9 27.2 14.9 29.8 15.9 29.8 18.7 29.8 22.5 27 25.6 24 26 21 25.6 18.2 22.5 18.2 18.7Z"/></clipPath>'
   let backFx = ''
   let frontFx = ''
   let innerFx = ''
+  let sheenFx = ''
+  let reduceOverrides = ''
 
   if (effective === 'working') {
-    const flapDur = jitter(150)
-    const hoverDur = jitter(variant === 2 ? 920 : 1020)
-    const fxDur = jitter(1120)
-    const antDur = jitter(520)
-    baseStyle += '.buzz,.spark,.pollen{opacity:0}'
+    const flapDur = jitter(260)
+    const hoverDur = jitter(1500)
+    const fxDur = jitter(1400)
+    const antDur = jitter(1200)
+    const flapDelay = delay(flapDur, 'fl')
     const flutterCss =
-      `.wing-l{transform-box:fill-box;transform-origin:95% 58%;animation:w-flap-l ${flapDur}ms ${easeInOut} ${delay(flapDur, 'fl')} infinite}` +
-      `.wing-r{transform-box:fill-box;transform-origin:5% 58%;animation:w-flap-r ${flapDur}ms ${easeInOut} ${delay(flapDur, 'fr')} infinite}` +
-      `.wing-glint{animation:w-glint ${flapDur}ms ${easeInOut} ${delay(flapDur, 'gl')} infinite}` +
-      `.wing-glint-back{animation-delay:${delay(flapDur, 'glb')}}`
-    const flutterFrames =
-      '@keyframes w-flap-l{0%,100%{transform:rotate(22deg) scaleY(.92)}50%{transform:rotate(-20deg) scaleY(.76)}}' +
-      '@keyframes w-flap-r{0%,100%{transform:rotate(-22deg) scaleY(.92)}50%{transform:rotate(20deg) scaleY(.76)}}' +
-      '@keyframes w-glint{0%,100%{opacity:.28}50%{opacity:.95}}'
+      `.wing-l{transform-origin:20px 14.5px;animation:w-flap-l ${flapDur}ms ${easeInOut} ${flapDelay} infinite}` +
+      `.wing-r{transform-origin:28px 14.5px;animation:w-flap-r ${flapDur}ms ${easeInOut} ${flapDelay} infinite}` +
+      `.wing-glint{animation:w-glint ${flapDur}ms ${easeInOut} ${flapDelay} infinite}` +
+      '@keyframes w-flap-l{0%,100%{transform:rotate(20deg) scaleY(.94)}50%{transform:rotate(-22deg) scaleY(.76)}}' +
+      '@keyframes w-flap-r{0%,100%{transform:rotate(-20deg) scaleY(.94)}50%{transform:rotate(22deg) scaleY(.76)}}' +
+      '@keyframes w-glint{0%,100%{opacity:.35}50%{opacity:.95}}'
 
     if (variant === 0) {
-      // hover-dart: figure-8 darting bob + 3 rising sparks
       motionStyle =
-        `.bee-hover{transform-box:fill-box;transform-origin:50% 55%;animation:w-dart ${hoverDur}ms ${easeInOut} ${delay(hoverDur, 'hv')} infinite}` +
+        `.bee-hover{transform-origin:24px 16.5px;animation:w-dart ${hoverDur}ms ${easeInOut} ${delay(hoverDur, 'hv')} infinite}` +
         flutterCss +
-        `.spark{transform-box:fill-box;transform-origin:center;animation:w-spark ${fxDur}ms ${easeOut} ${delay(fxDur, 's1')} infinite}` +
-        `.s2{animation-delay:${delay(fxDur, 's2')}}.s3{animation-delay:${delay(fxDur, 's3')}}` +
-        '@keyframes w-dart{0%,100%{transform:translate(0,-.9px) rotate(-3deg)}25%{transform:translate(.6px,.2px) rotate(2deg)}50%{transform:translate(0,.75px) rotate(3deg)}75%{transform:translate(-.6px,-.2px) rotate(-2deg)}}' +
-        flutterFrames +
-        '@keyframes w-spark{0%{opacity:0;transform:translateY(.6px) scale(.8)}22%{opacity:.95;transform:translateY(-.4px) scale(1)}100%{opacity:0;transform:translateY(-2.2px) scale(.7)}}'
+        `.spark{transform-origin:center;transform-box:fill-box;animation:w-spark ${fxDur}ms ${easeOut} ${delay(fxDur, 'fx')} infinite}` +
+        `.s2{animation-delay:${delay(fxDur, 'fx', 460)}}.s3{animation-delay:${delay(fxDur, 'fx', 920)}}` +
+        '@keyframes w-dart{0%,100%{transform:translate(0,-2.2px) rotate(-4deg)}25%{transform:translate(2.2px,.4px) rotate(3deg)}50%{transform:translate(0,2.2px) rotate(4deg)}75%{transform:translate(-2.2px,-.4px) rotate(-3deg)}}' +
+        '@keyframes w-spark{0%{opacity:0;transform:translateY(2px) scale(.6)}25%{opacity:1;transform:translateY(-1px) scale(1.15)}100%{opacity:0;transform:translateY(-5.5px) scale(.6)}}'
       frontFx =
-        '<rect class="bee-fx spark s1" x="2" y="3" width="1" height="1" fill="var(--spark)"/>' +
-        '<rect class="bee-fx spark s2" x="21" y="3" width="1" height="1" fill="var(--spark)"/>' +
-        '<rect class="bee-fx spark s3" x="20" y="10" width="1" height="1" fill="var(--spark)"/>'
+        '<circle class="bee-fx spark s1" cx="7.5" cy="9.5" r="1.2" fill="var(--spark)"/>' +
+        '<circle class="bee-fx spark s2" cx="40.5" cy="9.5" r="1.2" fill="var(--spark)"/>' +
+        '<circle class="bee-fx spark s3" cx="38" cy="21.5" r="1.05" fill="var(--honey)"/>'
     } else if (variant === 1) {
-      // pollen-forage: foraging pitch-dip + lower orbiting pollen motes
       motionStyle =
-        `.bee-hover{transform-box:fill-box;transform-origin:50% 55%;animation:w-forage ${hoverDur}ms ${easeInOut} ${delay(hoverDur, 'hv')} infinite}` +
+        `.bee-hover{transform-origin:24px 16.5px;animation:w-forage ${hoverDur}ms ${easeInOut} ${delay(hoverDur, 'hv')} infinite}` +
         flutterCss +
-        `.pollen{transform-box:fill-box;transform-origin:center;animation:w-pollen ${fxDur}ms ${easeInOut} ${delay(fxDur, 'p1')} infinite}` +
-        `.p2{animation-delay:${delay(fxDur, 'p2')}}.p3{animation-delay:${delay(fxDur, 'p3')}}` +
-        '@keyframes w-forage{0%,100%{transform:translate(-.5px,-.5px) rotate(-4deg)}50%{transform:translate(.5px,.8px) rotate(4deg)}}' +
-        flutterFrames +
-        '@keyframes w-pollen{0%,100%{opacity:.18;transform:translate(-.7px,.4px)}50%{opacity:.95;transform:translate(.7px,-.8px)}}'
+        `.pollen{transform-origin:center;transform-box:fill-box;animation:w-pollen ${fxDur}ms ${easeInOut} ${delay(fxDur, 'fx')} infinite}` +
+        `.p2{animation-delay:${delay(fxDur, 'fx', 450)}}.p3{animation-delay:${delay(fxDur, 'fx', 900)}}` +
+        '@keyframes w-forage{0%,100%{transform:translate(-1.8px,-2px) rotate(-6deg)}50%{transform:translate(1.8px,2.2px) rotate(6deg)}}' +
+        '@keyframes w-pollen{0%,100%{opacity:.25;transform:translate(-2px,1.5px) scale(.85)}50%{opacity:1;transform:translate(2px,-3px) scale(1.2)}}'
       frontFx =
-        '<rect class="bee-fx pollen p1" x="3" y="10" width="1" height="1" fill="var(--honey)"/>' +
-        '<rect class="bee-fx pollen p2" x="20" y="10" width="1" height="1" fill="var(--spark)"/>' +
-        '<rect class="bee-fx pollen p3" x="12" y="13" width="1" height="1" fill="var(--spark)"/>'
+        '<circle class="bee-fx pollen p1" cx="8" cy="21.5" r="1.35" fill="var(--honey)"/>' +
+        '<circle class="bee-fx pollen p2" cx="40" cy="20.5" r="1.35" fill="var(--spark)"/>' +
+        '<circle class="bee-fx pollen p3" cx="24" cy="29" r="1.15" fill="var(--spark)"/>'
     } else if (variant === 2) {
-      // comb-tap: rhythmic double-beat work tap + dual comb sparks
       motionStyle =
-        `.bee-hover{transform-box:fill-box;transform-origin:50% 55%;animation:w-tap ${hoverDur}ms ${easeInOut} ${delay(hoverDur, 'hv')} infinite}` +
+        `.bee-hover{transform-origin:24px 16.5px;animation:w-tap ${hoverDur}ms ${easeInOut} ${delay(hoverDur, 'hv')} infinite}` +
         flutterCss +
-        `.spark{transform-box:fill-box;transform-origin:center;animation:w-burst ${fxDur}ms ${easeOut} ${delay(fxDur, 'b1')} infinite}` +
-        `.s2{animation-delay:${delay(fxDur, 'b2')}}` +
-        '@keyframes w-tap{0%,100%{transform:translateY(-.5px)}25%{transform:translateY(.7px)}45%{transform:translateY(-.2px)}68%{transform:translateY(.8px)}}' +
-        flutterFrames +
-        '@keyframes w-burst{0%{opacity:0;transform:scale(.6)}30%{opacity:.95;transform:translateY(-.8px) scale(1.1)}100%{opacity:0;transform:translateY(-1.8px) scale(.7)}}'
+        `.spark{transform-origin:center;transform-box:fill-box;animation:w-burst ${fxDur}ms ${easeOut} ${delay(fxDur, 'fx')} infinite}` +
+        `.s2{animation-delay:${delay(fxDur, 'fx', 550)}}` +
+        '@keyframes w-tap{0%,100%{transform:translateY(-2.2px)}25%{transform:translateY(2.2px)}48%{transform:translateY(-.8px)}70%{transform:translateY(2.3px)}}' +
+        '@keyframes w-burst{0%{opacity:0;transform:scale(.5)}30%{opacity:1;transform:translateY(-2px) scale(1.25)}100%{opacity:0;transform:translateY(-5px) scale(.6)}}'
       frontFx =
-        '<rect class="bee-fx spark s1" x="4" y="11" width="1" height="1" fill="var(--spark)"/>' +
-        '<rect class="bee-fx spark s2" x="19" y="11" width="1" height="1" fill="var(--spark)"/>'
+        '<path class="bee-fx spark s1" fill="var(--spark)" d="M9 22.5l1-2 1 2 2 1-2 1-1 2-1-2-2-1z"/>' +
+        '<path class="bee-fx spark s2" fill="var(--spark)" d="M38 22.5l1-2 1 2 2 1-2 1-1 2-1-2-2-1z"/>'
     } else {
-      // antenna-scan: poised hover + sweeping antennae + buzz lines
       motionStyle =
-        `.bee-hover{transform-box:fill-box;transform-origin:50% 55%;animation:w-poise ${hoverDur}ms ${easeInOut} ${delay(hoverDur, 'hv')} infinite}` +
+        `.bee-hover{transform-origin:24px 16.5px;animation:w-poise ${hoverDur}ms ${easeInOut} ${delay(hoverDur, 'hv')} infinite}` +
         flutterCss +
-        `.bee-antennae{transform-box:fill-box;transform-origin:50% 100%;animation:w-ant ${antDur}ms ${easeInOut} ${delay(antDur, 'an')} infinite}` +
+        `.bee-antennae{transform-origin:24px 7.5px;animation:w-ant ${antDur}ms ${easeInOut} ${delay(antDur, 'an')} infinite}` +
         `.buzz{animation:w-buzz ${flapDur}ms linear ${delay(flapDur, 'bz')} infinite}` +
-        '@keyframes w-poise{0%,100%{transform:translateY(-.6px)}50%{transform:translateY(.6px)}}' +
-        flutterFrames +
-        '@keyframes w-ant{0%,100%{transform:rotate(-7deg) scaleY(1.05)}50%{transform:rotate(7deg) scaleY(.95)}}' +
-        '@keyframes w-buzz{0%,100%{opacity:0}45%,65%{opacity:.7}}'
-      frontFx = '<path class="bee-fx buzz" fill="var(--wing-front)" d="M1 5h1v1H1zM2 7h1v1H2zM22 5h1v1h-1zM21 7h1v1h-1z"/>'
+        '@keyframes w-poise{0%,100%{transform:translateY(-2.2px)}50%{transform:translateY(2.2px)}}' +
+        '@keyframes w-ant{0%,100%{transform:rotate(-14deg)}50%{transform:rotate(14deg)}}' +
+        '@keyframes w-buzz{0%,100%{opacity:.15}50%{opacity:.85}}'
+      frontFx =
+        '<path class="bee-fx buzz" fill="none" stroke="var(--wing-front)" stroke-width="1.2" stroke-linecap="round" d="M5.5 11Q4 14 5.5 17M42.5 11Q44 14 42.5 17"/>'
     }
   } else if (effective === 'coordinating') {
-    const flapDur = jitter(220)
-    const hoverDur = jitter(1680)
-    const auraDur = jitter(2350)
-    baseStyle += '.aura{opacity:.48}.beacon{opacity:0}'
-    defs =
-      '<defs><radialGradient id="bg"><stop offset="0%" stop-color="var(--spark)" stop-opacity=".42"/>' +
-      '<stop offset="65%" stop-color="var(--honey)" stop-opacity=".16"/><stop offset="100%" stop-color="var(--honey)" stop-opacity="0"/></radialGradient></defs>'
-    backFx = '<ellipse class="bee-fx aura" cx="12" cy="8" rx="9" ry="6" fill="url(#bg)" shape-rendering="auto"/>'
+    const flapDur = jitter(340)
+    const hoverDur = jitter(1700)
+    const auraDur = jitter(1800)
+    const flapDelay = delay(flapDur, 'fl')
+    defs +=
+      '<radialGradient id="bg"><stop offset="0%" stop-color="var(--spark)" stop-opacity=".44"/>' +
+      '<stop offset="68%" stop-color="var(--honey)" stop-opacity=".14"/><stop offset="100%" stop-color="var(--honey)" stop-opacity="0"/></radialGradient>'
+    backFx = '<ellipse class="bee-fx aura" cx="24" cy="16.5" rx="17" ry="12" fill="url(#bg)"/>'
+    innerFx = '<path class="bee-crown" fill="var(--spark)" stroke="var(--ink)" stroke-width=".8" stroke-linejoin="round" d="M21.4 5.5L22.3 3.4 24 4.7 25.7 3.4 26.6 5.5Z"/>'
     const coordWings =
-      `.wing-l{transform-box:fill-box;transform-origin:95% 58%;animation:c-flap-l ${flapDur}ms ${easeInOut} ${delay(flapDur, 'fl')} infinite}` +
-      `.wing-r{transform-box:fill-box;transform-origin:5% 58%;animation:c-flap-r ${flapDur}ms ${easeInOut} ${delay(flapDur, 'fr')} infinite}` +
-      `.wing-glint{animation:c-glint ${flapDur}ms ${easeInOut} ${delay(flapDur, 'gl')} infinite}` +
-      `.aura{transform-box:fill-box;transform-origin:center;animation:c-aura ${auraDur}ms ${easeInOut} ${delay(auraDur, 'au')} infinite}`
-    const coordFrames =
-      '@keyframes c-flap-l{0%,100%{transform:rotate(15deg) scaleY(.95)}50%{transform:rotate(-14deg) scaleY(.84)}}' +
-      '@keyframes c-flap-r{0%,100%{transform:rotate(-15deg) scaleY(.95)}50%{transform:rotate(14deg) scaleY(.84)}}' +
-      '@keyframes c-glint{0%,100%{opacity:.3}50%{opacity:.9}}' +
-      '@keyframes c-aura{0%,100%{opacity:.32;transform:scale(.95)}50%{opacity:.78;transform:scale(1.08)}}'
-
+      `.wing-l{transform-origin:20px 14.5px;animation:c-flap-l ${flapDur}ms ${easeInOut} ${flapDelay} infinite}` +
+      `.wing-r{transform-origin:28px 14.5px;animation:c-flap-r ${flapDur}ms ${easeInOut} ${flapDelay} infinite}` +
+      `.aura{transform-origin:24px 16.5px;animation:c-aura ${auraDur}ms ${easeInOut} ${delay(auraDur, 'au')} infinite}` +
+      '@keyframes c-flap-l{0%,100%{transform:rotate(14deg) scaleY(.96)}50%{transform:rotate(-16deg) scaleY(.82)}}' +
+      '@keyframes c-flap-r{0%,100%{transform:rotate(-14deg) scaleY(.96)}50%{transform:rotate(16deg) scaleY(.82)}}' +
+      '@keyframes c-aura{0%,100%{opacity:.32;transform:scale(.88)}50%{opacity:.88;transform:scale(1.14)}}'
     if (variant === 0) {
-      // royal-hover
       motionStyle =
-        `.bee-hover{transform-box:fill-box;transform-origin:50% 55%;animation:c-royal ${hoverDur}ms ${easeInOut} ${delay(hoverDur, 'hv')} infinite}` +
+        `.bee-hover{transform-origin:24px 16.5px;animation:c-royal ${hoverDur}ms ${easeInOut} ${delay(hoverDur, 'hv')} infinite}` +
         coordWings +
-        '@keyframes c-royal{0%,100%{transform:translateY(-.65px) rotate(-1.5deg)}50%{transform:translateY(.6px) rotate(1.5deg)}}' +
-        coordFrames
+        '@keyframes c-royal{0%,100%{transform:translateY(-2px) rotate(-3deg)}50%{transform:translateY(2px) rotate(3deg)}}'
     } else if (variant === 1) {
-      // waggle-dance
       motionStyle =
-        `.bee-hover{transform-box:fill-box;transform-origin:50% 55%;animation:c-waggle ${hoverDur}ms ${easeInOut} ${delay(hoverDur, 'hv')} infinite}` +
+        `.bee-hover{transform-origin:24px 16.5px;animation:c-waggle ${hoverDur}ms ${easeInOut} ${delay(hoverDur, 'hv')} infinite}` +
         coordWings +
-        '@keyframes c-waggle{0%,100%{transform:translate(-.9px,-.3px) rotate(-2.5deg)}25%{transform:translate(0,.5px) rotate(0deg)}50%{transform:translate(.9px,-.3px) rotate(2.5deg)}75%{transform:translate(0,.5px) rotate(0deg)}}' +
-        coordFrames
+        '@keyframes c-waggle{0%,100%{transform:translate(-2.6px,-1.2px) rotate(-5deg)}25%{transform:translate(0,1.6px) rotate(0deg)}50%{transform:translate(2.6px,-1.2px) rotate(5deg)}75%{transform:translate(0,1.6px) rotate(0deg)}}'
     } else {
-      // beacon-pulse
       motionStyle =
-        `.bee-hover{transform-box:fill-box;transform-origin:50% 55%;animation:c-poise ${hoverDur}ms ${easeInOut} ${delay(hoverDur, 'hv')} infinite}` +
+        `.bee-hover{transform-origin:24px 16.5px;animation:c-poise ${hoverDur}ms ${easeInOut} ${delay(hoverDur, 'hv')} infinite}` +
         coordWings +
-        `.beacon{transform-box:fill-box;transform-origin:center;animation:c-beacon ${auraDur}ms ${easeOut} ${delay(auraDur, 'bc')} infinite}` +
-        '@keyframes c-poise{0%,100%{transform:translateY(-.45px)}50%{transform:translateY(.45px)}}' +
-        coordFrames +
-        '@keyframes c-beacon{0%{opacity:0;transform:scale(.7)}30%{opacity:.85}100%{opacity:0;transform:scale(1.22)}}'
-      backFx += `<path class="bee-fx beacon" fill="none" stroke="var(--honey)" stroke-width="1" d="${HEX_CELL}"/>`
+        `.beacon{transform-origin:24px 16.5px;animation:c-beacon ${auraDur}ms ${easeOut} ${delay(auraDur, 'bc')} infinite}` +
+        '@keyframes c-poise{0%,100%{transform:translateY(-2px)}50%{transform:translateY(2px)}}' +
+        '@keyframes c-beacon{0%{opacity:0;transform:scale(.76)}25%{opacity:.85}100%{opacity:0;transform:scale(1.22)}}'
+      backFx += '<ellipse class="bee-fx beacon" cx="24" cy="16.5" rx="16" ry="11.5" fill="none" stroke="var(--honey)" stroke-width="1.2"/>'
     }
   } else if (effective === 'waiting') {
-    const restDur = jitter(variant === 0 ? 4200 : variant === 1 ? 4600 : variant === 2 ? 4800 : 5200)
-    const restFrames = '@keyframes i-rest{0%,100%{transform:scaleY(1)}50%{transform:scaleY(.94)}}'
+    const dur = jitter(variant === 2 ? 1600 : variant === 3 ? 2200 : 2000)
+    const bob = '@keyframes w-bob{0%,100%{transform:translateY(1px)}50%{transform:translateY(-2.2px)}}'
     if (variant === 0) {
-      // sleep-zzz
-      baseStyle += '.doze-z{opacity:0}'
       motionStyle =
-        `.bee-hover{transform-box:fill-box;transform-origin:50% 90%;animation:i-rest ${restDur}ms ${easeInOut} ${delay(restDur, 'rs')} infinite}` +
-        `.z1{animation:i-doze 3600ms linear ${delay(3600, 'z1')} infinite}` +
-        `.z2{animation:i-doze 3600ms linear ${delay(3600, 'z2')} infinite}` +
-        restFrames +
-        '@keyframes i-doze{0%{opacity:0;transform:translate(0,0)}25%,65%{opacity:.88}100%{opacity:0;transform:translate(.8px,-1.4px)}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:w-bob ${dur}ms ${easeInOut} ${delay(dur, 'hv')} infinite}` +
+        `.z1{animation:i-doze ${dur}ms linear ${delay(dur, 'zz')} infinite}` +
+        `.z2{animation:i-doze ${dur}ms linear ${delay(dur, 'zz', 800)} infinite}` +
+        bob +
+        '@keyframes i-doze{0%{opacity:0;transform:translate(0,2px) scale(.88)}25%,65%{opacity:.95}100%{opacity:0;transform:translate(2.4px,-3.4px) scale(1.08)}}'
       frontFx =
-        '<path class="bee-fx doze-z z1" fill="var(--wing-back)" d="M17 3h3v1h-3zM19 4h1v1h-1zM18 5h1v1h-1zM17 6h3v1h-3z"/>' +
-        '<path class="bee-fx doze-z z2" fill="var(--wing-front)" d="M21 2h2v1h-2zM21 3h1v1h-1zM20 4h2v1h-2z"/>'
+        '<path class="bee-fx doze-z z1" fill="none" stroke="var(--wing-back)" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" d="M33.5 10h3.6l-3.6 3.8h3.6"/>' +
+        '<path class="bee-fx doze-z z2" fill="none" stroke="var(--wing-front)" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" d="M38.2 6.4h2.8l-2.8 3h2.8"/>'
+      reduceOverrides = '.doze-z{opacity:.85}'
     } else if (variant === 1) {
-      // wing-preen
+      const preenDelay = delay(dur, 'pr')
       motionStyle =
-        `.bee-hover{transform-box:fill-box;transform-origin:50% 90%;animation:i-rest ${restDur}ms ${easeInOut} ${delay(restDur, 'rs')} infinite}` +
-        `.wing-r{transform-box:fill-box;transform-origin:5% 60%;animation:i-preen ${restDur}ms ${easeInOut} ${delay(restDur, 'pr')} infinite}` +
-        `.wing-glint-back{animation:i-preen-g ${restDur}ms ${easeInOut} ${delay(restDur, 'pr')} infinite}` +
-        restFrames +
-        '@keyframes i-preen{0%,62%,100%{transform:rotate(0deg)}75%{transform:rotate(12deg) translateY(-.4px)}88%{transform:rotate(-2deg)}}' +
-        '@keyframes i-preen-g{0%,62%,100%{opacity:.54}75%{opacity:.98}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:w-bob ${dur}ms ${easeInOut} ${delay(dur, 'hv')} infinite}` +
+        `.wing-r{transform-origin:28px 14.5px;animation:i-preen ${dur}ms ${easeInOut} ${preenDelay} infinite}` +
+        `.wing-l{transform-origin:20px 14.5px;animation:i-preen-l ${dur}ms ${easeInOut} ${preenDelay} infinite}` +
+        `.wing-glint-back{animation:i-preen-g ${dur}ms ${easeInOut} ${preenDelay} infinite}` +
+        bob +
+        '@keyframes i-preen{0%,100%{transform:rotate(0deg)}45%{transform:rotate(-24deg) translateY(-1px)}75%{transform:rotate(4deg)}}' +
+        '@keyframes i-preen-l{0%,100%{transform:rotate(0deg)}45%{transform:rotate(10deg)}}' +
+        '@keyframes i-preen-g{0%,100%{opacity:.55}45%{opacity:1}}'
     } else if (variant === 2) {
-      // antenna-twitch
       motionStyle =
-        `.bee-hover{transform-box:fill-box;transform-origin:50% 90%;animation:i-rest ${restDur}ms ${easeInOut} ${delay(restDur, 'rs')} infinite}` +
-        `.bee-antennae{transform-box:fill-box;transform-origin:50% 100%;animation:i-twitch ${restDur}ms ${easeInOut} ${delay(restDur, 'tw')} infinite}` +
-        restFrames +
-        '@keyframes i-twitch{0%,34%,56%,100%{transform:rotate(0deg)}40%{transform:rotate(-8deg)}46%{transform:rotate(6deg)}51%{transform:rotate(-5deg)}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:i-tilt ${dur}ms ${easeInOut} ${delay(dur, 'hv')} infinite}` +
+        `.bee-antennae{transform-origin:24px 7.5px;animation:i-twitch ${dur}ms ${easeInOut} ${delay(dur, 'tw')} infinite}` +
+        '@keyframes i-tilt{0%,100%{transform:translateY(1px) rotate(-4deg)}50%{transform:translateY(-2px) rotate(4deg)}}' +
+        '@keyframes i-twitch{0%,20%,80%,100%{transform:rotate(0deg)}38%{transform:rotate(-18deg)}58%{transform:rotate(18deg)}}'
     } else {
-      // sunbeam-doze
-      baseStyle += '.sun-glow{opacity:.18}'
-      defs = '<defs><radialGradient id="sg"><stop offset="0%" stop-color="var(--spark)" stop-opacity=".46"/><stop offset="100%" stop-color="var(--honey)" stop-opacity="0"/></radialGradient></defs>'
-      backFx = '<ellipse class="bee-fx sun-glow" cx="12" cy="9" rx="8" ry="5" fill="url(#sg)" shape-rendering="auto"/>'
+      defs += '<radialGradient id="sg"><stop offset="0%" stop-color="var(--spark)" stop-opacity=".55"/><stop offset="100%" stop-color="var(--honey)" stop-opacity="0"/></radialGradient>'
+      backFx = '<ellipse class="bee-fx sun-glow" cx="24" cy="17.5" rx="16" ry="11" fill="url(#sg)"/>'
+      frontFx =
+        '<circle class="bee-fx sun-mote m1" cx="11" cy="12.5" r="1.1" fill="var(--spark)"/>' +
+        '<circle class="bee-fx sun-mote m2" cx="37" cy="19.5" r="1.1" fill="var(--honey)"/>'
       motionStyle =
-        `.bee-hover{transform-box:fill-box;transform-origin:50% 60%;animation:i-float ${restDur}ms ${easeInOut} ${delay(restDur, 'fl')} infinite}` +
-        `.sun-glow{animation:i-sunglow ${restDur}ms ${easeInOut} ${delay(restDur, 'sg')} infinite}` +
-        '@keyframes i-float{0%,100%{transform:translateY(0)}50%{transform:translateY(-.55px)}}' +
-        '@keyframes i-sunglow{0%,100%{opacity:.16}50%{opacity:.4}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:i-float ${dur}ms ${easeInOut} ${delay(dur, 'hv')} infinite}` +
+        `.sun-glow{transform-origin:24px 17.5px;animation:i-sunglow ${dur}ms ${easeInOut} ${delay(dur, 'sg')} infinite}` +
+        `.m1{animation:i-mote ${dur}ms ${easeInOut} ${delay(dur, 'mt')} infinite}` +
+        `.m2{animation:i-mote ${dur}ms ${easeInOut} ${delay(dur, 'mt', 900)} infinite}` +
+        '@keyframes i-float{0%,100%{transform:translateY(1.4px)}50%{transform:translateY(-2.4px)}}' +
+        '@keyframes i-sunglow{0%,100%{opacity:.22;transform:scale(.85)}50%{opacity:.82;transform:scale(1.16)}}' +
+        '@keyframes i-mote{0%,100%{opacity:.25;transform:translateY(2px)}50%{opacity:.95;transform:translateY(-3px)}}'
     }
   } else if (effective === 'not started') {
-    const broodDur = jitter(variant === 0 ? 4600 : variant === 1 ? 5200 : 4200)
-    // Desaturated warm wax brood-cell palette (>= 3:1 contrast) — no opacity:.5 washout.
+    const dur = jitter(2000)
+    // Desaturated warm wax brood-honey palette (>= 3:1 contrast) — no opacity:.5 washout and no enclosing hexagon.
     baseStyle +=
-      '.bee-body{fill:var(--brood-body)}.bee-band-honey{fill:var(--brood-band)}' +
+      '.bee-body{fill:var(--brood-body)}.bee-abdomen{fill:var(--brood-honey)}.bee-band-stripe{fill:var(--brood-stripe)}' +
       '.wing-front{fill:var(--brood-wing-f)}.wing-back{fill:var(--brood-wing-b)}' +
-      '.brood-cell{fill:none;stroke:var(--warn);stroke-width:1;stroke-dasharray:3 2;opacity:.82}'
-    backFx = `<path class="bee-fx brood-cell" d="${HEX_CELL}"/>`
-
+      '.brood-cradle{fill:none;stroke:var(--warn);stroke-width:1.15;stroke-dasharray:2.4 2.4;stroke-linecap:round;opacity:.85}'
+    backFx = '<path class="bee-fx brood-cradle" d="M13 28.8Q24 31.2 35 28.8"/>'
     if (variant === 0) {
-      // cell-incubate
+      defs += '<radialGradient id="ng"><stop offset="0%" stop-color="var(--honey)" stop-opacity=".48"/><stop offset="100%" stop-color="var(--honey)" stop-opacity="0"/></radialGradient>'
+      backFx = '<ellipse class="bee-fx brood-glow" cx="24" cy="17.5" rx="15" ry="10.5" fill="url(#ng)"/>' + backFx
+      frontFx =
+        '<circle class="bee-fx q-pip qp1" cx="35.5" cy="5.5" r="1.05" fill="var(--warn)"/>' +
+        '<circle class="bee-fx q-pip qp2" cx="39.5" cy="5.5" r="1.05" fill="var(--warn)"/>' +
+        '<circle class="bee-fx q-pip qp3" cx="43.5" cy="5.5" r="1.05" fill="var(--warn)"/>'
       motionStyle =
-        `.brood-cell{animation:n-incubate ${broodDur}ms ${easeInOut} ${delay(broodDur, 'in')} infinite}` +
-        '@keyframes n-incubate{0%,100%{opacity:.46}50%{opacity:.98}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:n-bob ${dur}ms ${easeInOut} ${delay(dur, 'hv')} infinite}` +
+        `.brood-glow{transform-origin:24px 17.5px;animation:n-glow ${dur}ms ${easeInOut} ${delay(dur, 'gl')} infinite}` +
+        // Scaled about its own centre: about the icon's origin the last pip left the 48-unit frame at its peak.
+        '.q-pip{transform-box:fill-box;transform-origin:center}' +
+        `.qp1{animation:n-pip ${dur}ms ${easeInOut} ${delay(dur, 'qp')} infinite}` +
+        `.qp2{animation:n-pip ${dur}ms ${easeInOut} ${delay(dur, 'qp', 350)} infinite}` +
+        `.qp3{animation:n-pip ${dur}ms ${easeInOut} ${delay(dur, 'qp', 700)} infinite}` +
+        '@keyframes n-bob{0%,100%{transform:translateY(1.2px)}50%{transform:translateY(-2px)}}' +
+        '@keyframes n-glow{0%,100%{opacity:.22;transform:scale(.85)}50%{opacity:.85;transform:scale(1.14)}}' +
+        '@keyframes n-pip{0%,100%{opacity:.25;transform:scale(.75)}45%{opacity:1;transform:scale(1.22)}}'
     } else if (variant === 1) {
-      // cell-peek
+      const peekDelay = delay(dur, 'pk')
       baseStyle += '.peek-eyes{opacity:0}'
-      innerFx = `<path class="bee-fx peek-eyes" fill="var(--ink)" d="${EYES.open}"/>`
+      innerFx = `<g class="bee-fx peek-eyes">${EYES.open}</g>`
+      frontFx = '<circle class="bee-fx q-pip" cx="40" cy="5.5" r="1.3" fill="var(--warn)"/>'
       motionStyle =
-        `.bee-hover{transform-box:fill-box;transform-origin:50% 60%;animation:n-nudge ${broodDur}ms ${easeInOut} ${delay(broodDur, 'nd')} infinite}` +
-        `.peek-eyes{animation:n-peek ${broodDur}ms ${easeInOut} ${delay(broodDur, 'pk')} infinite}` +
-        '@keyframes n-nudge{0%,10%,32%,100%{transform:translateY(0)}20%{transform:translateY(-.5px)}}' +
-        '@keyframes n-peek{0%,10%,32%,100%{opacity:0}16%,26%{opacity:1}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:n-hop ${dur}ms ${easeInOut} ${peekDelay} infinite}` +
+        `.bee-antennae{transform-origin:24px 7.5px;animation:n-perk ${dur}ms ${easeInOut} ${peekDelay} infinite}` +
+        `.bee-eyes{animation:n-hide ${dur}ms ${easeInOut} ${peekDelay} infinite}` +
+        `.peek-eyes{animation:n-peek ${dur}ms ${easeInOut} ${peekDelay} infinite}` +
+        // Hop and perk peak together: sized so the right antenna tip (30.7, 3.9, r 1.05) stays inside the frame's top edge.
+        '@keyframes n-hop{0%,20%,100%{transform:translateY(1.4px)}55%{transform:translateY(-1.6px)}}' +
+        '@keyframes n-perk{0%,20%,100%{transform:rotate(0deg)}55%{transform:rotate(-8deg)}}' +
+        '@keyframes n-hide{0%,22%,88%,100%{opacity:1}35%,75%{opacity:0}}' +
+        '@keyframes n-peek{0%,25%,85%,100%{opacity:0}40%,70%{opacity:1}}'
+      reduceOverrides = '.peek-eyes{opacity:0}'
     } else {
-      // pollen-cue
-      baseStyle += '.cue-dot{opacity:.55}'
-      frontFx = '<rect class="bee-fx cue-dot" x="12" y="1" width="1" height="1" fill="var(--honey)"/>'
+      frontFx =
+        '<circle class="bee-fx cue-dot cd1" cx="10" cy="14.5" r="1.3" fill="var(--honey)"/>' +
+        '<circle class="bee-fx cue-dot cd2" cx="38" cy="14.5" r="1.3" fill="var(--spark)"/>'
       motionStyle =
-        `.cue-dot{transform-box:fill-box;transform-origin:12px 7.5px;animation:n-cue ${broodDur}ms linear ${delay(broodDur, 'cu')} infinite}` +
-        '@keyframes n-cue{0%{opacity:.4;transform:translate(-5px,1px)}25%{opacity:1;transform:translate(0,0)}50%{opacity:.6;transform:translate(5px,1px)}75%{opacity:.9;transform:translate(0,2px)}100%{opacity:.4;transform:translate(-5px,1px)}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:n-sway ${dur}ms ${easeInOut} ${delay(dur, 'hv')} infinite}` +
+        `.cd1{animation:n-orb1 ${dur}ms ${easeInOut} ${delay(dur, 'o1')} infinite}` +
+        `.cd2{animation:n-orb2 ${dur}ms ${easeInOut} ${delay(dur, 'o2')} infinite}` +
+        '@keyframes n-sway{0%,100%{transform:translateX(-1.8px) rotate(-4deg)}50%{transform:translateX(1.8px) rotate(4deg)}}' +
+        '@keyframes n-orb1{0%,100%{opacity:.35;transform:translate(0,3px)}50%{opacity:1;transform:translate(3px,-5px)}}' +
+        '@keyframes n-orb2{0%,100%{opacity:.35;transform:translate(0,-4px)}50%{opacity:1;transform:translate(-3px,4px)}}'
     }
   } else if (effective === 'paused') {
-    const pauseDur = jitter(variant === 0 ? 4400 : variant === 1 ? 5200 : 4800)
-    baseStyle += '.stasis-hex{fill:none;stroke:var(--warn);stroke-width:1;opacity:.8}.stasis-bar{fill:var(--warn);opacity:.95}'
-    backFx = `<path class="bee-fx stasis-hex" d="${HEX_BADGE}"/>`
+    const dur = jitter(2200)
+    baseStyle += '.stasis-bar{fill:var(--warn)}'
     frontFx =
-      '<rect class="bee-fx stasis-bar b1" x="19" y="1" width="1" height="3"/>' +
-      '<rect class="bee-fx stasis-bar b2" x="21" y="1" width="1" height="3"/>'
-
+      '<rect class="bee-fx stasis-bar b1" x="37.5" y="3.5" width="2" height="5.5" rx=".8"/>' +
+      '<rect class="bee-fx stasis-bar b2" x="41" y="3.5" width="2" height="5.5" rx=".8"/>'
     if (variant === 0) {
-      // amber-stasis
+      defs += '<radialGradient id="pg"><stop offset="0%" stop-color="var(--warn)" stop-opacity=".4"/><stop offset="100%" stop-color="var(--warn)" stop-opacity="0"/></radialGradient>'
+      backFx = '<ellipse class="bee-fx p-halo" cx="24" cy="16.5" rx="16" ry="11" fill="url(#pg)"/>'
       motionStyle =
-        `.stasis-hex{animation:p-amber ${pauseDur}ms ${easeInOut} ${delay(pauseDur, 'am')} infinite}` +
-        '@keyframes p-amber{0%,100%{opacity:.52}50%{opacity:1}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:p-float ${dur}ms ${easeInOut} ${delay(dur, 'hv')} infinite}` +
+        `.p-halo{transform-origin:24px 16.5px;animation:p-amber ${dur}ms ${easeInOut} ${delay(dur, 'am')} infinite}` +
+        `.stasis-bar{animation:p-bars ${dur}ms ${easeInOut} ${delay(dur, 'br')} infinite}` +
+        '@keyframes p-float{0%,100%{transform:translateY(1.2px)}50%{transform:translateY(-1.6px)}}' +
+        '@keyframes p-amber{0%,100%{opacity:.22;transform:scale(.88)}50%{opacity:.85;transform:scale(1.12)}}' +
+        '@keyframes p-bars{0%,100%{opacity:.42}50%{opacity:1}}'
     } else if (variant === 1) {
-      // suspended-breath
+      const wingDelay = delay(dur, 'wg')
       motionStyle =
-        `.bee-hover{transform-box:fill-box;transform-origin:50% 60%;animation:p-breath ${pauseDur}ms ${easeInOut} ${delay(pauseDur, 'sb')} infinite}` +
-        `.stasis-bar{animation:p-bars ${pauseDur}ms ${easeInOut} ${delay(pauseDur, 'br')} infinite}` +
-        '@keyframes p-breath{0%,100%{transform:translateY(0)}50%{transform:translateY(-.35px)}}' +
-        '@keyframes p-bars{0%,100%{opacity:.62}50%{opacity:1}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:p-breath ${dur}ms ${easeInOut} ${delay(dur, 'hv')} infinite}` +
+        `.wing-l{transform-origin:20px 14.5px;animation:p-wl ${dur}ms ${easeInOut} ${wingDelay} infinite}` +
+        `.wing-r{transform-origin:28px 14.5px;animation:p-wr ${dur}ms ${easeInOut} ${wingDelay} infinite}` +
+        '@keyframes p-breath{0%,100%{transform:translateY(1.5px)}50%{transform:translateY(-1.8px)}}' +
+        '@keyframes p-wl{0%,100%{transform:rotate(0deg)}50%{transform:rotate(12deg)}}' +
+        '@keyframes p-wr{0%,100%{transform:rotate(0deg)}50%{transform:rotate(-12deg)}}'
     } else {
-      // wax-seal
-      baseStyle += '.seal-glint{opacity:0}'
-      frontFx += '<rect class="bee-fx seal-glint" x="9" y="8" width="2" height="1" fill="var(--spark)"/>'
+      sheenFx = '<rect class="bee-fx seal-glint" x="17" y="16" width="2.8" height="10" rx="1" fill="var(--spark)" fill-opacity=".65"/>'
       motionStyle =
-        `.bee-antennae{transform-box:fill-box;transform-origin:50% 100%;animation:p-tuck ${pauseDur}ms ${easeInOut} ${delay(pauseDur, 'tk')} infinite}` +
-        `.seal-glint{animation:p-sheen ${pauseDur}ms ${easeInOut} ${delay(pauseDur, 'sh')} infinite}` +
-        '@keyframes p-tuck{0%,100%{transform:scaleY(.92)}50%{transform:scaleY(1)}}' +
-        '@keyframes p-sheen{0%,35%,100%{opacity:0;transform:translateX(0)}55%{opacity:.85;transform:translateX(2px)}75%{opacity:0;transform:translateX(4px)}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:p-sway ${dur}ms ${easeInOut} ${delay(dur, 'hv')} infinite}` +
+        `.bee-antennae{transform-origin:24px 7.5px;animation:p-tuck ${dur}ms ${easeInOut} ${delay(dur, 'tk')} infinite}` +
+        `.seal-glint{animation:p-sheen ${dur}ms ${easeInOut} ${delay(dur, 'sh')} infinite}` +
+        '@keyframes p-sway{0%,100%{transform:rotate(-3deg)}50%{transform:rotate(3deg)}}' +
+        '@keyframes p-tuck{0%,100%{transform:rotate(-12deg)}50%{transform:rotate(12deg)}}' +
+        '@keyframes p-sheen{0%,100%{opacity:0;transform:translateX(0)}50%{opacity:.9;transform:translateX(11px)}}'
     }
   } else if (effective === 'closed') {
-    const closeDur = jitter(variant === 0 ? 5600 : variant === 1 ? 6000 : 5400)
-    baseStyle += '.arch-cradle{fill:none;stroke:var(--honey);stroke-width:1;opacity:.75}'
-    backFx = '<path class="bee-fx arch-cradle" d="M3 10L12 14L21 10"/>'
+    const dur = jitter(2400)
+    backFx = '<path class="bee-fx arch-cradle" fill="none" stroke="var(--honey)" stroke-width="1.2" stroke-linecap="round" d="M14 28.5Q24 31.2 34 28.5"/>'
+    frontFx = '<path class="bee-fx comb-seal" fill="var(--honey)" fill-opacity=".22" stroke="var(--honey)" stroke-width="1.15" stroke-linejoin="round" d="M40.5 3.4L43.2 5V8L40.5 9.6 37.8 8V5Z"/>'
     if (variant === 0) {
-      // sealed-comb
-      baseStyle += '.comb-luster{opacity:.2}'
-      frontFx = '<rect class="bee-fx comb-luster" x="9" y="10" width="2" height="1" fill="var(--spark)"/>'
+      sheenFx = '<rect class="bee-fx comb-luster" x="17" y="16" width="2.8" height="10" rx="1" fill="var(--spark)" fill-opacity=".68"/>'
       motionStyle =
-        `.comb-luster{animation:cl-sweep ${closeDur}ms ${easeInOut} ${delay(closeDur, 'sw')} infinite}` +
-        '@keyframes cl-sweep{0%,100%{opacity:.15;transform:translateX(0)}50%{opacity:.85;transform:translateX(4px)}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:cl-bob ${dur}ms ${easeInOut} ${delay(dur, 'hv')} infinite}` +
+        `.comb-luster{animation:cl-sweep ${dur}ms ${easeInOut} ${delay(dur, 'sw')} infinite}` +
+        '@keyframes cl-bob{0%,100%{transform:translateY(1px)}50%{transform:translateY(-1.5px)}}' +
+        '@keyframes cl-sweep{0%,100%{opacity:0;transform:translateX(0)}50%{opacity:.95;transform:translateX(11px)}}'
     } else if (variant === 1) {
-      // content-rest
+      const wingDelay = delay(dur, 'wg')
       motionStyle =
-        `.bee-hover{transform-box:fill-box;transform-origin:50% 90%;animation:cl-rest ${closeDur}ms ${easeInOut} ${delay(closeDur, 'cr')} infinite}` +
-        '@keyframes cl-rest{0%,100%{transform:scaleY(1)}50%{transform:scaleY(.96)}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:cl-rest ${dur}ms ${easeInOut} ${delay(dur, 'hv')} infinite}` +
+        `.wing-l{transform-origin:20px 14.5px;animation:cl-wl ${dur}ms ${easeInOut} ${wingDelay} infinite}` +
+        `.wing-r{transform-origin:28px 14.5px;animation:cl-wr ${dur}ms ${easeInOut} ${wingDelay} infinite}` +
+        '@keyframes cl-rest{0%,100%{transform:translateY(1.2px)}50%{transform:translateY(-1.6px)}}' +
+        '@keyframes cl-wl{0%,100%{transform:rotate(0deg)}50%{transform:rotate(12deg)}}' +
+        '@keyframes cl-wr{0%,100%{transform:rotate(0deg)}50%{transform:rotate(-12deg)}}'
     } else {
-      // nectar-gem
-      baseStyle += '.nectar-gem{opacity:.75}'
-      frontFx = '<rect class="bee-fx nectar-gem" x="20" y="2" width="2" height="2" fill="var(--honey)"/>'
+      frontFx += '<circle class="bee-fx nectar-gem" cx="40.5" cy="6.5" r="1.4" fill="var(--spark)"/>'
       motionStyle =
-        `.nectar-gem{animation:cl-gem ${closeDur}ms ${easeInOut} ${delay(closeDur, 'gm')} infinite}` +
-        '@keyframes cl-gem{0%,100%{opacity:.5;transform:scale(.92)}50%{opacity:.98;transform:scale(1.06)}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:cl-bob2 ${dur}ms ${easeInOut} ${delay(dur, 'hv')} infinite}` +
+        `.nectar-gem{transform-origin:40.5px 6.5px;animation:cl-gem ${dur}ms ${easeInOut} ${delay(dur, 'gm')} infinite}` +
+        '@keyframes cl-bob2{0%,100%{transform:translateY(1px)}50%{transform:translateY(-1.5px)}}' +
+        '@keyframes cl-gem{0%,100%{opacity:.4;transform:scale(.7)}50%{opacity:1;transform:scale(1.35)}}'
     }
   } else if (effective === 'killed') {
-    const retDur = jitter(variant === 0 ? 5600 : variant === 1 ? 5000 : 4800)
-    // Desaturated propolis-ash tones preserving >= 3:1 contrast without svg{opacity:.5}.
+    const dur = jitter(2400)
+    // Desaturated propolis-ash tones preserving >= 3:1 contrast without svg{opacity:.5} and without enclosing hexagon.
     baseStyle +=
-      '.bee-body{fill:var(--retired-body)}.bee-band-honey{fill:var(--retired-band)}.bee-band-stripe{fill:var(--retired-stripe)}' +
-      '.wing-front{fill:var(--retired-wing-f)}.wing-back{fill:var(--retired-wing-b)}.bee-antennae{fill:var(--retired-ant)}' +
-      '.retired-hex{fill:none;stroke:var(--retired-body);stroke-width:1;stroke-dasharray:2 2;opacity:.85}' +
-      '.retire-slash{stroke:var(--retired-body);stroke-width:1}'
-    backFx = `<path class="bee-fx retired-hex" d="${HEX_BADGE}"/>`
-    frontFx = '<path class="bee-fx retire-slash" d="M19 4L22 1"/>'
-
+      '.bee-body{fill:var(--retired-body)}.bee-abdomen{fill:var(--retired-honey)}.bee-band-stripe{fill:var(--retired-stripe)}' +
+      '.wing-front{fill:var(--retired-wing-f)}.wing-back{fill:var(--retired-wing-b)}' +
+      '.bee-antennae path{stroke:var(--retired-ant)}.bee-antennae circle{fill:var(--retired-ant)}' +
+      '.retire-badge{fill:none;stroke:var(--retired-body);stroke-width:1.3;stroke-linecap:round}'
+    frontFx = '<g class="bee-fx retire-badge"><circle cx="40.5" cy="6.4" r="2.9"/><path d="M38.5 8.4L42.5 4.4"/></g>'
     if (variant === 0) {
-      // spirit-drift
       motionStyle =
-        `.bee-hover{transform-box:fill-box;transform-origin:50% 60%;animation:k-drift ${retDur}ms ${easeInOut} ${delay(retDur, 'dr')} infinite}` +
-        `.retired-hex{animation:k-ring ${retDur}ms ${easeInOut} ${delay(retDur, 'rg')} infinite}` +
-        '@keyframes k-drift{0%,100%{transform:translateY(0)}50%{transform:translateY(-.7px)}}' +
-        '@keyframes k-ring{0%,100%{opacity:.55}50%{opacity:.95}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:k-drift ${dur}ms ${easeInOut} ${delay(dur, 'dr')} infinite}` +
+        '@keyframes k-drift{0%,100%{transform:translateY(1.5px) rotate(-3deg)}50%{transform:translateY(-2px) rotate(3deg)}}'
     } else if (variant === 1) {
-      // ash-mote
-      baseStyle += '.ash-mote{opacity:0}'
-      frontFx += '<rect class="bee-fx ash-mote" x="18" y="5" width="1" height="1" fill="var(--retired-band)"/>'
+      frontFx +=
+        '<circle class="bee-fx ash-mote am1" cx="35" cy="18.5" r="1.15" fill="var(--retired-honey)"/>' +
+        '<circle class="bee-fx ash-mote am2" cx="12" cy="16.5" r="1.05" fill="var(--retired-body)"/>'
       motionStyle =
-        `.ash-mote{animation:k-ash ${retDur}ms ${easeOut} ${delay(retDur, 'as')} infinite}` +
-        '@keyframes k-ash{0%{opacity:0;transform:translateY(1px)}28%{opacity:.9}100%{opacity:0;transform:translate(1px,-3px)}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:k-bob ${dur}ms ${easeInOut} ${delay(dur, 'hv')} infinite}` +
+        `.am1{animation:k-ash ${dur}ms ${easeOut} ${delay(dur, 'am')} infinite}` +
+        `.am2{animation:k-ash ${dur}ms ${easeOut} ${delay(dur, 'am', 900)} infinite}` +
+        '@keyframes k-bob{0%,100%{transform:translateY(1px)}50%{transform:translateY(-1.6px)}}' +
+        '@keyframes k-ash{0%{opacity:0;transform:translateY(2px)}30%{opacity:.95}100%{opacity:0;transform:translate(2.5px,-6px)}}'
     } else {
-      // retired-seal
+      const wingDelay = delay(dur, 'wg')
       motionStyle =
-        `.retired-hex{animation:k-seal ${retDur}ms ${easeInOut} ${delay(retDur, 'sl')} infinite}` +
-        '@keyframes k-seal{0%,100%{opacity:.48}50%{opacity:.92}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:k-bob2 ${dur}ms ${easeInOut} ${delay(dur, 'hv')} infinite}` +
+        `.wing-l{transform-origin:20px 14.5px;animation:k-wl ${dur}ms ${easeInOut} ${wingDelay} infinite}` +
+        `.wing-r{transform-origin:28px 14.5px;animation:k-wr ${dur}ms ${easeInOut} ${wingDelay} infinite}` +
+        '@keyframes k-bob2{0%,100%{transform:translateY(1px)}50%{transform:translateY(-1.5px)}}' +
+        '@keyframes k-wl{0%,100%{transform:rotate(0deg)}50%{transform:rotate(12deg)}}' +
+        '@keyframes k-wr{0%,100%{transform:rotate(0deg)}50%{transform:rotate(-12deg)}}'
     }
   } else if (effective === 'stopped') {
-    const stopDur = jitter(variant === 0 ? 3800 : variant === 1 ? 3200 : 3000)
-    baseStyle += '.stop-badge{fill:var(--stop);opacity:.95}'
-    frontFx = '<rect class="bee-fx stop-badge" x="19" y="1" width="3" height="3"/>'
-
+    const dur = jitter(1800)
+    frontFx = '<rect class="bee-fx stop-badge" x="38" y="3.8" width="5" height="5" rx="1" fill="var(--stop)"/>'
     if (variant === 0) {
-      // stall-shudder
+      const wingDelay = delay(dur, 'wg')
       motionStyle =
-        `.wing-l{transform-box:fill-box;transform-origin:95% 58%;animation:st-shudder-l ${stopDur}ms ${easeInOut} ${delay(stopDur, 'sl')} infinite}` +
-        `.wing-r{transform-box:fill-box;transform-origin:5% 58%;animation:st-shudder-r ${stopDur}ms ${easeInOut} ${delay(stopDur, 'sr')} infinite}` +
-        '@keyframes st-shudder-l{0%,68%,100%{transform:rotate(0deg)}76%{transform:rotate(11deg)}84%{transform:rotate(-5deg)}92%{transform:rotate(4deg)}}' +
-        '@keyframes st-shudder-r{0%,68%,100%{transform:rotate(0deg)}76%{transform:rotate(-11deg)}84%{transform:rotate(5deg)}92%{transform:rotate(-4deg)}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:st-jit ${dur}ms ${easeInOut} ${delay(dur, 'hv')} infinite}` +
+        `.wing-l{transform-origin:20px 14.5px;animation:st-shl ${dur}ms ${easeInOut} ${wingDelay} infinite}` +
+        `.wing-r{transform-origin:28px 14.5px;animation:st-shr ${dur}ms ${easeInOut} ${wingDelay} infinite}` +
+        '@keyframes st-jit{0%,55%,100%{transform:translateX(0)}65%{transform:translateX(-2px)}80%{transform:translateX(2px)}}' +
+        '@keyframes st-shl{0%,55%,100%{transform:rotate(0deg)}68%{transform:rotate(18deg)}84%{transform:rotate(-8deg)}}' +
+        '@keyframes st-shr{0%,55%,100%{transform:rotate(0deg)}68%{transform:rotate(-18deg)}84%{transform:rotate(8deg)}}'
     } else if (variant === 1) {
-      // askew-wing
       motionStyle =
-        `.wing-l{transform-box:fill-box;transform-origin:95% 58%;animation:st-askew ${stopDur}ms ${easeInOut} ${delay(stopDur, 'ak')} infinite}` +
-        `.stop-badge{animation:st-blink ${stopDur}ms ${easeInOut} ${delay(stopDur, 'bk')} infinite}` +
-        '@keyframes st-askew{0%,100%{transform:rotate(-10deg)}50%{transform:rotate(-5deg)}}' +
-        '@keyframes st-blink{0%,45%,100%{opacity:.95}55%,85%{opacity:.42}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:st-tilt ${dur}ms ${easeInOut} ${delay(dur, 'hv')} infinite}` +
+        `.wing-l{transform-origin:20px 14.5px;animation:st-askew ${dur}ms ${easeInOut} ${delay(dur, 'ak')} infinite}` +
+        `.stop-badge{animation:st-blink ${dur}ms ${easeInOut} ${delay(dur, 'bk')} infinite}` +
+        '@keyframes st-tilt{0%,100%{transform:rotate(-5deg)}50%{transform:rotate(2deg)}}' +
+        '@keyframes st-askew{0%,100%{transform:rotate(-18deg)}50%{transform:rotate(4deg)}}' +
+        '@keyframes st-blink{0%,40%,100%{opacity:1}60%,80%{opacity:.3}}'
     } else {
-      // grounded-thud
       motionStyle =
-        `.bee-hover{transform-box:fill-box;transform-origin:50% 60%;animation:st-thud ${stopDur}ms ${easeInOut} ${delay(stopDur, 'th')} infinite}` +
-        `.bee-antennae{transform-box:fill-box;transform-origin:50% 100%;animation:st-droop ${stopDur}ms ${easeInOut} ${delay(stopDur, 'dp')} infinite}` +
-        `.stop-badge{animation:st-pulse ${stopDur}ms ${easeInOut} ${delay(stopDur, 'ps')} infinite}` +
-        '@keyframes st-thud{0%,100%{transform:translateY(.9px)}50%{transform:translateY(.4px)}}' +
-        '@keyframes st-droop{0%,100%{transform:scaleY(.88)}50%{transform:scaleY(.95)}}' +
-        '@keyframes st-pulse{0%,100%{opacity:.55}50%{opacity:1}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:st-thud ${dur}ms ${easeInOut} ${delay(dur, 'th')} infinite}` +
+        `.bee-antennae{transform-origin:24px 7.5px;animation:st-droop ${dur}ms ${easeInOut} ${delay(dur, 'dp')} infinite}` +
+        '@keyframes st-thud{0%,100%{transform:translateY(-1.5px)}45%{transform:translateY(2.2px)}70%{transform:translateY(.5px)}}' +
+        '@keyframes st-droop{0%,100%{transform:rotate(-12deg)}50%{transform:rotate(12deg)}}'
     }
   } else if (effective === 'failed') {
-    const errDur = jitter(variant === 0 ? 2600 : variant === 1 ? 2400 : 2800)
-    baseStyle += '.err-mark{fill:var(--err);opacity:.95}'
-    frontFx = '<path class="bee-fx err-mark" d="M20 1h1v2h-1zM20 4h1v1h-1z"/>'
-
+    const dur = jitter(1500)
+    frontFx = '<path class="bee-fx err-mark" fill="var(--err)" d="M39.5 3.3h2v4h-2zM39.5 8.5h2v1.8h-2z"/>'
     if (variant === 0) {
-      // dizzy-antenna
-      baseStyle += '.err-spark{opacity:0}'
       frontFx +=
-        '<rect class="bee-fx err-spark es1" x="3" y="3" width="1" height="1" fill="var(--err)"/>' +
-        '<rect class="bee-fx err-spark es2" x="18" y="3" width="1" height="1" fill="var(--err)"/>'
+        '<circle class="bee-fx err-spark es1" cx="9" cy="9.5" r="1.25" fill="var(--err)"/>' +
+        '<circle class="bee-fx err-spark es2" cx="35" cy="9.5" r="1.25" fill="var(--err)"/>'
       motionStyle =
-        `.bee-antennae{transform-box:fill-box;transform-origin:50% 100%;animation:f-dizzy ${errDur}ms ${easeInOut} ${delay(errDur, 'dz')} infinite}` +
-        `.es1{animation:f-es ${errDur}ms ${easeOut} ${delay(errDur, 'e1')} infinite}` +
-        `.es2{animation:f-es ${errDur}ms ${easeOut} ${delay(errDur, 'e2')} infinite}` +
-        '@keyframes f-dizzy{0%,100%{transform:rotate(-8deg)}35%{transform:rotate(9deg)}70%{transform:rotate(-6deg)}}' +
-        '@keyframes f-es{0%,100%{opacity:0;transform:translateY(0)}30%{opacity:.95;transform:translateY(-1px)}70%{opacity:0;transform:translateY(-2px)}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:f-rock ${dur}ms ${easeInOut} ${delay(dur, 'rk')} infinite}` +
+        `.bee-antennae{transform-origin:24px 7.5px;animation:f-dizzy ${dur}ms ${easeInOut} ${delay(dur, 'dz')} infinite}` +
+        `.es1{animation:f-es ${dur}ms ${easeOut} ${delay(dur, 'es')} infinite}` +
+        `.es2{animation:f-es ${dur}ms ${easeOut} ${delay(dur, 'es', 600)} infinite}` +
+        '@keyframes f-rock{0%,100%{transform:rotate(-5deg)}50%{transform:rotate(5deg)}}' +
+        '@keyframes f-dizzy{0%,100%{transform:rotate(-20deg)}50%{transform:rotate(20deg)}}' +
+        '@keyframes f-es{0%,100%{opacity:0;transform:translateY(2px)}35%{opacity:1;transform:translateY(-2px)}80%{opacity:0;transform:translateY(-5px)}}'
     } else if (variant === 1) {
-      // alarm-halo
-      baseStyle += '.alarm-halo{opacity:.16}'
-      defs = '<defs><radialGradient id="fg"><stop offset="0%" stop-color="var(--err)" stop-opacity=".55"/><stop offset="100%" stop-color="var(--err)" stop-opacity="0"/></radialGradient></defs>'
-      backFx = '<ellipse class="bee-fx alarm-halo" cx="12" cy="8" rx="9" ry="6" fill="url(#fg)" shape-rendering="auto"/>'
+      defs += '<radialGradient id="fg"><stop offset="0%" stop-color="var(--err)" stop-opacity=".55"/><stop offset="100%" stop-color="var(--err)" stop-opacity="0"/></radialGradient>'
+      backFx = '<ellipse class="bee-fx alarm-halo" cx="24" cy="16.5" rx="17" ry="12" fill="url(#fg)"/>'
       motionStyle =
-        `.alarm-halo{animation:f-halo ${errDur}ms ${easeInOut} ${delay(errDur, 'hl')} infinite}` +
-        '@keyframes f-halo{0%,100%{opacity:.12;transform:scale(.95)}50%{opacity:.32;transform:scale(1.06)}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:f-quiv ${dur}ms ${easeInOut} ${delay(dur, 'qv')} infinite}` +
+        `.alarm-halo{transform-origin:24px 16.5px;animation:f-halo ${dur}ms ${easeInOut} ${delay(dur, 'hl')} infinite}` +
+        '@keyframes f-quiv{0%,100%{transform:translateX(-1.8px)}50%{transform:translateX(1.8px)}}' +
+        '@keyframes f-halo{0%,100%{opacity:.18;transform:scale(.85)}50%{opacity:.9;transform:scale(1.18)}}'
     } else {
-      // spark-sputter
-      baseStyle += '.sputter{opacity:0}'
       frontFx +=
-        '<rect class="bee-fx sputter sp1" x="5" y="10" width="1" height="1" fill="var(--err)"/>' +
-        '<rect class="bee-fx sputter sp2" x="18" y="11" width="1" height="1" fill="var(--honey)"/>'
+        '<circle class="bee-fx sputter sp1" cx="11" cy="20.5" r="1.25" fill="var(--err)"/>' +
+        '<circle class="bee-fx sputter sp2" cx="37" cy="21.5" r="1.25" fill="var(--honey)"/>'
       motionStyle =
-        `.bee-hover{transform-box:fill-box;transform-origin:50% 55%;animation:f-tilt ${errDur}ms ${easeInOut} ${delay(errDur, 'tl')} infinite}` +
-        `.sp1{animation:f-drop ${errDur}ms ${easeOut} ${delay(errDur, 'd1')} infinite}` +
-        `.sp2{animation:f-drop ${errDur}ms ${easeOut} ${delay(errDur, 'd2')} infinite}` +
-        '@keyframes f-tilt{0%,100%{transform:rotate(-4deg)}50%{transform:rotate(-2deg) translateY(.4px)}}' +
-        '@keyframes f-drop{0%{opacity:0;transform:translateY(-.5px)}25%{opacity:.95}100%{opacity:0;transform:translateY(2.2px)}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:f-tilt ${dur}ms ${easeInOut} ${delay(dur, 'tl')} infinite}` +
+        `.sp1{animation:f-drop ${dur}ms ${easeOut} ${delay(dur, 'sp')} infinite}` +
+        `.sp2{animation:f-drop ${dur}ms ${easeOut} ${delay(dur, 'sp', 600)} infinite}` +
+        '@keyframes f-tilt{0%,100%{transform:rotate(-7deg) translateY(-1px)}50%{transform:rotate(2deg) translateY(2px)}}' +
+        '@keyframes f-drop{0%{opacity:0;transform:translateY(-2px)}30%{opacity:1}100%{opacity:0;transform:translateY(5px)}}'
     }
   } else {
     // unreachable (3 lost-contact variants: signal-ping, antenna-search, weak-link)
-    const unDur = jitter(variant === 0 ? 2800 : variant === 1 ? 3400 : 3200)
-    baseStyle += '.sig-pip{fill:var(--unreach);opacity:.9}'
+    const dur = jitter(1700)
     if (variant === 0) {
-      // signal-ping
       frontFx =
-        '<rect class="bee-fx sig-pip sp1" x="5" y="1" width="2" height="1"/>' +
-        '<rect class="bee-fx sig-pip sp2" x="17" y="1" width="2" height="1"/>'
+        '<path class="bee-fx sig-pip sp1" fill="none" stroke="var(--unreach)" stroke-width="1.35" stroke-linecap="round" d="M8 7A4 4 0 0 1 13 5"/>' +
+        '<path class="bee-fx sig-pip sp2" fill="none" stroke="var(--unreach)" stroke-width="1.35" stroke-linecap="round" d="M35 5A4 4 0 0 1 40 7"/>'
       motionStyle =
-        `.sp1{animation:u-ping ${unDur}ms ${easeOut} ${delay(unDur, 'p1')} infinite}` +
-        `.sp2{animation:u-ping ${unDur}ms ${easeOut} ${delay(unDur, 'p2')} infinite}` +
-        '@keyframes u-ping{0%,100%{opacity:.25;transform:translateY(.5px)}45%{opacity:1;transform:translateY(-.8px)}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:u-hov ${dur}ms ${easeInOut} ${delay(dur, 'hv')} infinite}` +
+        `.sp1{animation:u-ping ${dur}ms ${easeOut} ${delay(dur, 'sg')} infinite}` +
+        `.sp2{animation:u-ping ${dur}ms ${easeOut} ${delay(dur, 'sg', 450)} infinite}` +
+        '@keyframes u-hov{0%,100%{transform:translateY(1.5px)}50%{transform:translateY(-1.8px)}}' +
+        '@keyframes u-ping{0%,100%{opacity:.2;transform:translateY(2px)}45%{opacity:1;transform:translateY(-3px)}}'
     } else if (variant === 1) {
-      // antenna-search
-      frontFx = '<rect class="bee-fx sig-pip" x="11" y="1" width="2" height="1"/>'
+      frontFx =
+        '<circle class="bee-fx sig-pip" cx="24" cy="2.6" r="1.25" fill="var(--unreach)"/>' +
+        '<path class="bee-fx sig-pip" fill="none" stroke="var(--unreach)" stroke-width="1.2" stroke-linecap="round" d="M20.5 4A5 5 0 0 1 27.5 4"/>'
       motionStyle =
-        `.bee-antennae{transform-box:fill-box;transform-origin:50% 100%;animation:u-search ${unDur}ms ${easeInOut} ${delay(unDur, 'sr')} infinite}` +
-        `.sig-pip{animation:u-blink ${unDur}ms linear ${delay(unDur, 'bk')} infinite}` +
-        '@keyframes u-search{0%,100%{transform:rotate(-9deg)}50%{transform:rotate(9deg)}}' +
-        '@keyframes u-blink{0%,45%,100%{opacity:.25}50%,85%{opacity:1}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:u-look ${dur}ms ${easeInOut} ${delay(dur, 'lk')} infinite}` +
+        `.bee-antennae{transform-origin:24px 7.5px;animation:u-search ${dur}ms ${easeInOut} ${delay(dur, 'sr')} infinite}` +
+        `.sig-pip{animation:u-blink ${dur}ms linear ${delay(dur, 'bk')} infinite}` +
+        '@keyframes u-look{0%,100%{transform:translateX(-2px)}50%{transform:translateX(2px)}}' +
+        '@keyframes u-search{0%,100%{transform:rotate(-20deg)}50%{transform:rotate(20deg)}}' +
+        '@keyframes u-blink{0%,35%,100%{opacity:.22}50%,85%{opacity:1}}'
     } else {
-      // weak-link
-      baseStyle += '.weak-hex{fill:none;stroke:var(--unreach);stroke-width:1;stroke-dasharray:2 3;opacity:.75}'
-      backFx = `<path class="bee-fx weak-hex" d="${HEX_CELL}"/>`
+      frontFx = '<path class="bee-fx weak-arc" fill="none" stroke="var(--unreach)" stroke-width="1.3" stroke-dasharray="2.4 2" stroke-linecap="round" d="M36 5A6 6 0 0 1 43 10"/>'
       motionStyle =
-        `.weak-hex{animation:u-flicker ${unDur}ms linear ${delay(unDur, 'wf')} infinite}` +
-        `.wing-glint{animation:u-flicker ${unDur}ms linear ${delay(unDur, 'wg')} infinite}` +
-        '@keyframes u-flicker{0%,28%,42%,74%,100%{opacity:.85}34%,68%{opacity:.22}}'
+        `.bee-hover{transform-origin:24px 16.5px;animation:u-drift ${dur}ms ${easeInOut} ${delay(dur, 'hv')} infinite}` +
+        `.wing-l{transform-origin:20px 14.5px;animation:u-wl ${dur}ms ${easeInOut} ${delay(dur, 'wl')} infinite}` +
+        `.weak-arc{animation:u-flicker ${dur}ms linear ${delay(dur, 'wf')} infinite}` +
+        '@keyframes u-drift{0%,100%{transform:translateY(1.2px)}50%{transform:translateY(-1.8px)}}' +
+        '@keyframes u-wl{0%,100%{transform:rotate(0deg)}50%{transform:rotate(-16deg)}}' +
+        '@keyframes u-flicker{0%,28%,42%,74%,100%{opacity:1}34%,68%{opacity:.2}}'
     }
   }
 
-  const reducedGuard =
-    '@media(prefers-reduced-motion:no-preference){' +
-    '.bee-hover,.wing-l,.wing-r,.bee-antennae,.bee-fx{shape-rendering:auto}' +
-    motionStyle +
-    '}'
+  const wingLGroup = wingPose === 'spread' ? WING_LEFT
+    : `<g transform="rotate(${wingPose === 'folded' ? -28 : -44} 20 14.5)">${WING_LEFT}</g>`
+  const wingRGroup = wingPose === 'spread' ? WING_RIGHT
+    : `<g transform="rotate(${wingPose === 'folded' ? 28 : 44} 28 14.5)">${WING_RIGHT}</g>`
 
-  const w = WINGS[wingPose]
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 15" shape-rendering="crispEdges"><style>${baseStyle}${reducedGuard}</style>${defs}${backFx}` +
+  const reducedBlock = `@media(prefers-reduced-motion:reduce){.bee-hover,.wing-l,.wing-r,.bee-antennae,.bee-eyes,.bee-fx,.wing-glint{animation:none!important}${reduceOverrides}}`
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 32"><style>${baseStyle}${motionStyle}${reducedBlock}</style><defs>${defs}</defs>${backFx}` +
     '<g class="bee-hover">' +
-    `<g class="wing-r"><path class="wing-back" fill="var(--wing-back)" d="${w.right}"/><path class="wing-glint wing-glint-back" d="${w.glintR}"/></g>` +
-    `<g class="wing-l"><path class="wing-front" fill="var(--wing-front)" d="${w.left}"/><path class="wing-glint" d="${w.glintL}"/></g>` +
-    '<path class="bee-antennae" fill="var(--antennae)" d="M8 3h1v1h1v1H9V4H8zM15 3h1v1h-1v1h-1V4h1z"/>' +
-    `<path class="bee-body" fill="${accent}" d="M10 4h4v1h2v5h-1v1h-1v1h-4v-1H9v-1H8V5h2z"/>` +
-    '<path class="bee-band bee-band-honey" fill="var(--honey)" d="M9 8h6v1H9zM9 10h6v1H9z"/>' +
-    '<path class="bee-band bee-band-stripe" fill="var(--stripe)" d="M9 9h6v1H9zM10 11h4v1h-4z"/>' +
-    `<path class="bee-eyes" fill="var(--ink)" d="${EYES[eyePose]}"/>${innerFx}</g>${frontFx}</svg>`
+    `<g class="wing-r">${wingRGroup}</g>` +
+    `<g class="wing-l">${wingLGroup}</g>` +
+    '<path class="bee-stinger" fill="var(--ink)" d="M23.1 25.5L24 28.1 24.9 25.5Z"/>' +
+    '<path class="bee-abdomen" fill="var(--honey)" d="M18.2 18.7C18.2 15.9 20.8 14.9 24 14.9 27.2 14.9 29.8 15.9 29.8 18.7 29.8 22.5 27 25.6 24 26 21 25.6 18.2 22.5 18.2 18.7Z"/>' +
+    '<g clip-path="url(#ab)">' +
+    '<path class="bee-band-stripe" fill="var(--stripe)" d="M17 18.1Q24 20.1 31 18.1V20.4Q24 22.4 17 20.4Z"/>' +
+    '<path class="bee-band-stripe" fill="var(--stripe)" d="M17 21.9Q24 23.7 31 21.9V24Q24 25.7 17 24Z"/>' +
+    '<ellipse fill="var(--spark)" fill-opacity=".34" cx="21.4" cy="17.3" rx="1.6" ry=".9" transform="rotate(-18 21.4 17.3)"/>' +
+    sheenFx +
+    '</g>' +
+    '<path fill="none" stroke="var(--ink)" stroke-width="1.15" d="M18.2 18.7C18.2 15.9 20.8 14.9 24 14.9 27.2 14.9 29.8 15.9 29.8 18.7 29.8 22.5 27 25.6 24 26 21 25.6 18.2 22.5 18.2 18.7Z"/>' +
+    `<path class="bee-body" fill="${accent}" stroke="var(--ink)" stroke-width="1.1" d="M19 13.5C18.1 13.7 17.8 14.7 18.4 15.5 18 16.2 18.6 17.1 19.8 17.1 21.2 17.7 26.8 17.7 28.2 17.1 29.4 17.1 30 16.2 29.6 15.5 30.2 14.7 29.9 13.7 29 13.5 27.8 12.2 20.2 12.2 19 13.5Z"/>` +
+    '<path fill="none" stroke="var(--ink)" stroke-opacity=".28" stroke-width=".9" stroke-linecap="round" d="M21 15.7Q24 16.7 27 15.7"/>' +
+    '<g class="bee-antennae">' +
+    '<path fill="none" stroke="var(--antennae)" stroke-width="1.35" stroke-linecap="round" d="M22 6.7C21.2 4.5 19.4 3.5 17.6 3.8"/>' +
+    '<circle cx="17.3" cy="3.9" r="1.05" fill="var(--antennae)"/>' +
+    '<path fill="none" stroke="var(--antennae)" stroke-width="1.35" stroke-linecap="round" d="M26 6.7C26.8 4.5 28.6 3.5 30.4 3.8"/>' +
+    '<circle cx="30.7" cy="3.9" r="1.05" fill="var(--antennae)"/>' +
+    '</g>' +
+    `<ellipse class="bee-body" cx="24" cy="9.7" rx="4.8" ry="3.7" fill="${accent}" stroke="var(--ink)" stroke-width="1.1"/>` +
+    '<ellipse cx="22.4" cy="7.7" rx="1.6" ry=".7" fill="#fff" fill-opacity=".24"/>' +
+    `<g class="bee-eyes">${EYES[eyePose]}</g>${innerFx}</g>${frontFx}</svg>`
 }
 
 /**
@@ -682,22 +728,20 @@ export function hiveArt(shown: Mood | 'paused' | 'attention', elapsed = 0): stri
       ? {
           style:
             '.aura{opacity:.48}.door-glow{opacity:.18}.prop{opacity:.9}' +
-            '@media(prefers-reduced-motion:no-preference){' +
             '.bee,.prop{shape-rendering:auto}' +
             `.bee{transform-box:fill-box;transform-origin:bottom center;animation:rest 5200ms ${easeInOut} ${loopDelay(elapsed, 5200, moodPhase)} infinite}` +
             `.right{animation-delay:${loopDelay(elapsed, 5200, 1400 + moodPhase)}}` +
             `.prop{animation:pause-glow 4400ms ${easeInOut} ${loopDelay(elapsed, 4400, moodPhase)} infinite}` +
             `.aura{transform-box:fill-box;transform-origin:center;animation:glow 4800ms ${easeInOut} ${loopDelay(elapsed, 4800, moodPhase)} infinite}` +
-            '}' +
             '@keyframes rest{0%,100%{transform:scaleY(1)}50%{transform:scaleY(.95)}}' +
             '@keyframes pause-glow{0%,100%{opacity:.58}50%{opacity:1}}' +
-            '@keyframes glow{0%,100%{opacity:.36;transform:scale(.97)}50%{opacity:.66;transform:scale(1.03)}}',
+            '@keyframes glow{0%,100%{opacity:.36;transform:scale(.97)}50%{opacity:.66;transform:scale(1.03)}}' +
+            '@media(prefers-reduced-motion:reduce){.bee,.prop,.aura{animation:none!important}.bee,.prop{shape-rendering:crispEdges}}',
           art: `<g transform="translate(8 2)">${propMarkup}</g>`,
         }
       : {
           style:
             '.aura{opacity:.65}.door-glow{opacity:.2}.spark{opacity:0}' +
-            '@media(prefers-reduced-motion:no-preference){' +
             '.bee,.prop,.spark{shape-rendering:auto}' +
             `.left{animation:l 3600ms linear ${loopDelay(elapsed, 3600, moodPhase)} infinite}` +
             `.right{animation:r 4300ms linear ${loopDelay(elapsed, 4300, 560 + moodPhase)} infinite}` +
@@ -707,14 +751,14 @@ export function hiveArt(shown: Mood | 'paused' | 'attention', elapsed = 0): stri
             `.spark{animation:spark ${pDur}ms ${easeOut} ${loopDelay(elapsed, pDur, 200 + moodPhase)} infinite}` +
             `.aura{transform-box:fill-box;transform-origin:center;animation:glow 4000ms ${easeInOut} ${loopDelay(elapsed, 4000, moodPhase)} infinite}` +
             `.door-glow{animation:door-glow 3200ms ${easeInOut} ${loopDelay(elapsed, 3200, moodPhase)} infinite}` +
-            '}' +
             `@keyframes l{${orbit(left, .6)}}` +
             `@keyframes r{${orbit(right, -.68)}}` +
             wingFrames +
             `@keyframes signal{${propKeyframes[mood]}}` +
             '@keyframes spark{0%,24%{opacity:0;transform:translateY(.5px)}48%{opacity:.85}100%{opacity:0;transform:translateY(-1.25px)}}' +
             '@keyframes glow{0%,100%{opacity:.45;transform:scale(.96)}50%{opacity:.85;transform:scale(1.06)}}' +
-            '@keyframes door-glow{0%,100%{opacity:.13}50%{opacity:.38}}',
+            '@keyframes door-glow{0%,100%{opacity:.13}50%{opacity:.38}}' +
+            '@media(prefers-reduced-motion:reduce){.bee,.left .wing,.right .wing,.prop,.spark,.aura,.door-glow{animation:none!important}.bee,.prop,.spark{shape-rendering:crispEdges}}',
           art: `<g transform="translate(${mood === 'build' || mood === 'forage' ? 6 : 8} ${mood === 'relay' ? 1 : 2})">${propMarkup}</g>`,
         }
 

@@ -4,11 +4,11 @@ import { BOARD_CALL, CASE_PATTERN, COORDINATOR_READ, RUN, boardCalls, closesAfte
 import { edgesOf, graphSvg, isBroadcast } from './graph'
 import { actsAsAnother, commitsInSharedCheckout, hasHiddenBoardLimit, waitsOnLooseMatch } from './guard'
 import { BOARD_ACTIONS, MEMBER_BEE_SIZE, hiveArt, memberBee, toolMood, toolSummary } from './hive'
-import { DEFAULT_EFFORT, DEFAULT_MODEL, SWARM_AGENTS, familyOf, latestOf, sizedEffort } from './models'
+import { DEFAULT_EFFORT, DEFAULT_MODEL, SWARM_AGENTS, advisorBarred, familyOf, latestOf, sizedEffort } from './models'
 import { elapsedMs, hashSeed, loopDelay, pickVariant, seededPhase } from './motion'
 import { beehivePalette, hairlineDivider, liveIndicator, progressBar, semanticIcon, statusCss, statusDot, statusInk, statusKey, swarmEmblem } from './palette'
-import { END, budgetOf, contextState, detailOf, heldAt, isWindingDown, findAgent, ledger, mentions, parse, parsePosts, postFields, statusOf, targets, tokensUsed } from './roster'
-import { bodyOf, chipped, clean, clip, compact, fenceAfter, fenced, figuresIn, hasQuestion, head, kindOf, openedText, repeatsPosts, stripKind, unquoted, verdictOf } from './text'
+import { END, advisorSpent, budgetOf, contextState, detailOf, heldAt, isWindingDown, findAgent, ledger, mentions, owedOf, parse, parsePosts, postFields, statusOf, targets, tokensUsed } from './roster'
+import { bodyOf, chipped, clean, clip, compact, fenceAfter, fenced, figuresIn, hasQuestion, head, kindOf, openedText, pointsAt, repeatsPosts, stripKind, unquoted, verdictOf } from './text'
 
 const post = (text: string, to: string[] = []): Post => ({ seq: 1, agent: 'parser', to, text, time: '2026-11-16T14:03:22+0100' })
 
@@ -242,7 +242,7 @@ test('wave 3 command, graph, roster, text and hive edge cases', async () => {
   expect(stripKind('@coordinator, @parser READY: all good')).toBe('all good')
   expect(bodyOf(post('@coordinator\n  indented line', ['coordinator']))).toBe('  indented line')
   const tildeClip = clip(`~~~py\n${'x'.repeat(480)}\n~~~`)
-  expect(tildeClip.endsWith('\n~~~\n…')).toBe(true)
+  expect(tildeClip.endsWith(' …\n~~~')).toBe(true)
   const inlineTicks = clip(`Here is \`\`\`inline\`\`\` text ${'x'.repeat(480)}`)
   expect(inlineTicks.endsWith(' …')).toBe(true)
 
@@ -529,7 +529,7 @@ test('F22: a line of ```code``` opens no fence, and a cut inside a fence closes 
   expect(fenceAfter({ ch: '`', len: 3 }, '````')).toBeNull()
   expect(clip(`\`\`\`foo\`\`\` and ${'word '.repeat(120)}`).endsWith(' …')).toBe(true)
   const long = openedText(post(`intro\n\`\`\`ts\n${'x = 1\n'.repeat(5000)}\`\`\`\nend`))
-  expect(long).toMatch(/\n```\n…\n\n\(\d+ more characters\./)
+  expect(long).toMatch(/ …\n```\n\n\(\d+ more characters\./)
   expect((long.match(/^```/gm) ?? []).length).toBe(2)
 })
 
@@ -1274,7 +1274,7 @@ test('visual polish: animated emblems, progress bars, semantic icons, status dot
     }
   }
   expect(swarmEmblem('working', 200)).toContain('emb-ring')
-  expect(swarmEmblem('working', 200)).toContain('prefers-reduced-motion:no-preference')
+  expect(swarmEmblem('working', 200)).toContain('prefers-reduced-motion:reduce')
   expect(swarmEmblem('closed')).not.toContain('emb-ring')
   expect(swarmEmblem('paused')).toContain('<rect ')
 
@@ -1293,10 +1293,10 @@ test('visual polish: animated emblems, progress bars, semantic icons, status dot
     expect(icon).toContain('prefers-color-scheme:dark')
   }
 
-  // Animated statusDot keeps safe elapsed handling and opt-in reduced-motion guards
+  // Animated statusDot keeps safe elapsed handling and opt-out reduced-motion guards
   expect(statusDot('working', NaN)).not.toContain('NaN')
   expect(statusDot('working', 500)).toContain('sw-pulse')
-  expect(statusDot('working', 500)).toContain('prefers-reduced-motion:no-preference')
+  expect(statusDot('working', 500)).toContain('prefers-reduced-motion:reduce')
   expect(statusDot('coordinating', 500)).toContain('sw-aura')
 
   // Hive art uses smooth animations + soft radial aura when active, none when sleeping
@@ -1305,7 +1305,7 @@ test('visual polish: animated emblems, progress bars, semantic icons, status dot
   expect(asleep).not.toContain('radialGradient')
   expect(asleep).toContain('translate(31 7)"><path class="sleep-mark"')
   expect(asleep).toContain('translate(37 4)"><path class="sleep-mark sleep-mark-small"')
-  expect(asleep).toContain('prefers-reduced-motion:no-preference')
+  expect(asleep).toContain('prefers-reduced-motion:reduce')
   expect(asleep).not.toContain('prop-echo')
   expect(hiveArt('verify', 400)).toContain('var(--ok)')
 
@@ -1347,34 +1347,42 @@ test('visual polish: animated emblems, progress bars, semantic icons, status dot
 
 test('member bees keep their wings, antennae, and striped body across statuses and energize when working', () => {
   const accent = '#628fd2'
-  const parts = (svg: string) => svg.match(/<path class="(?:bee-body|bee-antennae|bee-band[^"]*|wing-front|wing-back)"[^>]+>/g)
-  const coreBody = (svg: string) => svg.match(/<path class="(?:bee-body|bee-antennae|bee-band[^"]*)"[^>]+>/g)
+  const parts = (svg: string) => svg.match(/<(?:path|ellipse) class="(?:bee-body|bee-abdomen|bee-stinger|bee-band-stripe|wing-front|wing-back)"[^>]+>/g)
+  const coreBody = (svg: string) => svg.match(/<(?:path|ellipse) class="(?:bee-body|bee-abdomen|bee-stinger|bee-band-stripe)"[^>]+>/g)
   const active = memberBee(accent, 'working', 300, 'worker-a')
   const coord = memberBee(accent, 'coordinating', 300, 'coordinator')
-  expect(MEMBER_BEE_SIZE).toEqual({ width: 24, height: 15 })
+  expect(MEMBER_BEE_SIZE).toEqual({ width: 24, height: 16 })
   expect(active).toContain(`class="bee-body" fill="${accent}"`)
-  expect(active).toContain('viewBox="0 0 24 15"')
-  expect(active).toContain('shape-rendering="crispEdges"')
-  expect(active).toContain('@media(prefers-reduced-motion:no-preference)')
+  expect(active).toContain('viewBox="0 0 48 32"')
+  expect(active).not.toContain('shape-rendering="crispEdges"')
+  expect(active).toContain('@media(prefers-reduced-motion:reduce)')
+  expect(active).toContain('svg[data-mode=dark]')
   expect(active).toContain('@keyframes w-flap-l')
   expect(active).toContain('@keyframes w-flap-r')
   expect(coord).toContain('@keyframes c-flap-l')
   expect(coord).toContain('radialGradient id="bg"')
-  expect(parts(active)).toHaveLength(6)
+  expect(parts(active)).toHaveLength(10)
   expect(parts(coord)).toEqual(parts(active))
   for (const status of ['waiting', 'not started', 'paused', 'failed', 'unreachable', 'stopped', 'closed', 'killed']) {
     const resting = memberBee(accent, status, 300, `seed-${status}`)
-    expect(parts(resting)).toHaveLength(6)
+    expect(parts(resting)).toHaveLength(10)
     expect(coreBody(resting)).toEqual(coreBody(active))
+    expect(resting).toContain('<g class="bee-antennae">')
+    expect(resting).toContain('<g class="bee-eyes">')
     expect(resting).not.toContain('@keyframes w-flap-l')
     expect(resting).not.toContain('@keyframes c-flap-l')
-    // No opacity:.5 washout on any status; killed and not started use desaturated high-contrast tokens instead
+    // No opacity:.5 washout or enclosing hexagon cell on any status
     expect(resting).not.toContain('svg{opacity:.5}')
+    expect(resting).not.toContain('stasis-hex')
+    expect(resting).not.toContain('retired-hex')
+    expect(resting).toContain('@media(prefers-reduced-motion:reduce)')
+    expect(resting).toContain('svg[data-mode=dark]')
     expect(resting).toContain('@keyframes ')
   }
   // one family with the hive bees: the same wing and honey in both themes
   for (const shared of ['--wing-back:#4b8f91', '--wing-back:#99c8c8', '--honey:#e8a848']) expect(active).toContain(shared)
   expect(hiveArt('sleep')).toContain('--wing:#4b8f91;--honey:#e8a848')
+  expect(hiveArt('sleep')).toContain('svg[data-mode=dark]')
   // a paused run is the waiting tone in its icon as in its emblem, not a colour of its own
   expect(semanticIcon('paused')).toContain(semanticIcon('warn').match(/--ic:#[0-9a-f]{6}/)![0])
 })
@@ -1522,7 +1530,8 @@ test('beehive palette covers all 10 statusDot statuses, swarmEmblem states, sema
   for (const status of allStatuses) {
     const svg = statusDot(status, 350, 'worker-1')
     expect(svg).toContain('viewBox="0 0 12 12"')
-    expect(svg).toContain('prefers-reduced-motion:no-preference')
+    expect(svg).toContain('prefers-reduced-motion:reduce')
+    expect(svg).toContain('svg[data-mode=dark]')
     expect(svg).not.toMatch(/NaN|Infinity|--\d/)
     dots.set(status, svg)
   }
@@ -1589,7 +1598,7 @@ test('hiveArt paused/attention/unknown and deterministic memberBee animation var
     const keyframeSets = new Set<string>()
     for (const seed of seeds) {
       const svg = memberBee('#628fd2', status, 250, seed)
-      expect(svg).toContain('viewBox="0 0 24 15"')
+      expect(svg).toContain('viewBox="0 0 48 32"')
       expect(svg).not.toContain('svg{opacity:.5}')
       expect(svg).not.toMatch(/NaN|Infinity|--\d/)
       const names = [...svg.matchAll(/@keyframes ([a-z0-9-]+)/g)].map(m => m[1]).sort().join(',')
@@ -1599,12 +1608,112 @@ test('hiveArt paused/attention/unknown and deterministic memberBee animation var
     expect(keyframeSets.size).toBe(count)
   }
   // isPaused=true turns non-terminal bees into paused stasis, while terminal/broken statuses keep their own visuals
-  expect(memberBee('#628fd2', 'working', 250, 'w1', true)).toContain('stasis-hex')
-  expect(memberBee('#628fd2', 'killed', 250, 'w1', true)).toContain('retired-hex')
+  expect(memberBee('#628fd2', 'working', 250, 'w1', true)).toContain('stasis-bar')
+  expect(memberBee('#628fd2', 'killed', 250, 'w1', true)).toContain('retire-badge')
   expect(memberBee('#628fd2', 'failed', 250, 'w1', true)).toContain('err-mark')
 
   // roster detailOf heavy & paused regression
   const heavyHint = { type: 'explorer', model: 'sonnet', effort: 'medium', depends: [], owns: '', ready: false, blocked_on: [], asked: 0, unreachable: false, heavy: true }
   expect(detailOf('waiting', heavyHint, false, false)).toBe('context ceiling reached')
   expect(detailOf('waiting', heavyHint, false, true)).toBe('its token budget is spent')
+})
+
+test('Bug 1 & Bug 7: clip() and openedText() keep ellipsis inside closing fence and strip dangling Markdown markers', () => {
+  // Bug 1: clip() places … inside closing fence for backticks, tildes, and 4-backtick fences
+  const backtickClip = clip(`\`\`\`ts\n${'const a = 1\n'.repeat(60)}\`\`\``, 80)
+  expect(backtickClip).toMatch(/ …\n```$/)
+  expect((backtickClip.match(/^```/gm) ?? []).length).toBe(2)
+
+  const quadClip = clip(`\`\`\`\`md\n${'line item\n'.repeat(40)}\`\`\`\``, 80)
+  expect(quadClip).toMatch(/ …\n````$/)
+
+  // Bare opener edge case: cut lands right on the opening fence line (```ts) so … goes on its own line inside the fence
+  const bareOpenerText = `${'a'.repeat(40)}\n\`\`\`ts\n${'x'.repeat(100)}\n\`\`\``
+  const bareClip = clip(bareOpenerText, 47)
+  expect(bareClip).toBe(`${'a'.repeat(40)}\n\`\`\`ts\n…\n\`\`\``)
+
+  // openedText() bare opener edge case when OPEN_LIMIT lands on opening fence line
+  const longPrefix = `${'a'.repeat(19_993)}\n\`\`\`ts\n${'x'.repeat(100)}\n\`\`\``
+  const openedBare = openedText(post(longPrefix))
+  expect(openedBare).toMatch(/\n```ts\n…\n```\n\n\(\d+ more characters\./)
+
+  // Bug 7: clip() strips dangling empty Markdown markers (including Unicode bullet •) before …
+  for (const marker of ['- ', '* ', '+ ', '• ', '1. ', '2) ', '- [ ] ', '- [x] ', '## ', '> ']) {
+    const prefix = 'Intro line with content here'
+    const text = `${prefix}\n${marker}${'word '.repeat(20)}`
+    const cutLen = prefix.length + 1 + marker.length + 2
+    const clipped = clip(text, cutLen)
+    expect(clipped, `marker ${JSON.stringify(marker)}`).toBe(`${prefix} …`)
+  }
+  // Inside an open code fence, trailing markers are code and stay inside the fence
+  const fencedDash = clip(`\`\`\`diff\ncontext line here\n- ${'x'.repeat(80)}\n\`\`\``, 29)
+  expect(fencedDash).toMatch(/\n- …\n```$/)
+})
+
+test('Bug 10: liveIndicator uses 2.4s breath with 1.2s stagger, opt-out reduced motion, and data-mode=dark', () => {
+  const svg = liveIndicator(300)
+  expect(svg).toContain('animation:breath 2.4s')
+  expect(svg).toContain('-300ms')
+  expect(svg).toContain('-1500ms')
+  expect(svg).toContain('@media(prefers-reduced-motion:reduce){.breath{animation:none;opacity:0}}')
+  expect(svg).toContain('svg[data-mode=dark]')
+})
+
+// Seen live (2026-11-25): 5 of a run's 17 posts were a member's last line, put on the board as a hand-back.
+test('a last line that only points at the member\'s own post is no report, and one with news still is', async () => {
+  const ready = { seq: 14, text: 'READY\nF1: fixed. Build exit 0. No tests run, no new test.' }
+  const verdict = { seq: 9, text: '@download NOT PASSED 3b6c\n- F1: not fixed.\n@core: both fixes pass diff review.' }
+  expect(pointsAt([ready], 'posted #14 (READY revision, F1 fixed, Debug arm64 build exit 0, no tests run); candidate posted to @verifier (#15).')).toBe(true)
+  expect(pointsAt([verdict], 'posted #9 (download NOT PASSED, F1 still open; core fixes pass review; candidate not test-run), waiting on @download.')).toBe(true)
+  expect(repeatsPosts([ready.text], 'posted #14 (READY revision), waiting on @verifier.')).toBe(false)  // why the rule exists
+  expect([
+    pointsAt([ready], 'posted #14 (READY revision); afterwards the Debug build failed with 2 errors'),  // a status word the post lacks
+    pointsAt([ready], 'posted #14. Should I also run the hosted tests?'),
+    pointsAt([ready], 'posted #7 (READY), waiting'),  // not a post of its own since the wake
+    pointsAt([ready], 'Posted #14. The migration also needs a manual restart.'),  // a second sentence is a report
+    pointsAt([ready], 'posted #14, waiting.\nThen I found a second race in DownloadManager.'),
+    pointsAt([ready], `posted #14 ${'and then more '.repeat(40)}`),
+    pointsAt([], 'posted #14, waiting on @verifier'),
+  ]).toEqual([false, false, false, false, false, false, false])
+  // an indented `+` is code, not an empty list item: the clip keeps it
+  expect(clip('intro\n\n    value\n    +\n    next', 23)).toContain('+')
+})
+
+// Seen live (2026-11-25): `fable=none`, and two Sonnet workers consulted the session's Fable advisor.
+test('a family the run keeps a member off bars a session advisor of that family, and its tokens are counted apart', async () => {
+  const limits = { budget: '2568000', opus: 'none', fable: 'none' }
+  expect(advisorBarred(limits, 'fable', 'worker', 'core')).toEqual({ family: 'fable', allowed: [] })
+  expect(advisorBarred(limits, 'claude-opus-5-5', 'worker', 'core')).toEqual({ family: 'opus', allowed: [] })
+  expect(advisorBarred({ opus: 'investigator' }, 'opus', 'worker', 'core')).toEqual({ family: 'opus', allowed: ['investigator'] })
+  expect([
+    advisorBarred({ opus: 'investigator,core' }, 'opus', 'worker', 'core'), advisorBarred({ opus: 'investigator' }, 'opus', 'investigator', 'inv'),
+    advisorBarred(limits, 'sonnet', 'worker', 'core'), advisorBarred(limits, undefined, 'worker', 'core'), advisorBarred(limits, '  ', 'worker', 'core'),
+    advisorBarred(undefined, 'fable', 'worker', 'core'), advisorBarred({ budget: '1' }, 'fable', 'worker', 'core'),
+  ]).toEqual([undefined, undefined, undefined, undefined, undefined, undefined, undefined])
+  const usage = [
+    { model: 'claude-sonnet-5-5', input_tokens: 30, output_tokens: 11_429, cache_creation_input_tokens: 130_395, cache_read_input_tokens: 1_361_019 },
+    { model: 'claude-fable-5-2', input_tokens: 117_096, output_tokens: 18_544, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    { model: 'claude-haiku-5-5', input_tokens: 500, output_tokens: 50 },  // a summary or a classifier call: nobody's advisor
+  ]
+  const spent = advisorSpent(usage, 'fable', 'sonnet', familyOf)
+  expect(spent).toEqual({ input_tokens: 117_096, output_tokens: 18_544, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, model: 'claude-fable-5-2' })
+  expect(owedOf(spent, undefined)).toEqual({ amount: 135_640, detail: '117096,0,0,18544' })
+  expect(owedOf(spent, { ...spent, input_tokens: 100_000, output_tokens: 18_544 })).toEqual({ amount: 17_096, detail: '17096,0,0,0' })
+  expect(owedOf(spent, spent).amount).toBe(0)
+  // No advisor set, or one of the member's own family: nothing can be told apart, so nothing is charged twice.
+  expect([advisorSpent(usage, '', 'sonnet', familyOf).input_tokens, advisorSpent(usage, 'sonnet', 'sonnet', familyOf).input_tokens, advisorSpent(undefined, 'fable', 'sonnet', familyOf).input_tokens]).toEqual([0, 0, 0])
+})
+
+test('a not-started bee keeps its pips and its antenna inside the icon at the peak of its motion', () => {
+  const seeds = Array.from({ length: 40 }, (_, n) => `seed-${n}`).map(seed => memberBee('#628fd2', 'not started', 0, seed))
+  const pips = seeds.find(svg => svg.includes('qp3'))!
+  const peek = seeds.find(svg => svg.includes('n-perk'))!
+  // scaled about the icon's origin, the pip at x=43.5 reached 53.1 in a 48-unit frame
+  expect(pips).toContain('.q-pip{transform-box:fill-box;transform-origin:center}')
+  // the right antenna tip at the 55% keyframe, where the hop and the perk peak together
+  const hop = Number(/n-hop\{[^}]*\}55%\{transform:translateY\((-?[\d.]+)px\)/.exec(peek)![1])
+  const perk = /n-perk\{[^}]*\}55%\{transform:rotate\((-?[\d.]+)deg\)(?: scaleY\(([\d.]+)\))?/.exec(peek)!
+  const angle = Number(perk[1]) * Math.PI / 180, stretch = Number(perk[2] ?? 1)
+  const top = 7.5 + (30.7 - 24) * Math.sin(angle) + (3.9 - 7.5) * stretch * Math.cos(angle) + hop - 1.05 * stretch
+  expect(top).toBeGreaterThanOrEqual(0)
 })

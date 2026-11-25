@@ -1055,6 +1055,43 @@ class VerifyRegressions(unittest.TestCase):
 
     # The audit of 0.3.47.
 
+    def test_a_rejection_on_review_wakes_only_the_rejected_worker(self):
+        """Seen live (2026-11-25): a NOT PASSED for one worker that also said "@core: both fixes pass" woke @core; the
+        rejected worker's REVISE woke the verifier and the coordinator; and its READY printed the coordinator's
+        UNREAD notice, so it read the board again. Each was a turn at a member's whole context, for nothing."""
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            self._init_git(proj)
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "plan", "init", "Plan").strip())
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            for name in ("a", "b"):
+                run(*post, "member", name)
+            run(*post, "member", "v", "role=verifier")
+
+            def last_post():
+                return json.loads((board / "board.jsonl").read_text().splitlines()[-1])
+            assert run(sys.executable, SCRIPTS / "verify.py", board, proj, "prepare", "shared", "--check", "true", "--when-ready").startswith("planned:")
+            run(*post, "ready", "a", text="done a")
+            (proj / "b.txt").write_text("b\n")
+            said = run(*post, "ready", "b", text="done b")
+            first = json.loads((board / "verification.json").read_text())["candidate"]
+            # The candidate goes up in the coordinator's name, and its backlog is not the worker's to read.
+            assert first in said and "UNREAD" not in said, said
+            assert "needs no word to the coordinator" in last_post()["text"]
+            run(*post, "read", "v")
+            # Rejected on review, before any test: no `attempt` and no `verified_by` is on the candidate yet.
+            said = run(*post, "post", "v", "@b NOT PASSED %s\n- b.txt: wrong\n@a: reviewed, your fix passes." % first)
+            verdict = last_post()
+            assert verdict["rejects"] == ["b"] and verdict["to"] == ["b"], verdict
+            assert "@a is not woken" in said, said
+            # The verdict killed the candidate, and its author knows: the REVISE that answers it wakes nobody.
+            assert run(*post, "revise", "b", "fixing F1").startswith("posted #%d -> nobody" % (verdict["seq"] + 1))
+            # A worker the verdict did not reject still withdraws work the candidate holds: the verifier hears.
+            assert "@v" in run(*post, "revise", "a", "one more thing")
+            # And once the rejected worker has reported again, its next withdrawal is news to the verifier again.
+            run(*post, "ready", "b", text="F1: fixed \u2014 b.txt, checked by hand")
+            assert "@v" in run(*post, "revise", "b", "a second flaw")
+
     def test_a_planned_candidate_is_prepared_by_the_ready_that_completes_the_team(self):
         with tempfile.TemporaryDirectory() as t:
             proj = Path(t).resolve()

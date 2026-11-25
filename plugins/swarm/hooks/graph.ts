@@ -56,7 +56,7 @@ export function pairOf(edge: string): [string, string] | undefined {
 
 const PILL_HEIGHT = 38
 const LEGEND = 68
-const ROUTE_LOOP_MS = 3600
+const ROUTE_LOOP_MS = 2600
 const TRAVEL_MS = 840
 const TAIL_DELAY_MS = 62
 const TRAVEL_EASE = '.37 0 .3 1'
@@ -208,18 +208,18 @@ function stageOf(all: Swarm['members'], direct?: ReadonlyMap<string, number>) {
 // What one text column measures across the frame, as the pane draws it.
 const COLUMN_WIDTH = 8.77
 
-export function graphHeight(columns: number, members: Swarm['members']): number {
+export function graphHeight(columns: number, members: Swarm['members'], legendHeight = LEGEND): number {
   // The desktop clamps the frame width to the actual slot. Columns estimate its height only, so a change in font
   // metrics cannot narrow the frame. The height follows the drawing's shape: a frame taller than the drawing
   // leaves the difference empty above the graph and below its legend.
   const { width, height } = stageOf(members)
-  return Math.max(200, Math.min(members.length > 22 ? 780 : 620, Math.round(columns * COLUMN_WIDTH * (height + LEGEND) / width)))
+  return Math.max(200, Math.min(members.length > 22 ? 780 : 620, Math.round(columns * COLUMN_WIDTH * (height + legendHeight) / width)))
 }
 
 /** The on-screen size of a member's name, in CSS pixels, in a pane `columns` wide: an estimate, at 8.77 px a column. */
-export function labelPx(columns: number, members: Swarm['members']): number {
+export function labelPx(columns: number, members: Swarm['members'], legendHeight = LEGEND): number {
   const { width, height } = stageOf(members)
-  return 14 * Math.min(columns * COLUMN_WIDTH / width, graphHeight(columns, members) / (height + LEGEND))
+  return 14 * Math.min(columns * COLUMN_WIDTH / width, graphHeight(columns, members, legendHeight) / (height + legendHeight))
 }
 
 /** Each member's name as its pill shows it: a long one keeps its start and its end, and two never read the same. */
@@ -281,9 +281,9 @@ export function drawGraph(
   elapsed = 0,
   expandAll = false,
   limit = SVG_LIMIT,
-): { svg?: string; hidden: number; key: string } {
+): { svg?: string; hidden: number; key: string; legendHeight: number } {
   const ms = elapsedMs(elapsed)
-  const loopRoutes = repeat && !swarm.isClosed && !swarm.isPaused
+  const loopRoutes = repeat
   const phase = loopRoutes ? ms % ROUTE_LOOP_MS : ms
   const timing = (duration: number, start = 0) => `begin="${start - phase}ms" dur="${duration / 1000}s"`
   const repeatAttr = loopRoutes ? ' repeatCount="indefinite"' : ''
@@ -751,13 +751,14 @@ export function drawGraph(
   // The key under the diagram is drawn with the diagram's own classes, so it cannot say one thing and the lines another.
   const STATUS_ORDER = ['coordinating', 'working', 'waiting', 'paused', 'not started', 'closed', 'stopped', 'failed', 'unreachable', 'killed'] as const
   const presentStatuses = live ? STATUS_ORDER.filter(s => nodeStatuses.has(s)) : []
+  const rowStatuses = presentStatuses.filter(s => s !== 'closed')
   const row = height + 14
   const lcw = Math.max(44, 30 + String(allPosts).length * 6.5)
   let lx = 16
   let rowY = row + 42
-  let statusRows = presentStatuses.length > 0 ? 1 : 0
+  let statusRows = rowStatuses.length > 0 ? 1 : 0
   const statusLegendParts: string[] = []
-  for (const st of presentStatuses) {
+  for (const st of rowStatuses) {
     const itemW = 14 + st.length * 6.3
     if (lx > 16 && lx + itemW > width - 12) {
       lx = 16
@@ -770,6 +771,10 @@ export function drawGraph(
     )
     lx += itemW + 12
   }
+  const inlineClosed = live && nodeStatuses.has('closed')
+    ? `<g transform="translate(0 ${row + 21})">${statusGlyph('closed', width - 16 - 46, false, 0)}</g>` +
+      `<text x="${n1(width - 16)}" y="${row + 21}" dy=".35em" text-anchor="end">closed</text>`
+    : ''
   const legendHeight = statusRows === 0 ? 50 : LEGEND + (statusRows - 1) * 18
   const legend =
     `<g class="legend"><g opacity=".72"><path class="edge" d="M16 ${row}H40" stroke-width="2.4"/><path class="tip" d="M48 ${row}l-9 -4.2v8.4z"/></g>` +
@@ -780,6 +785,7 @@ export function drawGraph(
     `<text x="384" y="${row}" dy=".35em">posted with no mention</text>` +
     `<g class="chip" transform="translate(${n1(16 + lcw / 2)} ${row + 21})"><rect x="${n1(-lcw / 2)}" y="-8" width="${n1(lcw)}" height="16" rx="8"/><text dy=".35em">@all ${allPosts}</text></g>` +
     `<text x="${n1(16 + lcw + 8)}" y="${row + 21}" dy=".35em">${allPosts === 0 ? 'no @all posts yet' : expandAll ? '@all posts, drawn as dashed arrows' : '@all posts, drawn by Expand @all'}</text>` +
+    inlineClosed +
     statusLegendParts.join('') + '</g>'
   const key = 'Arrow: @mention, thicker for more · Dashed arrow: reached via @all · Dashed outline: posted with no mention · ' +
     (allPosts === 0 ? 'No @all posts yet' : `“@all N” on a member: its @all posts (${allPosts} in all), ${expandAll ? 'drawn as dashed arrows' : 'drawn by Expand @all'}`) +
@@ -811,63 +817,62 @@ export function drawGraph(
     `<defs><clipPath id="stage"><rect width="${width}" height="${height}"/></clipPath>` +
     `<filter id="sh" x="-15%" y="-25%" width="130%" height="160%"><feDropShadow dx="0" dy="1.5" stdDeviation="2" flood-opacity=".11"/></filter>` +
     `<linearGradient id="sg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--tint)"/><stop offset="100%" stop-color="var(--pill)"/></linearGradient></defs>` +
-    `<style>
-      ${statusCss}
-      svg{--edge:#73685a;--pill:#fcfaf5;--border:#968c7d;--ink:#2a231c;--accent:#b87314;--tint:#fdf3df;--packet:#fde08d;--failed-tint:#fdf1f2;--status-closed:#8c7d68;--status-killed:#74716c}
-      @media (prefers-color-scheme: dark){svg{--edge:#a59b8d;--pill:#272420;--border:#7a7062;--ink:#f3efe8;--accent:#f2bd6a;--tint:#382d1e;--packet:#fde08d;--failed-tint:#382022;--status-closed:#a89b86;--status-killed:#9e9a93}}
-      @supports(color:color(display-p3 1 0 0)){
-        svg{--edge:color(display-p3 .451 .408 .353);--pill:color(display-p3 .988 .980 .960);--border:color(display-p3 .588 .549 .490);--ink:color(display-p3 .165 .137 .110);--accent:color(display-p3 .678 .455 .137);--tint:color(display-p3 .988 .953 .878);--packet:color(display-p3 .9733 .8825 .5954);--failed-tint:color(display-p3 .990 .945 .950);--status-closed:color(display-p3 .549 .490 .408);--status-killed:color(display-p3 .4529 .4435 .4255)}
-        @media(prefers-color-scheme:dark){svg{--edge:color(display-p3 .647 .608 .553);--pill:color(display-p3 .153 .141 .125);--border:color(display-p3 .478 .439 .384);--ink:color(display-p3 .953 .937 .910);--accent:color(display-p3 .9166 .7493 .4652);--tint:color(display-p3 .216 .176 .122);--packet:color(display-p3 .9733 .8825 .5954);--failed-tint:color(display-p3 .220 .125 .135);--status-closed:color(display-p3 .659 .608 .525);--status-killed:color(display-p3 .6169 .6044 .5792)}}
-      }
-      .edge,.route,.route-base{fill:none;stroke-linecap:round}
-      .history-edge{opacity:.64;transition:opacity .18s ease}.history-edge:hover{opacity:1}.history-edge:hover .edge{stroke:var(--accent)}.history-edge:hover .tip{fill:var(--accent)}
-      .edge{stroke:var(--edge);transition:stroke .18s ease}.tip{fill:var(--edge);transition:fill .18s ease}
-      .via-all{stroke-dasharray:6 5;stroke-linecap:butt}
-      .route-base{stroke:var(--accent);opacity:.15}
-      .route{stroke:var(--accent)}.motion-route{stroke-dasharray:102 102}.tip-current{fill:var(--accent)}
-      .packet-tail{fill:var(--accent)}.packet-halo{fill:var(--packet)}.packet{fill:var(--packet);stroke:var(--accent);stroke-width:1.6}
-      .pill{fill:var(--pill);stroke:var(--border);filter:url(#sh);transition:stroke .16s ease,fill .16s ease}
-      .node:hover>.pill{stroke:var(--accent)}
-      .coord-hex{fill:none;stroke:var(--status-coordinating);stroke-opacity:.38;stroke-width:1.15}
-      .coord-crown{fill:var(--status-coordinating);fill-opacity:.11;stroke:var(--status-coordinating);stroke-opacity:.42;stroke-width:1;stroke-linejoin:round}
-      .sender{fill:url(#sg);stroke:var(--accent);stroke-width:1.8}.recipient{stroke:var(--accent);stroke-width:1.5}
-      .quiet{stroke-dasharray:5 4}
-      .not-started .pill{opacity:.86}.closed .pill{opacity:.88}
-      .killed .pill{stroke-dasharray:2 3;opacity:.62}.killed .name{opacity:.68;text-decoration:line-through}
-      .stopped .pill{stroke:var(--status-stopped);stroke-dasharray:4 2}
-      .failed .pill{stroke:var(--status-failed);fill:var(--failed-tint)}
-      .unreachable .pill{stroke:var(--status-unreachable);stroke-dasharray:3 2.5}
-      .arrival,.ripple,.origin-pulse{fill:none;stroke:var(--accent)}.arrival{stroke-width:4}.ripple{stroke-width:1.8}.origin-pulse{stroke-width:1.6}
-      .name,.count{fill:var(--ink);text-anchor:middle;font-weight:600}.name{font-size:14px}.count{font-size:12px}
-      .badge{fill:var(--tint);stroke:var(--accent);filter:url(#sh)}
-      .chip rect{fill:var(--pill);stroke:var(--border)}.chip text{fill:var(--ink);opacity:.82;font-size:11.2px;font-weight:600;text-anchor:middle}
-      .chip.on rect{fill:var(--tint);stroke:var(--accent)}
-      .legend>text{fill:var(--ink);opacity:.72;font-size:12px}
-      .legend .pill{filter:none;stroke-dasharray:3.5 2.5;stroke-width:1.15}
-      ${statusAnimCss}
-      .presence{fill:none;stroke:var(--status-inactive);stroke-width:1.2}
-      .presence-ring{fill:none;stroke:var(--status-waiting);stroke-width:1.2}
-      .presence-ring.paused{stroke:var(--status-paused)}
-      .presence.paused{stroke:var(--status-paused);stroke-width:1.4;stroke-linecap:round}
-      .presence.not-started{stroke-dasharray:2 1.8;stroke:var(--status-inactive)}
-      .presence.closed{stroke:var(--status-closed);fill:var(--status-closed);fill-opacity:.14}
-      .presence-core.closed{fill:var(--status-closed)}
-      .presence.killed{stroke:var(--status-killed)}
-      .presence-slash.killed{fill:none;stroke:var(--status-killed);stroke-width:1.3;stroke-linecap:round}
-      .presence.stopped{stroke:var(--status-stopped)}
-      .presence-core.stopped{fill:var(--status-stopped)}
-      .presence-x{fill:none;stroke:var(--status-failed);stroke-width:1.6;stroke-linecap:round}
-      .presence.unreachable{stroke:var(--status-unreachable);stroke-dasharray:2.4 1.6}
-      .presence-sig.unreachable{fill:none;stroke:var(--status-unreachable);stroke-width:1.2;stroke-linecap:round}
-      ${['working', 'coordinating', 'waiting'].map(status => `.presence.${status}{fill:var(--status-${status});stroke:none}`).join('')}
-      .reduced-route{display:none}
-      @media (prefers-reduced-motion: reduce){
-        ${liveMotion ? '.motion,.motion-route,.p-ping,.p-alert{display:none}' : '.motion,.motion-route{display:none}'}.reduced-route{display:inline}
-        ${liveMotion ? '.p-wait,.p-queue,.p-pause,.p-stop,.p-sig{animation:none;opacity:1}' : pausedMotion ? '.p-pause{animation:none;opacity:1}' : ''}
-        .history-edge,.edge,.tip,.pill{transition:none}
-      }
-    </style>
-    ` +
+    '<style>' +
+    statusCss +
+    'svg{--edge:#73685a;--pill:#fcfaf5;--border:#968c7d;--ink:#2a231c;--accent:#b87314;--tint:#fdf3df;--packet:#fde08d;--failed-tint:#fdf1f2;--status-closed:#8c7d68;--status-killed:#74716c}' +
+    'svg[data-mode=dark]{--edge:#a59b8d;--pill:#272420;--border:#7a7062;--ink:#f3efe8;--accent:#f2bd6a;--tint:#382d1e;--failed-tint:#382022;--status-closed:#a89b86;--status-killed:#9e9a93}' +
+    '@media(prefers-color-scheme:dark){svg:not([data-mode=light]){--edge:#a59b8d;--pill:#272420;--border:#7a7062;--ink:#f3efe8;--accent:#f2bd6a;--tint:#382d1e;--failed-tint:#382022;--status-closed:#a89b86;--status-killed:#9e9a93}}' +
+    '@supports(color:color(display-p3 1 0 0)){' +
+    'svg{--edge:color(display-p3 .451 .408 .353);--pill:color(display-p3 .988 .980 .960);--border:color(display-p3 .588 .549 .490);--ink:color(display-p3 .165 .137 .110);--accent:color(display-p3 .678 .455 .137);--tint:color(display-p3 .988 .953 .878);--packet:color(display-p3 .9733 .8825 .5954);--failed-tint:color(display-p3 .990 .945 .950);--status-closed:color(display-p3 .549 .490 .408);--status-killed:color(display-p3 .4529 .4435 .4255)}' +
+    'svg[data-mode=dark]{--edge:color(display-p3 .647 .608 .553);--pill:color(display-p3 .153 .141 .125);--border:color(display-p3 .478 .439 .384);--ink:color(display-p3 .953 .937 .910);--accent:color(display-p3 .9166 .7493 .4652);--tint:color(display-p3 .216 .176 .122);--failed-tint:color(display-p3 .220 .125 .135);--status-closed:color(display-p3 .659 .608 .525);--status-killed:color(display-p3 .6169 .6044 .5792)}' +
+    '@media(prefers-color-scheme:dark){svg:not([data-mode=light]){--edge:color(display-p3 .647 .608 .553);--pill:color(display-p3 .153 .141 .125);--border:color(display-p3 .478 .439 .384);--ink:color(display-p3 .953 .937 .910);--accent:color(display-p3 .9166 .7493 .4652);--tint:color(display-p3 .216 .176 .122);--failed-tint:color(display-p3 .220 .125 .135);--status-closed:color(display-p3 .659 .608 .525);--status-killed:color(display-p3 .6169 .6044 .5792)}}}' +
+    '.edge,.route,.route-base{fill:none;stroke-linecap:round}' +
+    '.history-edge{opacity:.64;transition:opacity .18s ease}.history-edge:hover{opacity:1}.history-edge:hover .edge{stroke:var(--accent)}.history-edge:hover .tip{fill:var(--accent)}' +
+    '.edge{stroke:var(--edge);transition:stroke .18s ease}.tip{fill:var(--edge);transition:fill .18s ease}' +
+    '.via-all{stroke-dasharray:6 5;stroke-linecap:butt}' +
+    '.route-base{stroke:var(--accent);opacity:.15}' +
+    '.route{stroke:var(--accent)}.motion-route{stroke-dasharray:102 102}.tip-current{fill:var(--accent)}' +
+    '.packet-tail{fill:var(--accent)}.packet-halo{fill:var(--packet)}.packet{fill:var(--packet);stroke:var(--accent);stroke-width:1.6}' +
+    '.pill{fill:var(--pill);stroke:var(--border);filter:url(#sh);transition:stroke .16s ease,fill .16s ease}' +
+    '.node:hover>.pill{stroke:var(--accent)}' +
+    '.coord-hex{fill:none;stroke:var(--status-coordinating);stroke-opacity:.38;stroke-width:1.15}' +
+    '.coord-crown{fill:var(--status-coordinating);fill-opacity:.11;stroke:var(--status-coordinating);stroke-opacity:.42;stroke-width:1;stroke-linejoin:round}' +
+    '.sender{fill:url(#sg);stroke:var(--accent);stroke-width:1.8}.recipient{stroke:var(--accent);stroke-width:1.5}' +
+    '.quiet{stroke-dasharray:5 4}' +
+    '.not-started .pill{opacity:.86}.closed .pill{opacity:.88}' +
+    '.killed .pill{stroke-dasharray:2 3;opacity:.62}.killed .name{opacity:.68;text-decoration:line-through}' +
+    '.stopped .pill{stroke:var(--status-stopped);stroke-dasharray:4 2}' +
+    '.failed .pill{stroke:var(--status-failed);fill:var(--failed-tint)}' +
+    '.unreachable .pill{stroke:var(--status-unreachable);stroke-dasharray:3 2.5}' +
+    '.arrival,.ripple,.origin-pulse{fill:none;stroke:var(--accent)}.arrival{stroke-width:4}.ripple{stroke-width:1.8}.origin-pulse{stroke-width:1.6}' +
+    '.name,.count{fill:var(--ink);text-anchor:middle;font-weight:600}.name{font-size:14px}.count{font-size:12px}' +
+    '.badge{fill:var(--tint);stroke:var(--accent);filter:url(#sh)}' +
+    '.chip rect{fill:var(--pill);stroke:var(--border)}.chip text{fill:var(--ink);opacity:.82;font-size:11.2px;font-weight:600;text-anchor:middle}' +
+    '.chip.on rect{fill:var(--tint);stroke:var(--accent)}' +
+    '.legend>text{fill:var(--ink);opacity:.72;font-size:12px}' +
+    '.legend .pill{filter:none;stroke-dasharray:3.5 2.5;stroke-width:1.15}' +
+    statusAnimCss +
+    '.presence{fill:none;stroke:var(--status-inactive);stroke-width:1.2}' +
+    '.presence-ring{fill:none;stroke:var(--status-waiting);stroke-width:1.2}' +
+    '.presence-ring.paused{stroke:var(--status-paused)}' +
+    '.presence.paused{stroke:var(--status-paused);stroke-width:1.4;stroke-linecap:round}' +
+    '.presence.not-started{stroke-dasharray:2 1.8;stroke:var(--status-inactive)}' +
+    '.presence.closed{stroke:var(--status-closed);fill:var(--status-closed);fill-opacity:.14}' +
+    '.presence-core.closed{fill:var(--status-closed)}' +
+    '.presence.killed{stroke:var(--status-killed)}' +
+    '.presence-slash.killed{fill:none;stroke:var(--status-killed);stroke-width:1.3;stroke-linecap:round}' +
+    '.presence.stopped{stroke:var(--status-stopped)}' +
+    '.presence-core.stopped{fill:var(--status-stopped)}' +
+    '.presence-x{fill:none;stroke:var(--status-failed);stroke-width:1.6;stroke-linecap:round}' +
+    '.presence.unreachable{stroke:var(--status-unreachable);stroke-dasharray:2.4 1.6}' +
+    '.presence-sig.unreachable{fill:none;stroke:var(--status-unreachable);stroke-width:1.2;stroke-linecap:round}' +
+    ['working', 'coordinating', 'waiting'].map(status => `.presence.${status}{fill:var(--status-${status});stroke:none}`).join('') +
+    '.reduced-route{display:none}' +
+    '@media(prefers-reduced-motion:reduce){' +
+    (liveMotion ? '.motion,.motion-route,.p-ping,.p-alert{display:none}' : '.motion,.motion-route{display:none}') + '.reduced-route{display:inline}' +
+    (liveMotion ? '.p-wait,.p-queue,.p-pause,.p-stop,.p-sig{animation:none;opacity:1}' : pausedMotion ? '.p-pause{animation:none;opacity:1}' : '') +
+    '.history-edge,.edge,.tip,.pill{transition:none}}' +
+    '</style>' +
     `<g clip-path="url(#stage)">${ripples.join('')}</g>`
   const close = active.join('') + nodes.join('') + badges.join('') +
     `<line x1="16" y1="${height + 0.5}" x2="${width - 16}" y2="${height + 0.5}" stroke="var(--border)" opacity=".35"/>` +
@@ -876,13 +881,13 @@ export function drawGraph(
   // drawing past the limit. A shorter, quieter one after it stays out too, so what is left out is always the
   // quietest; and no route after that one is routed at all, since none could be drawn.
   let room = limit - byteLen(open) - byteLen(close)
-  if (room < 0) return { hidden: quieter.length, key }
+  if (room < 0) return { hidden: quieter.length, key, legendHeight }
   const history: string[] = []
   for (const [index, one] of quieter.entries()) {
     const route = routeOf(one)
     if (route === undefined) continue
-    if ((room -= byteLen(route)) < 0) return { svg: open + history.join('') + close, hidden: quieter.length - index, key }
+    if ((room -= byteLen(route)) < 0) return { svg: open + history.join('') + close, hidden: quieter.length - index, key, legendHeight }
     history.push(route)
   }
-  return { svg: open + history.join('') + close, hidden: 0, key }
+  return { svg: open + history.join('') + close, hidden: 0, key, legendHeight }
 }

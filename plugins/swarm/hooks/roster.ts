@@ -62,6 +62,29 @@ const weigh = (spent: Spent | undefined) => spent === undefined ? 0
 // detail follows the charge through every retry.
 type Turn = { steps: Set<number>; sum: Spent; charged: number; endCharged: number; pending: Map<number, number>; raw: Map<number, Spent>; taken: Spent; landing: Promise<unknown>; agentId?: string; last: number }
 const KINDS = ['input_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens', 'output_tokens'] as const
+
+/**
+ * What an agent's advisor has spent so far, off the agent's own per-model usage: the entries of the advisor's family.
+ * A step's usage holds the member's own tokens alone, so the advisor's are charged from here, under their own name.
+ * ponytail: told apart by family, so an advisor of the member's own family is not counted apart; compare model ids
+ * if such a pairing is ever allowed.
+ */
+export function advisorSpent(usage: readonly (Partial<Spent> & { model: string })[] | undefined, advisorFamily: string, ownFamily: string, familyOf: (model: string) => string): Spent & { model: string } {
+  const total = { ...none(), model: '' }
+  if (advisorFamily === '' || advisorFamily === ownFamily) return total
+  for (const entry of usage ?? []) {
+    if (familyOf(entry.model) !== advisorFamily) continue
+    for (const kind of KINDS) total[kind] += positive(entry[kind])
+    total.model = entry.model
+  }
+  return total
+}
+/** What the board is charged for SPENT less what it already TOOK, weighed as a step is, and the raw counts of that. */
+export function owedOf(spent: Spent, took: Spent | undefined): { amount: number; detail: string } {
+  const rest = none()
+  for (const kind of KINDS) rest[kind] = Math.max(0, spent[kind] - (took?.[kind] ?? 0))
+  return { amount: weigh(rest), detail: `${rest.input_tokens},${rest.cache_creation_input_tokens},${rest.cache_read_input_tokens},${rest.output_tokens}` }
+}
 const none = (): Spent => ({ input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 })
 const fresh = (agentId: string | undefined, last: number): Turn => ({ steps: new Set(), sum: none(), charged: 0, endCharged: 0, pending: new Map(), raw: new Map(), taken: none(), landing: Promise.resolve(), agentId, last })
 /**

@@ -135,7 +135,10 @@ export function openedText(post: Post): string {
   if (body.length <= OPEN_LIMIT) return body
   const cut = head(body, OPEN_LIMIT).trimEnd()
   const fence = openFence(cut)
-  return `${cut}${fence ? `\n${fence}\n` : ' '}…\n\n(${body.length - OPEN_LIMIT} more characters. The board's \`show --post=${post.seq}\` prints the whole post.)`
+  const footer = `(${body.length - cut.length} more characters. The board's \`show --post=${post.seq}\` prints the whole post.)`
+  return fence
+    ? `${cut}${fence.onOpener ? '\n' : ' '}…\n${fence.close}\n\n${footer}`
+    : `${cut} …\n\n${footer}`
 }
 
 export type Fence = { ch: '`' | '~'; len: number } | null
@@ -147,12 +150,20 @@ export function fenceAfter(fence: Fence, line: string): Fence {
   if (fence === null) return ch === '`' && m[2]!.includes('`') ? null : { ch, len: m[1]!.length }
   return fence.ch === ch && m[1]!.length >= fence.len && m[2]!.trim() === '' ? null : fence
 }
-/** The line that closes the fence `text` leaves open, or '' when it leaves none. */
-function openFence(text: string): string {
+/** The closing fence `text` leaves open (and whether `text` ends on the opening fence line itself), or null when none is open. */
+function openFence(text: string): { close: string; onOpener: boolean } | null {
   let fence: Fence = null
-  for (const line of text.split('\n')) fence = fenceAfter(fence, line)
-  return fence ? fence.ch.repeat(fence.len) : ''
+  let onOpener = false
+  for (const line of text.split('\n')) {
+    const prev = fence
+    fence = fenceAfter(fence, line)
+    onOpener = prev === null && fence !== null
+  }
+  return fence ? { close: fence.ch.repeat(fence.len), onOpener } : null
 }
+
+// Trailing lines that hold only empty Markdown/Unicode block/list/heading/quote markers (e.g. `-`, `*`, `+`, `•`, `1.`, `- [ ]`, `##`, `>`).
+const TRAILING_EMPTY_MARKERS = /(?:\n+ {0,3}(?:(?:>[ \t]*)*(?:[-*+\u2022]|\d+[.)]|#{1,6})(?:[ \t]+\[(?:[ xX]\])?)?|(?:>[ \t]*)+)[ \t]*)+$/
 
 // Cuts a long text at a word, not inside one, and closes any unclosed code fence.
 export function clip(text: string, length = CLIP): string {
@@ -161,7 +172,9 @@ export function clip(text: string, length = CLIP): string {
   const space = cut.search(/\s\S*$/)
   const trimmed = (space > length / 2 ? cut.slice(0, space) : cut).trimEnd()
   const fence = openFence(trimmed)
-  return fence ? `${trimmed}\n${fence}\n…` : `${trimmed} …`
+  if (fence) return `${trimmed}${fence.onOpener ? '\n' : ' '}…\n${fence.close}`
+  const cleaned = trimmed.replace(TRAILING_EMPTY_MARKERS, '').trimEnd()
+  return `${cleaned || trimmed} …`
 }
 
 /**
@@ -186,6 +199,23 @@ const statusOf = (text: string) => text.toLowerCase().match(/\b(?:not|no|never|\
  * ponytail: words of four letters or more, so a one-word sentence ("Blocked.") is no news; only the negations and
  * status words in statusOf count however short; compare phrases if a short report that differs otherwise is dropped.
  */
+/**
+ * Whether REPORT is only a pointer at one of the member's OWN posts since its wake: one line that opens `posted #N`,
+ * asks nothing, and uses no negation or status word that post lacks. A member's last line is such a pointer by its
+ * own instructions, and its words (the post's number, who it waits on) are in no post, so repeatsPosts calls it
+ * news. Seen live: 5 of a run's 17 posts were these lines, put on the board as hand-backs.
+ */
+export function pointsAt(own: readonly { seq: number; text: string }[], report: string): boolean {
+  const line = report.trim()
+  const at = /^posted #(\d+)\b/i.exec(line)
+  const post = at && own.find(one => one.seq === Number(at[1]))
+  // shortcut: one sentence, so "Posted #17. The migration needs a restart." is news; an instruction folded into the
+  // pointer's own sentence still passes. Match a fixed pointer grammar if members start writing those.
+  if (!post || line.includes('\n') || line.length > 400 || line.includes('?') || /[.!]\s+\S/.test(line.replace(/\([^()]*\)/g, ''))) return false
+  const said = new Set(statusOf(post.text))
+  return statusOf(line).every(word => said.has(word))
+}
+
 export function repeatsPosts(posts: string[], report: string): boolean {
   const said = new Set(posts.flatMap(wordsOf))
   const statusSaid = new Set(posts.flatMap(statusOf))

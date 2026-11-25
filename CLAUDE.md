@@ -14,6 +14,7 @@ The plugin lives in `plugins/swarm`; run everything below from there.
 - `skills/swarm/scripts/board.py`, `verify.py` - the engine; tests in `tests/`
 - `hooks/register.tsx` - hooks and pane; pure helpers in `command.ts`, `guard.ts`, `roster.ts`, `text.ts`, `graph.ts`, `hive.ts`
 - `tests/parity.json` - vectors both Python and TypeScript must agree on; add one for any mirrored regex or rule
+- `<run>/events.jsonl` - the run's debug log: every board command, post, model step (with its model), turn end and advisor call. `board.py event` adds the hooks' lines; `export` prints it as the summary's Timeline, Models and Advisor sections
 
 ## Gotchas
 - Host tests call tools through the `toolCall` helper, never `$.tool.call(` directly: direct calls push the validator's type check past its 2 GB limit.

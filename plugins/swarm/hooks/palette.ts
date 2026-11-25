@@ -180,8 +180,12 @@ function themeVars(entries: readonly (readonly [string, PaletteToken])[]): strin
   const darkP3 = entries.map(([name, t]) => `--${name}:${t.darkP3}`).join(';')
   return (
     `svg{${light}}` +
-    `@media(prefers-color-scheme:dark){svg{${dark}}}` +
-    `@supports(color:color(display-p3 1 0 0)){svg{${lightP3}}@media(prefers-color-scheme:dark){svg{${darkP3}}}}`
+    `svg[data-mode=dark]{${dark}}` +
+    `@media(prefers-color-scheme:dark){svg:not([data-mode=light]){${dark}}}` +
+    `@supports(color:color(display-p3 1 0 0)){` +
+    `svg{${lightP3}}` +
+    `svg[data-mode=dark]{${darkP3}}` +
+    `@media(prefers-color-scheme:dark){svg:not([data-mode=light]){${darkP3}}}}`
   )
 }
 
@@ -199,7 +203,7 @@ export const hairlineDivider =
 const DOT_HEX_FILL = 'M6 2L9.5 4V8L6 10L2.5 8V4Z'
 const DOT_HEX_OUTER = 'M6 1.5L9.9 3.75V8.25L6 10.5L2.1 8.25V3.75Z'
 
-/** 12x12 hexagonal cell status dot with distinct per-status glyphs and opt-in motion. */
+/** 12x12 hexagonal cell status dot with distinct per-status glyphs and reduced-motion opt-out. */
 export function statusDot(status: string, elapsed = 0, seed = ''): string {
   const key = statusKey(status)
   const color = `var(--status-${key})`
@@ -208,10 +212,12 @@ export function statusDot(status: string, elapsed = 0, seed = ''): string {
 
   let extraCss = ''
   let animCss = ''
+  let animTarget = ''
   let glyph = ''
 
   if (status === 'working') {
     extraCss = '.pulse{opacity:0}'
+    animTarget = '.pulse'
     animCss =
       `.pulse{transform-box:fill-box;transform-origin:center;animation:sw-pulse 2.8s ${easeOut} ${delayOf(2800)} infinite}` +
       '@keyframes sw-pulse{0%{transform:scale(1);opacity:0}16%{opacity:.4}82%,100%{transform:scale(1.45);opacity:0}}'
@@ -221,6 +227,7 @@ export function statusDot(status: string, elapsed = 0, seed = ''): string {
       '<circle cx="5.2" cy="4.9" r=".7" fill="#fff" opacity=".36"/>'
   } else if (status === 'coordinating') {
     extraCss = '.aura{opacity:0}'
+    animTarget = '.aura'
     animCss =
       `.aura{transform-box:fill-box;transform-origin:center;animation:sw-aura 3.4s ${easeInOut} ${delayOf(3400)} infinite}` +
       '@keyframes sw-aura{0%{transform:scale(.94);opacity:0}20%{opacity:.46}82%,100%{transform:scale(1.16);opacity:0}}'
@@ -228,6 +235,7 @@ export function statusDot(status: string, elapsed = 0, seed = ''): string {
       `<path class="aura" d="${DOT_HEX_OUTER}" fill="none" stroke="${color}" stroke-width="1.15" stroke-linejoin="round"/>` +
       `<path d="M6 2L10 6L6 10L2 6Z" fill="${color}"/>`
   } else if (status === 'waiting') {
+    animTarget = '.breathe'
     animCss =
       `.breathe{transform-box:fill-box;transform-origin:center;animation:sw-wait 3.6s ${easeInOut} ${delayOf(3600)} infinite}` +
       '@keyframes sw-wait{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(.78);opacity:.55}}'
@@ -235,6 +243,7 @@ export function statusDot(status: string, elapsed = 0, seed = ''): string {
       `<path d="${DOT_HEX_OUTER}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round"/>` +
       `<circle class="breathe" cx="6" cy="6" r="1.5" fill="${color}"/>`
   } else if (status === 'paused') {
+    animTarget = '.pause-bar'
     animCss =
       `.pause-bar{animation:sw-pause 4.2s ${easeInOut} ${delayOf(4200)} infinite}` +
       '@keyframes sw-pause{0%,100%{opacity:1}50%{opacity:.55}}'
@@ -243,12 +252,14 @@ export function statusDot(status: string, elapsed = 0, seed = ''): string {
       `<rect class="pause-bar" x="4.5" y="4" width="1" height="4" rx=".4" fill="${color}"/>` +
       `<rect class="pause-bar" x="6.5" y="4" width="1" height="4" rx=".4" fill="${color}"/>`
   } else if (status === 'not started') {
+    animTarget = '.queued'
     animCss =
       `.queued{animation:sw-queue 4.4s ${easeInOut} ${delayOf(4400)} infinite}` +
       '@keyframes sw-queue{0%,100%{opacity:.85}50%{opacity:.5}}'
     glyph = `<path class="queued" d="${DOT_HEX_OUTER}" fill="none" stroke="${color}" stroke-width="1.5" stroke-dasharray="2.5 2" stroke-dashoffset="-1" stroke-linecap="round"/>`
   } else if (status === 'closed') {
     extraCss = themeVars([['cap', beehivePalette.honeyCore]])
+    animTarget = '.cap'
     animCss =
       `.cap{animation:sw-cap 5.4s ${easeInOut} ${delayOf(5400)} infinite}` +
       '@keyframes sw-cap{0%,100%{fill-opacity:.14}50%{fill-opacity:.22}}'
@@ -256,6 +267,7 @@ export function statusDot(status: string, elapsed = 0, seed = ''): string {
       `<path class="cap" d="${DOT_HEX_OUTER}" fill="var(--cap)" fill-opacity=".14" stroke="${color}" stroke-width="1.5" stroke-linejoin="round"/>` +
       `<circle cx="6" cy="6" r="1.2" fill="${color}"/>`
   } else if (status === 'killed') {
+    animTarget = '.retired'
     animCss =
       `.retired{animation:sw-retire 4.8s ${easeInOut} ${delayOf(4800)} infinite}` +
       '@keyframes sw-retire{0%,100%{opacity:1}50%{opacity:.68}}'
@@ -263,6 +275,7 @@ export function statusDot(status: string, elapsed = 0, seed = ''): string {
       `<path class="retired" d="${DOT_HEX_OUTER}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round"/>` +
       `<path d="M3.5 8.5L8.5 3.5" fill="none" stroke="${color}" stroke-width="1.45" stroke-linecap="round"/>`
   } else if (status === 'stopped') {
+    animTarget = '.halt'
     animCss =
       `.halt{animation:sw-halt 3.2s ${easeInOut} ${delayOf(3200)} infinite}` +
       '@keyframes sw-halt{0%,100%{opacity:1}50%{opacity:.52}}'
@@ -270,6 +283,7 @@ export function statusDot(status: string, elapsed = 0, seed = ''): string {
       `<path d="${DOT_HEX_OUTER}" fill="none" stroke="${color}" stroke-width="1.4" stroke-linejoin="round"/>` +
       `<rect class="halt" x="4.5" y="4.5" width="3" height="3" rx=".5" fill="${color}"/>`
   } else if (status === 'failed') {
+    animTarget = '.alert'
     animCss =
       `.alert{animation:sw-alert 3.2s ${easeInOut} ${delayOf(3200)} infinite}` +
       '@keyframes sw-alert{0%,100%{opacity:.08}50%{opacity:.18}}'
@@ -277,6 +291,7 @@ export function statusDot(status: string, elapsed = 0, seed = ''): string {
       `<path class="alert" d="${DOT_HEX_OUTER}" fill="${color}" opacity=".14"/>` +
       `<path d="M3.5 3.5L8.5 8.5M8.5 3.5L3.5 8.5" fill="none" stroke="${color}" stroke-width="1.75" stroke-linecap="round"/>`
   } else if (status === 'unreachable') {
+    animTarget = '.sig'
     animCss =
       `.sig{animation:sw-sig 2.8s ${easeInOut} ${delayOf(2800)} infinite}` +
       '@keyframes sw-sig{0%,100%{opacity:1}50%{opacity:.3}}'
@@ -288,7 +303,7 @@ export function statusDot(status: string, elapsed = 0, seed = ''): string {
     glyph = `<path d="${DOT_HEX_OUTER}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round"/>`
   }
 
-  const motion = animCss ? `@media(prefers-reduced-motion:no-preference){${animCss}}` : ''
+  const motion = animCss ? `${animCss}@media(prefers-reduced-motion:reduce){${animTarget}{animation:none}}` : ''
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><style>${statusCss}${extraCss}${motion}</style>${glyph}</svg>`
 }
 
@@ -299,11 +314,10 @@ export function liveIndicator(elapsed: number): string {
   const style =
     `${statusCss}${vars}` +
     '.core{fill:var(--status-working)}' +
-    '.breath{fill:none;stroke:var(--status-working);stroke-width:1.1;stroke-linejoin:round;opacity:0}' +
-    '@media(prefers-reduced-motion:no-preference){' +
-    `.breath{transform-box:fill-box;transform-origin:center;animation:breath 4s ${easeOut} ${loopDelay(elapsed, 4000)} infinite}` +
-    `.breath2{animation-delay:${loopDelay(elapsed, 4000, 2000)}}` +
-    '@keyframes breath{0%{transform:scale(.95);opacity:0}16%{opacity:.48}70%,100%{transform:scale(1.75);opacity:0}}}'
+    `.breath{fill:none;stroke:var(--status-working);stroke-width:1.1;stroke-linejoin:round;opacity:0;transform-box:fill-box;transform-origin:center;animation:breath 2.4s ${easeOut} ${loopDelay(elapsed, 2400)} infinite}` +
+    `.breath2{animation-delay:${loopDelay(elapsed, 2400, 1200)}}` +
+    '@keyframes breath{0%{transform:scale(.95);opacity:0}16%{opacity:.48}70%,100%{transform:scale(1.75);opacity:0}}' +
+    '@media(prefers-reduced-motion:reduce){.breath{animation:none;opacity:0}}'
   return (
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><style>${style}</style>` +
     `<path class="breath" d="${hex}"/>` +
@@ -336,17 +350,17 @@ export function swarmEmblem(state: EmblemState, elapsed = 0): string {
     `${statusCss}` +
     `${themeVars([['cell-warm', beehivePalette.honeyCore]])}` +
     `svg{--cell-stroke:var(--status-${tone});--hi-op:.22;--hi-low:.14}` +
-    '@media(prefers-color-scheme:dark){svg{--hi-op:.2;--hi-low:.12}}' +
+    'svg[data-mode=dark]{--hi-op:.2;--hi-low:.12}' +
+    '@media(prefers-color-scheme:dark){svg:not([data-mode=light]){--hi-op:.2;--hi-low:.12}}' +
     '.c{fill:var(--cell-stroke);fill-opacity:.13;stroke:var(--cell-stroke);stroke-width:1.3;stroke-linejoin:round}' +
     '.c-hi{fill:var(--cell-warm);fill-opacity:var(--hi-op);stroke:var(--cell-stroke);stroke-width:1.3;stroke-linejoin:round}' +
     `.dot{fill:var(--status-${tone})}` +
     (active
-      ? `.ring{fill:none;stroke:var(--status-${tone});stroke-width:1;stroke-linejoin:round;opacity:0}` +
-        '@media(prefers-reduced-motion:no-preference){' +
-        `.ring{transform-box:fill-box;transform-origin:center;animation:emb-ring 3.4s ${easeOut} ${loopDelay(elapsed, 3400)} infinite}` +
+      ? `.ring{fill:none;stroke:var(--status-${tone});stroke-width:1;stroke-linejoin:round;opacity:0;transform-box:fill-box;transform-origin:center;animation:emb-ring 3.4s ${easeOut} ${loopDelay(elapsed, 3400)} infinite}` +
         `.c-hi{animation:emb-glow 3.4s ${easeInOut} ${loopDelay(elapsed, 3400)} infinite}` +
         '@keyframes emb-ring{0%{transform:scale(1);opacity:0}18%{opacity:.46}82%,100%{transform:scale(1.06);opacity:0}}' +
-        '@keyframes emb-glow{0%,100%{fill-opacity:var(--hi-low)}50%{fill-opacity:var(--hi-op)}}}'
+        '@keyframes emb-glow{0%,100%{fill-opacity:var(--hi-low)}50%{fill-opacity:var(--hi-op)}}' +
+        '@media(prefers-reduced-motion:reduce){.ring,.c-hi{animation:none}.ring{opacity:0}}'
       : '')
 
   const badge =
@@ -373,7 +387,7 @@ export const progressUnits = (ratio: number): number =>
 
 const MAX_NOTCHES = 200
 const MAX_BAR_WIDTH = 100_000
-/** Rounded beeswax progress bar with explicit outer viewBox, comb notches, 3:1+ track border, and opt-in shimmer. */
+/** Rounded beeswax progress bar with explicit outer viewBox, comb notches, 3:1+ track border, and reduced-motion opt-out shimmer. */
 export function progressBar(
   ratio: number,
   tone: BarTone = 'accent',
@@ -402,10 +416,9 @@ export function progressBar(
       ['fill', fillToken[tone]],
     ]) +
     (glowing
-      ? '.shimmer{opacity:0}' +
-        '@media(prefers-reduced-motion:no-preference){' +
-        `.shimmer{animation:sw-shim 3.1s linear ${loopDelay(elapsed, 3100)} infinite}` +
-        `@keyframes sw-shim{0%{transform:translateX(-${shineW}px);opacity:0}16%{opacity:.6}52%{opacity:.45}68%,100%{transform:translateX(${fillW}px);opacity:0}}}`
+      ? `.shimmer{opacity:0;animation:sw-shim 3.1s linear ${loopDelay(elapsed, 3100)} infinite}` +
+        `@keyframes sw-shim{0%{transform:translateX(-${shineW}px);opacity:0}16%{opacity:.6}52%{opacity:.45}68%,100%{transform:translateX(${fillW}px);opacity:0}}` +
+        '@media(prefers-reduced-motion:reduce){.shimmer{animation:none;opacity:0}}'
       : '')
 
   const defs =

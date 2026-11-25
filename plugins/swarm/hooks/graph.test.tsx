@@ -637,7 +637,8 @@ test('a closed run shows no live state on its graph, only who was closed or reti
   expect(svg).toContain('class="presence closed"')
   expect(svg).not.toMatch(/<title>[^<]*(?:waiting|working)|class="presence[^"]*(?:waiting|working)"/)
   expect(svg).not.toContain('p-ping')
-  expect(svg).not.toContain('repeatCount="indefinite"')
+  expect(svg).toContain('repeatCount="indefinite"')
+  expect(svg).toContain('dur="2.6s"')
   expect(svg).toContain('class="node killed"')
   expect(svg).toContain('class="presence killed"')
   // the current route has one description, on the line always drawn
@@ -764,9 +765,10 @@ test('graph regression: scoped .node hover, UTF-8 byte SVG_LIMIT, clamped badges
   expect(liveCenter.svg).toContain('class="node killed"')
   expect(liveCenter.key).toContain('Statuses: coordinating, working, waiting, paused, not started, stopped, failed, unreachable, killed')
 
-  // Paused run gates live route loops and p-ping, while showing paused treatment on live workers
+  // Paused run gates p-ping while keeping the 2.6s latest-post breathing loop and paused treatment on live workers
   const pausedRun = drawGraph({ ...swarm, isPaused: true }, 1, new Set(), false, true, true, 120, false)
-  expect(pausedRun.svg).not.toContain('repeatCount="indefinite"')
+  expect(pausedRun.svg).toContain('repeatCount="indefinite"')
+  expect(pausedRun.svg).toContain('dur="2.6s"')
   expect(pausedRun.svg).not.toContain('p-ping')
   expect(pausedRun.svg).toContain('class="presence-ring paused p-pause"')
   // Terminal/broken statuses remain distinct even when the run is paused
@@ -807,4 +809,47 @@ test('graph regression: scoped .node hover, UTF-8 byte SVG_LIMIT, clamped badges
   expect(bounded.svg).toBeDefined()
   expect(utf8.encode(bounded.svg!).length).toBeLessThanOrEqual(midLimit)
   expect(bounded.hidden).toBeGreaterThan(0)
+})
+
+test('Bug 9 & Bug 10: closed renders inline on Row 2 right-aligned, legendHeight syncs with graphHeight, and 2.6s loop stays active across live/paused/closed runs', () => {
+  const closedOnlyMembers = teamOf(['coordinator', 'parser', 'verifier'], 'closed')
+  const posts: Post[] = [{ seq: 1, agent: 'coordinator', to: ['parser'], text: '@parser go', time: '' }]
+  const closedOnly: Swarm = {
+    title: 'ClosedOnly', dir: '/r', isClosed: true, attention: [], budget: 0, tokens: {},
+    posts, members: closedOnlyMembers,
+  }
+  const gClosed = drawGraph(closedOnly, 1, new Set(), false, true, true, 0, false)
+  expect(gClosed.legendHeight).toBe(50)
+  expect(gClosed.key).toContain('Statuses: closed')
+  const [, vw = 0, vh = 0] = /viewBox="0 0 (\d+) (\d+)"/.exec(gClosed.svg!)?.map(Number) ?? []
+  const stageH = vh - gClosed.legendHeight
+  const row2Y = stageH + 14 + 21
+  // 'closed' is right-aligned on Row 2 (y = row + 21) and excluded from Row 3 (y = row + 42)
+  expect(gClosed.svg).toContain(`<text x="${(vw - 16).toFixed(1)}" y="${row2Y}" dy=".35em" text-anchor="end">closed</text>`)
+  expect(gClosed.svg).toContain(`<g transform="translate(0 ${row2Y})">`)
+  expect(gClosed.svg).not.toContain(`y="${stageH + 14 + 42}" dy=".35em">closed</text>`)
+  // graphHeight(columns, members, legendHeight) matches actual viewBox aspect ratio
+  expect(Math.abs(graphHeight(60, closedOnlyMembers, gClosed.legendHeight) - 60 * 8.77 * vh / vw)).toBeLessThan(1)
+  expect(graphHeight(60, closedOnlyMembers, 50)).toBeLessThan(graphHeight(60, closedOnlyMembers, 68))
+
+  // When a Row 3 status (killed) is also present, closed stays on Row 2 while killed renders on Row 3 (legendHeight = 68)
+  const mixedMembers = teamOf(['coordinator', 'parser', 'old'], 'closed')
+  mixedMembers[2]!.status = 'killed'
+  const gMixed = drawGraph({ ...closedOnly, members: mixedMembers }, 1, new Set(), false, true, true, 0, false)
+  expect(gMixed.legendHeight).toBe(68)
+  expect(gMixed.key).toContain('Statuses: closed, killed')
+  const [, mVw = 0, mVh = 0] = /viewBox="0 0 (\d+) (\d+)"/.exec(gMixed.svg!)?.map(Number) ?? []
+  const mStageH = mVh - gMixed.legendHeight
+  expect(gMixed.svg).toContain(`<text x="${(mVw - 16).toFixed(1)}" y="${mStageH + 35}" dy=".35em" text-anchor="end">closed</text>`)
+  expect(gMixed.svg).toContain(`y="${mStageH + 56}" dy=".35em">killed</text>`)
+  expect(Math.abs(graphHeight(60, mixedMembers, gMixed.legendHeight) - 60 * 8.77 * mVh / mVw)).toBeLessThan(1)
+
+  // Bug 10: 2.6s loop is active on latest post across live, paused, and closed runs, and dark-mode CSS is emitted
+  const liveSwarm: Swarm = { ...closedOnly, isClosed: false, members: teamOf(['coordinator', 'parser', 'verifier'], 'working') }
+  for (const variant of [liveSwarm, { ...liveSwarm, isPaused: true }, closedOnly]) {
+    const svg = graphSvg(variant, 1, new Set(), false, true, true, 0, false)
+    expect(svg).toContain('repeatCount="indefinite"')
+    expect(svg).toContain('dur="2.6s"')
+    expect(svg).toContain('svg[data-mode=dark]')
+  }
 })

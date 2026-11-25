@@ -28,3 +28,19 @@ export const sizedEffort = (kind: string, size?: string) => {
 }
 export const familyOf = (model: string) =>
   Object.keys(LATEST).find(name => model.toLowerCase().includes(name)) ?? model
+
+/**
+ * The family the run's limits keep member NAME (of type KIND) off although the session's advisor answers on it, and
+ * whom the limit allows. A member inherits the session's advisor (`advisorModel` in the settings), the API runs its
+ * calls inside the member's own steps, and no hook can refuse one: so a limit on a family is kept at the start, or not
+ * at all. Seen live: a run limited to `fable=none` had two Sonnet workers consult a Fable advisor, 135k tokens the
+ * budget never counted and a six-minute call that timed out.
+ */
+export function advisorBarred(limits: Record<string, string> | undefined, advisorModel: unknown, kind: string, name: string): { family: string; allowed: string[] } | undefined {
+  if (typeof advisorModel !== 'string' || advisorModel.trim() === '') return undefined
+  const family = familyOf(latestOf(advisorModel.trim()) ?? '')
+  const raw = limits && Object.hasOwn(limits, family) ? limits[family] : undefined
+  if (typeof raw !== 'string') return undefined
+  const allowed = raw.split(',').filter(x => x && x !== 'none')
+  return allowed.includes(kind) || allowed.includes(name) ? undefined : { family, allowed }
+}
