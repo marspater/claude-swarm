@@ -4,13 +4,17 @@ import sys
 
 sys.dont_write_bytecode = True  # a test run leaves no __pycache__ in the plugin folder
 from pathlib import Path
+import contextlib
 import fcntl
+import io
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
 import tempfile
+import time
 import unittest
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "skills" / "swarm" / "scripts"
@@ -1103,8 +1107,12 @@ class VerifyRegressions(unittest.TestCase):
             # After a rework the next READY prepares the next one, again with no word from the coordinator.
             run(*post, "post", "v", "@a NOT PASSED: F2 the file is missing a line")
             assert candidate() == first
+            (proj / "added.txt").write_text("the missing work\n")
             assert "candidate" in run(*post, "ready", "a", text="F2: fixed — added the line, test -d .git passes")
             assert candidate() != first and candidate() in last_post()["text"]
+            assert f"Compared with {first}, 1 changed source path: added.txt" in last_post()["text"]
+            # The fingerprints the comparison reads are kept apart: each verifier attempt rewrites the record, not them.
+            assert "source_entries" not in json.loads((board / "verification.json").read_text())
             # A plan that cannot be prepared is the coordinator's to hear of, from the member whose READY met it.
             (board / "verification-plan.json").write_text(json.dumps(["shared", "--check", "true", "--base", "main"]))
             run(*post, "post", "v", "@b NOT PASSED: F3 one more")
@@ -1119,6 +1127,471 @@ class VerifyRegressions(unittest.TestCase):
             assert candidate() != before and candidate() in again and request["to"] == ["v", "v2"], (again, request)
             assert request["text"].endswith("test %s <you>" % candidate()), request["text"]
             json.loads(run(*post, "attention", "--json"))  # the journal still reads: one post, one number
+
+    def test_prepare_plan_uses_parsed_arguments(self):
+        with tempfile.TemporaryDirectory() as t:
+            project = Path(t).resolve() / "prepare"
+            project.mkdir()
+            script = [sys.executable, SCRIPTS / "board.py"]
+            board = Path(run(*script, project / ".swarm" / "plan", "init", "Plan"))
+            run(*script, board, "member", "w")
+            gate = [sys.executable, SCRIPTS / "verify.py", board, "prepare"]
+            assert run(*gate, "prepare", "shared", "--check=--keep-standing", "--when-ready", cwd=t).startswith("planned:")
+            plan = json.loads((board / "verification-plan.json").read_text())
+            assert plan == ["shared", "--check=--keep-standing"]
+
+    @staticmethod
+    def _served(board, timeout=20):
+        """The candidate the owed dispatch's waiter prepared, once it has cleared what it owed."""
+        stop = time.monotonic() + timeout
+        while time.monotonic() < stop:
+            state = json.loads((board / "members.json").read_text())
+            if "owed_dispatch" not in state and (board / "verification.json").exists():
+                return json.loads((board / "verification.json").read_text())["candidate"]
+            time.sleep(0.05)
+        raise AssertionError("the owed dispatch was not served: %s" % (board / "members.json").read_text())
+
+    def test_a_planned_candidate_the_verification_lock_held_up_is_prepared_when_the_lock_is_let_go(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            self._init_git(proj)
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "plan", "init", "Plan").strip())
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "a")
+            run(*post, "member", "v", "role=verifier")
+            assert run(*gate, "prepare", "shared", "--check", "true", "--when-ready").startswith("planned:")
+            with (proj / ".git" / ".verification.lock").open("a") as held:
+                fcntl.flock(held, fcntl.LOCK_EX)  # a verifier's test, say, still running
+                said = run(*post, "ready", "a", text="done a")
+                assert "waits for the verification action" in said, said
+                time.sleep(0.3)
+                assert not (board / "verification.json").exists()
+                assert "could not be prepared" not in (board / "board.jsonl").read_text()
+                # Recorded in the run's state while the waiter waits: nothing the lock's holder must remember.
+                assert json.loads((board / "members.json").read_text())["owed_dispatch"]["author"] == "a"
+            candidate = self._served(board)
+            request = json.loads((board / "board.jsonl").read_text().splitlines()[-1])
+            assert request["to"] == ["v"] and request["text"].endswith("test %s v" % candidate), request
+
+    def test_a_planned_candidate_held_up_by_another_project_or_a_prune_is_prepared_when_that_lets_go(self):
+        # Two projects in one checkout share its verification lock, and prune takes it naming no project.
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import verify
+            with tempfile.TemporaryDirectory() as t:
+                root = Path(t).resolve()
+                self._init_git(root)
+                proj = root / "b"
+                proj.mkdir()
+                board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "plan", "init", "Plan").strip())
+                post = [sys.executable, SCRIPTS / "board.py", board]
+                gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+                run(*post, "member", "a")
+                run(*post, "member", "v", "role=verifier")
+                assert run(*gate, "prepare", "shared", "--check", "true", "--when-ready").startswith("planned:")
+                with verify.verification_lock(root / ".git"):  # as `board.py .swarm prune` holds it, from the top
+                    assert "waits for the verification action" in run(*post, "ready", "a", text="done a")
+                    assert not (board / "verification.json").exists()
+                candidate = self._served(board)
+                request = json.loads((board / "board.jsonl").read_text().splitlines()[-1])
+                assert request["to"] == ["v"] and request["text"].endswith("test %s v" % candidate), request
+        finally:
+            sys.path.remove(str(SCRIPTS))
+
+    def test_an_owed_dispatch_whose_waiter_ended_is_the_coordinators_to_hear(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            self._init_git(proj)
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "plan", "init", "Plan").strip())
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            run(*post, "member", "a")
+            state = json.loads((board / "members.json").read_text())
+            dead = subprocess.Popen([sys.executable, "-c", "pass"])
+            dead.wait()
+            state["owed_dispatch"] = {"token": "t1", "author": "a", "pid": dead.pid}
+            (board / "members.json").write_text(json.dumps(state))
+            items = json.loads(run(*post, "attention", "--json"))["items"]
+            assert [i["kind"] for i in items if i["kind"] == "dispatch"] == ["dispatch"], items
+
+    def test_two_dispatches_that_meet_on_one_candidate_ask_each_verifier_once(self):
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import board as module
+            from unittest import mock
+            with tempfile.TemporaryDirectory() as t:
+                proj = Path(t).resolve()
+                self._init_git(proj)
+                board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "plan", "init", "Plan").strip())
+                post = [sys.executable, SCRIPTS / "board.py", board]
+                run(*post, "member", "a")
+                run(*post, "member", "v", "role=verifier")
+                run(*post, "ready", "a", text="done a")
+                (board / "verification-plan.json").write_text(json.dumps(["shared", "--check", "true"]))
+                real, met = subprocess.run, []
+
+                def overtaken(argv, *args, **kwargs):
+                    done = real(argv, *args, **kwargs)
+                    if "prepare" in argv and not met:  # another dispatch posts for the same candidate meanwhile
+                        met.append(real([*post, "dispatch"], capture_output=True, text=True, check=True).stdout)
+                    return done
+                with mock.patch.object(module.subprocess, "run", overtaken), \
+                        contextlib.redirect_stdout(io.StringIO()) as said:
+                    module.main(["board.py", str(board), "dispatch"])
+                requests = [p for p in map(json.loads, (board / "board.jsonl").read_text().splitlines()) if "CANDIDATE" in p["text"]]
+                assert len(requests) == 1 and requests[0]["to"] == ["v"], (requests, met, said.getvalue())
+                # The candidate stands by now (the dispatch that met this one posted it), or is this one's own.
+                assert re.search(r"every verifier (?:already )?has its test command", said.getvalue()), said.getvalue()
+        finally:
+            sys.path.remove(str(SCRIPTS))
+
+    def test_a_live_waiter_keeps_serving_an_owed_dispatch_and_one_past_its_deadline_tells_the_coordinator(self):
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import board as module
+            from unittest import mock
+            with tempfile.TemporaryDirectory() as t:
+                proj = Path(t).resolve()
+                self._init_git(proj)
+                board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "plan", "init", "Plan").strip())
+                post = [sys.executable, SCRIPTS / "board.py", board]
+                run(*post, "member", "a")
+                run(*post, "member", "v", "role=verifier")
+                (board / "verification-plan.json").write_text(json.dumps(["shared", "--check", "true"]))
+                kinds = lambda: [i["kind"] for i in json.loads(run(*post, "attention", "--json"))["items"]]
+                # A process that merely has the id a waiter had serves nothing: only the waiter lock tells.
+                stranger = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+                waiter = None
+                try:
+                    state = json.loads((board / "members.json").read_text())
+                    state["owed_dispatch"] = {"token": "t1", "author": "a", "pid": stranger.pid}
+                    (board / "members.json").write_text(json.dumps(state))
+                    assert "dispatch" in kinds()
+                    # A waiter that holds the lock keeps serving: a busy READY starts no second one.
+                    waiter = subprocess.Popen([sys.executable, "-c", (
+                        "import fcntl, sys, time; f = open(sys.argv[1], 'a'); fcntl.flock(f, fcntl.LOCK_EX); "
+                        "print('held', flush=True); time.sleep(60)"), str(board / ".dispatch-waiter")],
+                        stdout=subprocess.PIPE, text=True)
+                    assert waiter.stdout.readline().strip() == "held"
+                    assert "dispatch" not in kinds()
+                    with (proj / ".git" / ".verification.lock").open("a") as held:
+                        fcntl.flock(held, fcntl.LOCK_EX)
+                        assert "waits for the verification action" in run(*post, "ready", "a", text="done a")
+                        assert json.loads((board / "members.json").read_text())["owed_dispatch"]["token"] != "t1"
+                        waiter.kill()
+                        waiter.wait()
+                        # A waiter whose lock stays held past its deadline stops waiting, says so, and prepares nothing
+                        # after it, even when the lock is let go just then; the dispatch stays owed, for attention.
+                        real = module.subprocess.run
+
+                        def freed(argv, *args, **kwargs):
+                            if "prepare" in argv:  # a prepare after the deadline would find the lock free
+                                fcntl.flock(held, fcntl.LOCK_UN)
+                            return real(argv, *args, **kwargs)
+                        with mock.patch.object(module, "OWED_WAIT_S", 0.5), mock.patch.object(module.subprocess, "run", freed), \
+                                contextlib.redirect_stdout(io.StringIO()):
+                            module.main(["board.py", str(board), "dispatch", "--owed"])
+                    last = json.loads((board / "board.jsonl").read_text().splitlines()[-1])
+                    assert last["to"] == ["coordinator"] and "still not prepared" in last["text"], last
+                    assert not (board / "verification.json").exists()
+                    assert json.loads((board / "members.json").read_text())["owed_dispatch"]["failed"]
+                    assert "dispatch" in kinds()
+                    # Served by hand, as attention asks: the request is posted and the item goes.
+                    assert "posted to the verifier" in run(*post, "dispatch")
+                    assert "owed_dispatch" not in json.loads((board / "members.json").read_text())
+                    assert "dispatch" not in kinds()
+                finally:
+                    for one in (stranger, waiter):
+                        if one is not None:
+                            one.kill()
+                            one.wait()
+        finally:
+            sys.path.remove(str(SCRIPTS))
+
+    def test_a_process_that_reused_a_waiters_id_does_not_stand_in_for_it(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            self._init_git(proj)
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "plan", "init", "Plan").strip())
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "a")
+            run(*post, "member", "v", "role=verifier")
+            assert run(*gate, "prepare", "shared", "--check", "true", "--when-ready").startswith("planned:")
+            stranger = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            try:
+                state = json.loads((board / "members.json").read_text())
+                state["owed_dispatch"] = {"token": "t1", "author": "a", "pid": stranger.pid}
+                (board / "members.json").write_text(json.dumps(state))
+                with (proj / ".git" / ".verification.lock").open("a") as held:
+                    fcntl.flock(held, fcntl.LOCK_EX)
+                    assert "waits for the verification action" in run(*post, "ready", "a", text="done a")
+                self._served(board)  # a real waiter was started, and served it
+            finally:
+                stranger.kill()
+                stranger.wait()
+
+    def test_a_dispatch_clears_only_the_owed_entry_it_served(self):
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import board as module
+            from unittest import mock
+            with tempfile.TemporaryDirectory() as t:
+                proj = Path(t).resolve()
+                self._init_git(proj)
+                board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "plan", "init", "Plan").strip())
+                post = [sys.executable, SCRIPTS / "board.py", board]
+                run(*post, "member", "a")
+                run(*post, "member", "v", "role=verifier")
+                run(*post, "ready", "a", text="done a")
+                (board / "verification-plan.json").write_text(json.dumps(["shared", "--check", "true"]))
+                state = json.loads((board / "members.json").read_text())
+                state["owed_dispatch"] = {"n": 1, "token": "first", "author": "a", "failed": "its waiter ended"}
+                (board / "members.json").write_text(json.dumps(state))
+                real = subprocess.run
+
+                def renewed(argv, *args, **kwargs):
+                    done = real(argv, *args, **kwargs)
+                    if "prepare" in argv:  # meanwhile that entry was served, and a newer refusal owes another
+                        now = json.loads((board / "members.json").read_text())
+                        now["owed_dispatch"] = {"n": 1, "token": "second", "author": "b"}
+                        (board / "members.json").write_text(json.dumps(now))
+                    return done
+                with mock.patch.object(module.subprocess, "run", renewed), contextlib.redirect_stdout(io.StringIO()):
+                    module.main(["board.py", str(board), "dispatch"])
+                assert json.loads((board / "members.json").read_text())["owed_dispatch"]["token"] == "second"
+        finally:
+            sys.path.remove(str(SCRIPTS))
+
+    def test_a_dispatch_owed_after_its_candidate_was_prepared_still_posts_the_request_once(self):
+        # The waiter prepared the candidate and died before it posted: `dispatch`, as attention asks, posts it.
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            self._init_git(proj)
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "plan", "init", "Plan").strip())
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "a")
+            run(*post, "member", "v", "role=verifier")
+            run(*post, "ready", "a", text="done a")
+            candidate = json.loads(run(*gate, "prepare", "shared", "--check", "true"))["candidate"]
+            (board / "verification-plan.json").write_text(json.dumps(["shared", "--check", "true"]))
+            state = json.loads((board / "members.json").read_text())
+            state["owed_dispatch"] = {"token": "t1", "author": "a"}
+            (board / "members.json").write_text(json.dumps(state))
+            assert "dispatch" in [i["kind"] for i in json.loads(run(*post, "attention", "--json"))["items"]]
+            assert "posted to the verifier" in run(*post, "dispatch")
+            assert "every verifier has its test command" in run(*post, "dispatch")
+            requests = [p for p in map(json.loads, (board / "board.jsonl").read_text().splitlines()) if p.get("requests")]
+            assert [(p["requests"], p["to"]) for p in requests] == [(candidate, ["v"])], requests
+            assert "owed_dispatch" not in json.loads((board / "members.json").read_text())
+
+    def test_a_verifiers_successor_agent_reads_the_test_request_its_predecessor_read(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            self._init_git(proj)
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "plan", "init", "Plan").strip())
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "a")
+            run(*post, "member", "v", "role=verifier", "id=v-1")
+            assert run(*gate, "prepare", "shared", "--check", "true", "--when-ready").startswith("planned:")
+            run(*post, "ready", "a", text="done a")
+            candidate = json.loads((board / "verification.json").read_text())["candidate"]
+            assert "test %s v" % candidate in run(*post, "read", "v")
+            run(*post, "started", "v", "v-2", "v-1")  # a new agent for v, reading on from v-1's cursor
+            assert "test %s v" % candidate in run(*post, "read", "v")
+            assert "test %s v" % candidate not in run(*post, "read", "v")  # once
+
+    def test_a_note_that_names_a_candidate_is_no_test_request(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            self._init_git(proj)
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "plan", "init", "Plan").strip())
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "a")
+            run(*post, "ready", "a", text="done a")
+            candidate = json.loads(run(*gate, "prepare", "shared", "--check", "true"))["candidate"]
+            run(*post, "member", "v", "role=verifier")
+            run(*post, "post", "coordinator", "@v CANDIDATE %s is on the table; wait for instructions." % candidate)
+            (board / "verification-plan.json").write_text(json.dumps(["shared", "--check", "true"]))
+            assert "posted to the verifier" in run(*post, "dispatch")
+            request = json.loads((board / "board.jsonl").read_text().splitlines()[-1])
+            assert request["requests"] == candidate and request["to"] == ["v"], request
+
+    def test_a_planned_candidate_prepared_as_the_run_closes_is_not_requested(self):
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import board as module
+            from unittest import mock
+            with tempfile.TemporaryDirectory() as t:
+                proj = Path(t).resolve()
+                self._init_git(proj)
+                board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "plan", "init", "Plan").strip())
+                post = [sys.executable, SCRIPTS / "board.py", board]
+                run(*post, "member", "a")
+                run(*post, "member", "v", "role=verifier")
+                run(*post, "ready", "a", text="done a")
+                (board / "verification-plan.json").write_text(json.dumps(["shared", "--check", "true"]))
+                real = subprocess.run
+
+                def closing(argv, *args, **kwargs):
+                    done = real(argv, *args, **kwargs)
+                    if "prepare" in argv:
+                        real([*post, "kill", "ended"], capture_output=True, text=True, check=True)
+                    return done
+                with mock.patch.object(module.subprocess, "run", closing), contextlib.redirect_stdout(io.StringIO()) as said:
+                    module.main(["board.py", str(board), "dispatch"])
+                assert "no test command is posted" in said.getvalue(), said.getvalue()
+                assert '"requests"' not in (board / "board.jsonl").read_text()
+        finally:
+            sys.path.remove(str(SCRIPTS))
+
+    def test_a_candidate_whose_comparison_record_cannot_be_written_still_stands(self):
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import verify
+            from unittest import mock
+            with tempfile.TemporaryDirectory() as t:
+                proj = Path(t).resolve()
+                self._init_git(proj)
+                board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "plan", "init", "Plan").strip())
+                post = [sys.executable, SCRIPTS / "board.py", board]
+                run(*post, "member", "a")
+                run(*post, "ready", "a", text="done a")
+                real = verify.atomic_write
+
+                def failing(path, text):
+                    if Path(path).name == verify.SOURCES_FILE:
+                        raise OSError("disk full")
+                    return real(path, text)
+                with mock.patch.object(verify, "atomic_write", failing), \
+                        contextlib.redirect_stdout(io.StringIO()) as said, contextlib.redirect_stderr(io.StringIO()):
+                    verify.prepare(board, proj, "shared", ["true"])
+                made = json.loads(said.getvalue().strip().splitlines()[-1])
+                assert json.loads((board / "verification.json").read_text())["candidate"] == made["candidate"]
+        finally:
+            sys.path.remove(str(SCRIPTS))
+
+    def test_a_candidate_record_that_cannot_be_read_back_is_a_failure_not_a_replacement(self):
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import board as module
+            from unittest import mock
+            with tempfile.TemporaryDirectory() as t:
+                proj = Path(t).resolve()
+                self._init_git(proj)
+                board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "plan", "init", "Plan").strip())
+                post = [sys.executable, SCRIPTS / "board.py", board]
+                run(*post, "member", "a")
+                run(*post, "member", "v", "role=verifier")
+                run(*post, "ready", "a", text="done a")
+                (board / "verification-plan.json").write_text(json.dumps(["shared", "--check", "true"]))
+                real = subprocess.run
+
+                def torn(argv, *args, **kwargs):
+                    done = real(argv, *args, **kwargs)
+                    if "prepare" in argv:
+                        (board / "verification.json").write_text("{not json")
+                    return done
+                with mock.patch.object(module.subprocess, "run", torn), contextlib.redirect_stdout(io.StringIO()) as said:
+                    module.main(["board.py", str(board), "dispatch"])
+                assert "could not be read back" in said.getvalue() and "replaced by" not in said.getvalue(), said.getvalue()
+        finally:
+            sys.path.remove(str(SCRIPTS))
+
+    def test_a_planned_candidate_another_prepare_replaced_meanwhile_is_not_handed_out(self):
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import board as module
+            from unittest import mock
+            with tempfile.TemporaryDirectory() as t:
+                proj = Path(t).resolve()
+                self._init_git(proj)
+                board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "plan", "init", "Plan").strip())
+                post = [sys.executable, SCRIPTS / "board.py", board]
+                gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+                run(*post, "member", "a")
+                run(*post, "member", "v", "role=verifier")
+                run(*post, "ready", "a", text="done a")
+                (board / "verification-plan.json").write_text(json.dumps(["shared", "--check", "true"]))
+                real, newer = subprocess.run, []
+
+                def overtaken(argv, *args, **kwargs):
+                    done = real(argv, *args, **kwargs)
+                    if "prepare" in argv and not newer:  # a second prepare lands while this one's board is unlocked
+                        (proj / "late.txt").write_text("later work\n")
+                        newer.append(json.loads(real([*gate, "prepare", "shared", "--check", "true"], capture_output=True,
+                                                     text=True, check=True).stdout)["candidate"])
+                    return done
+                with mock.patch.object(module.subprocess, "run", overtaken), \
+                        contextlib.redirect_stdout(io.StringIO()) as said:
+                    module.main(["board.py", str(board), "dispatch"])
+                current = json.loads((board / "verification.json").read_text())["candidate"]
+                assert current == newer[0] and "replaced by " + current in said.getvalue(), said.getvalue()
+                assert "CANDIDATE" not in (board / "board.jsonl").read_text()
+        finally:
+            sys.path.remove(str(SCRIPTS))
+
+    def test_an_owed_dispatch_overtaken_by_the_planned_dispatch_of_a_newer_ready_leaves_that_one_requested(self):
+        # The candidate that replaced this one came from the board's own plan: its dispatch posted its request, so
+        # clearing the owed entry loses nothing. (A candidate prepared by hand is the coordinator's to hand out.)
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import board as module
+            from unittest import mock
+            with tempfile.TemporaryDirectory() as t:
+                proj = Path(t).resolve()
+                self._init_git(proj)
+                board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "plan", "init", "Plan").strip())
+                post = [sys.executable, SCRIPTS / "board.py", board]
+                run(*post, "member", "a")
+                run(*post, "member", "v", "role=verifier")
+                run(*post, "ready", "a", text="done a")
+                (board / "verification-plan.json").write_text(json.dumps(["shared", "--check", "true"]))
+                state = json.loads((board / "members.json").read_text())
+                state["owed_dispatch"] = {"token": "t1", "author": "a", "failed": "its waiter ended"}
+                (board / "members.json").write_text(json.dumps(state))
+                real, newer = subprocess.run, []
+
+                def overtaken(argv, *args, **kwargs):
+                    done = real(argv, *args, **kwargs)
+                    if "prepare" in argv and not newer:  # a newer READY's planned dispatch lands meanwhile
+                        (proj / "late.txt").write_text("later work\n")
+                        newer.append(real([*post, "dispatch"], capture_output=True, text=True, check=True).stdout)
+                    return done
+                with mock.patch.object(module.subprocess, "run", overtaken), \
+                        contextlib.redirect_stdout(io.StringIO()) as said:
+                    module.main(["board.py", str(board), "dispatch"])
+                current = json.loads((board / "verification.json").read_text())["candidate"]
+                assert "replaced by " + current in said.getvalue(), said.getvalue()
+                requests = [p for p in map(json.loads, (board / "board.jsonl").read_text().splitlines()) if p.get("requests")]
+                assert [(p["requests"], p["to"]) for p in requests] == [(current, ["v"])], requests
+                assert "owed_dispatch" not in json.loads((board / "members.json").read_text())
+        finally:
+            sys.path.remove(str(SCRIPTS))
+
+    def test_a_verifier_registered_after_the_planned_candidate_gets_its_test_command(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            self._init_git(proj)
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "plan", "init", "Plan").strip())
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "a")
+            assert run(*gate, "prepare", "shared", "--check", "true", "--when-ready").startswith("planned:")
+            assert "No verifier is registered" in run(*post, "ready", "a", text="done a")
+            candidate = json.loads((board / "verification.json").read_text())["candidate"]
+            run(*post, "member", "v", "role=verifier")
+            run(*post, "dispatch")
+            request = json.loads((board / "board.jsonl").read_text().splitlines()[-1])
+            assert request["to"] == ["v"] and request["text"].endswith("test %s v" % candidate), request
+            assert json.loads((board / "verification.json").read_text())["candidate"] == candidate
+            # Asked once: dispatching again posts nothing more.
+            seq = request["seq"]
+            assert "already holds" in run(*post, "dispatch")
+            assert json.loads((board / "board.jsonl").read_text().splitlines()[-1])["seq"] == seq
 
     def test_the_commit_after_a_shared_accept_takes_the_verified_files_whatever_was_staged(self):
         with tempfile.TemporaryDirectory() as t:
@@ -2679,6 +3152,96 @@ class LandingDataLoss(unittest.TestCase):
             g("add", "--chmod=+x", "--", "run.sh")
             assert "COMMITTED" in run(*gate, "commit", cand, "-m", "land")
             assert g("ls-tree", "HEAD", "run.sh").startswith("100755 ")
+
+    def test_shared_commit_refuses_to_drop_a_bit_set_during_the_run_on_an_unchanged_file(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g = self._init_git(proj)
+            g("config", "core.filemode", "false")
+            script = proj / "runner.sh"
+            script.write_text("#!/bin/sh\nexit 0\n")
+            stray = proj / "stray.txt"
+            stray.write_text("old\n")
+            g("add", "runner.sh", "stray.txt")
+            g("commit", "-m", "Add script")
+            stray.chmod(0o755)  # before the run: no part of its work
+            time.sleep(0.05)
+            board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Review")
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            time.sleep(0.05)
+            # The run's work: the script made executable, its contents untouched, and another file edited. The stray
+            # file is rewritten as it was: its bit still differs as it did before the run, and is no part of the work.
+            stray.write_text("old\n")
+            script.chmod(0o755)
+            (proj / "file.txt").write_text("v2")
+            run(*post, "ready", "w", text="done")
+            cand = json.loads(run(*gate, "prepare", "shared", "--check", "test -x runner.sh"))["candidate"]
+            run(*post, "post", "v", "@coordinator " + run(*gate, "test", cand, "v").splitlines()[-1])
+            run(*gate, "accept", cand)
+            base = g("rev-parse", "HEAD")
+            refused = subprocess.run([*gate, "commit", cand, "-m", "land"], capture_output=True, text=True)
+            assert refused.returncode and "runner.sh" in refused.stderr and "--chmod=+x" in refused.stderr, refused.stderr
+            assert "stray.txt" not in refused.stderr, refused.stderr
+            assert g("rev-parse", "HEAD") == base
+            g("add", "--chmod=+x", "--", "runner.sh")
+            assert "COMMITTED" in run(*gate, "commit", cand, "-m", "land")
+            assert g("ls-tree", "HEAD", "runner.sh").startswith("100755 ")
+
+    def test_shared_commit_holds_every_bit_to_the_checks_when_init_recorded_no_baseline(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g = self._init_git(proj)
+            g("config", "core.filemode", "false")
+            script = proj / "runner.sh"
+            script.write_text("#!/bin/sh\nexit 0\n")
+            g("add", "runner.sh")
+            g("commit", "-m", "Add script")
+            board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Review")
+            state = json.loads((Path(board) / "members.json").read_text())
+            state["mode_drift"] = "unknown"  # as init leaves it when git could not list the modes
+            (Path(board) / "members.json").write_text(json.dumps(state))
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            script.chmod(0o755)  # the run's work: the bit alone, and another file
+            (proj / "file.txt").write_text("v2")
+            run(*post, "ready", "w", text="done")
+            cand = json.loads(run(*gate, "prepare", "shared", "--check", "test -x runner.sh"))["candidate"]
+            run(*post, "post", "v", "@coordinator " + run(*gate, "test", cand, "v").splitlines()[-1])
+            run(*gate, "accept", cand)
+            refused = subprocess.run([*gate, "commit", cand, "-m", "land"], capture_output=True, text=True)
+            assert refused.returncode and "runner.sh" in refused.stderr and "could not record" in refused.stderr, refused.stderr
+
+    def test_shared_commit_refuses_a_bit_the_run_turned_back_against_a_new_index_mode(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g = self._init_git(proj)
+            g("config", "core.filemode", "false")
+            script = proj / "runner.sh"
+            script.write_text("#!/bin/sh\nexit 0\n")
+            g("add", "runner.sh")
+            g("commit", "-m", "Add script")
+            script.chmod(0o755)  # differs from Git's 100644 before the run: recorded at init as that difference
+            board = run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Review")
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            # The run stages +x and commits it, then takes the bit off again, the contents as they were.
+            g("add", "--chmod=+x", "--", "runner.sh")
+            g("commit", "-m", "Make it executable")
+            script.chmod(0o644)
+            (proj / "file.txt").write_text("v2")
+            run(*post, "ready", "w", text="done")
+            cand = json.loads(run(*gate, "prepare", "shared", "--check", "test ! -x runner.sh"))["candidate"]
+            run(*post, "post", "v", "@coordinator " + run(*gate, "test", cand, "v").splitlines()[-1])
+            run(*gate, "accept", cand)
+            refused = subprocess.run([*gate, "commit", cand, "-m", "land"], capture_output=True, text=True)
+            assert refused.returncode and "runner.sh" in refused.stderr and "--chmod=-x" in refused.stderr, refused.stderr
 
     def test_isolated_prepare_refuses_a_checkout_a_hook_left_unlike_its_commit(self):
         with tempfile.TemporaryDirectory() as t:

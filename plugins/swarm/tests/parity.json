@@ -1674,5 +1674,17 @@
  ],
  "actions": ["account", "adopt", "agent-run", "attention", "bind", "claim", "close", "confirm", "dispatch", "export", "init", "kill", "limit", "locate", "member", "pause", "plan", "post", "prune", "read", "ready", "rearm", "replace", "restore", "resume", "retry", "revise", "show", "started", "status", "sync", "tail", "wake", "woke"],
  "effort": [["worker", "", "medium"], ["worker", "s", "low"], ["worker", "l", "high"], ["investigator", "s", "low"], ["investigator", "l", "high"], ["architect", "s", "medium"], ["architect", "l", "high"], ["explorer", "s", "low"], ["verifier", "m", "medium"]],
- "defaults": {"worker": ["sonnet", "medium"], "verifier": ["sonnet", "medium"], "explorer": ["haiku", "medium"], "investigator": ["opus", "medium"], "architect": ["fable", "high"], "designer": ["opus", "high"]}
+ "defaults": {"worker": ["sonnet", "medium"], "verifier": ["sonnet", "medium"], "explorer": ["haiku", "medium"], "investigator": ["opus", "medium"], "architect": ["fable", "high"], "designer": ["opus", "high"]},
+ "edges": [
+  {"posts": [{"agent": "a", "to": ["b"], "text": "@b hi"}], "expect": {"a>b": 1}},
+  {"posts": [{"agent": "a", "to": ["b", "c"], "text": "@all heads up, @b first"}], "expect": {"a>@all": 1, "a>b": 1, "a>c>all": 1}},
+  {"posts": [{"agent": "a", "to": [], "text": "note to self"}], "expect": {"a>@none": 1}},
+  {"posts": [{"agent": "a", "to": ["b"], "text": "`@all` is quoted; @b is not"}], "expect": {"a>b": 1}},
+  {"posts": [{"agent": "a", "to": ["b"], "text": "@ALL_ update"}], "expect": {"a>@all": 1, "a>b>all": 1}},
+  {"posts": [{"agent": "a", "to": ["b-2"], "text": "@all and @b-2-"}], "expect": {"a>@all": 1, "a>b-2": 1}},
+  {"posts": [{"agent": "a", "to": ["b"], "text": "```\n@all\n```\n@b"}], "expect": {"a>b": 1}},
+  {"posts": [{"agent": "a", "to": ["b"], "text": "@b hi"}, {"agent": "a", "to": ["b", "c"], "text": "@all heads up, @b first"}, {"agent": "a", "to": [], "text": "note to self"}], "expect": {"a>b": 2, "a>@all": 1, "a>c>all": 1, "a>@none": 1}},
+  {"posts": [{"agent": "a", "to": ["b_", "bob", "c-1"], "text": "@all @B__ and @bobby, `@c-1` quoted"}], "expect": {"a>@all": 1, "a>b_>all": 1, "a>bob>all": 1, "a>c-1>all": 1}},
+  {"posts": [{"agent": "a", "to": ["bob", "v"], "text": "@all. Per @bob #5, the check passed. @v please rerun"}], "expect": {"a>@all": 1, "a>bob>all": 1, "a>v": 1}}
+ ]
 }

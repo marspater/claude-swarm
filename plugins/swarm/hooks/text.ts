@@ -9,6 +9,17 @@ export const compact = (tokens: number) =>
 // pattern as QUOTED; each is replaced by a space, so the words on either side stay apart.
 const QUOTED = /(`{3,})[\s\S]*?\1`*|^ {0,3}(~{3,})[\s\S]*?^ {0,3}\2~*|(`+)[^\n]*?\3|(?<!\w)\w+:\/\/\S+?(?=[.,;:!)]*(?:\?(?=\s|$))?(?:\s|$))/gm
 export const unquoted = (text: string) => text.replace(QUOTED, ' ')
+
+// The same rule as board.py: @name at a word start, never an email or a path.
+const MENTION = /(?<![\w.@/])@([A-Za-z][\w-]*)/g
+// A post's author named as its source ("per @lead #5", "from @novelty (post #6)") addresses nobody: board.py's CITED.
+const CITE = String.raw`@[A-Za-z][A-Za-z0-9_-]*(?:['’]s)?[ \t]*\(?(?:(?:posts?|in)[ \t]+)?#[0-9]+\)?`
+const CITED = new RegExp(String.raw`(?:\b(?:from|per|see|by|in|of|via|cf\.?)[ \t]+|\()${CITE}(?:[ \t]*(?:,|and|&)[ \t]*${CITE})*`, 'gi')
+/** The names TEXT addresses, as board.py's mentions() reads them: outside code, and not a post's author it cites. */
+export const mentions = (text: string) => new Set(
+  [...unquoted(text).replace(CITED, ' ').matchAll(MENTION)].map(m => (m[1] ?? '').toLowerCase())
+    .flatMap(name => [name, name.replace(/[-_]+$/, '')]),
+)
 // The board's QUESTION: a question mark that asks, in a run of them too ("sure??"), and none of `a ?? b`, `a?.b`,
 // `name?: type` or `c ? a : b`.
 const QUESTION_MARK = /(?<![ \t]\?)(?:(?<![ \t])\?|\?(?![ \t][^\n?]*[ \t]:))(?!\?|\.?\w|:)/
@@ -65,24 +76,24 @@ export function verdictOf(post: Post):
   const kind = kindOf(post.text)
   if (kind?.label !== 'VERIFIED' || post.partial !== true) return kind
   const covered = post.members ?? []
-  return { label: 'Partial pass', color: 'warning', covered }
+  return { label: 'PARTIAL PASS', color: 'warning', covered }
 }
 
 // Removes a leading kind token when the caller already renders it as a header chip.
 export function stripKind(text: string): string {
-  return text.replace(/^(?:@[\w-]+[ \t,:]*)*(BRIEF|NOT PASSED|NOT VERIFIED|VERIFIED|READY|REVISE|FINDING|SHUTDOWN)\b[ \t:,-]*(?:\n|$)?/, '')
+  return text.replace(/^(?:@[\w-]+[ \t,:]*)*(BRIEF|NOT PASSED|NOT VERIFIED|VERIFIED|READY|REVISE|FINDING|SHUTDOWN)\b[ \t:,-]*(?:\n+|$)?/, '')
 }
 
 // A post's body under a header that shows its kind as a chip. The word goes only when the chip really shows it:
 // a kind word on line two is prose to the board and to kindOf, so it stays in the body.
-export const chipped = (post: Post, text = bodyOf(post)) => kindOf(post.text) ? stripKind(text) : text
+export const chipped = (post: Post, text = bodyOf(post)) => (kindOf(post.text) ? stripKind(text) : text).replace(/^\n+/, '')
 
 // A post as the feed shows it: the header already names the recipients and the kind, and a full
 // commit id is noise, so the body starts at what the post says.
 export function bodyOf(post: Post): string {
   const text = post.to.length > 0 ? post.text.replace(/^(?:@[\w-]+[ \t,:]*)+(?:\n)?/, '') : post.text
 
-  return text.replace(/\b([0-9a-f]{8})[0-9a-f]{32}\b/g, '$1')
+  return text.replace(/\b([0-9a-f]{8})(?:[0-9a-f]{32}|[0-9a-f]{56})\b/g, '$1')
 }
 
 // Text and Markdown refuse control characters other than tab and newline, and one refused character blanks

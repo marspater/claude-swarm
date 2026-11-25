@@ -19,6 +19,17 @@ export type Post = {
   candidate?: string
 }
 
+export type MemberStatus =
+  | 'coordinating'
+  | 'working'
+  | 'waiting'
+  | 'not started'
+  | 'failed'
+  | 'stopped'
+  | 'unreachable'
+  | 'killed'
+  | 'closed'
+
 export type Member = {
   name: string
   role: string
@@ -34,9 +45,15 @@ export type Member = {
   depends: string[]
   owns: string
   /** `coordinating`, `working`, `waiting`, `not started`, `failed`, `stopped` (its agent was killed while it is still on the roster), `unreachable`, `killed` (retired), or in a closed run `closed` (there at the close). */
-  status: string
+  status: MemberStatus | (string & {})
   /** What a member that is not working waits for, in words; empty when nothing is pending. A member paused on its own token budget says so even while it works. */
   detail: string
+  /** Paused on its own token budget. */
+  isPaused?: boolean
+  /** Read-only specialist that reached the context ceiling; the board wakes it no more. */
+  isHeavy?: boolean
+  /** Retired on the roster, but its underlying agent is still running. */
+  isZombie?: boolean
   unread: number
   posts: number
 }
@@ -45,7 +62,7 @@ export type Member = {
 export type AttentionItem = { kind: string; member: string; seq: number; text: string }
 
 export type Swarm = {
-  mood?: 'sleep' | 'forage' | 'inspect' | 'build' | 'verify' | 'relay'
+  mood?: 'sleep' | 'forage' | 'inspect' | 'build' | 'verify' | 'relay' | 'paused' | 'attention'
   title: string
   dir: string
   /** The coordinator closed the run: nothing more is woken or called. */

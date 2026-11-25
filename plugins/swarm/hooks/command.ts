@@ -969,7 +969,7 @@ const SCRIPTERS = /^(?:perl|ruby|node|nodejs|bun|deno|php|lua|osascript|[gmn]?aw
  * them: -W, -X and --check-hash-based-pycs take a value (`-Wonce` holds no c), and -c and -m end the options, with
  * their value attached (`-Bc…`) or the next word.
  */
-function pythonRuns(args: readonly string[], file: string, input: string, includeInteractive = false): 'script' | 'other' | undefined {
+function pythonRuns(args: readonly string[], file: string, input: string, includeInteractive = false): 'script' | 'other' | 'reader' | undefined {
   const named = (words: readonly string[]) => words.some(word => word.includes(file))
   let inspects = false
   const script = (word: string | undefined) => {
@@ -993,7 +993,7 @@ function pythonRuns(args: readonly string[], file: string, input: string, includ
         const value = word.slice(j + 1) || args[++i] || ''
         const rest = args.slice(i + 1)
         if (option === 'c') return named([value, ...rest]) ? 'other' : undefined
-        return !READING_MODULES.has(value) && named(rest) ? 'other' : undefined
+        return READING_MODULES.has(value) ? 'reader' : named(rest) ? 'other' : undefined
       }
       if (option === 'W' || option === 'X' || option === 'Q') {
         if (j === word.length - 1) i++
@@ -1020,16 +1020,28 @@ export function launches(statementWords: readonly string[], file: string, input 
   // Where a command starts: after assignments, and after a command that runs the rest of its words with its options.
   const isCommand = (k: number) => words.slice(0, k).every((word, j) =>
     /^[A-Za-z_]\w*=/.test(word) || RUNNERS.has(base(word)) || /^[-+\d]/.test(word) || words[j - 1]?.startsWith('-'))
-  // A search that runs nothing it is given: `grep -n python3 board.py`, `git log -S python3 -- board.py`.
-  const command = words.findIndex(word => !/^[A-Za-z_]\w*=/.test(word))
-  const isReader = command >= 0 && (/^[ef]?grep$/.test(words[command]!) ||
-    (words[command] === 'git' && /^(?:log|show|diff|grep|blame)$/.test(words[command + 1] ?? '')))
+  let first = words.findIndex(word => !/^[A-Za-z_]\w*=/.test(word))
+  while (first >= 0 && DIRECT.has(base(words[first]!)) && /^[A-Za-z_./~]/.test(words[first + 1] ?? '-') &&
+      !/^[A-Za-z_]\w*=/.test(words[first + 1]!)) first++
+  if (first < 0) return undefined
+  const command = base(words[first]!)
+  const args = words.slice(first + 1)
+  // Readers, and the file commands that only move, copy or describe their operands: `cp tests/*.py dir/` runs none of
+  // them, though its glob may name the script. Not tar, rsync, find or sed: each has a way to run a command.
+  if (/^(?:[ef]?grep|cat|head|tail|wc|ls|stat|file|diff|cmp|md5sum|sha256sum|shasum|mypy|echo|printf|cp|mv|rm|mkdir|rmdir|touch|chmod|chown|ln|du|realpath|readlink|basename|dirname|sort|uniq|cut|tee)$/.test(command) ||
+      (command === 'rg' && !args.some(arg => arg.startsWith('--pre'))) ||
+      (command === 'git' && /^(?:log|show|diff|grep|blame)$/.test(args[0] ?? '')) ||
+      (command === 'ruff' && args[0] === 'check') ||
+      (command === 'find' && args.length === 3 && /^(?:-name|-path)$/.test(args[1]!)) ||
+      (/^(?:for|select)$/.test(command) && args[1] === 'in')) return undefined
   for (let k = 0; k < words.length; k++) {
     const name = base(words[k]!)
     const after = words.slice(k + 1)
-    if (PYTHON.test(name) && !(isReader && k > command)) {
+    if (PYTHON.test(name)) {
       const how = pythonRuns(after, file, stdin)
-      if (how) return how
+      if (how === 'reader' && isCommand(k)) return undefined
+      if (how === 'script') return isCommand(k) ? 'script' : 'other'
+      if (how === 'other') return how
     } else if (SHELLS.test(name) && isCommand(k)) {
       if (shellLaunch(after).stdin && stdin.includes(file)) return 'other'
     } else if (SCRIPTERS.test(name) && isCommand(k)) {
@@ -1039,11 +1051,6 @@ export function launches(statementWords: readonly string[], file: string, input 
   }
   const at = words.findIndex(word => base(word) === file)
   if (at < 0) return undefined
-  // Run as the command itself, or behind a command that runs the rest of its words; `find -name board.py` runs nothing.
-  let first = words.findIndex(word => !/^[A-Za-z_]\w*=/.test(word))
-  // A runner whose next word is the program it runs: `env grep board.py` runs grep. One followed by an option or an
-  // operand of its own keeps its words unread, so the script among them counts as run.
-  while (first >= 0 && first < at && DIRECT.has(base(words[first]!)) && /^[A-Za-z_./~]/.test(words[first + 1] ?? '-') &&
-      !/^[A-Za-z_]\w*=/.test(words[first + 1]!)) first++
-  return first >= 0 && (first === at || RUNNERS.has(base(words[first]!))) ? 'script' : undefined
+  // Without a known reader or invocation, the script name is an ambiguous operand.
+  return first === at || RUNNERS.has(command) ? 'script' : 'other'
 }

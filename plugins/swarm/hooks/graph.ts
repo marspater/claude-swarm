@@ -1,19 +1,16 @@
-import { statusCss, statusKey } from './palette'
-import { easeOut, elapsedMs, loopDelay } from './motion'
-import { head as clipHead, unquoted as stripCode } from './text'
+import { statusCss } from './palette'
+import { easeInOut, easeOut, elapsedMs, hashSeed, loopDelay } from './motion'
+import { head as clipHead, mentions } from './text'
 import type { Post, Swarm } from '../types'
 
-const BROADCAST = /(?<![\w.@/])@all[-_]*(?![\w-])/i
-// `text` is stripped of code already.
-const named = (text: string, name: string) =>
-  new RegExp(`(?<![\\w.@/])@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[-_]*(?![\\w-])`, 'i').test(text)
-
+// Read as the board routes a post (board.py's mentions()): outside code, and a cited author ("per @bob #5") is no
+// mention, so it reaches nobody by name.
 /** True when the post addresses `@all`: the members it does not also name are reached through that alone. */
-export const isBroadcast = (post: Post) => BROADCAST.test(stripCode(post.text))
-/** The recipients a post reached through `@all` alone, its text stripped of code once for all of them. */
+export const isBroadcast = (post: Post) => mentions(post.text).has('all')
+/** The recipients a post reached through `@all` alone. */
 function viaAllOf(post: Post): ReadonlySet<string> {
-  const text = stripCode(post.text)
-  return BROADCAST.test(text) ? new Set(post.to.filter(to => !named(text, to))) : new Set()
+  const named = mentions(post.text)
+  return named.has('all') ? new Set(post.to.filter(to => !named.has(to.toLowerCase()))) : new Set()
 }
 
 /**
@@ -34,6 +31,23 @@ export function edgesOf(posts: Post[]): Record<string, number> {
   return counts
 }
 
+/**
+ * The edges of the posts before KEPT. WHOLE is the board's count over its whole journal (its attention report), counted
+ * through post THROUGH: when ALL is only the board's tail (its first post is not #1), the posts before it are counted
+ * there and nowhere else. Joined only to a tail that ends at that post: a post that landed between the two reads would
+ * otherwise be drawn as history before it is shown.
+ */
+export function earlierEdgesOf(all: Post[], kept: Post[], whole?: Record<string, number>, through?: number): Record<string, number> {
+  if (!whole || (all[0]?.seq ?? 1) <= 1 || through !== (all.at(-1)?.seq ?? 0)) return edgesOf(all.slice(0, all.length - kept.length))
+  const counts: Record<string, number> = {}
+  const recent = edgesOf(kept)
+  for (const [edge, count] of Object.entries(whole)) {
+    const left = count - (recent[edge] ?? 0)
+    if (left > 0) counts[edge] = left
+  }
+  return counts
+}
+
 /** The two members of an edge key, or nothing for a key that counts `@all` or mention-free posts. */
 export function pairOf(edge: string): [string, string] | undefined {
   const [from = '', to = ''] = edge.split('>')
@@ -41,7 +55,7 @@ export function pairOf(edge: string): [string, string] | undefined {
 }
 
 const PILL_HEIGHT = 38
-const LEGEND = 50
+const LEGEND = 68
 const ROUTE_LOOP_MS = 3600
 const TRAVEL_MS = 840
 const TAIL_DELAY_MS = 62
@@ -50,10 +64,12 @@ const FADE_EASE = '.4 0 .6 1'
 const LINEAR = '0 0 1 1'
 const keyTimes = (duration: number, ...marks: number[]) =>
   marks.map(mark => String(Math.round(mark / duration * 10_000) / 10_000)).join(';')
-// The host refuses an Svg source longer than this, and the whole pane with it.
+const utf8 = new TextEncoder()
+const byteLen = (text: string) => utf8.encode(text).length
+// The host refuses an Svg source longer than this UTF-8 byte count, and the whole pane with it.
 export const SVG_LIMIT = 131_072
 // The name font is 14px in the drawing's own units; drawn smaller than this on screen, the graph gives way to a list.
-export const MIN_LABEL_PX = 9
+export const MIN_LABEL_PX = 10
 
 // Past this many members round the coordinator the ring gives way to two arcs, one name to a row.
 const RING_LIMIT = 10
@@ -267,9 +283,10 @@ export function drawGraph(
   limit = SVG_LIMIT,
 ): { svg?: string; hidden: number; key: string } {
   const ms = elapsedMs(elapsed)
-  const phase = repeat ? ms % ROUTE_LOOP_MS : ms
+  const loopRoutes = repeat && !swarm.isClosed && !swarm.isPaused
+  const phase = loopRoutes ? ms % ROUTE_LOOP_MS : ms
   const timing = (duration: number, start = 0) => `begin="${start - phase}ms" dur="${duration / 1000}s"`
-  const repeatAttr = repeat ? ' repeatCount="indefinite"' : ''
+  const repeatAttr = loopRoutes ? ' repeatCount="indefinite"' : ''
   const current = swarm.posts.find(post => post.seq === upTo)
   const earlier = Object.entries(swarm.earlierEdges ?? {})
   const members = visibleMembers(swarm, upTo, hidden, live)
@@ -548,29 +565,32 @@ export function drawGraph(
     }
 
     active.push(`<path class="route-base" d="${d}" stroke-width="${n1(weight + 4)}"/>`)
-    if (animate) active.push(`<path class="route reduced-route${isDashed ? ' via-all' : ''}" d="${d}" stroke-width="${n1(weight + 0.9)}"/>`)
-    // A dashed line cannot also be drawn on by its dashes, so it fades in instead.
-    const draw = !animate ? '' : isDashed
+    const routeDur = isDashed ? 610 : TRAVEL_MS
+    const routeAnim = animate && phase < routeDur
+    if (routeAnim) active.push(`<path class="route reduced-route${isDashed ? ' via-all' : ''}" d="${d}" stroke-width="${n1(weight + 0.9)}"/>`)
+    // A dashed line cannot also be drawn on by its dashes, so it fades in instead; once settled, omit the frozen <animate>.
+    const draw = !routeAnim ? '' : isDashed
       ? `<animate attributeName="opacity" from="0" to="1" ${timing(610)} calcMode="spline" keyTimes="0;1" keySplines="${FADE_EASE}" fill="freeze"/>`
       : `<animate attributeName="stroke-dashoffset" from="102" to="0" ${timing(TRAVEL_MS)} calcMode="spline" keyTimes="0;1" keySplines="${TRAVEL_EASE}" fill="freeze"/>`
     active.push(isDashed
-      ? `<path class="route via-all${animate ? ' motion' : ''}" d="${d}" stroke-width="${n1(weight + 0.9)}"${animate ? ' opacity="0"' : ''}>${description}${draw}</path>`
-      : `<path class="route${animate ? ' motion-route' : ''}" d="${d}" pathLength="100" stroke-width="${n1(weight + 0.9)}"${animate ? ' stroke-dashoffset="102"' : ''}>${description}${draw}</path>`)
-    // The arrowhead eases in as the packet reaches its destination.
-    active.push(animate
+      ? `<path class="route via-all${routeAnim ? ' motion' : ''}" d="${d}" stroke-width="${n1(weight + 0.9)}"${routeAnim ? ' opacity="0"' : ''}>${description}${draw}</path>`
+      : `<path class="route${routeAnim ? ' motion-route' : ''}" d="${d}" pathLength="100" stroke-width="${n1(weight + 0.9)}"${routeAnim ? ' stroke-dashoffset="102"' : ''}>${description}${draw}</path>`)
+    // The arrowhead eases in as the packet reaches its destination; once settled, draw it directly.
+    const tipAnim = animate && phase < TRAVEL_MS + 35
+    active.push(tipAnim
       ? `<path class="tip-current motion" d="${tip}" opacity="0"><animate attributeName="opacity" from="0" to="1" ${timing(160, TRAVEL_MS - 125)} calcMode="spline" keyTimes="0;1" keySplines="${FADE_EASE}" fill="freeze"/></path>` +
         `<path class="tip-current reduced-route" d="${tip}"/>`
       : `<path class="tip-current" d="${tip}"/>`)
-    if (animate || repeat) {
+    if (animate || loopRoutes) {
       const route = `M${n1(x1)} ${n1(y1)} Q${n1(cx)} ${n1(cy)} ${n1(x2)} ${n1(y2)}`
-      const motion = (lag = 0) => repeat
+      const motion = (lag = 0) => loopRoutes
         ? `<animateMotion ${timing(ROUTE_LOOP_MS, lag)} path="${route}" calcMode="spline" keyPoints="0;1;1" keyTimes="${keyTimes(ROUTE_LOOP_MS, 0, TRAVEL_MS, ROUTE_LOOP_MS)}" keySplines="${TRAVEL_EASE};${LINEAR}"${repeatAttr}/>`
         : `<animateMotion ${timing(TRAVEL_MS, lag)} path="${route}" calcMode="spline" keyPoints="0;1" keyTimes="0;1" keySplines="${TRAVEL_EASE}" fill="freeze"/>`
       const opacity = (peak: string, lag = 0) => {
         const finish = TRAVEL_MS + 130
-        const duration = repeat ? ROUTE_LOOP_MS : finish
-        const marks = repeat ? [0, 105, TRAVEL_MS - 65, finish, duration] : [0, 105, TRAVEL_MS - 65, finish]
-        return `<animate attributeName="opacity" values="0;${peak};${peak};0${repeat ? ';0' : ''}" keyTimes="${keyTimes(duration, ...marks)}" calcMode="spline" keySplines="${FADE_EASE};${LINEAR};${FADE_EASE}${repeat ? `;${LINEAR}` : ''}" ${timing(duration, lag)}${repeatAttr}/>`
+        const duration = loopRoutes ? ROUTE_LOOP_MS : finish
+        const marks = loopRoutes ? [0, 105, TRAVEL_MS - 65, finish, duration] : [0, 105, TRAVEL_MS - 65, finish]
+        return `<animate attributeName="opacity" values="0;${peak};${peak};0${loopRoutes ? ';0' : ''}" keyTimes="${keyTimes(duration, ...marks)}" calcMode="spline" keySplines="${FADE_EASE};${LINEAR};${FADE_EASE}${loopRoutes ? `;${LINEAR}` : ''}" ${timing(duration, lag)}${repeatAttr}/>`
       }
       const headMotion = motion()
       active.push(
@@ -588,9 +608,11 @@ export function drawGraph(
       const mx = (x1 + x2) / 2
       const my = (y1 + y2) / 2
       const side = (-(cx - mx) * uy + (cy - my) * ux) < 0 ? -1 : 1
-      const x = (x1 + 2 * cx + x2) / 4 + (short ? -uy * 15 * side : 0)
-      const y = (y1 + 2 * cy + y2) / 4 + (short ? ux * 15 * side : 0)
       const bw = Math.max(20, 10 + String(total).length * 7)
+      const rawX = (x1 + 2 * cx + x2) / 4 + (short ? -uy * 15 * side : 0)
+      const rawY = (y1 + 2 * cy + y2) / 4 + (short ? ux * 15 * side : 0)
+      const x = Math.max(bw / 2 + 4, Math.min(width - bw / 2 - 4, rawX))
+      const y = Math.max(12, Math.min(height - 12, rawY))
       badges.push(
         `<g transform="translate(${n1(x)} ${n1(y)})">` +
         `<rect class="badge" x="${n1(-bw / 2)}" y="-10" width="${n1(bw)}" height="20" rx="10"/><text class="count" y="0" dy=".35em">${total}</text></g>`,
@@ -604,42 +626,107 @@ export function drawGraph(
 
   const allPosts = [...broadcasts.values()].reduce((sum, count) => sum + count, 0)
   const pulse = (start: number) => {
-    const duration = repeat ? ROUTE_LOOP_MS : 340
-    const marks = repeat ? [0, 100, 340, duration] : [0, 100, duration]
-    return `<animate attributeName="opacity" values="0;.56;0${repeat ? ';0' : ''}" keyTimes="${keyTimes(duration, ...marks)}" calcMode="spline" keySplines="${FADE_EASE};${FADE_EASE}${repeat ? `;${LINEAR}` : ''}" ${timing(duration, start)}${repeatAttr}/>`
+    const duration = loopRoutes ? ROUTE_LOOP_MS : 340
+    const marks = loopRoutes ? [0, 100, 340, duration] : [0, 100, duration]
+    return `<animate attributeName="opacity" values="0;.56;0${loopRoutes ? ';0' : ''}" keyTimes="${keyTimes(duration, ...marks)}" calcMode="spline" keySplines="${FADE_EASE};${FADE_EASE}${loopRoutes ? `;${LINEAR}` : ''}" ${timing(duration, start)}${repeatAttr}/>`
   }
+  const liveMotion = live && !swarm.isClosed && !swarm.isPaused
+  const pausedMotion = live && !swarm.isClosed
+  const statusOfNode = (member: Swarm['members'][number]) => {
+    if (!live) return ''
+    if (swarm.isClosed) return member.status === 'killed' ? 'killed' : 'closed'
+    if (member.status === 'killed' || member.status === 'failed' || member.status === 'stopped' || member.status === 'unreachable') {
+      return member.status
+    }
+    if (swarm.isPaused) return member.status === 'not started' ? 'not started' : 'paused'
+    if (member.status === 'paused' || member.detail === 'its token budget is spent') return 'paused'
+    return member.status
+  }
+  const statusGlyph = (status: string, px: number, animateNode: boolean, seed: number): string => {
+    if (status === '') return ''
+    const dly = (dur: number) => animateNode ? ` style="animation-delay:${loopDelay(ms, dur, seed % dur)}"` : ''
+    const x = n1(px)
+    switch (status) {
+      case 'coordinating': {
+        const d = `M${x} -4L${n1(px + 3.5)} -2V2L${x} 4L${n1(px - 3.5)} 2V-2Z`
+        return (animateNode && liveMotion ? `<path class="motion p-ping coordinating" d="${d}"${dly(3400)}/>` : '') +
+          `<path class="presence coordinating" d="${d}"/>`
+      }
+      case 'working':
+        return (animateNode && liveMotion ? `<circle class="motion p-ping working" cx="${x}" r="3.6"${dly(2800)}/>` : '') +
+          `<circle class="presence working" cx="${x}" r="3.7"/>`
+      case 'waiting':
+        return `<circle class="presence-ring waiting" cx="${x}" r="3.3"/>` +
+          `<circle class="presence waiting${animateNode && liveMotion ? ' p-wait' : ''}" cx="${x}" r="1.5"${liveMotion ? dly(3600) : ''}/>`
+      case 'not started':
+        return `<path class="presence not-started${animateNode && liveMotion ? ' p-queue' : ''}" d="M${x} -3.5L${n1(px + 3)} -1.8V1.8L${x} 3.5L${n1(px - 3)} 1.8V-1.8Z"${liveMotion ? dly(4400) : ''}/>`
+      case 'paused':
+        return `<circle class="presence-ring paused${animateNode && pausedMotion ? ' p-pause' : ''}" cx="${x}" r="3.8"${pausedMotion ? dly(4800) : ''}/>` +
+          `<path class="presence paused" d="M${n1(px - 1.2)} -1.8V1.8M${n1(px + 1.2)} -1.8V1.8"/>`
+      case 'closed':
+        return `<path class="presence closed" d="M${x} -3.4L${n1(px + 2.9)} -1.7V1.7L${x} 3.4L${n1(px - 2.9)} 1.7V-1.7Z"/>` +
+          `<circle class="presence-core closed" cx="${x}" r="1.2"/>`
+      case 'killed':
+        return `<circle class="presence killed" cx="${x}" r="3.4"/>` +
+          `<path class="presence-slash killed" d="M${n1(px - 2.4)} 2.4L${n1(px + 2.4)} -2.4"/>`
+      case 'stopped':
+        return `<rect class="presence stopped" x="${n1(px - 3.3)}" y="-3.3" width="6.6" height="6.6" rx="1.1"/>` +
+          `<rect class="presence-core stopped${animateNode && liveMotion ? ' p-stop' : ''}" x="${n1(px - 1.5)}" y="-1.5" width="3" height="3" rx=".4"${liveMotion ? dly(3600) : ''}/>`
+      case 'failed':
+        return (animateNode && liveMotion ? `<circle class="motion p-alert failed" cx="${x}" r="4.8"${dly(2800)}/>` : '') +
+          `<path class="presence-x failed" d="M${n1(px - 2.6)} -2.6L${n1(px + 2.6)} 2.6M${n1(px + 2.6)} -2.6L${n1(px - 2.6)} 2.6"/>`
+      case 'unreachable':
+        return `<circle class="presence unreachable" cx="${x}" r="3.4"/>` +
+          `<path class="presence-sig unreachable${animateNode && liveMotion ? ' p-sig' : ''}" d="M${n1(px - 2)} -4.6Q${x} -6.2 ${n1(px + 2)} -4.6"${liveMotion ? dly(3200) : ''}/>`
+      default:
+        return `<circle class="presence ${esc(status.replace(/\s+/g, '-'))}" cx="${x}" r="3.1"/>`
+    }
+  }
+  const nodeStatuses = new Set<string>()
   const nodes = members.map(member => {
     const p = positions.get(member.name)!
+    const isCenter = member === coordinator || (coordinator === undefined && members.length === 1)
     const sender = current?.agent === member.name
     const recipient = current?.to.includes(member.name)
-    // A closed run has no live state to show, only who was retired.
-    const status = live && (!swarm.isClosed || member.status === 'killed') ? member.status : ''
+    const status = statusOfNode(member)
+    if (status) nodeStatuses.add(status)
     const silent = unaddressed.get(member.name) ?? 0
     const sent = broadcasts.get(member.name) ?? 0
     const title = [member.name, status, silent > 0 ? `${silent} ${silent === 1 ? 'post' : 'posts'} with no mention` : '',
       sent > 0 ? `${sent} to @all` : ''].filter(part => part !== '').join(' · ')
     const emphasis = sender ? ' sender' : recipient ? ' recipient' : ''
     const rect = `x="${-p.half}" y="${-PILL_HEIGHT / 2}" width="${p.half * 2}" height="${PILL_HEIGHT}" rx="13"`
-    const moving = animate || repeat
+    const moving = animate || loopRoutes
     // A recipient lights up as the packet lands. The sender of a post that names nobody has no line to
     // show it, so its own outline answers instead.
     const arrival = moving && (recipient || (sender && current?.to.length === 0))
       ? `<rect class="motion arrival" ${rect} opacity="0">${pulse(recipient ? TRAVEL_MS - 34 : 0)}</rect>`
       : ''
-    if (moving && sender && isCurrentBroadcast && !expandAll) {
-      ripples.push(
-        `<g transform="translate(${p.x.toFixed(1)} ${p.y.toFixed(1)})">` +
-        [0, 135, 270].map(delay => {
-          const duration = repeat ? ROUTE_LOOP_MS : TRAVEL_MS
-          const motionMarks = repeat ? [0, TRAVEL_MS, duration] : [0, duration]
-          const fadeMarks = repeat ? [0, 125, TRAVEL_MS, duration] : [0, 125, duration]
-          const attrs = `${timing(duration, delay)}${repeatAttr}`
-          return `<circle class="motion ripple" r="24" opacity="0">` +
-            `<animate attributeName="r" values="24;154${repeat ? ';154' : ''}" keyTimes="${keyTimes(duration, ...motionMarks)}" calcMode="spline" keySplines=".22 .61 .36 1${repeat ? `;${LINEAR}` : ''}" ${attrs}/>` +
-            `<animate attributeName="opacity" values="0;.4;0${repeat ? ';0' : ''}" keyTimes="${keyTimes(duration, ...fadeMarks)}" calcMode="spline" keySplines="${FADE_EASE};${FADE_EASE}${repeat ? `;${LINEAR}` : ''}" ${attrs}/></circle>`
-        }).join('') +
-        '</g>',
-      )
+    if (moving && sender && isCurrentBroadcast) {
+      const duration = loopRoutes ? ROUTE_LOOP_MS : TRAVEL_MS
+      const motionMarks = loopRoutes ? [0, TRAVEL_MS, duration] : [0, duration]
+      const fadeMarks = loopRoutes ? [0, 125, TRAVEL_MS, duration] : [0, 125, duration]
+      if (!expandAll) {
+        const maxR = isCenter ? 154 : 100
+        ripples.push(
+          `<g transform="translate(${p.x.toFixed(1)} ${p.y.toFixed(1)})">` +
+          [0, 135, 270].map(delay => {
+            const attrs = `${timing(duration, delay)}${repeatAttr}`
+            return `<circle class="motion ripple" r="24" opacity="0">` +
+              `<animate attributeName="r" values="24;${maxR}${loopRoutes ? `;${maxR}` : ''}" keyTimes="${keyTimes(duration, ...motionMarks)}" calcMode="spline" keySplines=".22 .61 .36 1${loopRoutes ? `;${LINEAR}` : ''}" ${attrs}/>` +
+              `<animate attributeName="opacity" values="0;.4;0${loopRoutes ? ';0' : ''}" keyTimes="${keyTimes(duration, ...fadeMarks)}" calcMode="spline" keySplines="${FADE_EASE};${FADE_EASE}${loopRoutes ? `;${LINEAR}` : ''}" ${attrs}/></circle>`
+          }).join('') +
+          '</g>',
+        )
+      } else {
+        const attrs = `${timing(duration, 0)}${repeatAttr}`
+        ripples.push(
+          `<g transform="translate(${p.x.toFixed(1)} ${p.y.toFixed(1)})">` +
+          `<circle class="motion origin-pulse" r="24" opacity="0">` +
+          `<animate attributeName="r" values="24;54${loopRoutes ? ';54' : ''}" keyTimes="${keyTimes(duration, ...motionMarks)}" calcMode="spline" keySplines=".22 .61 .36 1${loopRoutes ? `;${LINEAR}` : ''}" ${attrs}/>` +
+          `<animate attributeName="opacity" values="0;.36;0${loopRoutes ? ';0' : ''}" keyTimes="${keyTimes(duration, ...fadeMarks)}" calcMode="spline" keySplines="${FADE_EASE};${FADE_EASE}${loopRoutes ? `;${LINEAR}` : ''}" ${attrs}/></circle></g>`,
+        )
+      }
     }
     const cw = Math.max(44, 30 + String(sent).length * 6.5)
     const chip = sent > 0
@@ -647,56 +734,90 @@ export function drawGraph(
         `<rect x="${n1(-cw / 2)}" y="-8" width="${n1(cw)}" height="16" rx="8"/><text dy=".35em">@all ${sent}</text></g>`
       : ''
     const px = -p.half + 14
-    const skey = statusKey(status)
-    const scls = esc(status.replace(/\s+/g, '-'))
-    const pulseRing = repeat && (skey === 'working' || skey === 'coordinating')
-      ? `<circle class="motion p-ping ${skey}" cx="${px}" r="3.6"/>`
+    const scls = status ? esc(status.replace(/\s+/g, '-')) : ''
+    const coordFrame = member === coordinator
+      ? `<path class="coord-hex" d="M${n1(-p.half + 5)} -22H${n1(p.half - 5)}L${n1(p.half + 5)} 0L${n1(p.half - 5)} 22H${n1(-p.half + 5)}L${n1(-p.half - 5)} 0Z"/>` +
+        `<path class="coord-crown" d="M${n1(px)} -6.8L${n1(px + 5.9)} -3.4V3.4L${n1(px)} 6.8L${n1(px - 5.9)} 3.4V-3.4Z"/>`
       : ''
-    const dot = status === '' ? ''
-      : skey === 'working' ? `${pulseRing}<circle class="presence working" cx="${px}" r="3.7"/>`
-      : skey === 'waiting' ? `<circle class="presence-ring waiting" cx="${px}" r="3.1"/><circle class="presence waiting" cx="${px}" r="1.4"/>`
-      : skey === 'coordinating' ? `${pulseRing}<path class="presence coordinating" d="M${px} -4L${px + 4} 0 ${px} 4 ${px - 4} 0z"/>`
-      : skey === 'failed' ? `<path class="presence-x ${scls}" d="M${px - 2.6} -2.6L${px + 2.6} 2.6M${px + 2.6} -2.6L${px - 2.6} 2.6"/>`
-      : `<circle class="presence ${scls}" cx="${px}" r="3.1"/>`
+    const dot = statusGlyph(status, px, true, hashSeed(member.name))
     return (
-      `<g transform="translate(${p.x.toFixed(1)} ${p.y.toFixed(1)})"${status === 'killed' ? ' class="killed"' : ''}>` +
-      `<title>${esc(title)}</title><rect class="pill${emphasis}${silent > 0 ? ' quiet' : ''}" ${rect}/>` +
+      `<g class="node${scls ? ` ${scls}` : ''}" transform="translate(${p.x.toFixed(1)} ${p.y.toFixed(1)})">` +
+      `<title>${esc(title)}</title>${coordFrame}<rect class="pill${emphasis}${silent > 0 ? ' quiet' : ''}" ${rect}/>` +
       arrival + dot +
       `<text class="name" x="${dot ? 7 : 0}" dy=".35em">${esc(p.label)}</text>` + chip + '</g>'
     )
   })
 
   // The key under the diagram is drawn with the diagram's own classes, so it cannot say one thing and the lines another.
-  const row = height + 16
+  const STATUS_ORDER = ['coordinating', 'working', 'waiting', 'paused', 'not started', 'closed', 'stopped', 'failed', 'unreachable', 'killed'] as const
+  const presentStatuses = live ? STATUS_ORDER.filter(s => nodeStatuses.has(s)) : []
+  const row = height + 14
   const lcw = Math.max(44, 30 + String(allPosts).length * 6.5)
+  let lx = 16
+  let rowY = row + 42
+  let statusRows = presentStatuses.length > 0 ? 1 : 0
+  const statusLegendParts: string[] = []
+  for (const st of presentStatuses) {
+    const itemW = 14 + st.length * 6.3
+    if (lx > 16 && lx + itemW > width - 12) {
+      lx = 16
+      rowY += 18
+      statusRows++
+    }
+    statusLegendParts.push(
+      `<g transform="translate(${n1(lx + 4.5)} ${rowY})">${statusGlyph(st, 0, false, 0)}</g>` +
+      `<text x="${n1(lx + 13)}" y="${rowY}" dy=".35em">${esc(st)}</text>`,
+    )
+    lx += itemW + 12
+  }
+  const legendHeight = statusRows === 0 ? 50 : LEGEND + (statusRows - 1) * 18
   const legend =
     `<g class="legend"><g opacity=".72"><path class="edge" d="M16 ${row}H40" stroke-width="2.4"/><path class="tip" d="M48 ${row}l-9 -4.2v8.4z"/></g>` +
     `<text x="56" y="${row}" dy=".35em">@mention, width = count</text>` +
-    `<g opacity=".72"><path class="edge via-all" d="M224 ${row}H248" stroke-width="1.6"/><path class="tip" d="M256 ${row}l-9 -4.2v8.4z"/></g>` +
-    `<text x="264" y="${row}" dy=".35em">via @all</text>` +
-    `<rect class="pill quiet" x="336" y="${row - 7}" width="26" height="14" rx="6"/>` +
-    `<text x="370" y="${row}" dy=".35em">posted with no mention</text>` +
-    `<g class="chip" transform="translate(${n1(16 + lcw / 2)} ${row + 22})"><rect x="${n1(-lcw / 2)}" y="-8" width="${n1(lcw)}" height="16" rx="8"/><text dy=".35em">@all ${allPosts}</text></g>` +
-    `<text x="${n1(16 + lcw + 8)}" y="${row + 22}" dy=".35em">${allPosts === 0 ? 'no @all posts yet' : expandAll ? '@all posts, drawn as dashed arrows' : '@all posts, drawn by Expand @all'}</text></g>`
+    `<g opacity=".72"><path class="edge via-all" d="M234 ${row}H258" stroke-width="1.6"/><path class="tip" d="M266 ${row}l-9 -4.2v8.4z"/></g>` +
+    `<text x="274" y="${row}" dy=".35em">via @all</text>` +
+    `<rect class="pill quiet" x="350" y="${row - 7}" width="26" height="14" rx="6"/>` +
+    `<text x="384" y="${row}" dy=".35em">posted with no mention</text>` +
+    `<g class="chip" transform="translate(${n1(16 + lcw / 2)} ${row + 21})"><rect x="${n1(-lcw / 2)}" y="-8" width="${n1(lcw)}" height="16" rx="8"/><text dy=".35em">@all ${allPosts}</text></g>` +
+    `<text x="${n1(16 + lcw + 8)}" y="${row + 21}" dy=".35em">${allPosts === 0 ? 'no @all posts yet' : expandAll ? '@all posts, drawn as dashed arrows' : '@all posts, drawn by Expand @all'}</text>` +
+    statusLegendParts.join('') + '</g>'
   const key = 'Arrow: @mention, thicker for more · Dashed arrow: reached via @all · Dashed outline: posted with no mention · ' +
-    (allPosts === 0 ? 'No @all posts yet' : `“@all N” on a member: its @all posts (${allPosts} in all), ${expandAll ? 'drawn as dashed arrows' : 'drawn by Expand @all'}`)
+    (allPosts === 0 ? 'No @all posts yet' : `“@all N” on a member: its @all posts (${allPosts} in all), ${expandAll ? 'drawn as dashed arrows' : 'drawn by Expand @all'}`) +
+    (presentStatuses.length > 0 ? ` · Statuses: ${presentStatuses.join(', ')}` : '')
 
-  const pingCss = repeat
-    ? `.p-ping{fill:none;stroke-width:1.4;transform-box:fill-box;transform-origin:center;animation:pp 3.2s ${easeOut} ${loopDelay(ms, 3200)} infinite}` +
-      `.p-ping.working{stroke:var(--status-working)}.p-ping.coordinating{stroke:var(--status-coordinating)}` +
-      '@keyframes pp{0%{transform:scale(.9);opacity:0}14%{opacity:.45}78%,100%{transform:scale(2.05);opacity:0}}'
-    : ''
+  const statusAnimCss = liveMotion
+    ? `.p-ping{fill:none;stroke-width:1.4;transform-box:fill-box;transform-origin:center}` +
+      `.p-ping.working{stroke:var(--status-working);animation:gp-ring 2.8s ${easeOut} infinite}` +
+      `.p-ping.coordinating{stroke:var(--status-coordinating);animation:gp-hex 3.4s ${easeOut} infinite}` +
+      `.p-wait{transform-box:fill-box;transform-origin:center;animation:gp-wait 3.6s ${easeInOut} infinite}` +
+      `.p-queue{animation:gp-queue 4.4s ${easeInOut} infinite}` +
+      `.p-pause{animation:gp-pause 4.8s ${easeInOut} infinite}` +
+      `.p-stop{animation:gp-stop 3.6s ${easeInOut} infinite}` +
+      `.p-alert{fill:var(--status-failed);animation:gp-alert 2.8s ${easeInOut} infinite}` +
+      `.p-sig{animation:gp-sig 3.2s ${easeInOut} infinite}` +
+      `@keyframes gp-ring{0%{transform:scale(.9);opacity:0}14%{opacity:.45}78%,100%{transform:scale(2.05);opacity:0}}` +
+      `@keyframes gp-hex{0%{transform:scale(.95);opacity:0}16%{opacity:.46}80%,100%{transform:scale(2.05);opacity:0}}` +
+      `@keyframes gp-wait{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(.78);opacity:.5}}` +
+      `@keyframes gp-queue{0%,100%{opacity:.42}50%{opacity:.85}}` +
+      `@keyframes gp-pause{0%,100%{opacity:1}50%{opacity:.48}}` +
+      `@keyframes gp-stop{0%,100%{opacity:1}50%{opacity:.42}}` +
+      `@keyframes gp-alert{0%,100%{opacity:.12}50%{opacity:.28}}` +
+      `@keyframes gp-sig{0%,60%,100%{opacity:1}25%,40%{opacity:.25}}`
+    : pausedMotion
+      ? `.p-pause{animation:gp-pause 4.8s ${easeInOut} infinite}@keyframes gp-pause{0%,100%{opacity:1}50%{opacity:.48}}`
+      : ''
   const open =
-    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height + LEGEND}" width="100%" height="100%" font-family="system-ui, sans-serif">` +
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height + legendHeight}" width="100%" height="100%" font-family="system-ui, sans-serif">` +
     `<defs><clipPath id="stage"><rect width="${width}" height="${height}"/></clipPath>` +
     `<filter id="sh" x="-15%" y="-25%" width="130%" height="160%"><feDropShadow dx="0" dy="1.5" stdDeviation="2" flood-opacity=".11"/></filter>` +
     `<linearGradient id="sg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--tint)"/><stop offset="100%" stop-color="var(--pill)"/></linearGradient></defs>` +
     `<style>
-      svg{--edge:#596375;--pill:#f8f8f7;--border:#87909d;--ink:#252628;--accent:#235fc4;--tint:#eaf2ff;--packet:#fff}
-      @media (prefers-color-scheme: dark){svg{--edge:#9399a5;--pill:#242424;--border:#737982;--ink:#f1f1ef;--accent:#8fb8ff;--tint:#243750;--packet:#fff}}
+      ${statusCss}
+      svg{--edge:#73685a;--pill:#fcfaf5;--border:#968c7d;--ink:#2a231c;--accent:#b87314;--tint:#fdf3df;--packet:#fde08d;--failed-tint:#fdf1f2;--status-closed:#8c7d68;--status-killed:#74716c}
+      @media (prefers-color-scheme: dark){svg{--edge:#a59b8d;--pill:#272420;--border:#7a7062;--ink:#f3efe8;--accent:#f2bd6a;--tint:#382d1e;--packet:#fde08d;--failed-tint:#382022;--status-closed:#a89b86;--status-killed:#9e9a93}}
       @supports(color:color(display-p3 1 0 0)){
-        svg{--edge:color(display-p3 .35 .39 .46);--pill:color(display-p3 .97 .97 .965);--border:color(display-p3 .53 .56 .61);--ink:color(display-p3 .15 .15 .16);--accent:color(display-p3 .2033 .3675 .7427);--tint:color(display-p3 .92 .95 1);--packet:color(display-p3 1 1 1)}
-        @media(prefers-color-scheme:dark){svg{--edge:color(display-p3 .58 .60 .64);--pill:color(display-p3 .14 .14 .14);--border:color(display-p3 .45 .47 .51);--ink:color(display-p3 .95 .95 .94);--accent:color(display-p3 .5935 .7170 .9777);--tint:color(display-p3 .15 .22 .31)}}
+        svg{--edge:color(display-p3 .451 .408 .353);--pill:color(display-p3 .988 .980 .960);--border:color(display-p3 .588 .549 .490);--ink:color(display-p3 .165 .137 .110);--accent:color(display-p3 .678 .455 .137);--tint:color(display-p3 .988 .953 .878);--packet:color(display-p3 .9733 .8825 .5954);--failed-tint:color(display-p3 .990 .945 .950);--status-closed:color(display-p3 .549 .490 .408);--status-killed:color(display-p3 .4529 .4435 .4255)}
+        @media(prefers-color-scheme:dark){svg{--edge:color(display-p3 .647 .608 .553);--pill:color(display-p3 .153 .141 .125);--border:color(display-p3 .478 .439 .384);--ink:color(display-p3 .953 .937 .910);--accent:color(display-p3 .9166 .7493 .4652);--tint:color(display-p3 .216 .176 .122);--packet:color(display-p3 .9733 .8825 .5954);--failed-tint:color(display-p3 .220 .125 .135);--status-closed:color(display-p3 .659 .608 .525);--status-killed:color(display-p3 .6169 .6044 .5792)}}
       }
       .edge,.route,.route-base{fill:none;stroke-linecap:round}
       .history-edge{opacity:.64;transition:opacity .18s ease}.history-edge:hover{opacity:1}.history-edge:hover .edge{stroke:var(--accent)}.history-edge:hover .tip{fill:var(--accent)}
@@ -704,26 +825,45 @@ export function drawGraph(
       .via-all{stroke-dasharray:6 5;stroke-linecap:butt}
       .route-base{stroke:var(--accent);opacity:.15}
       .route{stroke:var(--accent)}.motion-route{stroke-dasharray:102 102}.tip-current{fill:var(--accent)}
-      .packet-tail{fill:var(--accent)}.packet-halo{fill:var(--accent)}.packet{fill:var(--packet);stroke:var(--accent);stroke-width:1.6}
+      .packet-tail{fill:var(--accent)}.packet-halo{fill:var(--packet)}.packet{fill:var(--packet);stroke:var(--accent);stroke-width:1.6}
       .pill{fill:var(--pill);stroke:var(--border);filter:url(#sh);transition:stroke .16s ease,fill .16s ease}
-      g:hover>.pill{stroke:var(--accent)}
+      .node:hover>.pill{stroke:var(--accent)}
+      .coord-hex{fill:none;stroke:var(--status-coordinating);stroke-opacity:.38;stroke-width:1.15}
+      .coord-crown{fill:var(--status-coordinating);fill-opacity:.11;stroke:var(--status-coordinating);stroke-opacity:.42;stroke-width:1;stroke-linejoin:round}
       .sender{fill:url(#sg);stroke:var(--accent);stroke-width:1.8}.recipient{stroke:var(--accent);stroke-width:1.5}
-      .quiet{stroke-dasharray:5 4}.killed .pill{stroke-dasharray:2 3}.killed .name{opacity:.68;text-decoration:line-through}
-      .arrival,.ripple{fill:none;stroke:var(--accent)}.arrival{stroke-width:4}.ripple{stroke-width:1.8}
+      .quiet{stroke-dasharray:5 4}
+      .not-started .pill{opacity:.86}.closed .pill{opacity:.88}
+      .killed .pill{stroke-dasharray:2 3;opacity:.62}.killed .name{opacity:.68;text-decoration:line-through}
+      .stopped .pill{stroke:var(--status-stopped);stroke-dasharray:4 2}
+      .failed .pill{stroke:var(--status-failed);fill:var(--failed-tint)}
+      .unreachable .pill{stroke:var(--status-unreachable);stroke-dasharray:3 2.5}
+      .arrival,.ripple,.origin-pulse{fill:none;stroke:var(--accent)}.arrival{stroke-width:4}.ripple{stroke-width:1.8}.origin-pulse{stroke-width:1.6}
       .name,.count{fill:var(--ink);text-anchor:middle;font-weight:600}.name{font-size:14px}.count{font-size:12px}
       .badge{fill:var(--tint);stroke:var(--accent);filter:url(#sh)}
-      .chip rect{fill:var(--pill);stroke:var(--border)}.chip text{fill:var(--ink);opacity:.82;font-size:10.5px;font-weight:600;text-anchor:middle}
+      .chip rect{fill:var(--pill);stroke:var(--border)}.chip text{fill:var(--ink);opacity:.82;font-size:11.2px;font-weight:600;text-anchor:middle}
       .chip.on rect{fill:var(--tint);stroke:var(--accent)}
       .legend>text{fill:var(--ink);opacity:.72;font-size:12px}
       .legend .pill{filter:none;stroke-dasharray:3.5 2.5;stroke-width:1.15}
-      ${statusCss}${pingCss}
+      ${statusAnimCss}
       .presence{fill:none;stroke:var(--status-inactive);stroke-width:1.2}
       .presence-ring{fill:none;stroke:var(--status-waiting);stroke-width:1.2}
+      .presence-ring.paused{stroke:var(--status-paused)}
+      .presence.paused{stroke:var(--status-paused);stroke-width:1.4;stroke-linecap:round}
+      .presence.not-started{stroke-dasharray:2 1.8;stroke:var(--status-inactive)}
+      .presence.closed{stroke:var(--status-closed);fill:var(--status-closed);fill-opacity:.14}
+      .presence-core.closed{fill:var(--status-closed)}
+      .presence.killed{stroke:var(--status-killed)}
+      .presence-slash.killed{fill:none;stroke:var(--status-killed);stroke-width:1.3;stroke-linecap:round}
+      .presence.stopped{stroke:var(--status-stopped)}
+      .presence-core.stopped{fill:var(--status-stopped)}
       .presence-x{fill:none;stroke:var(--status-failed);stroke-width:1.6;stroke-linecap:round}
+      .presence.unreachable{stroke:var(--status-unreachable);stroke-dasharray:2.4 1.6}
+      .presence-sig.unreachable{fill:none;stroke:var(--status-unreachable);stroke-width:1.2;stroke-linecap:round}
       ${['working', 'coordinating', 'waiting'].map(status => `.presence.${status}{fill:var(--status-${status});stroke:none}`).join('')}
       .reduced-route{display:none}
       @media (prefers-reduced-motion: reduce){
-        .motion,.motion-route{display:none}.reduced-route{display:inline}
+        ${liveMotion ? '.motion,.motion-route,.p-ping,.p-alert{display:none}' : '.motion,.motion-route{display:none}'}.reduced-route{display:inline}
+        ${liveMotion ? '.p-wait,.p-queue,.p-pause,.p-stop,.p-sig{animation:none;opacity:1}' : pausedMotion ? '.p-pause{animation:none;opacity:1}' : ''}
         .history-edge,.edge,.tip,.pill{transition:none}
       }
     </style>
@@ -732,16 +872,16 @@ export function drawGraph(
   const close = active.join('') + nodes.join('') + badges.join('') +
     `<line x1="16" y1="${height + 0.5}" x2="${width - 16}" y2="${height + 0.5}" stroke="var(--border)" opacity=".35"/>` +
     legend + '</svg>'
-  // Measured whole: the history goes in, busiest first, until the first route that would take the drawing past the
-  // limit. A shorter, quieter one after it stays out too, so what is left out is always the quietest; and no route
-  // after that one is routed at all, since none could be drawn.
-  let room = limit - open.length - close.length
+  // Measured whole in UTF-8 bytes: the history goes in, busiest first, until the first route that would take the
+  // drawing past the limit. A shorter, quieter one after it stays out too, so what is left out is always the
+  // quietest; and no route after that one is routed at all, since none could be drawn.
+  let room = limit - byteLen(open) - byteLen(close)
   if (room < 0) return { hidden: quieter.length, key }
   const history: string[] = []
   for (const [index, one] of quieter.entries()) {
     const route = routeOf(one)
     if (route === undefined) continue
-    if ((room -= route.length) < 0) return { svg: open + history.join('') + close, hidden: quieter.length - index, key }
+    if ((room -= byteLen(route)) < 0) return { svg: open + history.join('') + close, hidden: quieter.length - index, key }
     history.push(route)
   }
   return { svg: open + history.join('') + close, hidden: 0, key }

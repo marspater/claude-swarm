@@ -139,7 +139,7 @@ test('the pane draws the board, the members and the graph', async ($, on) => {
       } else {
         expect(first?.props).toMatchObject({ flexDirection: 'row', alignItems: 'flex-start' })
         expect(card.props.borderColor).toMatch(/^#[\da-f]{6}$/i)
-        expect(card.props.borderDimColor).toBe(false)
+        expect(card.props.borderDimColor).toBe(true)
         const [identity, art] = first?.children ?? []
         expect(identity?.props).toMatchObject({ flexDirection: 'column', flexShrink: 1, minWidth: 0 })
         expect(identity?.children?.[0]?.type).toBe('Text')
@@ -156,7 +156,7 @@ test('the pane draws the board, the members and the graph', async ($, on) => {
       expect((await ui.findAll({ type: 'Svg' })).map(svg => String(svg.props.alt ?? '').trim())).not.toContain('')
       const parserBee = async () => (await ui.find({ key: 'bee-parser' }))?.children?.[0] as { props: Record<string, unknown> } | undefined
       const wideBee = await parserBee()
-      expect(String(wideBee?.props.source)).toContain('@keyframes flutter')
+      expect(String(wideBee?.props.source)).toMatch(/@keyframes w-/)
       await clock.advance(180)
       for (const bodyColumns of [42, 27, 20]) {
         await ui.redraw({ ...PANE.props, bodyColumns })
@@ -272,8 +272,9 @@ test('the pane draws the board, the members and the graph', async ($, on) => {
   expect(await findSvg(ui, /^Post /).then(svg => svg?.props.alt)).toMatch(/^Post 5 · @later to @verifier\. A mention graph of /)
   expect(String((await findSvg(ui, /^Post /))?.props.source)).toContain('animateMotion')
   await clock.advance(370)
-  await ui.press({ key: 'expand-all' })
+  await ui.press({ key: 'hide-inactive' })
   expect(String((await findSvg(ui, /^Post /))?.props.source)).toContain('animateMotion begin="-370ms"')
+  await ui.press({ key: 'hide-inactive' })
   await clock.advance(830)
   const repeating = String((await findSvg(ui, /^Post /))?.props.source)
   expect(repeating).toContain('repeatCount="indefinite"')
@@ -529,7 +530,7 @@ test('the shortcut leads crab-buddy\'s row and Swarm\'s own row goes', async ($,
   const band = await $.ui.mount({ component: 'AbovePrompt', plugin: 'swarm', surface: 'desktop', props })
   // One row: the shortcut first on the crab's line, Swarm's own row left out.
   expect(keys(await band.drawn() as Tree)).toEqual(['swarm-board-shortcut', 'crab-band', 'crab-fill', 'crab-text', 'crab-buddy'])
-  expect(await band.find({ type: 'Button', text: /Swarm: The Board/ })).toBeDefined()
+  expect(await band.find({ type: 'Button', text: /Swarm Board/ })).toBeDefined()
   await band.press({ key: 'swarm-board-shortcut' })
   expect(opened).toEqual(['swarm'])
   await band.unmount()
@@ -1110,6 +1111,39 @@ test('a restored run enforces its saved budget before the first pane refresh', a
   expect((await $.agent.spawn(spawn)).agentId).toBe('started')
 })
 
+test('a budget cut is judged against the saved budget, not an older pane snapshot', async ($, on) => {
+  const state = { title: 'Team', limits: { budget: '1000000' }, members: { coordinator: { role: 'coordinator', last_read_seq: 0 } } }
+  let unreadable = false
+  const { answer, board } = owning(on, { board: () => '', roster: () => { if (unreadable) throw new Error('gone'); return JSON.stringify(state) } })
+  on('process.run', (_, e) => answer(board(e)))
+  on('agent.list', () => ({ value: [] }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await clock.advance(2000)  // the pane polls: its snapshot holds 1M
+  const cut = () => toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" limit budget=2000000` })
+  expect((await cut()).deny).toContain('the budget is the user\'s to set')
+  await clock.advance(2000)  // polled again after that refusal: the snapshot holds 1M
+  state.limits.budget = '3000000'  // the user's raise, saved before the next poll
+  expect((await cut()).deny).toBeUndefined()
+  // --raise has the board write the figure whatever the budget is by then: only the user's figure passes with it.
+  expect((await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" limit --raise budget=2000000` })).deny)
+    .toContain('the budget is the user\'s to set')
+  // `..` after a symlink would have the board raise another run than the one read here: refused, however it is put.
+  for (const dir of [`/project/link/../.swarm/demo-20261116-101010`, `link/../.swarm/demo-20261116-101010`, `../x/../.swarm/demo-20261116-101010`]) {
+    const run = await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${dir}" limit budget=2000000` })
+    expect([dir, run.deny]).toEqual([dir, expect.stringContaining('Nothing ran: set run limits')])
+  }
+  // A roster that cannot be read is no budget to judge against, whatever the pane last saw: here 3M.
+  await clock.advance(2000)
+  unreadable = true
+  expect((await cut()).deny).toContain('the budget is the user\'s to set')
+  await ui.unmount()
+})
+
 
 test('starting a registered member binds the run, however the board commands were typed', async ($, on) => {
   on('ui.panes', () => ({ value: [] }))
@@ -1169,7 +1203,7 @@ test('starting a registered member binds the run, however the board commands wer
     plugin: 'swarm', component: 'Placed', requestId: placed[0]!, surface: 'desktop',
     props: { id: placed[0]!, plugin: 'swarm' },
   })
-  expect(await row.find({ type: 'Button', text: /Open Swarm board/ })).toBeDefined()
+  expect(await row.find({ type: 'Button', text: /Open Swarm Board/ })).toBeDefined()
   await row.press({ key: 'open-swarm' })
   expect(opened).toEqual(['swarm', 'swarm'])  // once by the run itself when its first member started, once by the press
   const shortcut = await $.ui.mount({
@@ -1323,7 +1357,7 @@ test('concurrent starts reserve a member once and a recorded agent is resumed ra
 
 test('Attention opens a post outside the recent window and a missing board clears the preview', async ($, on) => {
   const run = '/project/.swarm/history'
-  const olderPage = gate()
+  let olderPage = gate()
   let delayPage = false
   let current = 'history'
   const board = Array.from({ length: 302 }, (_, i) => JSON.stringify({
@@ -1368,6 +1402,11 @@ test('Attention opens a post outside the recent window and a missing board clear
   await ui.press({ key: 'history-page' })
   expect(await ui.find({ type: 'Markdown', text: /Original question still open/ })).toBeDefined()
   expect((await ui.findAll({ type: 'Markdown' })).length).toBe(2)
+  // a member's feed opens on the latest window, not on the older page left open
+  await ui.press({ key: 'agent-1' })  // the sender's feed, as Graph and Members open it
+  expect(await ui.find({ key: 'history-latest' })).toBeUndefined()
+  await ui.press({ key: 'board-search-clear' })
+  await ui.press({ key: 'history-page' })
   await ui.press({ key: 'history-latest' })
   expect(await ui.find({ type: 'Markdown', text: /Original question still open/ })).toBeUndefined()
   delayPage = true
@@ -1379,6 +1418,19 @@ test('Attention opens a post outside the recent window and a missing board clear
   await pendingPage
   expect(await ui.find({ key: 'history-latest' })).toBeUndefined()
   expect(await ui.find({ type: 'Markdown', text: /Original question still open/ })).toBeDefined()
+  // the page that navigation dropped leaves no "Loading…" behind it, and another can be asked for
+  await ui.press({ key: 'tab-board' })
+  expect((await ui.find({ type: 'Button', key: 'history-page' }))?.props.label).toBe('Browse older posts')
+  // nor does one still loading when the user leaves the tab open on their return
+  olderPage = gate()
+  const leftBehind = ui.press({ key: 'history-page' })
+  await olderPage.held
+  await ui.press({ key: 'tab-members' })
+  olderPage.open()
+  await leftBehind
+  await ui.press({ key: 'tab-board' })
+  expect(await ui.find({ key: 'history-latest' })).toBeUndefined()
+  expect((await ui.find({ type: 'Button', key: 'history-page' }))?.props.label).toBe('Browse older posts')
   current = '../other-workspace'
   await clock.advance(2000)
   expect(await ui.find({ type: 'Text', text: /could not read the board/ })).toBeDefined()
@@ -2254,7 +2306,7 @@ test('the pane pauses, resumes and answers attention items on the board itself, 
   for (const label of [/^PAUSED$/, /^IGNORED$/, /^REVIEW$/, /^REWORK$/, /^SPEND$/, /^MYSTERY$/]) expect(await ui.find({ type: 'Text', text: label })).toBeDefined()
   seen.commands.length = 0
   await ui.press({ key: 'attention-budget-paused-coordinator-0' })
-  expect(ran()).toEqual(['limit budget=501200', 'resume'])
+  expect(ran()).toEqual(['limit --raise budget=501200', 'resume'])
   await ui.press({ key: 'attention-retry-ignored-parser-2' })
   expect(ran().at(-1)).toBe('retry parser')
   expect(seen.prompts).toEqual([])
@@ -4111,7 +4163,7 @@ test('a member that spends its own token budget is stopped at once, the coordina
   await ui.press({ key: 'tab-members' })
   expect(await ui.find({ type: 'Text', text: 'its token budget is spent' })).toBeDefined()
   await ui.press({ key: 'tab-attention' })
-  for (const label of [/^MEMBER_PAUSED$/, /^LOOP$/, /^CONFLICT$/]) expect(await ui.find({ type: 'Text', text: label })).toBeDefined()
+  for (const label of [/^MEMBER PAUSED$/, /^LOOP$/, /^CONFLICT$/]) expect(await ui.find({ type: 'Text', text: label })).toBeDefined()
   expect(await ui.find({ key: 'attention-ask-member_paused-alice-0' })).toBeUndefined()
   await ui.press({ key: 'attention-resume-member_paused-alice-0' })
   expect(seen.commands.some(command => /^member alice budget=\d+$/.test(command))).toBe(true)
@@ -4227,6 +4279,51 @@ test('a READY with a commit opens its diff, the run exports to Markdown, and the
   const told = await toolCall($, { tool: 'Bash', command: 'ls' })
   expect(told.context?.join(' ')).toContain('The user posted #3 to the board in your name from the Swarm pane')
   expect(told.context?.join(' ')).toContain("the board's show --post=3")
+  await ui.unmount()
+})
+
+test('a diff that loads after a newer one was asked for does not replace it', async ($, on) => {
+  const [slow, fast] = ['a'.repeat(40), 'b'.repeat(40)]
+  const lines = [
+    { seq: 1, agent: 'coordinator', to: ['alice'], text: '@alice BRIEF', time: '2026-11-16T14:03:22+0100' },
+    { seq: 2, agent: 'alice', to: ['coordinator'], text: `READY ${slow}\nFirst.`, time: '2026-11-16T14:04:22+0100', kind: 'ready', revision: slow },
+    { seq: 3, agent: 'alice', to: ['coordinator'], text: `READY ${fast}\nSecond.`, time: '2026-11-16T14:05:22+0100', kind: 'ready', revision: fast },
+  ].map(line => JSON.stringify(line)).join('\n') + '\n'
+  const state = { title: 'Team', members: { coordinator: { role: 'coordinator', last_read_seq: 3 }, alice: { role: 'worker', id: 'alice-1', last_read_seq: 1 } } }
+  const { answer, board } = owning(on, { board: () => lines, roster: () => JSON.stringify(state) })
+  let release = () => {}
+  const held = new Promise<void>(resolve => { release = resolve })
+  let slowAgain: Promise<void> | undefined
+  on('process.run', async (_, e) => {
+    if (e.argv[0] !== 'git') return answer(board(e))
+    if (e.argv.join(' ').includes(slow)) await (slowAgain ?? held)
+    return answer(`diff --git a/x b/x\n+${e.argv.join(' ').includes(slow) ? 'slow' : 'fast'}\n`)
+  })
+  on('agent.list', () => ({ value: [{ id: 'alice-1', description: '@alice', type: 'swarm:worker', status: 'running' }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  const first = ui.press({ key: 'diff-2' })  // git is slow for this one
+  await ui.press({ key: 'diff-3' })
+  expect(await ui.find({ type: 'Markdown', text: /\+fast/ })).toBeDefined()
+  release()
+  await first
+  expect(await ui.find({ type: 'Markdown', text: /\+slow/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Markdown', text: /\+fast/ })).toBeDefined()
+  // one still loading when the user leaves the tab does not open on their return
+  await ui.press({ key: 'diff-3' })
+  let releaseAgain = () => {}
+  slowAgain = new Promise<void>(resolve => { releaseAgain = resolve })
+  const again = ui.press({ key: 'diff-2' })
+  await ui.press({ key: 'tab-members' })
+  await ui.press({ key: 'tab-board' })
+  releaseAgain()
+  await again
+  expect(await ui.find({ type: 'Markdown', text: /diff --git/ })).toBeUndefined()
   await ui.unmount()
 })
 
@@ -4784,7 +4881,7 @@ test('audit: a partial pass is labelled as one, a long recipient list opens, the
   }
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   // a partial pass names the workers it covered, in a tone of its own; a full pass is still VERIFIED
-  const partial = await ui.find({ type: 'Text', text: /^Partial pass · @parser @lexer$/ })
+  const partial = await ui.find({ type: 'Text', text: /^PARTIAL PASS · @parser @lexer$/ })
   expect(partial?.props.color).toBe('warning')
   expect((await ui.find({ type: 'Text', text: /^VERIFIED$/ }))?.props.color).toBe('success')
   // three recipients past the first two are one press away, and the opened post names them all
@@ -4796,7 +4893,7 @@ test('audit: a partial pass is labelled as one, a long recipient list opens, the
   // the expanded partial pass says what it is not
   await ui.press({ key: 'recipients-1' })
   await ui.press({ key: 'graph-post-2' })
-  expect(await ui.find({ type: 'Text', text: / · Partial pass of @parser, @lexer$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^PARTIAL PASS · @parser @lexer$/ })).toBeDefined()
   // the run's steps and the replay's are labelled, and a step that leads nowhere is no control
   expect(await ui.find({ type: 'Text', text: /^Run$/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /^Replay$/ })).toBeDefined()
@@ -5319,9 +5416,11 @@ test('guard: every common wrapper is read through, or refused for sure when it c
   }
   // A dynamically named board script is refused because its identity cannot be checked.
   expect(await deny(`B="python3 /p/board.py ${OWNED}"; $B ready alice <<'EOF'\nNo git commit was run.\nEOF`)).toBeDefined()
-  // What only a report or a variable that names no commit says is not read as one.
+  // The launcher must be known even when the board action and member are visible.
+  expect(await deny(`$PY /p/board.py ${OWNED} post alice "git diff is clean, I am done"`)).toContain('board refused')
+  // What only a report or a shell command that names no commit says is not read as one.
   for (const command of [
-    `$PY /p/board.py ${OWNED} post alice "git diff is clean, I am done"`,
+    `python3 /p/board.py ${OWNED} post alice "git diff is clean, I am done"`,
     "trap 'rm -f /tmp/x' EXIT", '. ./env.sh && git status',
   ]) expect(await deny(command), command).toBeUndefined()
 })
@@ -5949,7 +6048,7 @@ test('no run here: tool calls, turns and the chat are left as they are, though a
   expect(await terminal.find({ type: 'Button', text: /Swarm/ })).toBeUndefined()
   await terminal.unmount()
   const desktop = await above('desktop')
-  expect(await desktop.find({ type: 'Button', text: 'Swarm: The Board' })).toBeDefined()
+  expect(await desktop.find({ type: 'Button', text: 'Swarm Board' })).toBeDefined()
   await desktop.unmount()
   expect(seen.opened).toEqual([])
 })
@@ -7314,6 +7413,7 @@ test('token-economy #3: the coordinating conversation is compacted after deploym
   const { seen, answer, board } = owning(on, {
     board: () => boardText,
     roster: () => JSON.stringify(state),
+    read: path => path.endsWith('/members.json') && path !== `${OWNED}/members.json` ? '' : undefined,
   })
   on('session.usage', () => ({ value: { context: { tokens: contextTokens }, total: { input: 0, output: 0 } } as never }))
   const compactions: string[] = []
@@ -7353,6 +7453,12 @@ test('token-economy #3: the coordinating conversation is compacted after deploym
   // Right after init no poll has shown the budget yet: the board's own figure stands, so lowering it is allowed.
   Object.assign(state, { limits: { budget: '3000000' } })
   expect((await toolCall($, { tool: 'mcp__swarm__board', action: 'limit', options: ['budget=1500000'] } as never)).deny).toBeUndefined()
+  const relativeRun = `.swarm/${OWNED.split('/').at(-1)}`
+  for (const command of [
+    `cd src && python3 /p/board.py "../${relativeRun}" limit budget=2000000`,
+    `cd src && python3 /p/board.py "${OWNED}" limit budget=2000000`,
+    `(cd src && python3 /p/board.py "../${relativeRun}" limit budget=2000000) && python3 /p/board.py "${relativeRun}" limit budget=2000000`,
+  ]) expect((await toolCall($, { tool: 'Bash', command })).deny, command).toBeUndefined()
   Object.assign(state, { limits: undefined })
 
   await clock.advance(2000)
@@ -7418,6 +7524,7 @@ test('token-economy #3: the coordinating conversation is compacted after deploym
   expect((await limit('3000000')).deny).toContain('the budget is the user\'s to set')
   await $.prompt.submit({ text: 'ok, give it 3M', origin: { kind: 'composer' }, wait: false })
   expect([(await limit('3000000')).deny, (await limit('2000000')).deny, (await limit('3_000_000')).deny, (await limit('')).deny].map(deny => deny?.includes('the budget is the user'))).toEqual([undefined, true, true, true])
+  expect((await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" limit "budget=3000000"` })).deny).toBeUndefined()
   expect((await toolCall($, { tool: 'Bash', command: `B=9000000; python3 /p/board.py "${OWNED}" limit budget=$B` })).deny).toContain('the budget is the user\'s to set')
   expect((await toolCall($, { tool: 'mcp__swarm__board', action: 'limit', options: ['budget=3000000', 'budget=9000000'] } as never)).deny).toContain('the budget is the user\'s to set')
   await $.prompt.submit({ text: 'raise it by 500k', origin: { kind: 'composer' }, wait: false })
@@ -7906,4 +8013,83 @@ test('a delayed retirement read cannot mark a replacement run’s member retired
   releaseRoster()
   await stale
   expect((await toolCall($, { tool: 'Read', file_path: '/project/a.ts', agentId: 'shared-address' } as never)).deny).toBeUndefined()
+})
+
+test('UI audit regressions: compact 12x12 statusDot, Widget !isClosed guard, budget-paused/zombie Needs attention grouping, and disabled Expand @all when !hasBroadcast', async ($, on) => {
+  let isClosed = false
+  let board = JSON.stringify({ seq: 1, agent: 'coordinator', to: ['worker'], text: '@worker BRIEF\nStart work.', time: '2026-11-16T14:03:22+0100' }) + '\n'
+  const rosterOf = () => JSON.stringify({
+    title: 'Audit UI',
+    ...(isClosed ? { closed: true } : {}),
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 },
+      worker: { role: 'worker', id: 'w1', last_read_seq: 1 },
+      pausedMember: { role: 'worker', id: 'p1', paused: 'budget', last_read_seq: 1 },
+      zombieMember: { role: 'worker', id: 'z1', killed: '1', last_read_seq: 1 },
+      idleMember: { role: 'worker', last_read_seq: 1 },
+    },
+  })
+  on('command.register', (_, spec) => ({ value: { command: spec.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('tool.register', (_, spec) => ({ value: { tool: `mcp__swarm__${spec.name}` } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.cwd', () => ({ value: '/project' }))
+  on('fs.exists', () => ({ value: true }))
+  on('fs.read', (_, e) => ({
+    value: e.path.endsWith('/current') ? 'audit\n' : e.path.endsWith('/board.jsonl') ? board : rosterOf(),
+  }))
+  on('agent.list', () => ({
+    value: [
+      { id: 'w1', description: '@worker', type: 'swarm:worker', status: 'running' },
+      { id: 'p1', description: '@pausedMember', type: 'swarm:worker', status: 'completed' },
+      { id: 'z1', description: '@zombieMember', type: 'swarm:worker', status: 'running' },
+    ] as never,
+  }))
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await clock.advance(2000)
+
+  // 1. Members tab: compact 12x12 statusDot + budget-paused & zombie grouped under Needs attention and never hidden by Hide inactive
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-members' })
+  const statusDots = (await ui.findAll({ type: 'Svg' })).filter(svg => svg.props.width === 12 && svg.props.height === 12 && String(svg.props.source).includes('viewBox="0 0 12 12"'))
+  expect(statusDots.length).toBeGreaterThanOrEqual(4)
+  expect(await ui.find({ type: 'Text', text: /^Needs attention · 2$/ })).toBeDefined()
+  await ui.press({ key: 'hide-inactive' })
+  // Idle member is hidden, but budget-paused and zombie members remain visible under Needs attention
+  expect(await ui.find({ type: 'Text', text: /^Needs attention · 2$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /@pausedMember/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /@zombieMember/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /@idleMember/ })).toBeUndefined()
+  await ui.press({ key: 'hide-inactive' })
+
+  // 2. Graph tab: Expand @all is a dim Text (not a Button) when !hasBroadcast on both desktop and terminal
+  await ui.press({ key: 'tab-graph' })
+  expect(await ui.find({ type: 'Button', key: 'expand-all' })).toBeUndefined()
+  const disabledDesktop = await ui.find({ type: 'Text', text: /^Expand @all$/ })
+  expect(disabledDesktop?.props.dimColor).toBe(true)
+
+  const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await term.find({ type: 'Button', key: 'expand-all' })).toBeUndefined()
+  const disabledTerm = await term.find({ type: 'Text', text: /^Expand @all$/ })
+  expect(disabledTerm?.props.dimColor).toBe(true)
+  await term.unmount()
+
+  // Once an @all post arrives, Expand @all becomes an interactive Button
+  board += JSON.stringify({ seq: 2, agent: 'coordinator', to: ['worker'], text: '@all checkpoint', time: '2026-11-16T14:03:25+0100' }) + '\n'
+  await clock.advance(2000)
+  expect(await ui.find({ type: 'Button', key: 'expand-all' })).toBeDefined()
+  await ui.unmount()
+
+  // 3. Widget !isClosed guard: live run with zombie shows attention count; closed run shows Closed and NO attention count
+  const liveWidget = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, placement: 'widget' } })
+  expect(await liveWidget.find({ type: 'Text', text: /^1 attention$/ })).toBeDefined()
+  await liveWidget.unmount()
+
+  isClosed = true
+  await clock.advance(2000)
+  const closedWidget = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, placement: 'widget' } })
+  expect(await closedWidget.find({ type: 'Text', text: /^Closed$/ })).toBeDefined()
+  expect(await closedWidget.find({ type: 'Text', text: /attention/ })).toBeUndefined()
+  await closedWidget.unmount()
 })

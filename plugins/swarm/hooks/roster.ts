@@ -3,8 +3,10 @@
 import type { AgentInfo } from 'claude-code'
 
 import type { AttentionItem, Member, Post, Swarm } from '../types'
-import { edgesOf } from './graph'
-import { clean, unquoted, verdictOf } from './text'
+import { earlierEdgesOf } from './graph'
+import { clean, mentions, verdictOf } from './text'
+
+export { mentions }
 
 // ponytail: keeps the newest 300 posts; page through board.jsonl if a swarm outgrows that
 export const KEPT = 300
@@ -171,11 +173,6 @@ export function ledger(kept = 256, graceMs = 600_000) {
   }
 }
 
-// The same rule as board.py: @name at a word start, never an email or a path.
-const MENTION = /(?<![\w.@/])@([A-Za-z][\w-]*)/g
-// A post's author named as its source ("per @lead #5", "from @novelty (post #6)") addresses nobody: board.py's CITED.
-const CITE = String.raw`@[A-Za-z][A-Za-z0-9_-]*(?:['’]s)?[ \t]*\(?(?:(?:posts?|in)[ \t]+)?#[0-9]+\)?`
-const CITED = new RegExp(String.raw`(?:\b(?:from|per|see|by|in|of|via|cf\.?)[ \t]+|\()${CITE}(?:[ \t]*(?:,|and|&)[ \t]*${CITE})*`, 'gi')
 
 export type Roster = Record<
   string,
@@ -238,17 +235,22 @@ export type Report = {
   /** Each name's posts, and each member's unread mentions, over the whole journal. Absent from an older board. */
   sent?: Record<string, number>
   unread?: Record<string, number>
+  /** Each member's last report over the whole journal, and every edge's count there. Absent from an older board. */
+  reported?: Record<string, { seq: number; word: string; partial: boolean; members: string[] }>
+  edges?: Record<string, number>
+  /** The last post `reported` and `edges` count. */
+  through?: number
 }
 
 // What a member that is not working is waiting for, in words.
-export function detailOf(status: string, hint: Report['members'][string] | undefined, isPaused: boolean, isMemberPaused = false): string {
+export function detailOf(status: string, hint: Report['members'][string] | undefined, _isPaused = false, isMemberPaused = false): string {
   if (status === 'killed' || status === 'coordinating' || status === 'failed') return ''
   // Said while it still works too: its next tool call is refused.
   if (isMemberPaused) return 'its token budget is spent'
   if (status === 'working') return ''
   if (status === 'unreachable') return 'cannot be woken'
   if (status === 'stopped') return 'its agent was stopped'
-  if (isPaused) return 'run paused'
+  if (hint?.heavy) return 'context ceiling reached'
   if (hint?.asked) return `waiting for an answer to #${hint.asked}`
   if (Array.isArray(hint?.blocked_on) && hint.blocked_on.length) return `waiting for ${hint.blocked_on.map(name => `@${name}`).join(', ')}`
   if (hint?.ready) return 'reported ready'
@@ -257,10 +259,6 @@ export function detailOf(status: string, hint: Report['members'][string] | undef
 }
 
 /** The names a text mentions, in lower case, code and URLs left out: members, groups and `all` alike. */
-export const mentions = (text: string) => new Set(
-  [...unquoted(text).replace(CITED, ' ').matchAll(MENTION)].map(m => (m[1] ?? '').toLowerCase())
-    .flatMap(name => [name, name.replace(/[-_]+$/, '')]),
-)
 
 /** The live members a post reaches, as board.py's targets reads them: `@verifiers` is every verifier, `@dependents` whoever waits for the sender. */
 export function targets(text: string, roster: Roster, sender?: string): string[] {
@@ -383,14 +381,24 @@ export function parse(
   const heard = new Map<string, number>()
   // The last report each member made, for a closed run's roster.
   const reported = new Map<string, string>()
+  const noteReport = (name: string, post: Pick<Post, 'seq' | 'text' | 'partial' | 'members'>) => {
+    const kind = verdictOf(post as Post)
+    if (!kind || kind.label === 'BRIEF') return
+    const covered = kind.covered?.length ? ` of ${kind.covered.map(one => `@${one}`).join(', ')}` : ''
+    reported.set(name, `Last report: ${kind.label}${covered} (#${post.seq})`)
+  }
+  // Read off the board's tail alone, a report before it is the board's to name. Seen in a test: a 4.2 MB journal left
+  // an early READY "No outcome recorded".
+  if ((posts[0]?.seq ?? 1) > 1) {
+    for (const [name, last] of entriesOf(report?.reported)) {
+      // One the tail holds, or newer than it, is read off the tail itself.
+      if (last && typeof last.word === 'string' && Number(last.seq) < (posts[0]?.seq ?? 1)) noteReport(clean(name), { seq: Number(last.seq), text: last.word, ...(last.partial === true ? { partial: true as const } : {}), members: Array.isArray(last.members) ? last.members.map(String) : [] })
+    }
+  }
   for (const post of posts) {
     counts(post.agent).sent++
     said.set(post.agent, post.seq)
-    const kind = verdictOf(post)
-    if (kind && kind.label !== 'BRIEF') {
-      const covered = kind.covered?.length ? ` of ${kind.covered.map(name => `@${name}`).join(', ')}` : ''
-      reported.set(post.agent, `Last report: ${kind.label}${covered} (#${post.seq})`)
-    }
+    noteReport(post.agent, post)
     for (const name of post.to) {
       heard.set(name, post.seq)
       if (post.seq > (memberNamed(roster, name)?.last_read_seq ?? Infinity)) counts(name).unread++
@@ -432,6 +440,8 @@ export function parse(
       })
     }
 
+    const isMemberPaused = !isClosed && !member.killed && (Boolean(member.paused) || hint?.paused === true)
+    const isHeavy = !isClosed && !member.killed && hint?.heavy === true
     return {
       name,
       id: member.id,
@@ -443,7 +453,10 @@ export function parse(
       depends: hint?.depends ?? [],
       owns: clean(typeof hint?.owns === 'string' ? hint.owns : ''),
       status,
-      detail: isClosed ? (status !== 'closed' || member.role === 'coordinator' ? '' : reported.get(name) ?? 'No outcome recorded') : isZombie ? `still ${zombie.status} (${zombie.id})` : detailOf(status, hint, Boolean(state.paused), Boolean(member.paused) || hint?.paused === true),
+      detail: isClosed ? (status !== 'closed' || member.role === 'coordinator' ? '' : reported.get(name) ?? 'No outcome recorded') : isZombie ? `still ${zombie.status} (${zombie.id})` : detailOf(status, hint, Boolean(state.paused), isMemberPaused),
+      ...(isMemberPaused ? { isPaused: true as const } : {}),
+      ...(isHeavy ? { isHeavy: true as const } : {}),
+      ...(isZombie ? { isZombie: true as const } : {}),
       // The board counts over its whole journal; the posts read here are only the newest of a long board.
       unread: report?.unread ? countIn(report.unread, name) : counts(name).unread,
       posts: report?.sent ? countIn(report.sent, name) : counts(name).sent,
@@ -460,7 +473,7 @@ export function parse(
     isPaused: Boolean(state.paused),
     posts: kept,
     total: Math.max(posts.length, posts.at(-1)?.seq ?? 0),
-    earlierEdges: edgesOf(posts.slice(0, posts.length - kept.length)),
+    earlierEdges: earlierEdgesOf(posts, kept, report?.edges, report?.through),
     members,
     attention: [...(report?.items ?? []), ...zombieAttention],
     budget: budgetOf(state),

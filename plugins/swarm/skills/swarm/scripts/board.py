@@ -3,7 +3,7 @@
 
 usage: board.py DIR init TITLE                    prints the run folder it created; use that as DIR from then on
        board.py DIR member NAME [key=value ...]   add or update (role= profile= writes= consult= group= depends= after= owns= paths= model= effort= size=<s|m|l> id= backend= isolated= budget=<tokens> killed=1)
-       board.py DIR limit [key=value ...]         set run limits: max_workers= max_members= budget=<tokens> member_budget=<tokens> <model>=<types>
+       board.py DIR limit [--raise] [key=value ...]  set run limits (--raise to raise or lift the budget): max_workers= max_members= budget=<tokens> member_budget=<tokens> <model>=<types>
        board.py DIR plan                          the team as a table: type, model, effort, dependencies, ownership
        board.py DIR attention [--json]            what needs someone: a paused run or member, unread posts, unanswered questions, findings to review, rework, disputed findings, heavy spend, loops, unstarted, unreachable, ignoring or blocked members, stale verification, conflicting commits
        board.py DIR retry NAME                    let delivery try an unreachable or unresponsive member again
@@ -49,6 +49,7 @@ candidate it is testing and has posted no verdict on, and "delivered" the curren
 and "base" and "except" when it can: the reporter's own work is `git log --first-parent --no-merges REVISION --not
 BASE EXCEPT...`.
 """
+import contextlib
 import hashlib
 import fcntl  # ponytail: POSIX only; swap in msvcrt.locking if Windows support is needed
 import json
@@ -166,7 +167,7 @@ SUMMARY_CHARS = 200
 ARG_COUNTS = {
     "init": (1, None), "restore": (1, 1), "adopt": (2, None), "locate": (2, None),
     "agent-run": (2, 3), "started": (3, 4), "member": (1, None),
-    "limit": (0, None), "dispatch": (0, 0), "plan": (0, 0), "attention": (0, 1), "retry": (1, 1),
+    "limit": (0, None), "dispatch": (0, 1), "plan": (0, 0), "attention": (0, 1), "retry": (1, 1),
     "replace": (2, None), "post": (1, None), "ready": (1, 2), "revise": (1, None),
     "confirm": (2, 2), "read": (1, 4), "show": (0, 2), "wake": (0, 0),
     "claim": (3, 3), "woke": (3, 3), "rearm": (2, None), "bind": (1, 1),
@@ -206,6 +207,23 @@ def set_reviews(member, asked, members):
     member["reviews"] = ",".join(asked)
     if not asked:
         member.pop("reviews")
+
+
+# verify.py's refusal while another verification action holds the checkout, and how long a waiter waits it out.
+BUSY = "another verification action is already running"
+OWED_WAIT_S, OWED_POLL_S = 2 * 60 * 60, 0.2
+
+
+def waiter_running(d):
+    """Whether an owed dispatch's waiter runs for run D: it holds the waiter lock for as long as it serves."""
+    try:
+        with open(os.path.join(d, ".dispatch-waiter"), "a") as probe:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return False
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
 
 
 def planned(d):
@@ -1285,7 +1303,7 @@ def disputers(finding):
             if kind == "disputed" and seq < finding["judged"].get(owner, 0)]
 
 
-def attention(state, posts):
+def attention(state, posts, d=None):
     """What needs someone, each item naming the post that shows it, and a view of every member."""
     members = state["members"]
     team, ready = team_of(members), readiness(members, posts)
@@ -1295,7 +1313,7 @@ def attention(state, posts):
     budget, total = budget_usage(state)
     if budget and total >= budget and state.get("paused") != spent(budget):  # nobody is woken, whatever the pause says
         items.append({"kind": "paused", "member": COORDINATOR, "seq": 0,
-                      "text": "The token budget is spent (%s of %s), so nobody is woken. Raise it with limit budget=<tokens>, then resume"
+                      "text": "The token budget is spent (%s of %s), so nobody is woken. Raise it with limit --raise budget=<tokens>, then resume"
                               % (f"{total:,}", f"{budget:,}")})
     if not state.get("closed"):
         owed = unread_of(COORDINATOR, members, posts)
@@ -1404,6 +1422,11 @@ def attention(state, posts):
                 items.append({"kind": "conflict", "member": name, "seq": post["seq"],
                               "text": "@%s's commit and @%s's (#%d) both change %s, so merging them will conflict. "
                                       "Have them agree who changes what" % (name, peer, clash["seq"], ", ".join(clash["files"]))})
+    owed = state.get("owed_dispatch")
+    if isinstance(owed, dict) and (owed.get("failed") or (d is not None and not waiter_running(d))):
+        items.append({"kind": "dispatch", "member": COORDINATOR, "seq": 0,
+                      "text": "The planned candidate's dispatch is owed and nobody serves it: %s. Run dispatch" % (
+                          owed.get("failed") or "its waiter ended before the verification lock was let go")})
     closed = bool(state.get("closed"))
     if closed:  # a finished run asks for nothing: what was left open is history
         items, asked = [], {}
@@ -1424,6 +1447,45 @@ def attention(state, posts):
                 unread[name] = unread.get(name, 0) + 1
     return {"items": items, "members": view, "sent": sent, "unread": unread}
 
+
+ROUTES_MAX_BYTES = 1_000_000
+
+
+def journal_view(posts):
+    """What the pane cannot read off a board past its read limit: each member's last report and every route, over the
+    whole journal, and the post they are counted through, so the pane joins them only to the tail that ends there."""
+    reported = {}
+    for post in posts:
+        word = REPORT_WORD.match(post["text"])
+        if word and word[1] != "BRIEF":  # each member's last report, for a closed run's roster
+            reported[post["agent"]] = {"seq": post["seq"], "word": word[1], "partial": bool(post.get("partial")),
+                                       "members": post.get("members", [])}
+    routes = edges(posts)
+    # The pane reads at most 4 MiB of a command's output, and a report cut short is no report: its attention items
+    # would go with it. A route map past this is left out, and the pane counts routes off the tail it read.
+    if len(json.dumps(routes)) > ROUTES_MAX_BYTES:
+        return {"reported": reported}
+    return {"reported": reported, "edges": routes, "through": posts[-1]["seq"] if posts else 0}
+
+
+
+
+def edges(posts):
+    """How often each member addressed each other over the whole journal, keyed as the pane's graph keys them
+    (hooks/graph.ts edgesOf): `from>to`, `from>to>all` for one reached through @all alone, `from>@all`, `from>@none`.
+    Read as the board routes a post (mentions): a cited author ("per @bob #5") is no mention."""
+    counts = Counter()
+    for post in posts:
+        to = post.get("to", [])
+        named = mentions(post["text"]) if "@" in post["text"] else set()  # read once per post
+        broadcast = "all" in named
+        if broadcast:
+            counts[post["agent"] + ">@all"] += 1
+        elif not to:
+            counts[post["agent"] + ">@none"] += 1
+        for name in to:
+            counts["%s>%s%s" % (post["agent"], name, ">all" if broadcast and name.lower() not in named else "")] += 1
+    return dict(counts)
 
 def attention_text(report):
     lines = ["[%s] %s%s" % (item["kind"], "#%d " % item["seq"] if item["seq"] else "", item["text"]) for item in report["items"]]
@@ -1807,8 +1869,18 @@ def init(d, title):
                           "Verification leaves it out of the source fingerprint either way."
                           % os.path.join(parent, ".gitignore"), file=sys.stderr)
         open(os.path.join(d, "board.jsonl"), "a").close()
-        save(d, {"title": title, "members": {COORDINATOR: {"role": COORDINATOR, "last_read_seq": 0}},
-                 "limits": {"budget": str(DEFAULT_BUDGET)}, "auto_budget": True})
+        state = {"title": title, "members": {COORDINATOR: {"role": COORDINATOR, "last_read_seq": 0}},
+                 "limits": {"budget": str(DEFAULT_BUDGET)}, "auto_budget": True}
+        # With core.filemode=false, the executable bits that already differ from Git's: verify.py's commit holds the
+        # run to every other bit it changed. Seen in a test: a script made executable by the run landed without it.
+        import verify  # late: verify.py imports this module
+        try:
+            drift = verify.mode_drift(verify.Path(os.path.dirname(parent)))
+        except (OSError, ValueError):
+            drift = "unknown"  # no baseline: the commit then holds every differing bit to the checks
+        if drift is not None:
+            state["mode_drift"] = drift
+        save(d, state)
         atomic_write(os.path.join(parent, "current"), run + "\n")
     print(d)
     print("note: the run pauses at %s tokens until the team is registered; `plan` then shows the budget allocated from it. "
@@ -2056,17 +2128,20 @@ def main(argv):
             fcntl.flock(lock, fcntl.LOCK_EX)
             return load(d)
 
-        def run_plan(author):
+        def run_plan(author, waiter=False):
             """Prepare the run's planned candidate, if one is planned and the team is ready, and hand the verifiers its
             test command in the coordinator's name. Called after each step that can complete the team: a READY, a
             confirmed finding, a retirement, the plan itself. The board's state decides this step, so no turn of the
             coordinator's is spent on it. Seen live: each candidate cost the coordinator a wake at 180k tokens to run
             one command and post its output. The lock is let go meanwhile: verify.py takes it, and a merge may take
-            long. The candidate on the table is kept when it already holds these files and reports."""
+            long. The candidate on the table is kept when it already holds these files and reports. Returns "busy" when
+            another verification action held the checkout (the dispatch is then owed, see owe_dispatch), "failed" with
+            the reason in `failure`, "done" once every verifier has the candidate's test command, or None when there is
+            nothing to dispatch yet."""
             nonlocal state, posts, members
             plan = planned(d)
             if not plan:
-                return
+                return None
             fcntl.flock(lock, fcntl.LOCK_UN)
             run_dir = os.path.abspath(d)
             project = os.path.dirname(os.path.dirname(run_dir))
@@ -2076,35 +2151,175 @@ def main(argv):
             state, posts = relocked()
             members = state["members"]
             why = done.stderr.strip()
+            if state.get("closed"):  # closed while the lock was let go: a closed journal takes no request
+                print("the run closed while its planned candidate was prepared: no test command is posted")
+                return "done"
+            if BUSY in why:
+                # Another verification action holds the checkout (a test, a prune, another project's prepare). Owed,
+                # in the run's own state, to a waiter that takes it up once that action lets go. Seen in a test: the
+                # READY that completed the team prepared nothing, and nobody asked again.
+                owe_dispatch(author, waiter)
+                print("the planned candidate waits for the verification action running in this checkout: it is "
+                      "prepared, and its test command posted, when that action ends")
+                return "busy"
             made = json.loads(done.stdout.strip().split("\n")[-1]) if done.returncode == 0 else {}
-            if made.get("standing"):
-                print("candidate %s on the table already holds these files and reports: no new one was prepared"
-                      % made["candidate"])
-            elif done.returncode == 0:
+            if made:
+                try:
+                    with open(os.path.join(d, "verification.json"), encoding="utf-8") as f:
+                        table = json.load(f)
+                except (OSError, ValueError) as error:
+                    table = error
+                current = table.get("candidate") if isinstance(table, dict) else None
+                if not isinstance(current, str):
+                    made, why = {}, "verification: candidate %s was prepared, but its record could not be read back (%s)" % (
+                        made.get("candidate"), table if isinstance(table, Exception) else "no candidate in it")
+                elif made.get("candidate") != current:
+                    # Another prepare replaced this candidate while the lock was let go: its command tests nothing that
+                    # can pass. Seen in a test: the older candidate's command was posted after the newer one's.
+                    print("candidate %s was replaced by %s before its test command could be posted; the newer one's stands"
+                          % (made.get("candidate"), current))
+                    return "done"
+            verifiers = [name for name, entry in members.items() if entry.get("role") == "verifier" and not entry.get("killed")]
+            if made:
+                # Each verifier is asked once for a candidate, whichever dispatch reached it first: two dispatches can
+                # meet on one candidate, and a second test of it clears the first one's result. Read off the requests
+                # themselves (`requests` on the post), not off a note that names the candidate.
+                asked = {name for p in posts if p.get("requests") == made["candidate"] for name in p.get("to", ())}
+                waiting = [name for name in verifiers if name not in asked]
+                if verifiers and not waiting:
+                    print("candidate %s on the table already holds these files and reports, and every verifier has its "
+                          "test command" % made["candidate"] if made.get("standing")
+                          else "candidate %s: every verifier already has its test command" % made["candidate"])
+                    return "done"
+                verifiers = waiting
+            if made:
                 # One post for every verifier: each runs the command with its own name last.
-                verifiers = [name for name, entry in members.items() if entry.get("role") == "verifier" and not entry.get("killed")]
                 command = shlex.join(["python3", script, run_dir, project, "test", made["candidate"]])
                 if verifiers:
                     last = (verifiers[0], "") if len(verifiers) == 1 else ("<you>", ", with your own name in place of <you>")
+                    comparison = ""
+                    count = made.get("changed_file_count")
+                    if count is not None:
+                        files = made["changed_files"]
+                        preview = ": " + ", ".join(map(shown, files)) if files else ""
+                        if count > len(files):
+                            preview += " (+%d more)" % (count - len(files))
+                        paths = "path" if count == 1 else "paths"
+                        comparison = f"Compared with {made['previous_candidate']}, {count} changed source {paths}{preview}. "
                     post_message(COORDINATOR, "%s CANDIDATE %s (path %s, digest %s), prepared from the run's plan now that "
-                                 "every worker is READY. Review every READY you have not answered against your brief, "
+                                 "every worker is READY. %sReview every READY you have not answered against your brief, "
                                  "then run exactly%s:\n%s %s" % (
                                      " ".join("@" + name for name in verifiers), made["candidate"], made["path"],
-                                     made["digest"], last[1], command, last[0]), verifiers)
+                                     made["digest"], comparison, last[1], command, last[0]), verifiers,
+                                 requests=made["candidate"])
                 print("candidate %s was prepared from the run's plan%s" % (
                     made["candidate"], " and its test command posted to the verifier" if verifiers
                     else ". No verifier is registered: its test command is\n%s <verifier>" % command))
-            elif "waiting for READY from" in why or "worker readiness changed" in why or "there are no active workers" in why:
-                if author == COORDINATOR and cmd == "dispatch":
+                return "done"
+            if "waiting for READY from" in why or "worker readiness changed" in why or "there are no active workers" in why:
+                if author == COORDINATOR and cmd == "dispatch" and not waiter:
                     print("planned: the step that completes the team prepares this candidate and posts its test command "
                           "to the verifier. Nothing is prepared yet (%s)" % why.replace("verification: ", ""))
-            elif author == COORDINATOR:
-                print("the planned candidate could not be prepared: " + why)  # the coordinator's own command: it reads this
+                return None
+            failure["why"] = why
+            if author == COORDINATOR:
+                # The coordinator's own command reads this; a waiter's output nobody reads, so its caller keeps the
+                # failure on the owed dispatch, where attention shows it.
+                print("the planned candidate could not be prepared: " + why)
             else:
                 # Not this READY's to settle alone: the coordinator hears, and so does each worker a line names.
                 told = [COORDINATOR, *(n for n in targets(why, members, sender=author) if n not in (author, COORDINATOR))]
                 post_message(author, "@coordinator The planned candidate could not be prepared after this READY:\n" + why, told)
                 print("the planned candidate could not be prepared: " + why)
+            return "failed"
+
+        failure = {"why": ""}
+
+        def owe_dispatch(author, waiter):
+            """Record, under the board lock, that the plan's dispatch waits for the verification lock, and start the one
+            waiter that serves it. `token` is new with each refusal, so a dispatch clears only what it served."""
+            owed = state.get("owed_dispatch") if isinstance(state.get("owed_dispatch"), dict) else {}
+            # A token of its own for each refusal, never reused: a counter would start again once an entry is cleared,
+            # and a dispatch still waiting for the lock could then take a newer refusal's entry for the one it served.
+            state["owed_dispatch"] = {"token": uuid.uuid4().hex, "author": author}
+            save(d, state)
+            # A waiter that still holds the waiter lock keeps serving it: one started now would only find that lock
+            # taken and end. Told by the lock, not by a process id another process may have been given since.
+            if waiter or waiter_running(d):
+                return
+            try:
+                subprocess.Popen([sys.executable, "-B", os.path.abspath(__file__), os.path.abspath(d), "dispatch", "--owed"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+            except OSError as error:  # what was saved stays saved; the dispatch waits for `dispatch`, and attention says so
+                state["owed_dispatch"]["failed"] = "its waiter could not be started (%s)" % error
+                save(d, state)
+                print("note: this was saved, but the planned candidate's dispatch could not be started (%s). Run dispatch "
+                      "once the verification action ends" % error)
+
+        def serve_owed():
+            """The waiter: once the verification lock is let go, dispatch what is owed, until nothing is. One at a time,
+            by the waiter lock; a refusal made after it looked is seen on its last look, after it lets that lock go."""
+            nonlocal state, posts, members
+            import verify  # late: verify.py imports this module
+            run_dir = os.path.abspath(d)
+            gate = verify.lock_directory(verify.Path(os.path.dirname(os.path.dirname(run_dir))), run_dir) / ".verification.lock"
+            deadline = time.monotonic() + OWED_WAIT_S
+            with open(os.path.join(d, ".dispatch-waiter"), "a") as waiter:
+                try:
+                    fcntl.flock(waiter, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return  # another waiter serves it
+                while True:
+                    owed = state.get("owed_dispatch")
+                    if not isinstance(owed, dict) or state.get("closed"):
+                        state.pop("owed_dispatch", None)
+                        save(d, state)
+                        fcntl.flock(waiter, fcntl.LOCK_UN)
+                        state, posts = relocked()
+                        if isinstance(state.get("owed_dispatch"), dict) and not state.get("closed"):
+                            try:  # owed after it looked, while no other waiter could start: taken up again
+                                fcntl.flock(waiter, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                continue
+                            except BlockingIOError:
+                                return
+                        return
+                    if owed.get("failed"):
+                        return  # attention shows it until `dispatch` serves it
+                    if time.monotonic() > deadline:
+                        why = "the verification lock of this checkout stayed held for %d minutes" % (OWED_WAIT_S // 60)
+                        owed["failed"] = why
+                        post_message(COORDINATOR, "@coordinator The planned candidate is still not prepared: %s. Run "
+                                     "`dispatch` once it is free" % why, [COORDINATOR], save_roster=True)
+                        return
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                    acquired = False
+                    with open(gate, "a") as held:  # polled, so the deadline holds however long the action runs
+                        while not acquired:
+                            try:
+                                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                acquired = True
+                            except BlockingIOError:
+                                if time.monotonic() > deadline:
+                                    break
+                                time.sleep(OWED_POLL_S)
+                    state, posts = relocked()
+                    if not acquired:
+                        continue  # past the deadline: said above, and nothing is prepared after it
+                    owed = state.get("owed_dispatch")
+                    if not isinstance(owed, dict):
+                        continue
+                    members = state["members"]
+                    outcome = run_plan(owed.get("author") or COORDINATOR, waiter=True)
+                    if outcome == "busy":
+                        continue
+                    current = state.get("owed_dispatch")
+                    if isinstance(current, dict) and current.get("token") == owed.get("token"):
+                        if outcome == "failed":
+                            current["failed"] = failure["why"] or "the planned candidate could not be prepared"
+                        else:
+                            state.pop("owed_dispatch")
+                        save(d, state)
 
         def unmerged(repo, deps, revision):
             """The dependencies, of {name: READY post}, whose READY commit REVISION does not contain."""
@@ -2263,12 +2478,24 @@ def main(argv):
                 run_plan(COORDINATOR)  # so may a retirement, of the last worker that was not ready
 
         elif cmd == "dispatch":  # verify.py's, after `prepare --when-ready` recorded the plan
-            if state.get("closed"):
-                sys.exit("the run is closed")
-            run_plan(COORDINATOR)
+            if args and args != ["--owed"]:
+                sys.exit("dispatch takes no argument but --owed")
+            if args:
+                serve_owed()  # the waiter a refused dispatch started
+            else:
+                if state.get("closed"):
+                    sys.exit("the run is closed")
+                before = state.get("owed_dispatch") if isinstance(state.get("owed_dispatch"), dict) else None
+                outcome = run_plan(COORDINATOR)
+                current = state.get("owed_dispatch")
+                # Served by hand (attention asked for it): cleared, unless a newer refusal came meanwhile or it failed.
+                if before and outcome in ("done", None) and isinstance(current, dict) and current.get("token") == before.get("token"):
+                    state.pop("owed_dispatch")
+                    save(d, state)
 
         elif cmd == "limit":
-            changes = assignments(args, LIMITS)
+            raising = "--raise" in args
+            changes = assignments([arg for arg in args if arg != "--raise"], LIMITS)
             if any(changes[k] != "" and not re.fullmatch(r"[0-9]{1,15}", changes[k])
                    for k in changes if k in ("max_workers", "max_members", "budget", "member_budget")):
                 sys.exit("limits are max_workers=N max_members=N budget=TOKENS member_budget=TOKENS and <model>=<types>, "
@@ -2292,6 +2519,15 @@ def main(argv):
                 sys.exit("The run has already used %s tokens, so budget=%s would pause it at once and stop every member "
                          "mid-work. Set a budget above what is used (used plus what the rest may cost), or stop the run "
                          "with pause" % (f"{used:,}", changes["budget"]))
+            # Judged here, under the lock, against the budget as it stands now: the hooks judged a cut against the one
+            # they read, which the user may have lowered since. A raise, or lifting the budget, says so with --raise,
+            # which the hooks allow only with a figure the user wrote.
+            standing = int(state.get("limits", {}).get("budget") or 0)
+            if "budget" in changes and not raising and standing and (
+                    not changes["budget"] or not int(changes["budget"]) or int(changes["budget"]) > standing):
+                sys.exit("budget=%s would %s the run's budget of %s: that is the user's figure. Once they have named it, "
+                         "run it again with --raise" % (changes["budget"], "lift" if not changes["budget"] or not int(changes["budget"])
+                                                        else "raise", f"{standing:,}"))
             limits = state.setdefault("limits", {})
             if "budget" in changes:  # the user's figure, or none: the board allocates no more
                 state.pop("auto_budget", None)
@@ -2306,7 +2542,7 @@ def main(argv):
             if budget and total >= budget:
                 if not state.get("paused"):  # as `account` does when a turn crosses it
                     state["paused"] = spent(budget)
-                    print("paused: %s (%d used). Raise it with limit budget=<tokens>, then resume" % (state["paused"], total))
+                    print("paused: %s (%d used). Raise it with limit --raise budget=<tokens>, then resume" % (state["paused"], total))
                 elif state["paused"].startswith("token budget of "):
                     state["paused"] = spent(budget)
             if "member_budget" in changes:
@@ -2339,7 +2575,7 @@ def main(argv):
                     "" if frozen else ", coordinator %s, reserve %s" % (f"{coordinator:,}", f"{reserve:,}")))
                 if not frozen:
                     print("  note: a piece is sized m unless told: member <name> size=s for one file or question, size=l for a "
-                          "piece across sub-systems. Only the user changes the total: limit budget=<tokens>")
+                          "piece across sub-systems. Only the user changes the total: limit --raise budget=<tokens>")
             if budget and team:
                 # The budget stands, whoever set it, so the plan is what has to fit it: said before anyone starts, not
                 # at the pause. An allocated one is short too when the team is estimated past what the board allocates.
@@ -2358,9 +2594,9 @@ def main(argv):
         elif cmd == "attention":
             if args and args != ["--json"]:
                 sys.exit("attention accepts only --json")
-            report = attention(state, posts)
-            if "--json" in args:
-                print(json.dumps(report))
+            report = attention(state, posts, d)
+            if "--json" in args:  # the pane's: it also draws the routes
+                print(json.dumps({**report, **journal_view(posts)}))
             else:
                 print(attention_text(report))
 
@@ -2935,11 +3171,22 @@ def main(argv):
             latest, role, deps = latest_reports(posts), members[me].get("role"), dependencies(members[me])
             current = readiness(members, posts)
 
+            try:
+                with open(os.path.join(d, "verification.json"), encoding="utf-8") as f:
+                    table = json.load(f)
+                on_table = table.get("candidate") if isinstance(table, dict) else None
+            except (OSError, ValueError):
+                on_table = None
+
             def needed(p):
                 """A READY that counts now and the reader works from: a dependency's for a worker, any worker's for a
                 verifier. Withheld from its `to` until it could act, the reader would otherwise pay a show for each.
                 One a NOT PASSED rejected, a retired member's, or one whose own dependencies fell back is no work to
-                build on."""
+                build on. For a verifier, also the test request for the candidate on the table: a successor agent
+                (a new address through `started`) reads on from its predecessor's cursor, and dispatch counts the
+                request as the member's, so it would never see the command it is to run."""
+                if role == "verifier" and on_table and p.get("requests") == on_table and me in p.get("to", ()):
+                    return True
                 subject = p.get("subject", p["agent"])
                 if p.get("kind") != "ready" or current.get(subject) is not p:
                     return False
@@ -3035,10 +3282,12 @@ def main(argv):
                         "run `board.py DIR sync %s` from your worktree: it merges what is missing and nothing else"
                         % (", ".join("@" + dep for dep in behind), me))
             sys.stdout.flush()
-            # Kept to the posts that are still some subject's latest report: a replaced one is never needed again.
+            # Kept to the posts that are still some subject's latest report, or the request for the candidate on the
+            # table: a replaced one is never needed again.
             changed = False
+            current_posts = {p["seq"] for p in latest.values()} | {p["seq"] for p in posts if on_table and p.get("requests") == on_table}
             for key, seqs in (("delivered", delivered), ("clipped", clipped - delivered)):
-                seqs = sorted(seqs & {p["seq"] for p in latest.values()})
+                seqs = sorted(seqs & current_posts)
                 if seqs != reader.get(key, []):
                     if seqs:
                         reader[key] = seqs
@@ -3056,7 +3305,7 @@ def main(argv):
             if emitted or done or changed:
                 save(d, state)
             if attend and not remaining:  # after the cursor moved, so what was just read is not listed as unread
-                report = attention(state, posts)
+                report = attention(state, posts, d)
                 block = attention_text(report)
                 if maximum is not None and size + len(block.encode("utf-8")) + 1 > maximum:
                     block = "%d item(s) need attention, too many for this page. Run: attention" % len(report["items"])

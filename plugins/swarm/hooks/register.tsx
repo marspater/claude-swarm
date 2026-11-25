@@ -3,17 +3,17 @@ import { atom, read, update } from 'claude-code'
 import type { AgentInfo, EngineInterface, Register, SessionMessage, Timer, ToolCallResult } from 'claude-code'
 
 import type { Member, Post, Swarm, Tab } from '../types'
-import { COORDINATOR_READ, RUN, boardCalls, type ParsedBoardCall, runsNamed, scanShell, shellWords, splitShellSegments, substitutions, unwrap, wakeMessage, wakeSequence } from './command'
-import { actsAsAnother, commitsInSharedCheckout, normalizePath, resolveRealPath, waitsOnLooseMatch } from './guard'
+import { COORDINATOR_READ, RUN, boardCalls, type ParsedBoardCall, runsNamed, scanShell, shellWords, splitShellSegments, substitutions, unwrap, wakeMessage, wakeSequence, withoutRedirects } from './command'
+import { actsAsAnother, blocksRelativeBoardLimit, commitsInSharedCheckout, hasHiddenBoardLimit, normalizePath, resolveRealPath, waitsOnLooseMatch } from './guard'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, LATEST, SPECIALISTS, SWARM_AGENTS, familyOf, latestOf, sizedEffort } from './models'
 import { CONTEXT_EARLY, CONTEXT_STOP, END, KEPT, budgetOf, contextState, findAgent, heldAt, isWindingDown, ledger, memberNamed, mentions, parse, parsePosts, postFields, targets, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
 import { CLIP, bodyOf, chipped, clean, clip, compact, fenceAfter, fenced, figuresIn, hasQuestion, head, kindOf, openedText, repeatsPosts, verdictOf, type Fence } from './text'
-import { liveIndicator, memberAccents, progressBar, progressUnits, semanticIcon, statusDot, statusInk, swarmEmblem, type BarTone, type EmblemState } from './palette'
+import { hairlineDivider, liveIndicator, memberAccents, progressBar, progressUnits, semanticIcon, statusDot, statusInk, swarmEmblem, type BarTone, type EmblemState } from './palette'
 import { MEMBER_BEE_SIZE, hiveArt, memberBee, toolMood, toolSummary, type Mood } from './hive'
-import { MIN_LABEL_PX, SVG_LIMIT, drawGraph, edgesOf, graphHeight, isBroadcast, labelPx, pairOf, visibleMembers } from './graph'
+import { MIN_LABEL_PX, SVG_LIMIT, drawGraph, earlierEdgesOf, edgesOf, graphHeight, isBroadcast, labelPx, pairOf, visibleMembers } from './graph'
 
 const PANE = 'swarm'
-const TITLE = 'Swarm'
+const TITLE = 'Swarm Board'
 const DEPLOYED = /^Swarm deployed\.(?:\s|$)/m
 const EMPTY: Swarm = { title: '', dir: '', isClosed: false, posts: [], members: [], attention: [], budget: 0, tokens: {} }
 const BOARD_TOOL = 'mcp__swarm__board'
@@ -61,9 +61,13 @@ const estimateRows = (text: string, columns: number) =>
   text.split('\n').reduce((sum, line) => sum + Math.max(1, Math.ceil(visualWidth(line) / columns)), 0)
 const TABS: Tab[] = ['board', 'attention', 'members', 'graph']
 const REPLAY_FRAME_MS = 1200
-const INACTIVE_STATUSES = ['waiting', 'not started', 'killed', 'closed']
+const INACTIVE_STATUSES = new Set(['waiting', 'not started', 'killed', 'closed'])
+const isMemberBudgetPaused = (m: Member) => m.isPaused === true || m.detail === 'its token budget is spent'
+const isMemberZombie = (m: Member) => m.isZombie === true || (m.status === 'killed' && m.detail !== '')
+const needsMemberAttention = (m: Member) =>
+  ['failed', 'unreachable', 'stopped'].includes(m.status) || isMemberBudgetPaused(m) || isMemberZombie(m)
 const inactiveOf = (members: Swarm['members']) =>
-  new Set(members.filter(m => INACTIVE_STATUSES.includes(m.status)).map(m => m.name))
+  new Set(members.filter(m => INACTIVE_STATUSES.has(m.status) && !needsMemberAttention(m)).map(m => m.name))
 
 // Every new graph source reloads the host's sandboxed frame, and members report statuses many times a second.
 // The live graph takes new statuses with a new frame (another post, or play turning into the loop), or once
@@ -108,10 +112,10 @@ function emblemStateOf(shown: Swarm): EmblemState {
 }
 
 function verdictIconOf(label: string): 'pass' | 'ready' | 'warn' | 'error' | 'info' {
-  if (label === 'VERIFIED' || label === 'PASSED') return 'pass'
+  if (label === 'VERIFIED') return 'pass'
   if (label === 'READY') return 'ready'
-  if (label === 'NOT PASSED' || label === 'NOT VERIFIED' || label === 'BLOCKED') return 'error'
-  if (label === 'Partial pass') return 'warn'
+  if (label === 'NOT PASSED' || label === 'NOT VERIFIED') return 'error'
+  if (label === 'PARTIAL PASS' || label === 'Partial pass' || label === 'REVISE' || label === 'SHUTDOWN') return 'warn'
   return 'info'
 }
 
@@ -122,7 +126,20 @@ function attentionIconOf(kind: string, tone: string | undefined): 'warn' | 'erro
   return 'info'
 }
 
-const hairlineDivider = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 1" preserveAspectRatio="none"><style>rect{fill:#d8dbe0}@media(prefers-color-scheme:dark){rect{fill:#35383f}}@supports(color:color(display-p3 1 0 0)){rect{fill:color(display-p3 .85 .86 .88)}@media(prefers-color-scheme:dark){rect{fill:color(display-p3 .21 .22 .25)}}}</style><rect width="200" height="1"/></svg>`
+const formatAttentionKind = (kind: string) => String(kind || 'note').replace(/[_-]+/g, ' ').toUpperCase()
+
+function terminalStatusGlyph(status: string, isPaused = false): string {
+  if (isPaused && !['killed', 'closed', 'failed', 'unreachable', 'stopped'].includes(status)) return '‖'
+  if (status === 'coordinating') return '◆'
+  if (status === 'working') return '●'
+  if (status === 'failed') return '✕'
+  if (status === 'unreachable') return '!'
+  if (status === 'stopped') return '■'
+  return '○'
+}
+
+const utf8Encoder = new TextEncoder()
+const byteLength = (text: string) => utf8Encoder.encode(text).length
 
 const swarm = atom({ plugin: 'swarm', key: 'swarm' } as const, EMPTY, {
   shape: 'swarm-4',
@@ -145,6 +162,8 @@ const expanded = atom({ plugin: 'swarm', key: 'expanded' } as const, 0)
 const inspected = atom({ plugin: 'swarm', key: 'inspected' } as const, null as Post | null)
 const history = atom({ plugin: 'swarm', key: 'history' } as const, null as { dir: string; posts: Post[] } | null)
 let boardNavigation = 0
+// The newest diff asked for: an older one that loads after it is dropped, not shown over it.
+let diffAsked = 0
 // The READY whose commit's diff is open under it and that diff as git printed it, after a first line that says
 // what it covers; seq 0 for none.
 const NO_DIFF = { seq: 0, text: '' }
@@ -164,9 +183,18 @@ let runEdge: { dir: string; older?: boolean; newer?: boolean } = { dir: '' }
 const shownSwarm = async ($: EngineInterface) => browsed ?? await read($, swarm)
 // The run whose long title is shown whole; '' for none.
 let titleOpen = ''
+// Lightweight in-flight indicators for async pane actions.
+let loadingDiffSeq = 0
+// The request that shows each, 0 for none: one a navigation or a newer request made stale shows nothing, and its end
+// clears only its own.
+let loadingHistory = 0
+let exportingRun = 0
+let exportAsked = 0
+let retryingRun = 0
 // Whether the graph's routes are listed in words under the drawing, and how many pages of them are shown.
 let routesListed = false
 let routePages = 1
+let routeRun = ''
 
 // Roster order picks the member's hue across the board and cards.
 const HUES = ['claude', 'suggestion', 'planMode', 'ide', 'merged', 'permission', 'remember', 'autoAccept'] as const
@@ -1446,10 +1474,13 @@ function unreadNotice($: EngineInterface, dir: string): string {
 }
 
 function moodOf(full: Swarm, agents: AgentInfo[]): Mood {
-  if (full.isClosed || full.isPaused) return 'sleep'
+  if (full.isClosed) return 'sleep'
+  if (full.isPaused) return 'paused'
   const participants = new Set(full.members.filter(m => m.status === 'working' || m.status === 'coordinating')
     .map(m => m.role === 'coordinator' ? 'coordinator' : findAgent(agents, m.id)?.id ?? m.id))
-  if (!participants.size) return 'sleep'
+  if (!participants.size) {
+    return full.attention.length > 0 || full.members.some(needsMemberAttention) ? 'attention' : 'sleep'
+  }
   return Array.from(moods).reverse().find(([id]) => participants.has(id))?.[1] ?? 'forage'
 }
 
@@ -1581,7 +1612,7 @@ async function refresh($: EngineInterface): Promise<void> {
       attentionRetry = report ? 0 : now + 10_000
       full = parse(dir, board, rosterText, agents, Infinity, report, coordinating)
       full.mood = moodOf(full, agents)
-      const next = { ...full, posts: full.posts.slice(-KEPT), earlierEdges: edgesOf(full.posts.slice(0, -KEPT)), attentionUnavailable: !report }
+      const next = { ...full, posts: full.posts.slice(-KEPT), earlierEdges: earlierEdgesOf(full.posts, full.posts.slice(-KEPT), report?.edges, report?.through), attentionUnavailable: !report }
       const previous = await read($, swarm)
       if (epoch !== generation || isEnding) return
       const lastPost = previous.posts.at(-1)?.seq ?? 0
@@ -1589,6 +1620,11 @@ async function refresh($: EngineInterface): Promise<void> {
         closeTalk($)
         await seek($, 0)
         await update($, expanded, () => 0)
+        // A diff or an older page asked for on the run shown before is that visit's, even when it comes back to it.
+        // A poll of the same run leaves both alone.
+        diffAsked++
+        loadingDiffSeq = 0
+        boardNavigation++
         await update($, diff, () => NO_DIFF)
         await update($, inspected, () => null)
         await update($, earlier, () => 0)
@@ -1978,6 +2014,8 @@ let toldFailedCompaction = ''
 // one that stands. Seen live: a coordinator whose team was estimated past the budget set 3,000,000 by itself.
 const userFigures = new Set<number>()
 const BUDGET_IS_USERS = 'Nothing changed: the budget is the user\'s to set, and no message of theirs names this figure. Tell them what the run has used and what the plan estimates, and ask for the new total as a figure. Once they write one, set it. Lowering the budget needs no word from them.'
+const BUDGET_NEEDS_PLAIN_ARGS = 'Nothing ran: set run limits with the board tool or a direct board command with literal options.'
+const SHELL_LIMIT_EXPANSION = /[$`*?\[\]{}]/
 /**
  * Whether the coordinator may set this budget: one no higher than the one that stands, or the total the user wrote.
  * "Raise it by 500k" names no total, so the coordinator asks for one: a raise it could apply would apply again.
@@ -1989,17 +2027,57 @@ const mayBudget = (asked: number, standing: number) => Number.isSafeInteger(aske
  * keeps the last one; `budget=` with no figure lifts the budget, and a value that is no plain figure (`9_000_000`,
  * `$B`) is none the user wrote.
  */
-/** The budget that stands for the run driven now: the board's own word when no poll has shown it yet, as right after `init`. */
-async function standingBudget($: EngineInterface): Promise<number> {
-  const dir = await read($, run).catch(() => '')
-  if (snapshot && snapshot.dir === dir) return snapshot.budget
+/** The standing budget of the target run, or the run driven now for the board tool. */
+async function standingBudget($: EngineInterface, target?: string): Promise<number> {
+  const dir = await (target === undefined ? read($, run) : resolveRunDir($, target)).catch(() => '')
   if (!dir) return 0
-  return $.fs.read(`${dir}/members.json`).then(text => Number((JSON.parse(text) as { limits?: { budget?: string } }).limits?.budget ?? 0) || 0).catch(() => 0)
+  // The board's own word, never the pane's snapshot: that is as old as the last poll, and a raise judged against it
+  // could pass a figure the saved budget does not allow. A roster this cannot read stands for no budget, so only a
+  // figure the user wrote passes. Seen in a test: a budget raised to 3M while the snapshot still held 1M refused a cut
+  // to 2M.
+  try {
+    return Number((JSON.parse(await $.fs.read(`${dir}/members.json`)) as { limits?: { budget?: string } } | null)?.limits?.budget ?? 0) || 0
+  } catch {
+    return 0
+  }
 }
+// With --raise the board writes the figure whatever the budget is by then, so only one the user wrote passes. Without
+// it, a cut passes here and the board refuses it if, by the time it writes, it would be a raise.
 const breaksBudget = (options: string[], standing: number) => options.some(option => {
   const asked = /^budget=(.*)$/s.exec(option.trim())?.[1]
-  return asked !== undefined && !mayBudget(asked === '' ? 0 : Number(asked), standing)
+  if (asked === undefined) return false
+  const figure = asked === '' ? 0 : Number(asked)
+  return options.some(word => word.trim() === '--raise') ? !userFigures.has(figure) : !mayBudget(figure, standing)
 })
+const limitOptions = (call: ParsedBoardCall) => withoutRedirects(shellWords(call.rest)).words.slice(1)
+
+async function bashLimitDenial($: EngineInterface, command: string, calls: ParsedBoardCall[]): Promise<string | undefined> {
+  if (hasHiddenBoardLimit(command)) return BUDGET_NEEDS_PLAIN_ARGS
+  let hasRelative = false
+  for (const call of calls) {
+    if (call.action !== 'limit') continue
+    // `..` after a folder that may be a symlink leads the board elsewhere than the path read as text:
+    // `/p/link/../.swarm/R` is judged against /p/.swarm/R while board.py raises the run under link's target. A leading
+    // `../` is read from the physical folder the shell is in (see blocksRelativeBoardLimit), as the board reads it.
+    if (SHELL_LIMIT_EXPANSION.test(call.dir) || /(?:^|\/)(?!\.\.(?:\/|$))[^/]+\/\.\.(?:\/|$)/.test(call.dir)) return BUDGET_NEEDS_PLAIN_ARGS
+    const options = limitOptions(call)
+    if (call.dir.startsWith('/')) {
+      if (breaksBudget(options, await standingBudget($, call.dir))) return BUDGET_IS_USERS
+    } else {
+      hasRelative = true
+    }
+    if (options.some(word => SHELL_LIMIT_EXPANSION.test(word))) return BUDGET_NEEDS_PLAIN_ARGS
+  }
+  if (!hasRelative) return
+  let denial: string | undefined
+  const blocked = await blocksRelativeBoardLimit($, command, async (call, target) => {
+    const standing = target === undefined ? 0 : await standingBudget($, target)
+    if (!breaksBudget(limitOptions(call), standing)) return false
+    denial = target === undefined ? BUDGET_NEEDS_PLAIN_ARGS : BUDGET_IS_USERS
+    return true
+  })
+  return blocked ? denial ?? BUDGET_NEEDS_PLAIN_ARGS : undefined
+}
 /**
  * Owes the run's compaction when the coordinator is idle with a long conversation: first once the team is deployed
  * (LONG), then whenever the conversation has grown back (HEAVY). Never with a mention unread, a wake to relay or a
@@ -2526,6 +2604,10 @@ async function resetView($: EngineInterface): Promise<void> {
   talk = undefined
   await seek($, 0)
   await update($, expanded, () => 0)
+  // A diff or an older page still loading belongs to the visit this ends: back on the same run, neither opens.
+  diffAsked++
+  loadingDiffSeq = 0
+  boardNavigation++
   await update($, diff, () => NO_DIFF)
   await update($, inspected, () => null)
   await update($, earlier, () => 0)
@@ -2541,7 +2623,11 @@ async function readRun($: EngineInterface, dir: string, roster: string, isClosed
     return ''
   }), reportOf($, dir)])
   const agents = isClosed ? [] : await $.agent.list().catch(() => [])
-  return { ...parse(dir, board, roster, agents, KEPT, report), mood: 'sleep', attentionUnavailable: !report, boardUnavailable }
+  const parsed = parse(dir, board, roster, agents, KEPT, report)
+  const mood: Mood = parsed.isClosed ? 'sleep'
+    : parsed.isPaused ? 'paused'
+      : (parsed.attention.length > 0 || parsed.members.some(needsMemberAttention)) ? 'attention' : 'sleep'
+  return { ...parsed, mood, attentionUnavailable: !report, boardUnavailable }
 }
 
 /** Reads the browsed run again in place: the tab, the open post and the scroll stay as they are. */
@@ -2549,14 +2635,18 @@ async function reloadBrowsed($: EngineInterface): Promise<void> {
   const dir = browsed?.dir
   if (dir === undefined) return
   const gen = ++browseGen
+  retryingRun = gen
+  $.ui.invalidate('ui.render')
   try {
     const roster = await $.fs.read(`${dir}/members.json`)
     const next = await readRun($, dir, roster, (JSON.parse(roster) as { closed?: boolean } | null)?.closed === true)
     if (gen !== browseGen || browsed?.dir !== dir) return
     browsed = next
-    $.ui.invalidate('ui.render')
   } catch {
     if (gen === browseGen) $.ui.toast('Swarm could not read this run again.')
+  } finally {
+    if (retryingRun === gen) retryingRun = 0
+    $.ui.invalidate('ui.render')
   }
 }
 
@@ -2917,39 +3007,60 @@ let headNoted = ''
 async function showDiff($: EngineInterface, dir: string, seq: number, revision: string, base?: string, except: readonly string[] = []): Promise<void> {
   const project = dir.slice(0, dir.lastIndexOf('/.swarm/'))
   const sEpoch = sessionEpoch
+  const asked = ++diffAsked
+  loadingDiffSeq = seq
+  $.ui.invalidate('ui.render')
   const git = (args: string[]) => $.process.run(['git', '-C', project, ...args], { timeoutMs: 10_000 })
     .catch(error => ({ exitCode: 1, stdout: '', stderr: String(error) }))
   const shape = ['--stat', '--patch', '--no-color', '--no-ext-diff']
-  let shown
-  let scope
-  if (base !== undefined) {
-    shown = await git(['log', '--first-parent', '--no-merges', '--reverse', ...shape, revision, '--not', base, ...except])
-    scope = `First-parent commits since ${base.slice(0, 7)} · merges omitted`
-  } else {
-    shown = await git(['diff', ...shape, `HEAD...${revision}`])
-    scope = `What ${revision.slice(0, 7)} changes since it branched from HEAD, including any synced dependency's work not yet in HEAD`
-    if (shown.exitCode === 0 && shown.stdout.trim() === '') {
-      shown = await git(['show', '--first-parent', ...shape, revision])
-      scope = `Last commit only (${revision.slice(0, 7)}): this report records no base, so its earlier commits are not shown`
+  try {
+    let shown
+    let scope
+    if (base !== undefined) {
+      shown = await git(['log', '--first-parent', '--no-merges', '--reverse', ...shape, revision, '--not', base, ...except])
+      scope = `First-parent commits since ${base.slice(0, 7)} · merges omitted`
+    } else {
+      shown = await git(['diff', ...shape, `HEAD...${revision}`])
+      scope = `What ${revision.slice(0, 7)} changes since it branched from HEAD, including any synced dependency's work not yet in HEAD`
+      if (shown.exitCode === 0 && shown.stdout.trim() === '') {
+        shown = await git(['show', '--first-parent', ...shape, revision])
+        scope = `Last commit only (${revision.slice(0, 7)}): this report records no base, so its earlier commits are not shown`
+      }
+    }
+    // git may take seconds: a diff for a run no longer shown would open under another run's post of the same number.
+    if (sEpoch !== sessionEpoch || (await shownSwarm($)).dir !== dir || asked !== diffAsked) return
+    if (shown.exitCode !== 0) {
+      $.ui.toast(`Swarm could not show ${revision.slice(0, 12)}: ${clean(shown.stderr).trim().split('\n')[0] || 'git failed'}`)
+      return
+    }
+    const text = clip(clean(shown.stdout).trimEnd(), DIFF_CLIP)
+    // A fence longer than any run of backticks in the diff, so a Markdown file's own fences stay inside it.
+    const fence = '`'.repeat(Math.max(3, ...[...text.matchAll(/`+/g)].map(run => run[0].length + 1)))
+    // Asked again as it is stored: a newer diff may have been shown during the await above.
+    await update($, diff, current => asked === diffAsked ? { seq, text: `${scope}\n${fence}diff\n${text}\n${fence}` } : current)
+  } finally {
+    if (asked === diffAsked) {
+      loadingDiffSeq = 0
+      $.ui.invalidate('ui.render')
     }
   }
-  // git may take seconds: a diff for a run no longer shown would open under another run's post of the same number.
-  if (sEpoch !== sessionEpoch || (await shownSwarm($)).dir !== dir) return
-  if (shown.exitCode !== 0) {
-    $.ui.toast(`Swarm could not show ${revision.slice(0, 12)}: ${clean(shown.stderr).trim().split('\n')[0] || 'git failed'}`)
-    return
-  }
-  const text = clip(clean(shown.stdout).trimEnd(), DIFF_CLIP)
-  // A fence longer than any run of backticks in the diff, so a Markdown file's own fences stay inside it.
-  const fence = '`'.repeat(Math.max(3, ...[...text.matchAll(/`+/g)].map(run => run[0].length + 1)))
-  await update($, diff, () => ({ seq, text: `${scope}\n${fence}diff\n${text}\n${fence}` }))
 }
 
 /** Writes the shown run's Markdown summary with the board's export and says where. */
 async function exportRun($: EngineInterface, dir: string): Promise<void> {
-  const written = await boardCommand($, dir, ['export']).catch(error => ({ exitCode: 1, stdout: '', stderr: String(error) }))
-  const path = clean(written.stdout).trim().split('\n').at(-1) ?? ''
-  $.ui.toast(written.exitCode === 0 && path ? `Swarm wrote ${path}` : `Swarm: ${clean(written.stderr).trim() || 'the board\'s export command failed'}`)
+  if (exportingRun) return
+  // Its own number: one a session change left running neither ends a newer export's "Exporting…" nor speaks for it.
+  const asked = ++exportAsked
+  exportingRun = asked
+  $.ui.invalidate('ui.render')
+  try {
+    const written = await boardCommand($, dir, ['export']).catch(error => ({ exitCode: 1, stdout: '', stderr: String(error) }))
+    const path = clean(written.stdout).trim().split('\n').at(-1) ?? ''
+    if (exportingRun === asked) $.ui.toast(written.exitCode === 0 && path ? `Swarm wrote ${path}` : `Swarm: ${clean(written.stderr).trim() || 'the board\'s export command failed'}`)
+  } finally {
+    if (exportingRun === asked) exportingRun = 0
+    $.ui.invalidate('ui.render')
+  }
 }
 
 // The band's button that opens the pane.
@@ -2959,25 +3070,46 @@ function shortcut($: EngineInterface, e: Parameters<EngineInterface['ui']['resol
   const working = isLive ? shown.members.filter(m => m.status === 'working').length : 0
   const coordinating = isLive ? shown.members.filter(m => m.status === 'coordinating').length : 0
   const attentionCount = isLive ? shown.attention.length : 0
-  const isPrimary = isLive && !shown.isPaused && attentionCount === 0
-  const button = (
+  const isPrimary = isLive && (!shown.isPaused || attentionCount > 0)
+  const badgeParts: string[] = []
+  if (isLive) {
+    if (shown.isPaused) badgeParts.push('paused')
+    else if (working > 0) badgeParts.push(`${working} working`)
+    else if (coordinating > 0) badgeParts.push(`${coordinating} coordinating`)
+    if (attentionCount > 0) badgeParts.push(`${attentionCount} attention`)
+  }
+  const badgeText = badgeParts.join(' · ')
+  const badgeColor = shown?.isPaused || attentionCount > 0 ? 'warning' : working > 0 ? 'success' : 'claude'
+  const showBadge = badgeText !== '' && !singleCaption
+  const button = showBadge ? (
     <Button
       key={SHORTCUT}
       variant={isPrimary ? 'primary' : 'secondary'}
-      label="Swarm: The Board"
+      label={`Swarm Board · ${badgeText}`}
+      onPress={() => void openBoard($).catch(() => undefined)}
+    >
+      Swarm Board
+      <Text size="caption" weight="medium" color={isPrimary ? undefined : badgeColor} tabular>{` · ${badgeText}`}</Text>
+    </Button>
+  ) : (
+    <Button
+      key={SHORTCUT}
+      variant={isPrimary ? 'primary' : 'secondary'}
+      label="Swarm Board"
       onPress={() => void openBoard($).catch(() => undefined)}
     />
   )
-  if (e.surface !== 'desktop') return button
+  if (e.surface === 'terminal') return button
   const { Svg } = $.ui.resolve(e)
   const state = shown ? emblemStateOf(shown) : 'idle'
-  const badgeText = !isLive ? ''
-    : shown.isPaused ? 'paused'
-      : attentionCount > 0 ? `${attentionCount} attention`
-        : working > 0 ? `${working} working`
-          : coordinating > 0 ? `${coordinating} coordinating` : ''
-  const badgeColor = shown?.isPaused || attentionCount > 0 ? 'warning' : working > 0 ? 'success' : 'claude'
-  const showBadge = badgeText !== '' && !singleCaption
+  if (e.surface !== 'desktop') {
+    return (
+      <Box flexDirection="row" alignItems="center" flexShrink={0} columnGap="xs">
+        <Box flexShrink={0}><Svg source={swarmEmblem(state, emblemOffset)} alt="Swarm" width={16} height={16} /></Box>
+        {button}
+      </Box>
+    )
+  }
   // Cover the composer's tinted inset with the same theme surface as the crab.
   // Keep the honeycomb emblem beside the native Button (not trapped inside a separate outer border)
   // so the entire button pill highlights uniformly from edge to edge on mouse hover.
@@ -2999,18 +3131,8 @@ function shortcut($: EngineInterface, e: Parameters<EngineInterface['ui']['resol
       marginBottom={-1.16}
       paddingBottom={singleCaption ? 0.16 : 1.16}
     >
-      <Svg source={swarmEmblem(state, emblemOffset)} alt="Swarm" width={16} height={16} />
-      {showBadge ? (
-        <Button
-          key={SHORTCUT}
-          variant={isPrimary ? 'primary' : 'secondary'}
-          label="Swarm: The Board"
-          onPress={() => void openBoard($).catch(() => undefined)}
-        >
-          Swarm: The Board
-          <Text size="caption" weight="medium" color={isPrimary ? undefined : badgeColor} tabular>{` · ${badgeText}`}</Text>
-        </Button>
-      ) : button}
+      <Box flexShrink={0}><Svg source={swarmEmblem(state, emblemOffset)} alt="Swarm" width={16} height={16} /></Box>
+      {button}
     </Box>
   )
 }
@@ -3064,7 +3186,13 @@ export const register: Register = on => {
     isCoordinatorBusy = isEnding = isRefreshOwed = isPaneOpen = isWatched = false
     activeCoordinatorTurnId = undefined
     // A start that follows no session.end (a reload) still opens its run's pane and reads its state anew.
-    opened = closedRun = ''
+    opened = closedRun = titleOpen = ''
+    loadingDiffSeq = 0
+    loadingHistory = retryingRun = 0
+    exportingRun = 0
+    // A load the last session started is not this one's, even for the same run.
+    boardNavigation++
+    diffAsked++
     sawSwarmCommand = false
     pluginBoardScript = normalizePath(`${$.plugin.root}/skills/swarm/scripts/board.py`)
     forgetKills()
@@ -3178,9 +3306,9 @@ export const register: Register = on => {
       return { deny: 'Nothing ran: this command waits on a loose process match, which can match unrelated command lines. Match the process name exactly with `pgrep -x NAME`, or wait on the PID of a process you started.' }
     }
     const calls = e.tool === 'Bash' ? boardCalls(command) : []
-    if (e.agentId === undefined && calls.some(call => call.action === 'limit')) {
-      const standing = await standingBudget($)
-      if (calls.some(call => call.action === 'limit' && breaksBudget(call.rest.split(/\s+/).map(word => word.replace(/^['"]|['"]$/g, '')), standing))) return { deny: BUDGET_IS_USERS }
+    if (e.agentId === undefined && e.tool === 'Bash') {
+      const deny = await bashLimitDenial($, command, calls)
+      if (deny) return { deny }
     }
     const isCoordinatorBg = e.agentId === undefined && (e.tool === 'Monitor' || (e.tool === 'Bash' && e.run_in_background === true))
     const isMemberGuard = e.agentId !== undefined && (e.tool === 'Edit' || e.tool === 'Write' || e.tool === 'NotebookEdit' || e.tool === 'Bash')
@@ -3976,7 +4104,13 @@ export const register: Register = on => {
     spawnIsolations.clear()
     sharedAgents.clear()
     isolatedAgents.clear()
-    opened = closedRun = ''
+    opened = closedRun = titleOpen = ''
+    loadingDiffSeq = 0
+    loadingHistory = retryingRun = 0
+    exportingRun = 0
+    // A load the last session started is not this one's, even for the same run.
+    boardNavigation++
+    diffAsked++
     sawSwarmCommand = false
     talk = browsed = undefined
     isCoordinatorBusy = false
@@ -4120,7 +4254,7 @@ export const register: Register = on => {
     if (!(await read($, run)) && (e.surface !== 'desktop' || !hadRun)) return next(e)
     if (e.surface === 'desktop' && (await $.ui.panes()).some(p => p.id === PANE && p.isShown && p.isPlaced)) return next(e)
     const shown = await read($, swarm)
-    const offset = e.surface === 'desktop' ? phase(`${e.surface}:shortcut`, shown.dir, emblemStateOf(shown), await $.clock.now().catch(() => 0)) : 0
+    const offset = e.surface !== 'terminal' ? phase(`${e.surface}:shortcut`, shown.dir, emblemStateOf(shown), await $.clock.now().catch(() => 0)) : 0
     return shortcut($, e, false, shown, offset)
   })
 
@@ -4144,7 +4278,7 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
-    if (e.surface !== 'desktop' || e.props.isSummary || !DEPLOYED.test(e.props.text) || !(await read($, run))) return next(e)
+    if (e.surface === 'terminal' || e.props.isSummary || !DEPLOYED.test(e.props.text) || !(await read($, run))) return next(e)
     const { Box, Text, Button, Svg } = $.ui.resolve(e)
     const reply = await next(e)
     const shown = await read($, swarm)
@@ -4153,6 +4287,10 @@ export const register: Register = on => {
     const borderColor = shown.dir === '' || shown.isClosed ? 'subtle'
       : shown.isPaused || shown.attention.length > 0 ? 'warning'
         : working > 0 ? 'success' : 'claude'
+    const subtitle = shown.dir === '' ? 'Multi-agent board & graph'
+      : shown.isClosed ? 'Closed run · board & graph'
+        : shown.isPaused ? 'Paused run · board & graph'
+          : 'Live multi-agent board & graph'
     const emblemOffset = phase(`${e.surface}:reply:${shown.dir}`, shown.dir, state, await $.clock.now().catch(() => 0))
     return (
       <Box flexDirection="column" rowGap="sm">
@@ -4177,14 +4315,14 @@ export const register: Register = on => {
               <Svg source={swarmEmblem(state, emblemOffset)} alt="Swarm" width={20} height={20} />
             </Box>
             <Box flexDirection="column" flexShrink={1} minWidth={0}>
-              <Text weight="semibold" color={shown.isClosed ? undefined : 'claude'} wrap="truncate-end">Swarm</Text>
-              <Text size="caption" dimColor wrap="truncate-end">Live multi-agent board &amp; graph</Text>
+              <Text weight="semibold" color={shown.isClosed ? undefined : 'claude'} wrap="truncate-end">Swarm Board</Text>
+              <Text size="caption" dimColor wrap="truncate-end">{subtitle}</Text>
             </Box>
           </Box>
           <Button
             key="swarm-board-from-reply"
             variant="primary"
-            label="Open Swarm board"
+            label="Open Swarm Board"
             onPress={() => void openBoard($).catch(() => undefined)}
           />
         </Box>
@@ -4195,10 +4333,20 @@ export const register: Register = on => {
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
     if (e.props.origin.kind !== 'plugin' || e.props.origin.name !== $.plugin.name || !e.props.text.startsWith('Swarm: ')) return next(e)
     const { Box, Text } = $.ui.resolve(e)
+    const Emblem = e.surface !== 'terminal' ? $.ui.resolve(e).Svg : undefined
     const [heading, ...body] = e.props.text.slice('Swarm: '.length).split('\n')
     return (
       <Box flexDirection="column" borderStyle="round" borderColor="claude" borderDimColor paddingX="sm" paddingY="xs" gap="xs">
-        <Text dimColor><Text weight="semibold" color="claude">Swarm</Text>{` · ${heading}`}</Text>
+        <Box flexDirection="row" alignItems="center" columnGap="xs" minWidth={0}>
+          {Emblem && <Box flexShrink={0}><Emblem source={swarmEmblem('coordinating')} alt="Swarm" width={16} height={16} /></Box>}
+          <Box flexShrink={1} minWidth={0}>
+            <Text dimColor wrap="truncate-end">
+              <Text weight="semibold" color="claude">Swarm</Text>
+              {` · ${heading}`}
+              {!e.props.isExpanded && body.length > 0 && ` (${counted(body.length, 'more line')})`}
+            </Text>
+          </Box>
+        </Box>
         {e.props.isExpanded && body.length > 0 && <Text size="caption" dimColor>{body.join('\n')}</Text>}
       </Box>
     )
@@ -4238,15 +4386,17 @@ export const register: Register = on => {
         paddingY="xs"
       >
         <Box flexDirection="row" alignItems="center" columnGap="sm" flexShrink={1} minWidth={0}>
-          {Emblem && <Box flexShrink={0}><Emblem source={swarmEmblem(state, emblemOffset)} alt="Swarm" width={22} height={22} /></Box>}
+          {Emblem && <Box flexShrink={0}><Emblem source={swarmEmblem(state, emblemOffset)} alt="Swarm" width={20} height={20} /></Box>}
           <Box flexDirection="column" flexShrink={1} minWidth={0}>
             <Text wrap="truncate-end">
-              <Text weight="semibold" color={isShown && !shown.isClosed ? 'claude' : undefined}>Swarm</Text>
-              {isShown && <Text weight="medium">{`  ${shown.title}`}</Text>}
+              <Text weight="semibold" color={isShown && !shown.isClosed ? 'claude' : undefined}>Swarm Board</Text>
+              {isShown && <Text weight="medium">{` · ${shown.title}`}</Text>}
             </Text>
-            {isShown && (
-              <Text size="caption" dimColor tabular>
-                {`${shown.isClosed ? 'closed' : shown.isPaused ? `paused · ${counted(activeMembers, 'member')}` : counted(activeMembers, 'member')} · ${counted(shown.total ?? shown.posts.length, 'post')}`}
+            {isShown ? (
+              <Text size="caption" dimColor tabular wrap="truncate-end">
+                {shown.isClosed ? 'closed' : shown.isPaused ? <Text color="warning" weight="medium">paused</Text> : null}
+                {shown.isClosed ? '' : `${shown.isPaused ? ' · ' : ''}${counted(activeMembers, 'member')}`}
+                {` · ${counted(shown.total ?? shown.posts.length, 'post')}`}
                 {!shown.isClosed && !shown.isPaused && working > 0 && (
                   <Text color="success" weight="medium">{` · ${working} working`}</Text>
                 )}
@@ -4254,13 +4404,15 @@ export const register: Register = on => {
                   <Text color="warning" weight="medium">{` · ${shown.attention.length} attention`}</Text>
                 )}
               </Text>
+            ) : (
+              <Text size="caption" dimColor wrap="truncate-end">Open the Swarm board</Text>
             )}
           </Box>
         </Box>
         <Button
           key="open-swarm"
           variant="primary"
-          label="Open Swarm board"
+          label="Open Swarm Board"
           onPress={() => void openBoard($).catch(() => undefined)}
         />
       </Box>
@@ -4276,6 +4428,11 @@ export const register: Register = on => {
       void refresh($)
     }
     const shown = await shownSwarm($)
+    if (routeRun !== shown.dir) {
+      routeRun = shown.dir
+      routesListed = false
+      routePages = 1
+    }
     const error = await read($, loadError)
     const now = HeaderArt ? await $.clock.now() : 0
     const slot = (part: string) => `${e.surface}:pane:${part}`
@@ -4288,8 +4445,8 @@ export const register: Register = on => {
       const state = emblemStateOf(shown)
       return (
         <Box flexDirection="row" columnGap="xs" alignItems="center">
-          {HeaderArt && <HeaderArt source={swarmEmblem(state, phase(slot('widget'), shown.dir, state, now))} alt="Swarm" width={16} height={16} />}
-          <Text weight="semibold">Swarm board</Text>
+          {HeaderArt && <Box flexShrink={0}><HeaderArt source={swarmEmblem(state, phase(slot('widget'), shown.dir, state, now))} alt="Swarm" width={16} height={16} /></Box>}
+          <Text weight="semibold">Swarm Board</Text>
           {shown.dir === '' ? (
             <Text dimColor>No swarm</Text>
           ) : shown.isClosed ? (
@@ -4301,7 +4458,7 @@ export const register: Register = on => {
           ) : coordinating > 0 ? (
             <Text color="claude" weight="medium" tabular>{`${coordinating} coordinating`}</Text>
           ) : null}
-          {shown.dir !== '' && shown.attention.length > 0 && (
+          {shown.dir !== '' && !shown.isClosed && shown.attention.length > 0 && (
             <Text color="warning" weight="semibold" tabular>{`${shown.attention.length} attention`}</Text>
           )}
         </Box>
@@ -4329,6 +4486,9 @@ export const register: Register = on => {
       if ((await read($, query)) !== `@${name}`) await update($, query, () => `@${name}`)
       if ((await read($, inspected)) !== null) await update($, inspected, () => null)
       if (await read($, latestOnly)) await update($, latestOnly, () => false)
+      // The feed is the latest window's: an older page left open on Board may hold none of this member's posts.
+      boardNavigation++
+      if ((await read($, history)) !== null) await update($, history, () => null)
       if ((await read($, tab)) !== 'board') await update($, tab, () => 'board')
     }
     const hiding = await read($, hideInactive)
@@ -4373,7 +4533,7 @@ export const register: Register = on => {
     // The buttons that change a run act on the one this conversation owns, while it is open: never on a run only looked at.
     const isDriven = !browsed && !shown.isClosed && (await read($, run)) === shown.dir
     // A run looked at is read once, so what could not be read is read again only on a press, in place.
-    const retry = browsed && <Button key="run-retry" plain label="Retry" onPress={() => reloadBrowsed($)} />
+    const retry = browsed && <Button key="run-retry" plain label={retryingRun !== 0 && retryingRun === browseGen ? 'Retrying…' : 'Retry'} onPress={() => reloadBrowsed($)} />
     const working = shown.members.filter(m => m.status === 'working').length
     const coordinating = shown.members.filter(m => m.status === 'coordinating').length
     const waiting = shown.members.filter(m => m.role !== 'coordinator' && m.status === 'waiting').length
@@ -4458,11 +4618,16 @@ export const register: Register = on => {
       const most = [...edges.values()].reduce((max, count) => Math.max(max, count), 1)
       const maxDigits = Math.max(1, ...visibleEdges.map(([, c]) => String(c).length))
       return edges.size === 0 ? (
-        <Text dimColor>No mentions yet.</Text>
+        <Box flexDirection="row" alignItems="center" columnGap="xs" borderStyle="round" borderColor="subtle" borderDimColor paddingX="sm" paddingY="xs" minWidth={0}>
+          {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon('info')} alt="Info" width={12} height={12} /></Box>}
+          <Box flexShrink={1} minWidth={0}>
+            <Text dimColor>No mentions yet.</Text>
+          </Box>
+        </Box>
       ) : (
         <Box flexDirection="column">
           {visibleEdges.map(([edge, count]) => (
-            <Text key={edge} tabular>
+            <Text key={edge} tabular wrap="truncate-end">
               <Text color="claude">
                 {'█'.repeat(Math.max(1, Math.round((count / most) * 8))).padEnd(8, '░')}
               </Text>
@@ -4471,7 +4636,7 @@ export const register: Register = on => {
           ))}
           {unseen > 0 && <Text dimColor>{`… and ${unseen} more`}</Text>}
           {(unseen > 0 || routePages > 1) && (
-            <Box flexDirection="row" gap="sm">
+            <Box flexDirection="row" gap="sm" flexWrap="wrap">
               {unseen > 0 && <Button key="routes-more" plain dimColor label={`Show ${Math.min(page, unseen)} more routes`} onPress={() => showPages(routePages + 1)} />}
               {routePages > 1 && <Button key="routes-fewer" plain dimColor label="Show fewer routes" onPress={() => showPages(1)} />}
             </Box>
@@ -4497,20 +4662,27 @@ export const register: Register = on => {
         ? [inspectedPost, ...shown.posts] : shown.posts)
       const before = (page ?? shown.posts)[0]?.seq ?? 1
       const historyControls = (page || before > 1) && (
-        <Box flexDirection="row" flexWrap="wrap" gap="sm">
-          {page && <Text dimColor>{`Posts #${before}–#${page.at(-1)?.seq} of ${shown.total ?? shown.posts.length}`}</Text>}
+        <Box flexDirection="row" flexWrap="wrap" gap="sm" alignItems="center">
+          {page && <Text size="caption" dimColor tabular>{`Posts #${before}–#${page.at(-1)?.seq} of ${shown.total ?? shown.posts.length}`}</Text>}
           {page && <Button key="history-latest" plain label="Back to latest posts" onPress={() => {
             boardNavigation++
             return update($, history, () => null)
           }} />}
-          {before > 1 && <Button key="history-page" plain label={page ? 'Older posts' : 'Browse older posts'} onPress={async () => {
+          {before > 1 && <Button key="history-page" plain label={loadingHistory !== 0 && loadingHistory === boardNavigation ? 'Loading…' : page ? 'Older posts' : 'Browse older posts'} onPress={async () => {
             const navigation = ++boardNavigation
-            const loaded = await boardCommand($, shown.dir, ['show', `--before=${before}`, '--json']).catch(() => undefined)
-            if ((await shownSwarm($)).dir !== shown.dir || navigation !== boardNavigation) return
-            const posts = loaded?.exitCode === 0 && !loaded.isStdoutTruncated ? parsePosts(loaded.stdout, {}) : []
-            if (!posts.length) { $.ui.toast('Could not load earlier board posts.'); return }
-            await update($, history, current => navigation === boardNavigation ? { dir: shown.dir, posts } : current)
-            await update($, expanded, current => navigation === boardNavigation ? 0 : current)
+            loadingHistory = navigation
+            $.ui.invalidate('ui.render')
+            try {
+              const loaded = await boardCommand($, shown.dir, ['show', `--before=${before}`, '--json']).catch(() => undefined)
+              if ((await shownSwarm($)).dir !== shown.dir || navigation !== boardNavigation) return
+              const posts = loaded?.exitCode === 0 && !loaded.isStdoutTruncated ? parsePosts(loaded.stdout, {}) : []
+              if (!posts.length) { $.ui.toast('Could not load earlier board posts.'); return }
+              await update($, history, current => navigation === boardNavigation ? { dir: shown.dir, posts } : current)
+              await update($, expanded, current => navigation === boardNavigation ? 0 : current)
+            } finally {
+              if (loadingHistory === navigation) loadingHistory = 0
+              $.ui.invalidate('ui.render')
+            }
           }} />}
         </Box>
       )
@@ -4547,18 +4719,20 @@ export const register: Register = on => {
       const matching = terms.length === 0
         ? available
         : available.filter(post => terms.every(term => matchesTerm(post, term)))
-      const search = [
+      const search = (
+        <Box flexDirection="row" alignItems="center" columnGap="sm" rowGap="xs" flexWrap="wrap">
           <Input
             key="board-search"
             placeholder="Filter: text, @name, from:, to:, kind:"
             value={rawQuery}
             submitLabel="Filter"
             onSubmit={value => update($, query, () => value.trim())}
-          />,
-          terms.length > 0 && (
+          />
+          {terms.length > 0 && (
             <Button key="board-search-clear" plain label={`Clear filter (${matching.length} of ${available.length})`} onPress={() => update($, query, () => '')} />
-          ),
-      ]
+          )}
+        </Box>
+      )
       // The person posts in the coordinator's name, and the coordinator is told with its next tool call.
       const compose = isDriven && (
           <Input
@@ -4616,7 +4790,7 @@ export const register: Register = on => {
       }
       // A drawing over 100,000 characters is refused, and a post costs up to its clip and its frame: so many are drawn at once.
       const DRAWN = 100
-      const visible = page ? matching : matching.slice(collapsed && terms.length === 0 ? -1 : -Math.min(DRAWN, Math.max(1, fitted.length + more)))
+      const visible = page ? matching.slice(-DRAWN) : matching.slice(collapsed && terms.length === 0 ? -1 : -Math.min(DRAWN, Math.max(1, fitted.length + more)))
       const isFull = visible.length >= DRAWN
       if (selected && !visible.some(post => post.seq === open)) {
         visible.unshift(selected)
@@ -4628,8 +4802,8 @@ export const register: Register = on => {
             {bar(shown.posts.length > 0)}
             {historyControls}
             <Box flexDirection="column" gap="xs" marginTop={compose || shown.posts.length > 0 ? undefined : 'sm'} borderStyle="round" borderColor={browsed?.boardUnavailable ? 'warning' : 'subtle'} borderDimColor paddingX="sm" paddingY="xs">
-              <Box flexDirection="row" alignItems="flex-start" columnGap="xs" minWidth={0}>
-                {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon(browsed?.boardUnavailable ? 'warn' : 'info')} alt={browsed?.boardUnavailable ? 'Unavailable' : 'Info'} width={12} height={16} /></Box>}
+              <Box flexDirection="row" alignItems="center" columnGap="xs" minWidth={0}>
+                {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon(browsed?.boardUnavailable ? 'warn' : 'info')} alt={browsed?.boardUnavailable ? 'Unavailable' : 'Info'} width={12} height={12} /></Box>}
                 <Box flexShrink={1} minWidth={0}>
                   <Text dimColor>{shown.posts.length > 0 ? 'No posts match the filter.' : browsed?.boardUnavailable ? 'Board data unavailable: its board could not be read.' : 'No posts yet.'}</Text>
                 </Box>
@@ -4641,6 +4815,9 @@ export const register: Register = on => {
           <Box flexDirection="column" gap="sm">
             {bar(true)}
             {historyControls}
+            {!page && before > 1 && (
+              <Text size="caption" dimColor tabular>{`Recent view · ${shown.posts.length} of ${shown.total ?? shown.posts.at(-1)?.seq} posts`}</Text>
+            )}
             {!page && terms.length === 0 && shown.posts.length > 1 && (
               <Button
                 key="collapse-history"
@@ -4649,9 +4826,6 @@ export const register: Register = on => {
                 label={collapsed ? `Show history (${shown.posts.length - 1})` : 'Collapse history'}
                 onPress={() => update($, latestOnly, value => !value)}
               />
-            )}
-            {!page && before > 1 && (
-              <Text dimColor>{`Recent view · ${shown.posts.length} of ${shown.total ?? shown.posts.at(-1)?.seq} posts`}</Text>
             )}
             {(!collapsed || terms.length > 0) && older > 0 && isFull && (
               <Text dimColor>{`Showing the newest ${visible.length} of ${matching.length}. Narrow the filter to reach earlier posts.`}</Text>
@@ -4675,8 +4849,10 @@ export const register: Register = on => {
               const revision = kind?.label === 'READY' ? post.revision : undefined
               const since = revision !== undefined ? post.base : undefined
               const isDiffOpen = revision !== undefined && openDiff.seq === post.seq
+              const isDiffLoading = loadingDiffSeq === post.seq
               // A post opened from Attention that the pane no longer keeps: it stays until it is dismissed.
               const isInspected = inspectedPost?.seq === post.seq && !shown.posts.some(p => p.seq === post.seq)
+              const postText = isOpen ? chipped(post, openedText(post)) : preview(post)
 
               return (
                 <Box
@@ -4690,6 +4866,7 @@ export const register: Register = on => {
                   paddingX="sm"
                   paddingY="xs"
                 >
+                  {isInspected && <Text size="caption" color="warning">Pinned from attention</Text>}
                   <Box flexDirection="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" columnGap="sm">
                     <Box flexDirection="row" alignItems="center" columnGap="xs" flexWrap="wrap">
                       <Text color={hueOf(post.agent)}>●</Text>
@@ -4704,11 +4881,11 @@ export const register: Register = on => {
                       )}
                       {/* The rest of the recipients, on a press: an opened post names them all. */}
                       {post.to.length > 2 && !(isOpen && hasMore) && (
-                        <Button key={`recipients-${post.seq}`} plain dimColor hover={{ dimColor: false }} label={isOpen ? 'Show fewer' : `+${post.to.length - 2} more`} onPress={() => toggle(post.seq)} />
+                        <Button key={`recipients-${post.seq}`} plain dimColor label={isOpen ? 'Show fewer' : `+${post.to.length - 2} more`} onPress={() => toggle(post.seq)} />
                       )}
                       {kind !== undefined && (
                         <Box flexDirection="row" alignItems="center" columnGap="xs">
-                          {HeaderArt && <HeaderArt source={semanticIcon(verdictIconOf(kind.label))} alt={kind.label} width={12} height={12} />}
+                          {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon(verdictIconOf(kind.label))} alt={kind.label} width={12} height={12} /></Box>}
                           <Text size="caption" weight="semibold" color={kind.color}>{kind.covered?.length ? `${kind.label} · ${kind.covered.map(name => `@${name}`).join(' ')}` : kind.label}</Text>
                         </Box>
                       )}
@@ -4718,7 +4895,7 @@ export const register: Register = on => {
                   {isOpen && kind?.covered && (
                     <Text size="caption" color="warning">{`Partial pass of ${kind.covered.map(name => `@${name}`).join(', ') || 'some workers'}: their pieces only, not the run's pass.`}</Text>
                   )}
-                  <Markdown text={formatMarkdown(isOpen ? chipped(post, openedText(post)) : preview(post))} />
+                  {postText !== '' && <Markdown text={formatMarkdown(postText)} />}
                   {isDiffOpen && diffParts(openDiff.text)[0] !== '' && <Text key={`diff-scope-${post.seq}`} size="caption" dimColor>{diffParts(openDiff.text)[0]}</Text>}
                   {isDiffOpen && <Markdown key={`diff-text-${post.seq}`} text={diffParts(openDiff.text)[1]!} />}
                   {(hasMore || canViewGraph || isInspected || revision !== undefined) && (
@@ -4728,7 +4905,6 @@ export const register: Register = on => {
                           key={`dismiss-${post.seq}`}
                           plain
                           dimColor
-                          hover={{ dimColor: false }}
                           label="✕ Dismiss"
                           onPress={async () => {
                             await update($, inspected, () => null)
@@ -4741,7 +4917,6 @@ export const register: Register = on => {
                           key={`more-${post.seq}`}
                           plain
                           dimColor
-                          hover={{ dimColor: false }}
                           onPress={() => toggle(post.seq)}
                           label={isOpen ? '▴ Show less' : '▾ Show more'}
                         />
@@ -4751,8 +4926,7 @@ export const register: Register = on => {
                           key={`diff-${post.seq}`}
                           plain
                           dimColor
-                          hover={{ dimColor: false }}
-                          label={isDiffOpen ? '▴ Hide diff' : 'View diff'}
+                          label={isDiffOpen ? '▴ Hide diff' : isDiffLoading ? 'Loading diff…' : 'View diff'}
                           onPress={() => isDiffOpen ? update($, diff, () => NO_DIFF) : showDiff($, shown.dir, post.seq, revision, since, since ? post.except : undefined)}
                         />
                       )}
@@ -4761,7 +4935,6 @@ export const register: Register = on => {
                           key={`graph-post-${post.seq}`}
                           plain
                           dimColor
-                          hover={{ dimColor: false }}
                           label="View in graph"
                           onPress={async () => {
                             await seek($, post.seq)
@@ -4780,15 +4953,16 @@ export const register: Register = on => {
       // A kind this version does not know is still shown, uncoloured.
       const tone = (kind: string) =>
         ['unreachable', 'ignored', 'stale', 'rework', 'dispute', 'retired-running', 'conflict'].includes(kind) ? 'error' : kind === 'paused' || kind === 'member_paused' ? 'warning'
-          : ['unread', 'review', 'question', 'unstarted', 'blocked', 'spend', 'silent', 'loop'].includes(kind) ? 'warning' : undefined
+          : ['unread', 'review', 'question', 'unstarted', 'blocked', 'spend', 'silent', 'loop', 'heavy', 'dispatch'].includes(kind) ? 'warning' : undefined
       const isSpent = shown.budget > 0 && total >= shown.budget
       const ask = (text: string) => submitHeld($, text, () => $.ui.toast('Swarm could not send that request to the coordinator.'))
       const seenKeys = new Map<string, number>()
       // The live run's report is read again on the next poll; a browsed run's only on Retry.
+      const isAttentionIssue = Boolean(shown.attentionUnavailable || browsed?.boardUnavailable)
       body = shown.attention.length === 0 ? (
-        <Box flexDirection="column" gap="xs" marginTop="sm" borderStyle="round" borderColor="subtle" borderDimColor paddingX="sm" paddingY="xs">
-          <Box flexDirection="row" alignItems="flex-start" columnGap="xs" minWidth={0}>
-            {HeaderArt && !shown.attentionUnavailable && <Box flexShrink={0}><HeaderArt source={semanticIcon('pass')} alt="All clear" width={12} height={16} /></Box>}
+        <Box flexDirection="column" gap="xs" marginTop="sm" borderStyle="round" borderColor={isAttentionIssue ? 'warning' : 'subtle'} borderDimColor paddingX="sm" paddingY="xs">
+          <Box flexDirection="row" alignItems="center" columnGap="xs" minWidth={0}>
+            {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon(isAttentionIssue ? 'warn' : 'pass')} alt={isAttentionIssue ? 'Unavailable' : 'All clear'} width={12} height={12} /></Box>}
             <Box flexShrink={1} minWidth={0}>
               <Text dimColor>{!shown.attentionUnavailable ? 'Nothing needs attention.' : browsed ? 'Attention details unavailable for this run.' : 'Attention details unavailable. Swarm will retry.'}</Text>
             </Box>
@@ -4809,7 +4983,7 @@ export const register: Register = on => {
             const hasActions = item.seq > 0 || (isDriven && (
               item.kind === 'unreachable' ||
               item.kind === 'member_paused' ||
-              (item.kind === 'paused' && isSpent) ||
+              item.kind === 'paused' ||
               item.kind === 'ignored' ||
               item.kind === 'review' ||
               item.kind === 'rework' ||
@@ -4829,10 +5003,10 @@ export const register: Register = on => {
               paddingY="xs"
             >
               <Box flexDirection="row" alignItems="flex-start" columnGap="xs" minWidth={0}>
-                {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon(attentionIconOf(item.kind, itemTone))} alt={item.kind || 'note'} width={12} height={16} /></Box>}
+                {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon(attentionIconOf(item.kind, itemTone))} alt={formatAttentionKind(item.kind)} width={12} height={12} /></Box>}
                 <Box flexShrink={1} minWidth={0}>
                   <Text>
-                    <Text weight="semibold" color={itemTone}>{String(item.kind || 'note').toUpperCase()}</Text>
+                    <Text weight="semibold" color={itemTone}>{formatAttentionKind(item.kind)}</Text>
                     <Text>{`  ${item.text}`}</Text>
                   </Text>
                 </Box>
@@ -4844,7 +5018,6 @@ export const register: Register = on => {
                     key={`attention-open-${itemKey}`}
                     plain
                     dimColor
-                    hover={{ dimColor: false }}
                     label={`Open post #${item.seq}`}
                     onPress={() => openPost(item.seq)}
                   />
@@ -4862,7 +5035,15 @@ export const register: Register = on => {
                     key={`attention-budget-${itemKey}`}
                     plain
                     label="+500k & resume"
-                    onPress={() => control($, shown.dir, ['limit', `budget=${Math.max(shown.budget, total) + 500_000}`], ['resume'])}
+                    onPress={() => control($, shown.dir, ['limit', '--raise', `budget=${Math.max(shown.budget, total) + 500_000}`], ['resume'])}
+                  />
+                )}
+                {item.kind === 'paused' && !isSpent && isDriven && (
+                  <Button
+                    key={`attention-resume-run-${itemKey}`}
+                    plain
+                    label="Resume run"
+                    onPress={() => control($, shown.dir, ['resume'])}
                   />
                 )}
                 {item.kind === 'member_paused' && isDriven && (
@@ -4912,6 +5093,10 @@ export const register: Register = on => {
       const open = talk
       const member = memberOf(open.name)
       const memberOffset = phase(slot('members'), shown.dir, `talk/${open.name}`, now)
+      const talkPaused = member !== undefined && !shown.isClosed && (shown.isPaused === true || isMemberBudgetPaused(member))
+      const talkStatus = member
+        ? (talkPaused && !['killed', 'closed', 'failed', 'unreachable', 'stopped'].includes(member.status) ? 'paused' : member.status)
+        : ''
       // Filled from the newest row back, as the Board is, so what the agent does now is in view.
       let fitted = 0
       let used = 0
@@ -4932,7 +5117,10 @@ export const register: Register = on => {
           <Markdown text={formatMarkdown(row.text)} />
         </Box>
       ) : (
-        <Markdown key={`talk-${index}`} text={row.text} />
+        <Box key={`talk-${index}`} flexDirection="column" gap="xs">
+          <Text size="caption" weight="semibold" color={hueOf(open.name)}>@{open.name}</Text>
+          <Markdown text={formatMarkdown(row.text)} />
+        </Box>
       )
       body = (
         <Box flexDirection="column" marginTop="sm" gap="sm">
@@ -4940,7 +5128,9 @@ export const register: Register = on => {
             key="talk-header"
             flexDirection="row"
             alignItems="center"
+            justifyContent="space-between"
             columnGap="sm"
+            rowGap="xs"
             flexWrap="wrap"
             borderStyle="round"
             borderColor={hueOf(open.name)}
@@ -4949,20 +5139,36 @@ export const register: Register = on => {
             paddingX="sm"
             paddingY="xs"
           >
-            <Button key="talk-back" plain label="‹ Members" onPress={() => closeTalk($)} />
-            {HeaderArt && member && member.status !== 'closed' && (
-              <Box flexShrink={0}>
-                <HeaderArt source={statusDot(member.status, memberOffset)} alt={member.status} width={12} height={12} />
+            <Box flexDirection="row" alignItems="center" columnGap="sm" flexShrink={1} minWidth={0}>
+              <Button key="talk-back" plain label="‹ Members" onPress={() => closeTalk($)} />
+              {member && member.status !== 'closed' && (
+                HeaderArt ? (
+                  <Box flexShrink={0}>
+                    <HeaderArt source={statusDot(talkStatus, memberOffset, open.name)} alt={talkStatus} width={12} height={12} />
+                  </Box>
+                ) : (
+                  <Text color={statusInk(talkStatus)}>{terminalStatusGlyph(member.status, talkPaused)}</Text>
+                )
+              )}
+              <Box flexShrink={1} minWidth={0}>
+                <Text wrap="truncate-end">
+                  <Text weight="semibold" color={hueOf(open.name)}>@{open.name}</Text>
+                  <Text dimColor>{`  conversation${member ? ` · ${talkStatus}` : ''}`}</Text>
+                </Text>
               </Box>
-            )}
-            <Box flexShrink={1} minWidth={0}>
-              <Text wrap="truncate-end">
-                <Text weight="semibold" color={hueOf(open.name)}>@{open.name}</Text>
-                <Text dimColor>{`  conversation${member ? ` · ${member.status}` : ''}`}</Text>
-              </Text>
             </Box>
+            {member && member.posts > 0 && (
+              <Button key="talk-posts" plain dimColor label="Posts" onPress={() => feedOf(open.name)} />
+            )}
           </Box>
-          {open.rows.length === 0 ? <Text dimColor>Nothing said yet.</Text> : draw(open.rows[0]!, 0)}
+          {open.rows.length === 0 ? (
+            <Box flexDirection="row" alignItems="center" columnGap="xs" borderStyle="round" borderColor="subtle" borderDimColor paddingX="sm" paddingY="xs" minWidth={0}>
+              {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon('info')} alt="Info" width={12} height={12} /></Box>}
+              <Box flexShrink={1} minWidth={0}>
+                <Text dimColor>Nothing said yet.</Text>
+              </Box>
+            </Box>
+          ) : draw(open.rows[0]!, 0)}
           {from > 1 ? (
             <Button
               key="talk-earlier"
@@ -4983,7 +5189,7 @@ export const register: Register = on => {
       )
     } else if (current === 'members') {
       const memberOffset = phase(slot('members'), shown.dir, 'cards', now)
-      const beeScale = 3
+      const beeScale = 2
       const beeWidth = MEMBER_BEE_SIZE.width * beeScale
       const beeHeight = MEMBER_BEE_SIZE.height * beeScale
       const isCompact = HeaderArt !== undefined && columns < 42
@@ -4993,8 +5199,10 @@ export const register: Register = on => {
         const hue = hueOf(member.name)
         const accent = memberAccents[hue]
         const motionOffset = memberOffset + (memberOrder.get(member.name) ?? 0) * 173
-        const statusColor = statusInk(member.status)
+        const memberPaused = !shown.isClosed && (shown.isPaused === true || isMemberBudgetPaused(member))
         const isBroken = ['failed', 'unreachable', 'stopped'].includes(member.status)
+        const effectiveStatus = memberPaused && !isBroken && member.status !== 'killed' && member.status !== 'closed' ? 'paused' : member.status
+        const statusColor = statusInk(effectiveStatus)
         const plan = [
           member.owns === '' ? '' : `owns ${member.owns}`,
           member.depends.length === 0 ? '' : `after ${member.depends.map(name => `@${name}`).join(', ')}`,
@@ -5005,32 +5213,42 @@ export const register: Register = on => {
         const hasActions = canOpenTalk || member.posts > 0 || member.role === 'coordinator'
         const summaryLines = last ? bodyOf(last).split('\n').slice(0, kindOf(last.text) ? 2 : 1).filter(l => l.trim() !== '').join(' · ') : ''
         const meta = [member.role === 'coordinator' ? '' : member.type, `${member.model} ${member.effort}`.trim()].filter(Boolean).join(' · ')
-        // Allow for the bee, its right inset, and the header gap when fitting the name and model.
+        // Allow for card border, padding, column gap, and the bee's width + inset when fitting name and model.
         const identityWidth = visualWidth(member.name) + 3 + .8 * visualWidth(meta)
-        const stackIdentity = HeaderArt !== undefined && (isCompact || identityWidth > columns - Math.ceil(beeWidth / 8) - 3)
+        const stackIdentity = HeaderArt !== undefined && (isCompact || identityWidth > columns - Math.ceil(beeWidth / 8) - 7)
         const memberSpend = spentBy(member)
+        const detailColor = member.status === 'closed'
+          ? (member.detail.includes('NOT PASSED') || member.detail.includes('NOT VERIFIED') ? 'error'
+            : member.detail.includes('VERIFIED') || member.detail.includes('READY') ? 'success'
+              : member.detail.includes('PARTIAL PASS') || member.detail.includes('Partial pass') || member.detail.includes('REVISE') || member.detail.includes('SHUTDOWN') ? 'warning'
+                : undefined)
+          : isBroken || member.status === 'killed' ? 'error'
+            : member.detail === 'reported ready' ? 'success'
+              : 'warning'
         const identity = (
-          <Text strikethrough={member.status === 'killed'} wrap="truncate-end">
-            <Text weight="semibold" color={hue}>@{member.name}</Text>
-            {!stackIdentity && meta && <Text dimColor>{`  ${meta}`}</Text>}
+          <Text wrap="truncate-end">
+            <Text weight="semibold" color={hue} strikethrough={member.status === 'killed'}>@{member.name}</Text>
+            {!stackIdentity && meta && <Text size="caption" dimColor>{`  ${meta}`}</Text>}
           </Text>
         )
         const status = (
           <Box flexDirection="row" alignItems={isCompact ? 'flex-start' : 'center'} columnGap="xs" minWidth={0}>
             {member.status === 'closed' ? null : HeaderArt ? (
               <Box flexShrink={0}>
-                <HeaderArt source={statusDot(member.status, motionOffset)} alt={member.status} width={12} height={isCompact ? 16 : 12} />
+                <HeaderArt source={statusDot(effectiveStatus, motionOffset, member.name)} alt={effectiveStatus} width={12} height={12} />
               </Box>
-            ) : <Text color={statusColor}>{isBroken ? '!' : ['killed', 'not started'].includes(member.status) ? '○' : '●'}</Text>}
+            ) : <Text color={statusColor}>{terminalStatusGlyph(member.status, memberPaused)}</Text>}
             <Box flexShrink={1} minWidth={0}>
               <Text tabular size={HeaderArt ? 'caption' : undefined} wrap={isCompact ? 'wrap' : 'truncate-end'}>
-                <Text dimColor>{`${member.status} ·${unitSpace}${counted(member.posts, 'post').replace(' ', unitSpace)}`}</Text>
+                <Text dimColor>{`${effectiveStatus} ·${unitSpace}${counted(member.posts, 'post').replace(' ', unitSpace)}`}</Text>
                 {memberSpend > 0 && <Text dimColor>{` ·${unitSpace}${compact(memberSpend)}${unitSpace}tokens`}</Text>}
-                {member.unread > 0 && member.status !== 'killed' && (
-                  <Text weight="semibold" color="warning">{` ·${unitSpace}${member.unread}${unitSpace}unread`}</Text>
-                )}
               </Text>
             </Box>
+            {member.unread > 0 && member.status !== 'killed' && (
+              <Box flexShrink={0}>
+                <Text tabular size={HeaderArt ? 'caption' : undefined} weight="semibold" color="warning">{`·${unitSpace}${member.unread}${unitSpace}unread`}</Text>
+              </Box>
+            )}
           </Box>
         )
 
@@ -5041,8 +5259,8 @@ export const register: Register = on => {
             gap="xs"
             borderStyle="round"
             borderColor={HeaderArt ? accent : hue}
-            borderDimColor={!HeaderArt}
-            hover={HeaderArt ? undefined : { borderDimColor: false }}
+            borderDimColor
+            hover={{ borderDimColor: false }}
             paddingX="sm"
             paddingY="xs"
           >
@@ -5055,7 +5273,7 @@ export const register: Register = on => {
                 </Box>
                 <Box key={`bee-${member.name}`} flexShrink={0} paddingTop="md" paddingRight="sm">
                   <HeaderArt
-                    source={memberBee(accent, member.status, motionOffset)}
+                    source={memberBee(accent, member.status, motionOffset, member.name, memberPaused)}
                     alt={`Bee for ${member.name}`}
                     width={beeWidth}
                     height={beeHeight}
@@ -5065,7 +5283,7 @@ export const register: Register = on => {
             ) : identity}
             {!HeaderArt && status}
             {member.detail !== '' && (
-              <Text color={member.status === 'closed' ? undefined : isBroken || member.status === 'killed' ? 'error' : member.detail === 'reported ready' ? 'success' : 'warning'} wrap="truncate-end">{member.detail}</Text>
+              <Text color={detailColor} dimColor={member.status === 'closed' && detailColor === undefined} wrap="truncate-end">{member.detail}</Text>
             )}
             {member.status !== 'killed' && plan !== '' && <Text size="caption" dimColor wrap="truncate-end">{plan}</Text>}
             {last !== undefined && (
@@ -5076,10 +5294,10 @@ export const register: Register = on => {
             {hasActions && (
               <Box flexDirection="row" columnGap="sm" rowGap="xs" flexWrap="wrap" alignItems="center">
                 {canOpenTalk && (
-                  <Button key={`view-${member.name}`} plain dimColor hover={{ dimColor: false }} label="Open conversation" onPress={async () => { if (!(await viewAgent($, member))) await feedOf(member.name) }} />
+                  <Button key={`view-${member.name}`} plain dimColor label="Open conversation" onPress={async () => { if (!(await viewAgent($, member))) await feedOf(member.name) }} />
                 )}
                 {member.posts > 0 && (
-                  <Button key={`feed-${member.name}`} plain dimColor hover={{ dimColor: false }} label="Posts" onPress={() => feedOf(member.name)} />
+                  <Button key={`feed-${member.name}`} plain dimColor label="Posts" onPress={() => feedOf(member.name)} />
                 )}
                 {member.role === 'coordinator' && !hasMainTalk && <Text size="caption" dimColor>Its conversation is not available here.</Text>}
               </Box>
@@ -5099,28 +5317,42 @@ export const register: Register = on => {
       const byName = (a: Member, b: Member) =>
         Number(b.role === 'coordinator') - Number(a.role === 'coordinator') ||
         a.name.localeCompare(b.name)
+      const needsAttn = shown.members.filter(needsMemberAttention)
+      const needsAttnNames = new Set(needsAttn.map(m => m.name))
+      const knownStatuses = new Set(['failed', 'unreachable', 'stopped', 'working', 'coordinating', 'waiting', 'not started', 'closed', 'killed'])
       const groups: [string, Member[]][] = [
-        ['Needs attention', shown.members.filter(m => ['failed', 'unreachable', 'stopped'].includes(m.status))],
-        ['Active', shown.members.filter(m => ['working', 'coordinating'].includes(m.status))],
-        ['Standing by', shown.members.filter(m => ['waiting', 'not started'].includes(m.status) && !(hiding && inactive.has(m.name)))],
-        ['At close', hiding ? [] : shown.members.filter(m => m.status === 'closed')],
-        ['Retired', hiding ? [] : shown.members.filter(m => m.status === 'killed')],
+        ['Needs attention', needsAttn],
+        ['Active', shown.members.filter(m => !needsAttnNames.has(m.name) && ['working', 'coordinating'].includes(m.status))],
+        ['Standing by', shown.members.filter(m => !needsAttnNames.has(m.name) && ['waiting', 'not started'].includes(m.status) && !(hiding && inactive.has(m.name)))],
+        ['At close', hiding ? [] : shown.members.filter(m => !needsAttnNames.has(m.name) && m.status === 'closed')],
+        ['Retired', hiding ? [] : shown.members.filter(m => !needsAttnNames.has(m.name) && m.status === 'killed')],
+        ['Other', shown.members.filter(m => !needsAttnNames.has(m.name) && !knownStatuses.has(m.status))],
       ]
       const visibleGroups = groups.filter(([, list]) => list.length > 0)
       body = (
         <Box flexDirection="column" marginTop="sm" gap="sm">
-          <Box flexDirection="row" justifyContent="flex-end">{inactiveToggle(inactive.size)}</Box>
-          {visibleGroups.length === 0 && shown.members.length > 0 ? (
-            <Box flexDirection="row" alignItems="flex-start" columnGap="xs" borderStyle="round" borderColor="subtle" borderDimColor paddingX="sm" paddingY="xs" minWidth={0}>
-              {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon('info')} alt="Info" width={12} height={16} /></Box>}
+          {shown.members.length > 0 && <Box flexDirection="row" justifyContent="flex-end">{inactiveToggle(inactive.size)}</Box>}
+          {shown.members.length === 0 ? (
+            <Box flexDirection="row" alignItems="center" columnGap="xs" borderStyle="round" borderColor="subtle" borderDimColor paddingX="sm" paddingY="xs" minWidth={0}>
+              {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon('info')} alt="Info" width={12} height={12} /></Box>}
               <Box flexShrink={1} minWidth={0}>
-                <Text dimColor>All members are inactive.</Text>
+                <Text dimColor>No members registered yet.</Text>
               </Box>
+            </Box>
+          ) : visibleGroups.length === 0 ? (
+            <Box flexDirection="row" alignItems="center" justifyContent="space-between" flexWrap="wrap" columnGap="sm" rowGap="xs" borderStyle="round" borderColor="subtle" borderDimColor paddingX="sm" paddingY="xs" minWidth={0}>
+              <Box flexDirection="row" alignItems="center" columnGap="xs" flexShrink={1} minWidth={0}>
+                {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon('info')} alt="Info" width={12} height={12} /></Box>}
+                <Box flexShrink={1} minWidth={0}>
+                  <Text dimColor>All members are inactive.</Text>
+                </Box>
+              </Box>
+              <Button key="show-inactive-empty" plain label={`Show inactive (${inactive.size})`} onPress={() => update($, hideInactive, () => false)} />
             </Box>
           ) : (
             visibleGroups.map(([title, list]) => (
               <Box key={title} flexDirection="column" gap="sm">
-                <Text size="caption" weight="semibold" dimColor>{`${title} · ${list.length}`}</Text>
+                <Text size="caption" weight="semibold" dimColor tabular>{`${title} · ${list.length}`}</Text>
                 {[...list].sort(byName).map(card)}
               </Box>
             ))
@@ -5130,8 +5362,8 @@ export const register: Register = on => {
     } else if (shown.posts.length === 0) {
       body = (
         <Box flexDirection="column" gap="xs" marginTop="sm" borderStyle="round" borderColor={browsed?.boardUnavailable ? 'warning' : 'subtle'} borderDimColor paddingX="sm" paddingY="xs">
-          <Box flexDirection="row" alignItems="flex-start" columnGap="xs" minWidth={0}>
-            {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon(browsed?.boardUnavailable ? 'warn' : 'info')} alt={browsed?.boardUnavailable ? 'Unavailable' : 'Info'} width={12} height={16} /></Box>}
+          <Box flexDirection="row" alignItems="center" columnGap="xs" minWidth={0}>
+            {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon(browsed?.boardUnavailable ? 'warn' : 'info')} alt={browsed?.boardUnavailable ? 'Unavailable' : 'Info'} width={12} height={12} /></Box>}
             <Box flexShrink={1} minWidth={0}>
               <Text dimColor>{browsed?.boardUnavailable ? 'Board data unavailable: its board could not be read.' : 'No posts yet.'}</Text>
             </Box>
@@ -5154,10 +5386,10 @@ export const register: Register = on => {
         ...Object.keys(shown.earlierEdges ?? {}).flatMap(edge => pairOf(edge) ?? [edge.split('>')[0] ?? '']),
         ...shown.posts.slice(0, index + 1).flatMap(entry => [entry.agent, ...entry.to]),
       ])
-      // Incoming posts animate once on the live board. The latest route loops when playback is idle.
+      // Incoming posts animate once on the live board. The latest route loops when playback is idle on a live run.
       const isLiveRun = !browsed && !shown.isClosed && !shown.isPaused
       const animate = playing || (isLiveRun && live && pulse === post.seq)
-      const repeat = !playing && index === shown.posts.length - 1 && !animate
+      const repeat = isLiveRun && !playing && index === shown.posts.length - 1 && !animate
       const mode = animate ? 'play' : repeat ? 'repeat' : 'still'
       const isLiveVisible = live && isLiveRun
       if (!isLiveVisible) clearHeldStatuses()
@@ -5173,24 +5405,26 @@ export const register: Register = on => {
       const postKind = verdictOf(post)
       const time = postTime(post)
       const strippedGraphBody = chipped(post)
+      const graphPostBody = detailsOpen ? chipped(post, openedText(post)) : clip(strippedGraphBody)
       const drawnMembers = visibleMembers(graphSwarm, post.seq, hidden, live)
       // Names drawn smaller than this are not read, so the routes are listed instead. The pane gives its width in
       // columns only: pixels are estimated from them.
       const isLegible = labelPx(columns, drawnMembers) >= MIN_LABEL_PX
       const routeSlot = slot('route')
-      const drawing = JSON.stringify([live, isExpanded, [...hidden],
+      const drawing = JSON.stringify([live, isExpanded, Boolean(shown.isPaused), shown.isClosed, [...hidden],
         drawnMembers.map(m => [m.name, m.role, live ? m.status : '', m.depends])])
       const routeOffset = isLegible
         ? phase(routeSlot, `${shown.dir}/${post.seq}`, `${mode}/${drawing}`, now, animate && !clocks.get(routeSlot)?.view.startsWith('play/'))
         : 0
       const graph = isLegible ? drawGraph(graphSwarm, post.seq, hidden, animate, live, repeat, routeOffset, isExpanded) : undefined
       // The host refuses a longer source, and the whole pane with it: such a graph is listed too.
-      const source = graph?.svg !== undefined && graph.svg.length <= SVG_LIMIT ? graph.svg : undefined
+      const source = graph?.svg !== undefined && byteLength(graph.svg) <= SVG_LIMIT ? graph.svg : undefined
       if (source === undefined) hideMotion(routeSlot)
       const last = shown.posts.length - 1
       const feedMembers = shown.members.filter(member => !hidden.has(member.name) && member.posts > 0)
       const timelineRatio = (index + 1) / shown.posts.length
-      const timelineOffset = phase(slot('timeline'), shown.dir, `${progressUnits(timelineRatio)}/${playing}/${isLiveVisible}`, now)
+      const timelineBarWidth = Math.max(160, Math.min(600, columns * 8))
+      const timelineOffset = phase(slot('timeline'), shown.dir, `${progressUnits(timelineRatio)}/${playing}/${isLiveVisible}/${timelineBarWidth}`, now)
       // A step that leads nowhere is text, not a control that does nothing.
       const step = (key: string, label: string, seq: number | undefined) => seq === undefined
         ? <Text key={key} dimColor>{label}</Text>
@@ -5211,26 +5445,31 @@ export const register: Register = on => {
             <Box flexDirection="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" columnGap="sm" rowGap="xs">
               {isLiveVisible ? (
                 <Box flexDirection="row" alignItems="center" gap="xs">
-                  <Svg key="live-indicator" source={liveIndicator(phase(slot('live'), shown.dir, 'live', now))} alt="Live activity" width={16} height={16} />
+                  <Box flexShrink={0}><Svg key="live-indicator" source={liveIndicator(phase(slot('live'), shown.dir, 'live', now))} alt="Live activity" width={16} height={16} /></Box>
                   <Text weight="semibold" color="success">Live</Text>
                 </Box>
               ) : (
                 <Box flexDirection="row" alignItems="center" gap="sm">
-                  <Text dimColor tabular>{live ? (shown.isPaused && !shown.isClosed ? 'Paused' : 'Latest post') : `Post ${index + 1} of ${shown.posts.length}`}</Text>
+                  <Text dimColor={!shown.isPaused || shown.isClosed || !live} color={live && shown.isPaused && !shown.isClosed ? 'warning' : undefined} weight={live && shown.isPaused && !shown.isClosed ? 'medium' : undefined} tabular>
+                    {live ? (shown.isPaused && !shown.isClosed ? 'Paused' : 'Latest post') : `Post ${index + 1} of ${shown.posts.length}`}
+                  </Text>
                   {!live && (
                     <Button key="replay-live" plain label={shown.isClosed || browsed ? 'Latest' : 'Go live'} onPress={() => seek($, 0)} />
                   )}
                 </Box>
               )}
               <Box flexDirection="row" columnGap="sm" rowGap="xs" alignItems="center" flexWrap="wrap" minWidth={0}>
-                <Button
-                  key="expand-all"
-                  plain
-                  dimColor={!hasBroadcast}
-                  hover={{ dimColor: false }}
-                  label={isExpanded ? 'Collapse @all' : 'Expand @all'}
-                  onPress={() => update($, expandAll, isOn => !isOn)}
-                />
+                {hasBroadcast ? (
+                  <Button
+                    key="expand-all"
+                    plain
+                    dimColor={!isExpanded}
+                    label={isExpanded ? 'Collapse @all' : 'Expand @all'}
+                    onPress={() => update($, expandAll, isOn => !isOn)}
+                  />
+                ) : (
+                  <Text key="expand-all" dimColor>Expand @all</Text>
+                )}
                 {inactiveToggle(hideable.length)}
               </Box>
             </Box>
@@ -5239,15 +5478,16 @@ export const register: Register = on => {
               {step('replay-first', 'First', index > 0 ? shown.posts[0]!.seq : undefined)}
               {step('replay-back', '‹ Prev', index > 0 ? shown.posts[index - 1]!.seq : undefined)}
               {last > 0
-                ? <Button key="replay-play" variant="primary" label={playing ? 'Pause' : 'Play'} onPress={() => play($)} />
+                ? <Button key="replay-play" variant={playing ? 'primary' : 'secondary'} label={playing ? 'Pause' : 'Play'} onPress={() => play($)} />
                 : <Text key="replay-play" dimColor>Play</Text>}
               {step('replay-next', 'Next ›', index < last ? shown.posts[index + 1]!.seq : undefined)}
+              {step('replay-last', 'Last', index < last ? shown.posts[last]!.seq : undefined)}
             </Box>
             {shown.posts.length > 1 && (
               <Svg
-                source={progressBar(timelineRatio, isLiveVisible ? 'success' : 'accent', playing, timelineOffset)}
+                source={progressBar(timelineRatio, isLiveVisible ? 'success' : 'accent', playing, timelineOffset, timelineBarWidth)}
                 alt={`Timeline position ${index + 1} of ${shown.posts.length}`}
-                width={1024}
+                width={timelineBarWidth}
                 height={6}
               />
             )}
@@ -5279,7 +5519,10 @@ export const register: Register = on => {
             <Box key="graph-members" flexDirection="row" columnGap="sm" rowGap="xs" flexWrap="wrap" alignItems="center">
               <Text size="caption" weight="semibold" dimColor>Feed of</Text>
               {feedMembers.map(member => (
-                <Button key={`graph-feed-${member.name}`} plain label={`@${member.name}`} onPress={() => feedOf(member.name)} />
+                <Box key={`graph-feed-wrap-${member.name}`} flexDirection="row" alignItems="center" columnGap="xs">
+                  <Text color={hueOf(member.name)}>●</Text>
+                  <Button key={`graph-feed-${member.name}`} plain label={`@${member.name}`} onPress={() => feedOf(member.name)} />
+                </Box>
               ))}
             </Box>
           )}
@@ -5303,23 +5546,28 @@ export const register: Register = on => {
                   label={`@${post.agent}`}
                   onPress={async () => { if (!(await viewAgent($, memberOf(post.agent)))) await feedOf(post.agent) }}
                 />
-                <Text dimColor>{post.to.length ? `→ ${post.to.map(name => `@${name}`).join(' ')}` : '· no mentions'}</Text>
+                <Text dimColor>{post.to.length ? `→ ${(detailsOpen ? post.to : post.to.slice(0, 2)).map(name => `@${name}`).join(' ')}` : '· no mentions'}</Text>
+                {post.to.length > 2 && !(detailsOpen && strippedGraphBody.length > CLIP) && (
+                  <Button key="graph-post-recipients" plain dimColor label={detailsOpen ? 'Show fewer' : `+${post.to.length - 2} more`} onPress={() => update($, expanded, seq => seq === post.seq ? 0 : post.seq)} />
+                )}
                 {postKind !== undefined && (
                   <Box flexDirection="row" alignItems="center" columnGap="xs">
-                    <Text size="caption" weight="semibold" color={postKind.color}>{` · ${postKind.covered?.length ? `${postKind.label} of ${postKind.covered.map(name => `@${name}`).join(', ')}` : postKind.label}`}</Text>
-                    <Svg source={semanticIcon(verdictIconOf(postKind.label))} alt={postKind.label} width={12} height={12} />
+                    <Box flexShrink={0}><Svg source={semanticIcon(verdictIconOf(postKind.label))} alt={postKind.label} width={12} height={12} /></Box>
+                    <Text size="caption" weight="semibold" color={postKind.color}>{postKind.covered?.length ? `${postKind.label} · ${postKind.covered.map(name => `@${name}`).join(' ')}` : postKind.label}</Text>
                   </Box>
                 )}
               </Box>
               <Text size="caption" dimColor tabular>{`#${post.seq}${time ? ` · ${time}` : ''}`}</Text>
             </Box>
-            <Markdown text={formatMarkdown(detailsOpen ? chipped(post, openedText(post)) : clip(strippedGraphBody))} />
+            {detailsOpen && postKind?.covered && (
+              <Text size="caption" color="warning">{`Partial pass of ${postKind.covered.map(name => `@${name}`).join(', ') || 'some workers'}: their pieces only, not the run's pass.`}</Text>
+            )}
+            {graphPostBody !== '' && <Markdown text={formatMarkdown(graphPostBody)} />}
             {strippedGraphBody.length > CLIP && (
               <Button
                 key="graph-post-details"
                 plain
                 dimColor
-                hover={{ dimColor: false }}
                 label={detailsOpen ? '▴ Show less' : '▾ Show more'}
                 onPress={() => update($, expanded, seq => seq === post.seq ? 0 : post.seq)}
               />
@@ -5332,26 +5580,43 @@ export const register: Register = on => {
       const hasBroadcast = shown.posts.some(isBroadcast) || Object.keys(shown.earlierEdges ?? {}).some(edge => edge.endsWith('>@all'))
       // As in the diagram: the coordinator is never hidden for being idle.
       const hideable = [...inactive].filter(name => memberOf(name)?.role !== 'coordinator')
+      const hiddenSet = new Set(hiding ? hideable : [])
+      const feedMembers = shown.members.filter(member => !hiddenSet.has(member.name) && member.posts > 0)
       body = (
         <Box flexDirection="column" marginTop="sm" gap="sm">
-          <Box flexDirection="row" gap="sm" alignItems="center">
-            <Button
-              key="expand-all"
-              plain
-              dimColor={!hasBroadcast}
-              label={isExpanded ? 'Collapse @all' : 'Expand @all'}
-              onPress={() => update($, expandAll, isOn => !isOn)}
-            />
+          <Box flexDirection="row" columnGap="sm" rowGap="xs" alignItems="center" flexWrap="wrap">
+            {hasBroadcast ? (
+              <Button
+                key="expand-all"
+                plain
+                dimColor={!isExpanded}
+                label={isExpanded ? 'Collapse @all' : 'Expand @all'}
+                onPress={() => update($, expandAll, isOn => !isOn)}
+              />
+            ) : (
+              <Text key="expand-all" dimColor>Expand @all</Text>
+            )}
             {inactiveToggle(hideable.length)}
           </Box>
-          {routeList(isExpanded, new Set(hiding ? hideable : []))}
+          {routeList(isExpanded, hiddenSet)}
+          {feedMembers.length > 0 && (
+            <Box key="graph-members" flexDirection="row" columnGap="sm" rowGap="xs" flexWrap="wrap" alignItems="center">
+              <Text size="caption" weight="semibold" dimColor>Feed of</Text>
+              {feedMembers.map(member => (
+                <Box key={`graph-feed-wrap-${member.name}`} flexDirection="row" alignItems="center" columnGap="xs">
+                  <Text color={hueOf(member.name)}>●</Text>
+                  <Button key={`graph-feed-${member.name}`} plain label={`@${member.name}`} onPress={() => feedOf(member.name)} />
+                </Box>
+              ))}
+            </Box>
+          )}
         </Box>
       )
     }
 
     // Two lines of the heading's column: the pane's width less the hive's, at about 1.25 columns a heading character.
     const titleRoom = 2 * Math.max(12, Math.floor((columns - (HeaderArt ? (columns < 48 ? 8 : 11) : 0)) / 1.25))
-    const isTitleCut = shown.title.length > titleRoom
+    const isTitleCut = visualWidth(shown.title) > titleRoom
     const activeSummary = [
       coordinating > 0 ? `${coordinating} coordinating` : '',
       `${working} working`,
@@ -5361,14 +5626,16 @@ export const register: Register = on => {
     const budgetRatio = shown.budget > 0 ? total / shown.budget : 0
     const budgetTone: BarTone = budgetRatio >= 0.9 ? 'error' : budgetRatio >= 0.75 ? 'warning' : 'accent'
     const isHeaderLive = !browsed && !shown.isClosed && !shown.isPaused
-    const budgetOffset = phase(slot('budget'), shown.dir, `${progressUnits(budgetRatio)}/${budgetTone}/${isHeaderLive}/${tabView}`, now)
+    const budgetBarWidth = columns < 40 ? 80 : 120
+    const dividerWidth = Math.max(160, Math.min(1024, columns * 8))
+    const budgetOffset = phase(slot('budget'), shown.dir, `${progressUnits(budgetRatio)}/${budgetTone}/${isHeaderLive}/${tabView}/${budgetBarWidth}`, now)
 
     return (
       <Box flexDirection="column">
         <Box flexDirection="row" alignItems="center" columnGap="sm">
           {/* A narrow pane gives the title the hive's room. The host clamps no lines, so a title longer than two lines of
               its column is cut at a word, and the whole of it is one press away. */}
-          {HeaderArt && <HeaderArt key="hive" source={hiveArt(mood, hiveOffset)} alt={`Swarm hive: ${shown.mood ?? 'sleep'}`} width={columns < 48 ? 56 : 88} height={columns < 48 ? 28 : 44} />}
+          {HeaderArt && <Box flexShrink={0}><HeaderArt key="hive" source={hiveArt(mood, hiveOffset)} alt={`Swarm hive: ${shown.mood ?? 'sleep'}`} width={columns < 48 ? 56 : 88} height={columns < 48 ? 28 : 44} /></Box>}
           <Box flexDirection="column" gap="xs" flexGrow={1} flexShrink={1} minWidth={0}>
             <Text size="heading" weight="semibold" wrap="wrap">{isTitleCut && titleOpen !== shown.dir ? clip(shown.title, titleRoom) : shown.title}</Text>
             {isTitleCut && (
@@ -5376,20 +5643,27 @@ export const register: Register = on => {
                 onPress={() => { titleOpen = titleOpen === shown.dir ? '' : shown.dir; $.ui.invalidate('ui.render') }} />
             )}
             <Text dimColor tabular wrap="truncate-end">
-              {shown.isClosed ? 'Closed' : shown.isPaused ? 'Paused' : activeSummary}
+              {shown.isClosed ? 'Closed' : shown.isPaused ? <Text color="warning" weight="medium">Paused</Text> : activeSummary}
               {!shown.isClosed && failed > 0 && <Text color="error" weight="medium">{` · ${failed} failed`}</Text>}
               {!shown.isClosed && stopped > 0 && <Text color="error" weight="medium">{` · ${stopped} stopped`}</Text>}
               {` · ${counted(shown.total ?? shown.posts.length, 'post')}`}
               {total > 0 ? ` · ${compact(total)}${shown.budget > 0 ? ` of ${compact(shown.budget)}` : ''} tokens` : ''}
+              {!HeaderArt && shown.budget > 0 && (
+                <Text color={budgetRatio >= 0.9 ? 'error' : budgetRatio >= 0.75 ? 'warning' : undefined} dimColor={budgetRatio < 0.75}>
+                  {` (${Math.round(budgetRatio * 100)}%)`}
+                </Text>
+              )}
             </Text>
             {HeaderArt && shown.budget > 0 && (
               <Box flexDirection="row" alignItems="center" columnGap="xs">
-                <HeaderArt
-                  source={progressBar(budgetRatio, budgetTone, isHeaderLive && total > 0, budgetOffset)}
-                  alt={`Token budget ${Math.min(100, Math.round(budgetRatio * 100))}%`}
-                  width={120}
-                  height={6}
-                />
+                <Box flexShrink={0}>
+                  <HeaderArt
+                    source={progressBar(budgetRatio, budgetTone, isHeaderLive && total > 0, budgetOffset, budgetBarWidth)}
+                    alt={`Token budget ${Math.round(budgetRatio * 100)}%`}
+                    width={budgetBarWidth}
+                    height={6}
+                  />
+                </Box>
                 <Text size="caption" color={budgetRatio >= 0.9 ? 'error' : budgetRatio >= 0.75 ? 'warning' : undefined} dimColor={budgetRatio < 0.75} tabular>
                   {`${Math.round(budgetRatio * 100)}%`}
                 </Text>
@@ -5397,55 +5671,79 @@ export const register: Register = on => {
             )}
           </Box>
         </Box>
-        {error && <Text color="warning">{error}</Text>}
+        {error && (
+          <Box flexDirection="row" alignItems="center" columnGap="xs" marginTop="xs" borderStyle="round" borderColor="warning" borderDimColor paddingX="sm" paddingY="xs" minWidth={0}>
+            {HeaderArt && <Box flexShrink={0}><HeaderArt source={semanticIcon('warn')} alt="Warning" width={12} height={12} /></Box>}
+            <Box flexShrink={1} minWidth={0}><Text color="warning">{error}</Text></Box>
+          </Box>
+        )}
         <Box flexDirection="row" columnGap="sm" rowGap="xs" flexWrap="wrap" alignItems="center" marginTop="xs">
           <Text weight="medium" dimColor>Run</Text>
           {/* At an end of the history the list showed, the step is text, as a replay step that leads nowhere is. */}
           {runEdge.dir === shown.dir && runEdge.older === false
             ? <Text key="run-prev" dimColor>‹ Prev run</Text>
-            : <Button key="run-prev" plain dimColor hover={{ scope: 'run-prev', dimColor: false }} label="‹ Prev run" onPress={() => browse($, 1)} />}
+            : <Button key="run-prev" plain label="‹ Prev run" onPress={() => browse($, 1)} />}
           {runEdge.dir === shown.dir && runEdge.newer === false
             ? <Text key="run-next" dimColor>Next run ›</Text>
-            : <Button key="run-next" plain dimColor hover={{ scope: 'run-next', dimColor: false }} label="Next run ›" onPress={() => browse($, -1)} />}
-          <Button key="run-export" plain dimColor hover={{ scope: 'run-export', dimColor: false }} label="Export MD" onPress={() => exportRun($, shown.dir)} />
+            : <Button key="run-next" plain label="Next run ›" onPress={() => browse($, -1)} />}
+          <Button key="run-export" plain dimColor hover={{ scope: 'run-export', dimColor: false }} label={exportingRun !== 0 ? 'Exporting…' : 'Export MD'} onPress={() => exportRun($, shown.dir)} />
           {isDriven && (
             <Button
               key="run-pause"
               plain
-              dimColor
-              hover={{ scope: 'run-pause', dimColor: false }}
+              dimColor={!shown.isPaused}
+              hover={shown.isPaused ? undefined : { scope: 'run-pause', dimColor: false }}
               label={shown.isPaused ? 'Resume run' : 'Pause run'}
               onPress={() => control($, shown.dir, shown.isPaused ? ['resume'] : ['pause', 'paused from the pane'])}
             />
           )}
           {browsed && <Text weight="semibold" color="warning">Not the live run · read-only</Text>}
-          {browsed && <Button key="run-live" plain dimColor hover={{ scope: 'run-live', dimColor: false }} label="Back to live run" onPress={() => browse($, 0)} />}
+          {browsed && <Button key="run-live" plain label="Back to live run" onPress={() => browse($, 0)} />}
         </Box>
         {HeaderArt && (
           <Box marginTop="xs">
-            <HeaderArt source={hairlineDivider} alt="Section divider" width={1024} height={1} />
+            <HeaderArt source={hairlineDivider} alt="Section divider" width={dividerWidth} height={1} />
           </Box>
         )}
         <Box flexDirection="row" gap="xs" flexWrap="wrap" marginTop="sm">
-          {TABS.map((name, tabIdx) => (
-            <Button
-              key={`tab-${name}`}
-              hotkey={String(tabIdx + 1)}
-              variant={name === current ? 'primary' : 'secondary'}
-              onPress={async () => {
-                closeTalk($)
-                if (name !== current) {
-                  await stop($)
-                  await stopLive($)
-                  // A post opened from another tab belongs to that visit: it is not kept selected behind the next tab.
-                  if ((await read($, inspected)) !== null) await update($, inspected, () => null)
-                  if ((await read($, expanded)) !== 0) await update($, expanded, () => 0)
-                  await update($, tab, () => name)
-                }
-              }}
-              label={`${name[0]?.toUpperCase()}${name.slice(1)}${name === 'attention' && shown.attention.length > 0 ? ` ${shown.attention.length}` : ''}`}
-            />
-          ))}
+          {TABS.map((name, tabIdx) => {
+            const hasAlert = name === 'attention' && shown.attention.length > 0
+            const hasUrgent = hasAlert && shown.attention.some(item =>
+              ['unreachable', 'ignored', 'stale', 'rework', 'dispute', 'retired-running', 'conflict'].includes(item.kind),
+            )
+            const tabLabel = `${name[0]?.toUpperCase()}${name.slice(1)}${hasAlert ? ` ${shown.attention.length}` : ''}`
+            const onTabPress = async () => {
+              closeTalk($)
+              if (name !== current) {
+                await stop($)
+                await stopLive($)
+                // A post opened from another tab belongs to that visit: it is not kept selected behind the next tab.
+                if ((await read($, inspected)) !== null) await update($, inspected, () => null)
+                if ((await read($, expanded)) !== 0) await update($, expanded, () => 0)
+                // A diff or an older page still loading from this visit is dropped too: it would open on a tab the
+                // user left. A page that loaded before stays.
+                diffAsked++
+                loadingDiffSeq = 0
+                boardNavigation++
+                if ((await read($, diff)).seq !== 0) await update($, diff, () => NO_DIFF)
+                await update($, tab, () => name)
+              }
+            }
+            return hasAlert && name !== current ? (
+              <Button key={`tab-${name}`} hotkey={String(tabIdx + 1)} variant="secondary" label={tabLabel} onPress={onTabPress}>
+                Attention
+                <Text size="caption" weight="semibold" color={hasUrgent ? 'error' : 'warning'} tabular>{` ${shown.attention.length}`}</Text>
+              </Button>
+            ) : (
+              <Button
+                key={`tab-${name}`}
+                hotkey={String(tabIdx + 1)}
+                variant={name === current ? 'primary' : 'secondary'}
+                onPress={onTabPress}
+                label={tabLabel}
+              />
+            )
+          })}
         </Box>
         {body}
       </Box>

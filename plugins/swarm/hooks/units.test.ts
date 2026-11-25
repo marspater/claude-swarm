@@ -2,10 +2,11 @@ import { expect, test } from 'claude-code/testing'
 import type { Post } from '../types'
 import { BOARD_CALL, CASE_PATTERN, COORDINATOR_READ, RUN, boardCalls, closesAfter, launches, makesCommit, runsNamed, scanShell, scriptsRun, shellLaunch, shellWords, splitShellSegments, substitutions, UNREAD, unwrap, wakeMessage, wakeSequence } from './command'
 import { edgesOf, graphSvg, isBroadcast } from './graph'
-import { actsAsAnother, commitsInSharedCheckout, waitsOnLooseMatch } from './guard'
-import { BOARD_ACTIONS, hiveArt, memberBee, toolMood, toolSummary } from './hive'
+import { actsAsAnother, commitsInSharedCheckout, hasHiddenBoardLimit, waitsOnLooseMatch } from './guard'
+import { BOARD_ACTIONS, MEMBER_BEE_SIZE, hiveArt, memberBee, toolMood, toolSummary } from './hive'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, SWARM_AGENTS, familyOf, latestOf, sizedEffort } from './models'
-import { progressBar, semanticIcon, statusCss, statusDot, statusKey, swarmEmblem } from './palette'
+import { elapsedMs, hashSeed, loopDelay, pickVariant, seededPhase } from './motion'
+import { beehivePalette, hairlineDivider, liveIndicator, progressBar, semanticIcon, statusCss, statusDot, statusInk, statusKey, swarmEmblem } from './palette'
 import { END, budgetOf, contextState, detailOf, heldAt, isWindingDown, findAgent, ledger, mentions, parse, parsePosts, postFields, statusOf, targets, tokensUsed } from './roster'
 import { bodyOf, chipped, clean, clip, compact, fenceAfter, fenced, figuresIn, hasQuestion, head, kindOf, openedText, repeatsPosts, stripKind, unquoted, verdictOf } from './text'
 
@@ -58,7 +59,7 @@ test('the hive reads a tool call by what it does, the board by its subcommand', 
   expect(toolSummary([{ tool: 'Grep' }, { tool: 'Read' }, { tool: 'Read' }, { tool: 'Edit' }, { tool: 'Bash', input: { command: 'npm test' }, isError: true },
     { tool: 'Bash', input: { command: 'python3 /p/board.py /r post parser' } }, { tool: 'SendMessage' }]))
     .toBe('Searched code, read 2 files, edited 1 file, ran 1 check, used the board, sent 1 message, 1 failed')
-  expect([statusKey('unreachable'), statusKey('working'), statusKey('not started'), statusKey('killed')]).toEqual(['failed', 'working', 'inactive', 'inactive'])
+  expect([statusKey('unreachable'), statusKey('working'), statusKey('not started'), statusKey('killed')]).toEqual(['unreachable', 'working', 'inactive', 'inactive'])
 })
 
 test('board text is cleaned, labelled and cut without breaking a character', async () => {
@@ -67,6 +68,7 @@ test('board text is cleaned, labelled and cut without breaking a character', asy
   expect(kindOf('@coordinator FINDING awaiting review')?.label).toBe('FINDING')
   expect(kindOf('a plain note that mentions READY later')).toBeUndefined()
   expect(bodyOf(post('@coordinator @parser done at 0123456789abcdef0123456789abcdef01234567', ['coordinator']))).toBe('done at 01234567')
+  expect(bodyOf(post(`READY ${'0123456789abcdef'.repeat(4)}`))).toBe('READY 01234567')
   // 479 letters and one emoji: a cut inside the emoji's two halves would leave a lone surrogate
   const cut = clip(`${'a'.repeat(479)}😀${'b'.repeat(40)}`)
   expect(cut.endsWith(' …')).toBe(true)
@@ -155,11 +157,11 @@ test('multi-segment board calls, wakeSequence bounds, and roster status/closed-r
   }), [], 300)
   expect(ended.members.map(m => [m.name, m.status, m.detail])).toEqual([
     ['coordinator', 'closed', ''], ['constructor', 'closed', 'Last report: READY (#3)'],
-    ['checker', 'closed', 'Last report: Partial pass of @constructor, @x (#2)'], ['old', 'killed', ''],
+    ['checker', 'closed', 'Last report: PARTIAL PASS of @constructor, @x (#2)'], ['old', 'killed', ''],
   ])
   // only a full commit id goes on to git's command line
   expect(ended.posts.map(post => (post as { base?: string }).base)).toEqual(['b'.repeat(40), undefined, undefined])
-  expect(verdictOf(ended.posts[1]!)).toEqual({ label: 'Partial pass', color: 'warning', covered: ['constructor', 'x'] })
+  expect(verdictOf(ended.posts[1]!)).toEqual({ label: 'PARTIAL PASS', color: 'warning', covered: ['constructor', 'x'] })
   expect(verdictOf({ ...ended.posts[1]!, partial: false } as never)?.label).toBe('VERIFIED')
 })
 
@@ -193,8 +195,8 @@ test('wave 1/2 design, text, hive and palette helpers', async () => {
   expect((fenced.match(/```/g) ?? []).length).toBe(2)
 
   expect(statusCss).toContain('@media(prefers-color-scheme:dark)')
-  expect(statusDot('coordinating')).toContain('<path d="M6 1.2L10.8 6 6 10.8 1.2 6z"')
-  expect(statusDot('failed')).toContain('<path d="M2.8 2.8L9.2 9.2M9.2 2.8L2.8 9.2"')
+  expect(statusDot('coordinating')).toContain('<path d="M6 2L10 6L6 10L2 6Z"')
+  expect(statusDot('failed')).toContain('<path d="M3.5 3.5L8.5 8.5M8.5 3.5L3.5 8.5"')
   expect(statusDot('waiting')).toContain('stroke-width="1.5"')
   expect(statusDot('inactive')).toContain('fill="none"')
 })
@@ -462,12 +464,32 @@ test('F18: a member whose agent was killed is stopped, not retired, and a newer 
   expect(statusOf('worker', { id: 'a1', last_read_seq: 0 }, agents)).toBe('failed')
   const killed = [{ id: 'k1', description: '@art', type: 'swarm:worker', status: 'killed' }] as never
   expect(statusOf('worker', { id: 'k1', last_read_seq: 0 }, killed)).toBe('stopped')
-  expect([detailOf('stopped', undefined, false), statusKey('stopped')]).toEqual(['its agent was stopped', 'failed'])
+  expect([detailOf('stopped', undefined, false), statusKey('stopped')]).toEqual(['its agent was stopped', 'stopped'])
   expect(statusOf('worker', { id: 'k1', killed: '1', last_read_seq: 0 }, killed)).toBe('killed')
   const roster = JSON.stringify({ title: 'T', members: { coordinator: { role: 'coordinator', last_read_seq: 0 }, art: { role: 'worker', id: 'k1', last_read_seq: 0 } } })
   const hint = { type: 'worker', model: 'sonnet', effort: 'medium', depends: [], owns: '', ready: false, blocked_on: [], asked: 0, unreachable: true }
   const shown = parse('/p/.swarm/x-20261116-101010', '', roster, killed, 300, { items: [], members: { art: hint } })
   expect(shown.members.find(m => m.name === 'art')?.status).toBe('unreachable')
+})
+
+test('read off the board\'s tail alone, a closed run still names the reports and routes before it', () => {
+  const roster = JSON.stringify({ title: 'T', closed: true, members: { coordinator: { role: 'coordinator', last_read_seq: 9 }, art: { role: 'worker', last_read_seq: 9 }, bo: { role: 'worker', last_read_seq: 9 } } })
+  // #1-#7 are past the tail: art's READY (#3) among them
+  const board = [8, 9].map(seq => JSON.stringify({ seq, agent: 'bo', to: ['coordinator'], text: 'READY done', time: 't' })).join('\n') + '\n'
+  const report = {
+    items: [], members: {}, reported: { art: { seq: 3, word: 'READY', partial: false, members: [] }, bo: { seq: 9, word: 'READY', partial: false, members: [] } },
+    edges: { 'art>coordinator': 2, 'coordinator>art': 1, 'bo>coordinator': 3 }, through: 9,
+  }
+  const shown = parse('/p/.swarm/x-20261116-101010', board, roster, [], 300, report as never)
+  expect(shown.members.map(m => [m.name, m.detail])).toEqual([['coordinator', ''], ['art', 'Last report: READY (#3)'], ['bo', 'Last report: READY (#9)']])
+  expect(shown.earlierEdges).toEqual({ 'art>coordinator': 2, 'coordinator>art': 1, 'bo>coordinator': 1 })
+  // A journal read whole is its own record: the report is not counted twice.
+  const whole = [1, 2].map(seq => JSON.stringify({ seq, agent: 'bo', to: ['coordinator'], text: 'READY done', time: 't' })).join('\n') + '\n'
+  expect(parse('/p/.swarm/x-20261116-101010', whole, roster, [], 1, report as never).earlierEdges).toEqual({ 'bo>coordinator': 1 })
+  // A report counted past the tail's end (a post landed between the two reads) is not joined to it: its newer
+  // routes would be drawn as history before their post is shown.
+  const ahead = { ...report, edges: { ...report.edges, 'later>v': 1 }, through: 10 }
+  expect(parse('/p/.swarm/x-20261116-101010', board, roster, [], 1, ahead as never).earlierEdges).toEqual({ 'bo>coordinator': 1 })
 })
 
 test('F19: a malformed roster, token count or report draws what it can, and no limit keeps no post', () => {
@@ -599,6 +621,7 @@ test('the hooks read targets, quoting, questions, kinds, board subcommands and t
     actions?: string[]
     defaults?: Record<string, [string, string]>
     effort?: [string, string, string][]
+    edges?: { posts: { agent: string; to: string[]; text: string }[]; expect: Record<string, number> }[]
   }
   const bun = (globalThis as { Bun?: { file: (path: string) => { exists: () => Promise<boolean>; json: () => Promise<unknown> } } }).Bun
   if (bun === undefined) return
@@ -606,7 +629,7 @@ test('the hooks read targets, quoting, questions, kinds, board subcommands and t
   if (!(await file.exists())) return
   const parity = await file.json() as Parity
   // A kind of case this test does not read would pass unchecked: it fails instead.
-  expect(Object.keys(parity).filter(kind => !['targets', 'quoted', 'question', 'kind', 'actions', 'defaults', 'effort'].includes(kind))).toEqual([])
+  expect(Object.keys(parity).filter(kind => !['targets', 'quoted', 'question', 'kind', 'actions', 'defaults', 'effort', 'edges'].includes(kind))).toEqual([])
   for (const [kind, size, expected] of parity.effort ?? []) expect([kind, size, sizedEffort(kind, size || undefined)]).toEqual([kind, size, expected])
   if (parity.actions) expect([...BOARD_ACTIONS].sort()).toEqual(parity.actions)
   for (const [type, [family, effort]] of Object.entries(parity.defaults ?? {})) {
@@ -619,6 +642,46 @@ test('the hooks read targets, quoting, questions, kinds, board subcommands and t
   for (const one of parity.quoted ?? []) expect([one.text, unquoted(one.text)]).toEqual([one.text, one.expect])
   for (const one of parity.question ?? []) expect([one.text, hasQuestion(one.text)]).toEqual([one.text, one.expect])
   for (const one of parity.kind ?? []) expect([one.text, kindOf(one.text)?.label ?? '']).toEqual([one.text, one.expect])
+  for (const one of parity.edges ?? []) {
+    const posts = one.posts.map((post, index) => ({ seq: index + 1, time: '', ...post }) as Post)
+    expect([one.posts, edgesOf(posts)]).toEqual([one.posts, one.expect])
+  }
+})
+
+test('a progress bar of any width draws a bounded number of notches, ten units apart at pane widths', () => {
+  const notches = (svg: string) => (svg.match(/M\d+ 0L/g) ?? []).length
+  expect(notches(progressBar(1, 'accent', false, 0, 200))).toBe(20)
+  expect(notches(progressBar(1, 'accent', false, 0, 1_000_000_000))).toBeLessThanOrEqual(201)
+  // however wide it is asked to be, every size it draws is a finite number
+  expect(progressBar(1, 'accent', false, 0, Number.MAX_VALUE)).not.toMatch(/Infinity|NaN/)
+})
+
+test('the progress track border keeps 3:1 against the track, light and dark, in sRGB and in Display P3', () => {
+  const linear = (c: number) => c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4
+  const srgbY = (hex: string) => { const [r, g, b] = [1, 3, 5].map(i => linear(parseInt(hex.slice(i, i + 2), 16) / 255)); return 0.2126729 * r! + 0.7151522 * g! + 0.072175 * b! }
+  const p3Y = (css: string) => { const [r, g, b] = css.replace(/^color\(display-p3 |\)$/g, '').split(' ').map(Number).map(linear); return 0.2289746 * r! + 0.6917385 * g! + 0.0792869 * b! }
+  const ratio = (a: number, b: number) => (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05)
+  expect(ratio(srgbY(beehivePalette.waxTrack.light), srgbY(beehivePalette.waxBorder.light))).toBeGreaterThanOrEqual(3)
+  expect(ratio(p3Y(beehivePalette.waxTrack.lightP3), p3Y(beehivePalette.waxBorder.lightP3))).toBeGreaterThanOrEqual(3)
+  expect(ratio(srgbY(beehivePalette.waxTrack.dark), srgbY(beehivePalette.waxBorder.dark))).toBeGreaterThanOrEqual(3)
+  expect(ratio(p3Y(beehivePalette.waxTrack.darkP3), p3Y(beehivePalette.waxBorder.darkP3))).toBeGreaterThanOrEqual(3)
+})
+
+test('a member the run lost contact with keeps its lost bee through a pause', () => {
+  expect(memberBee('#e9ac55', 'unreachable', 0, 'a', true)).toBe(memberBee('#e9ac55', 'unreachable', 0, 'a', false))
+  expect(memberBee('#e9ac55', 'working', 0, 'a', true)).not.toBe(memberBee('#e9ac55', 'working', 0, 'a', false))
+  // nor does a pause make an unstarted member's brood cell a paused bee
+  expect(memberBee('#e9ac55', 'not started', 0, 'a', true)).toBe(memberBee('#e9ac55', 'not started', 0, 'a', false))
+})
+
+test('a file command whose glob may name board.py runs no board command', () => {
+  // Seen live: `cp tests/*.py …; git show …/board.py > …` was refused as a hidden budget change.
+  expect(hasHiddenBoardLimit('cp tests/*.py tests/parity.json $S/tests/; git show HEAD:a/board.py > $S/board.py')).toBe(false)
+  expect(launches(['cp', 'skills/*.py', 'dest/'], 'board.py')).toBeUndefined()
+  expect(launches(['mv', 'board.py', 'old.py'], 'board.py')).toBeUndefined()
+  // An unknown command handed the script still counts as running it.
+  expect(launches(['uv', 'run', 'board.py', 'run', 'close'], 'board.py')).toBe('other')
+  expect(hasHiddenBoardLimit('S=/p/board.py; uv run $S /p/.swarm/r-20260101-000000 limit budget=1')).toBe(true)
 })
 
 test('F23: a question mark before a long run of blanks is read in linear time', () => {
@@ -749,7 +812,8 @@ test('a launcher\'s options are read with their values: python\'s -W, a shell\'s
   expect(launches(words('python3 -c "print(1)"'), 'board.py')).toBeUndefined()
   expect(launches(words('python3 -m py_compile /p/board.py'), 'board.py')).toBeUndefined()
   expect(launches(words('python3 -m runpy /p/board.py'), 'board.py')).toBe('other')
-  expect(launches(words('python3 tool.py /p/board.py'), 'board.py')).toBeUndefined()
+  expect(launches(words('python3 tool.py /p/board.py'), 'board.py')).toBe('other')
+  expect(launches(words('tool.py /p/board.py'), 'board.py')).toBe('other')
   expect(launches(words('python3'), 'board.py', 'python3 <<EOF\nboard.py\nEOF')).toBe('other')
   expect(launches(words('perl -e "system(\'board.py\')"'), 'board.py')).toBe('other')
   expect(launches(words('echo perl'), 'board.py', 'board.py')).toBeUndefined()
@@ -1210,16 +1274,17 @@ test('visual polish: animated emblems, progress bars, semantic icons, status dot
     }
   }
   expect(swarmEmblem('working', 200)).toContain('emb-ring')
-  expect(swarmEmblem('working', 200)).toContain('prefers-reduced-motion:reduce')
+  expect(swarmEmblem('working', 200)).toContain('prefers-reduced-motion:no-preference')
   expect(swarmEmblem('closed')).not.toContain('emb-ring')
   expect(swarmEmblem('paused')).toContain('<rect ')
 
-  // Progress bar clamps ratios safely, animates shimmer only when requested and wide enough
+  // Progress bar clamps ratios safely, uses explicit viewBox, and animates shimmer only when requested and wide enough
   expect(progressBar(0, 'accent', true)).not.toContain('shimmer')
-  expect(progressBar(-5, 'accent')).toContain('viewBox="0 0 200 6"')
+  expect(progressBar(-5, 'accent')).toContain('viewBox="0 0 200 6" width="200" height="6"')
   expect(progressBar(NaN, 'warning')).not.toContain('NaN')
   expect(progressBar(0.65, 'success', true, 120)).toContain('class="shimmer"')
-  expect(progressBar(1.8, 'error', false)).toContain('width="200"')
+  expect(progressBar(1.8, 'error', false)).toContain('width="200" height="6" rx="3" fill="var(--fill)"')
+  expect(progressBar(0.5, 'accent')).toContain('width="100" height="6" rx="3" fill="var(--fill)"')
 
   // Semantic icons render distinct shapes across light/dark Display P3 themes
   for (const kind of ['pass', 'ready', 'warn', 'error', 'info', 'paused'] as const) {
@@ -1228,18 +1293,18 @@ test('visual polish: animated emblems, progress bars, semantic icons, status dot
     expect(icon).toContain('prefers-color-scheme:dark')
   }
 
-  // Animated statusDot keeps safe elapsed handling and reduced-motion guards
+  // Animated statusDot keeps safe elapsed handling and opt-in reduced-motion guards
   expect(statusDot('working', NaN)).not.toContain('NaN')
   expect(statusDot('working', 500)).toContain('sw-pulse')
-  expect(statusDot('working', 500)).toContain('prefers-reduced-motion:reduce')
+  expect(statusDot('working', 500)).toContain('prefers-reduced-motion:no-preference')
   expect(statusDot('coordinating', 500)).toContain('sw-aura')
 
   // Hive art uses smooth animations + soft radial aura when active, none when sleeping
   expect(hiveArt('build', 400)).toContain('radialGradient id="hg"')
   const asleep = hiveArt('sleep', 400)
   expect(asleep).not.toContain('radialGradient')
-  expect(asleep).toContain('translate(30 8)"><path class="sleep-mark"')
-  expect(asleep).toContain('translate(38 5)"><path class="sleep-mark sleep-mark-small"')
+  expect(asleep).toContain('translate(31 7)"><path class="sleep-mark"')
+  expect(asleep).toContain('translate(37 4)"><path class="sleep-mark sleep-mark-small"')
   expect(asleep).toContain('prefers-reduced-motion:no-preference')
   expect(asleep).not.toContain('prop-echo')
   expect(hiveArt('verify', 400)).toContain('var(--ok)')
@@ -1282,34 +1347,34 @@ test('visual polish: animated emblems, progress bars, semantic icons, status dot
 
 test('member bees keep their wings, antennae, and striped body across statuses and energize when working', () => {
   const accent = '#628fd2'
-  const outline = (svg: string) => svg.match(/<path class="(?:bee-body|bee-antennae|bee-band|wing-front|wing-back)"[^>]+>/g)
-  const active = memberBee(accent, 'working', 300)
-  const coord = memberBee(accent, 'coordinating', 300)
+  const parts = (svg: string) => svg.match(/<path class="(?:bee-body|bee-antennae|bee-band[^"]*|wing-front|wing-back)"[^>]+>/g)
+  const coreBody = (svg: string) => svg.match(/<path class="(?:bee-body|bee-antennae|bee-band[^"]*)"[^>]+>/g)
+  const active = memberBee(accent, 'working', 300, 'worker-a')
+  const coord = memberBee(accent, 'coordinating', 300, 'coordinator')
+  expect(MEMBER_BEE_SIZE).toEqual({ width: 24, height: 15 })
   expect(active).toContain(`class="bee-body" fill="${accent}"`)
-  expect(active).toContain('viewBox="0 0 20 12"')
+  expect(active).toContain('viewBox="0 0 24 15"')
   expect(active).toContain('shape-rendering="crispEdges"')
   expect(active).toContain('@media(prefers-reduced-motion:no-preference)')
-  expect(active).toContain('@keyframes flutter')
-  expect(active).toContain('@keyframes hover')
-  expect(active).toContain('class="spark s3"')
-  expect(active).toContain('animation:flutter 150ms')
-  expect(coord).toContain('animation:flutter 220ms')
-  expect(coord).not.toContain('class="spark s3"')
-  expect(outline(active)).toHaveLength(6)
-  expect(outline(coord)).toEqual(outline(active))
-  for (const status of ['waiting', 'not started', 'failed', 'unreachable', 'stopped', 'closed', 'killed']) {
-    const resting = memberBee(accent, status, 300)
-    expect(outline(resting)).toEqual(outline(active))
-    expect(resting).not.toContain('@keyframes flutter')
-    expect(resting).not.toContain('@keyframes hover')
-    expect(resting).not.toContain('class="spark')
-    expect(resting).not.toContain('radialGradient')
-    // only a member that never started or was retired is faded, whole, as its grey status dot says
-    expect(resting.includes('svg{opacity:.5}')).toBe(status === 'not started' || status === 'killed')
+  expect(active).toContain('@keyframes w-flap-l')
+  expect(active).toContain('@keyframes w-flap-r')
+  expect(coord).toContain('@keyframes c-flap-l')
+  expect(coord).toContain('radialGradient id="bg"')
+  expect(parts(active)).toHaveLength(6)
+  expect(parts(coord)).toEqual(parts(active))
+  for (const status of ['waiting', 'not started', 'paused', 'failed', 'unreachable', 'stopped', 'closed', 'killed']) {
+    const resting = memberBee(accent, status, 300, `seed-${status}`)
+    expect(parts(resting)).toHaveLength(6)
+    expect(coreBody(resting)).toEqual(coreBody(active))
+    expect(resting).not.toContain('@keyframes w-flap-l')
+    expect(resting).not.toContain('@keyframes c-flap-l')
+    // No opacity:.5 washout on any status; killed and not started use desaturated high-contrast tokens instead
+    expect(resting).not.toContain('svg{opacity:.5}')
+    expect(resting).toContain('@keyframes ')
   }
   // one family with the hive bees: the same wing and honey in both themes
-  for (const shared of ['--wing-back:#4b8f91', '--wing-back:#99c8c8', '--honey:#e9ac55']) expect(active).toContain(shared)
-  expect(hiveArt('sleep')).toContain('--wing:#4b8f91;--honey:#e9ac55')
+  for (const shared of ['--wing-back:#4b8f91', '--wing-back:#99c8c8', '--honey:#e8a848']) expect(active).toContain(shared)
+  expect(hiveArt('sleep')).toContain('--wing:#4b8f91;--honey:#e8a848')
   // a paused run is the waiting tone in its icon as in its emblem, not a colour of its own
   expect(semanticIcon('paused')).toContain(semanticIcon('warn').match(/--ic:#[0-9a-f]{6}/)![0])
 })
@@ -1416,4 +1481,130 @@ test('figuresIn reads the token figures a message names, however written', () =>
   expect(figuresIn('give it 3M, or 2.5 mln; not 500k but 3,000,000 or 1 250 000 or 660000')).toEqual([3_000_000, 2_500_000, 500_000, 3_000_000, 1_250_000, 660_000])
   expect(figuresIn('0.125M and 2,5 mln')).toEqual([125_000, 2_500_000])
   expect(figuresIn('wait 5 minutes, use 3 workers on #1361 and 0.7 lambda')).toEqual([])
+})
+
+test('motion helpers guard zero/NaN/negative inputs and produce deterministic seeded variety', () => {
+  expect([elapsedMs(-10), elapsedMs(NaN), elapsedMs(Infinity), elapsedMs(42.9)]).toEqual([0, 0, 0, 42])
+  // loopDelay guards non-positive/NaN duration and normalizes negative phase via Euclidean modulo
+  for (const bad of [0, -100, NaN, Infinity, 0.4]) expect(loopDelay(250, bad, 50)).toBe('0ms')
+  expect(loopDelay(0, 1000, 0)).toBe('0ms')
+  expect(loopDelay(250, 1000, 0)).toBe('-250ms')
+  expect(loopDelay(0, 1000, -50)).toBe('-950ms')
+  expect(loopDelay(10, 1000, -1060)).toBe('-950ms')
+  expect(loopDelay(10, 1000, NaN)).toBe('-10ms')
+  expect(loopDelay(-50, 1000, -50)).not.toMatch(/--/)
+
+  // hashSeed is deterministic unsigned 32-bit FNV-1a
+  const h1 = hashSeed('worker-alpha')
+  expect(h1).toBe(hashSeed('worker-alpha'))
+  expect(h1).toBeGreaterThanOrEqual(0)
+  expect(h1).toBeLessThanOrEqual(0xffffffff)
+  expect(hashSeed('worker-alpha')).not.toBe(hashSeed('worker-beta'))
+  expect(hashSeed(42)).toBe(hashSeed('42'))
+
+  // pickVariant stays in [0, count - 1] and guards count <= 1 / NaN
+  for (const bad of [0, 1, -3, NaN, Infinity]) expect(pickVariant('worker-a', bad)).toBe(0)
+  const picks = new Set(Array.from({ length: 40 }, (_, i) => pickVariant(`worker-${i}`, 4)))
+  expect(picks).toEqual(new Set([0, 1, 2, 3]))
+
+  // seededPhase stays in [0, duration - 1] and guards bad duration
+  for (const bad of [0, -100, NaN, Infinity, 0.5]) expect(seededPhase('worker-a', 'salt', bad)).toBe(0)
+  const p = seededPhase('worker-a', 'fl', 2800)
+  expect(p).toBe(seededPhase('worker-a', 'fl', 2800))
+  expect(p).toBeGreaterThanOrEqual(0)
+  expect(p).toBeLessThan(2800)
+  expect(seededPhase('worker-a', 'fl', 2800)).not.toBe(seededPhase('worker-a', 'hv', 2800))
+})
+
+test('beehive palette covers all 10 statusDot statuses, swarmEmblem states, semanticIcon kinds, explicit progressBar viewBox, and hairlineDivider', () => {
+  const allStatuses = ['coordinating', 'working', 'waiting', 'paused', 'not started', 'closed', 'killed', 'stopped', 'failed', 'unreachable'] as const
+  const dots = new Map<string, string>()
+  for (const status of allStatuses) {
+    const svg = statusDot(status, 350, 'worker-1')
+    expect(svg).toContain('viewBox="0 0 12 12"')
+    expect(svg).toContain('prefers-reduced-motion:no-preference')
+    expect(svg).not.toMatch(/NaN|Infinity|--\d/)
+    dots.set(status, svg)
+  }
+  // Every status renders a distinct SVG grammar
+  expect(new Set(dots.values()).size).toBe(allStatuses.length)
+  // Fallback status renders cleanly without motion
+  const fallback = statusDot('unknown-custom-state', 100)
+  expect(fallback).toContain('viewBox="0 0 12 12"')
+  expect(fallback).not.toContain('@keyframes')
+  // Distinct statusInk mapping while statusKey preserves paused/stopped/unreachable
+  expect([statusKey('paused'), statusInk('paused')]).toEqual(['paused', 'warning'])
+  expect([statusKey('stopped'), statusInk('stopped')]).toEqual(['stopped', 'error'])
+  expect([statusKey('unreachable'), statusInk('unreachable')]).toEqual(['unreachable', 'error'])
+
+  // swarmEmblem covers all 6 states with distinct badges/motion
+  const emblems = new Map<string, string>()
+  for (const state of ['working', 'coordinating', 'paused', 'attention', 'idle', 'closed'] as const) {
+    const svg = swarmEmblem(state, 240)
+    expect(svg).toContain('viewBox="0 0 20 20"')
+    expect(svg).not.toMatch(/NaN|Infinity/)
+    emblems.set(state, svg)
+  }
+  expect(new Set(emblems.values()).size).toBe(6)
+  expect(emblems.get('attention')).toContain('emb-ring')
+  expect(emblems.get('idle')).not.toContain('emb-ring')
+  expect(emblems.get('closed')).not.toContain('emb-ring')
+
+  // semanticIcon covers all 6 kinds with distinct glyphs
+  const icons = (['pass', 'ready', 'warn', 'error', 'info', 'paused'] as const).map(kind => semanticIcon(kind))
+  expect(new Set(icons).size).toBe(6)
+  for (const icon of icons) expect(icon).toContain('viewBox="0 0 12 12"')
+
+  // progressBar uses explicit outer viewBox, no nested <svg>, and supports custom widths
+  const bar = progressBar(0.4, 'accent', true, 150, 120)
+  expect(bar).toContain('viewBox="0 0 120 6" width="120" height="6"')
+  expect(bar.match(/<svg\b/g)?.length).toBe(1)
+  expect(bar).toContain('class="shimmer"')
+  expect(progressBar(0.4, 'accent', false, 0, NaN)).toContain('viewBox="0 0 200 6" width="200" height="6"')
+
+  // hairlineDivider & liveIndicator
+  expect(hairlineDivider).toContain('viewBox="0 0 200 1"')
+  expect(hairlineDivider).toContain('--hairline:#d5cbbd')
+  expect(liveIndicator(250)).toContain('viewBox="0 0 16 16"')
+  expect(liveIndicator(250)).toContain('@keyframes breath')
+})
+
+test('hiveArt paused/attention/unknown and deterministic memberBee animation variety across all statuses', () => {
+  const pausedArt = hiveArt('paused', 300)
+  const attentionArt = hiveArt('attention', 300)
+  const sleepArt = hiveArt('sleep', 300)
+  expect(pausedArt).toContain('viewBox="0 0 44 22"')
+  expect(pausedArt).not.toBe(sleepArt)
+  expect(attentionArt).toContain('radialGradient id="hg"')
+  expect(attentionArt).not.toBe(sleepArt)
+  expect(hiveArt('unknown-mood' as never, 300)).toBe(sleepArt)
+
+  // Every status exhibits deterministic multi-variant animation variety across distinct seeds
+  const expectedVariants: Record<string, number> = {
+    working: 4, coordinating: 3, waiting: 4, 'not started': 3, paused: 3,
+    closed: 3, killed: 3, stopped: 3, failed: 3, unreachable: 3,
+  }
+  const seeds = Array.from({ length: 40 }, (_, i) => `member-seed-${i}`)
+  for (const [status, count] of Object.entries(expectedVariants)) {
+    const keyframeSets = new Set<string>()
+    for (const seed of seeds) {
+      const svg = memberBee('#628fd2', status, 250, seed)
+      expect(svg).toContain('viewBox="0 0 24 15"')
+      expect(svg).not.toContain('svg{opacity:.5}')
+      expect(svg).not.toMatch(/NaN|Infinity|--\d/)
+      const names = [...svg.matchAll(/@keyframes ([a-z0-9-]+)/g)].map(m => m[1]).sort().join(',')
+      expect(names.length).toBeGreaterThan(0)
+      keyframeSets.add(names)
+    }
+    expect(keyframeSets.size).toBe(count)
+  }
+  // isPaused=true turns non-terminal bees into paused stasis, while terminal/broken statuses keep their own visuals
+  expect(memberBee('#628fd2', 'working', 250, 'w1', true)).toContain('stasis-hex')
+  expect(memberBee('#628fd2', 'killed', 250, 'w1', true)).toContain('retired-hex')
+  expect(memberBee('#628fd2', 'failed', 250, 'w1', true)).toContain('err-mark')
+
+  // roster detailOf heavy & paused regression
+  const heavyHint = { type: 'explorer', model: 'sonnet', effort: 'medium', depends: [], owns: '', ready: false, blocked_on: [], asked: 0, unreachable: false, heavy: true }
+  expect(detailOf('waiting', heavyHint, false, false)).toBe('context ceiling reached')
+  expect(detailOf('waiting', heavyHint, false, true)).toBe('its token budget is spent')
 })

@@ -27,7 +27,7 @@ Read only what decides the split: the task, the file list (`git ls-files`, Glob)
 - Sequential work of one type and model is one worker's: a second worker pays a cold start of about 65,000 tokens and re-reads the files.
 - Code or design changes get one verifier over the whole result.
 
-Type defaults (model, effort): worker Sonnet, medium; verifier Sonnet, medium (Opus, medium when the change crosses components, touches security or includes design); explorer Haiku, medium; investigator Opus, high; architect Fable, high; designer Opus, high.
+Type defaults (model, effort): worker Sonnet, medium; verifier Sonnet, medium (Opus, medium when the change crosses components, touches security or includes design); explorer Haiku, medium; investigator Opus, medium; architect Fable, high; designer Opus, high.
 
 ## Answer, briefly
 

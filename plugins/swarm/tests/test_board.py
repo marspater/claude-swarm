@@ -248,7 +248,7 @@ def scenario():
         assert not run(budget_run, "wake").strip()
         assert not run(budget_run, "claim", "worker", "worker-address", "1").strip()
         run(budget_run, "resume", ok=False)
-        run(budget_run, "limit", "budget=120")
+        run(budget_run, "limit", "--raise", "budget=120")
         run(budget_run, "resume")
         assert "@worker" in run(budget_run, "wake")
         duplicate = json.loads(run(budget_run, "account", "2" * 64, "coordinator", "42"))
@@ -259,7 +259,7 @@ def scenario():
         run(budget_run, "resume", ok=False)
         run(budget_run, "account", "bad key", actor, "1", ok=False)
         # The unweighted detail is kept by actor and wake, once per report, and never changes what is charged.
-        run(budget_run, "limit", "budget=1000")
+        run(budget_run, "limit", "--raise", "budget=1000")
         run(budget_run, "resume")
         owner = hashlib.sha256(b"swarm-agent:worker-address").hexdigest()
         for report in ("5", "5", "6"):
@@ -774,7 +774,7 @@ def audit(name):
     os.unlink(record)
     # the plan says what the run has no guard against
     assert "no token budget" not in run(team, "plan")  # every run starts with one
-    run(team, "limit", "budget=")
+    run(team, "limit", "--raise", "budget=")
     plan = run(team, "plan")
     assert "no token budget" in plan and "@all wakes all" in plan
     run(team, "limit", "budget=1000")
@@ -1793,11 +1793,11 @@ class BoardRegressions(unittest.TestCase):
             run(d, "resume")
             run(d, "limit", "max_workers=5", "max_members=10", "budget=100")
             run(d, "account", "a" * 64, "coordinator", "200")
-            run(d, "limit", "budget=150")
+            run(d, "limit", "--raise", "budget=150")
             assert saved(d)["paused"] == "token budget of 150 spent"
             paused_items = [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "paused"]
             assert len(paused_items) == 1
-            run(d, "limit", "max_workers=", "max_members=", "budget=")
+            run(d, "limit", "--raise", "max_workers=", "max_members=", "budget=")
             assert saved(d)["limits"] == {}
 
 
@@ -1970,7 +1970,7 @@ class BoardRegressions(unittest.TestCase):
 
     def test_low_limits_pause_and_a_pending_post_are_validated(self):
         d = self.init_run()
-        assert run(d, "limit", "budget=0").startswith("limits: none")  # zero is no budget, and is not kept as one
+        assert run(d, "limit", "--raise", "budget=0").startswith("limits: none")  # zero is no budget, and is not kept as one
         assert "budget" not in saved(d)["limits"]
         run(d, "limit", "opus=,", ok=False)
         run(d, "limit", "opus=architect,,architect")
@@ -2723,13 +2723,48 @@ class BoardRegressions(unittest.TestCase):
         assert board.asks("x" * 300_000 + " is that so?")
         assert time.monotonic() - started < 2
 
+    def test_a_route_map_too_large_for_the_pane_is_left_out_of_the_report(self):
+        sys.path.insert(0, os.path.dirname(BOARD))
+        import board
+        from unittest import mock
+        posts = [{"seq": n + 1, "agent": "m%d" % n, "to": ["m%d" % (n + 1)], "text": "@m%d go" % (n + 1)} for n in range(50)]
+        assert set(board.journal_view(posts)) == {"reported", "edges", "through"}
+        with mock.patch.object(board, "ROUTES_MAX_BYTES", 100):
+            # Whatever else it says still fits: only the routes go, and the pane counts them off its tail.
+            assert set(board.journal_view(posts)) == {"reported"}
+
+    def test_a_budget_raise_is_judged_at_write_time_and_takes_raise(self):
+        # The hooks pass a cut against the budget they read; the user may lower it before the board writes.
+        d = self.init_run()
+        run(d, "limit", "budget=2000000")  # a cut from the 3,000,000 a new run holds
+        refused = engine.board(d, "limit", "budget=2500000")
+        assert refused[0] == 1 and "--raise" in refused[2], refused
+        assert engine.board(d, "limit", "budget=")[0] == 1  # lifting it is a raise too
+        run(d, "limit", "--raise", "budget=2500000")
+        assert json.loads(open(os.path.join(d, "members.json")).read())["limits"]["budget"] == "2500000"
+        run(d, "limit", "budget=1000000")  # a cut needs no flag
+
+    def test_attention_names_each_members_last_report_and_every_route_over_the_whole_journal(self):
+        d = self.init_run()
+        run(d, "member", "art")
+        run(d, "post", "coordinator", stdin="@art BRIEF the parser")
+        run(d, "ready", "art", stdin="done")
+        run(d, "post", "art", stdin="@all heads up")
+        assert "reported" not in run(d, "attention")  # the text report draws no graph, and pays for none
+        report = json.loads(run(d, "attention", "--json"))
+        assert report["through"] == 3
+        assert report["reported"] == {"art": {"seq": 2, "word": "READY", "partial": False, "members": []}}, report["reported"]
+        assert report["edges"] == {"coordinator>art": 1, "art>coordinator": 1, "art>@all": 1, "art>coordinator>all": 1}, report["edges"]
+
     def test_parity_vectors_match_the_board(self):
         sys.path.insert(0, os.path.dirname(BOARD))
         import board  # noqa: E402
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "parity.json"), encoding="utf-8") as f:
             vectors = json.load(f)
         # A kind of vector added to the file and checked here by nobody would let drift through unseen.
-        assert set(vectors) == {"targets", "quoted", "question", "kind", "actions", "defaults", "effort"}, sorted(vectors)
+        assert set(vectors) == {"targets", "quoted", "question", "kind", "actions", "defaults", "effort", "edges"}, sorted(vectors)
+        for case in vectors["edges"]:  # the pane's graph (edgesOf) counts what attention's report counts
+            assert board.edges(case["posts"]) == case["expect"], case
         for kind, size, expect in vectors["effort"]:
             assert board.sized_effort(kind, size or None) == expect, (kind, size)
         # The pane's list of board commands (hooks/hive.ts) and its starting model and effort per type (hooks/models.ts).
@@ -3289,7 +3324,7 @@ class BoardRegressions(unittest.TestCase):
             run(d, "member", "w", "owns=src")
             run(d, "member", "w", "id=agent-w")  # the allocation freezes, and w keeps a share to be stopped at
             assert saved(d)["members"]["w"]["alloc"], saved(d)
-            run(d, "limit", "budget=" + figure)
+            run(d, "limit", "--raise", "budget=" + figure)  # the user's figure, whichever way it moves the budget
             assert "alloc" not in saved(d)["members"]["w"], saved(d)
             assert "member_paused" not in self.account(d, "agent-w", 2_000_000)
 

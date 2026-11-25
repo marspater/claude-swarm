@@ -45,17 +45,17 @@ test('the coordinator sits at the center with members around it', async () => {
     ],
   }
   const graph = graphSvg(swarm, 3, new Set(), false, true, true)
-  expect(graph).toContain('<g transform="translate(280.0 165.0)"><title>coordinator')
-  expect(graph).toContain('<g transform="translate(280.0 36.0)"><title>parser')
-  expect(graph).toContain('<g transform="translate(280.0 294.0)"><title>verifier')
+  expect(graph).toContain('<g class="node waiting" transform="translate(280.0 165.0)"><title>coordinator')
+  expect(graph).toContain('<g class="node waiting" transform="translate(280.0 36.0)"><title>parser')
+  expect(graph).toContain('<g class="node waiting" transform="translate(280.0 294.0)"><title>verifier')
   expect(graph).toContain('parser to verifier')
   expect(graph).toContain('repeatCount="indefinite"')
   expect(graph).toContain('prefers-reduced-motion')
   const first = graphSvg(swarm, 1, new Set(), false, false)
-  expect(first).toContain('<g transform="translate(280.0 36.0)"><title>parser')
+  expect(first).toContain('<g class="node" transform="translate(280.0 36.0)"><title>parser')
   expect(first).not.toContain('<title>verifier')
   const filtered = graphSvg(swarm, 3, new Set(['verifier']), false, true)
-  expect(filtered).toContain('<g transform="translate(280.0 36.0)"><title>parser')
+  expect(filtered).toContain('<g class="node waiting" transform="translate(280.0 36.0)"><title>parser')
   expect(filtered).not.toContain('parser to verifier')
   expect(graphSvg({ ...swarm, earlierEdges: { 'parser>parser': 2 } }, 3, new Set(), false, true)).not.toMatch(/NaN|Infinity/)
   const peerRoute = graph.match(/d="M([\d.]+) ([\d.]+) Q([\d.]+) ([\d.]+) ([\d.]+) ([\d.]+)"[^>]*><title>parser to verifier/)
@@ -69,7 +69,7 @@ test('the coordinator sits at the center with members around it', async () => {
   }
 
   const single = graphSvg({ ...swarm, members: [swarm.members[0]!] }, 3, new Set(), false, true)
-  expect(single).toContain('<g transform="translate(280.0 165.0)"><title>parser')
+  expect(single).toContain('<g class="node waiting" transform="translate(280.0 165.0)"><title>parser')
   expect(single).not.toContain('NaN')
 })
 
@@ -125,7 +125,7 @@ test('an @all post is counted on its sender, drawn dashed only when expanded, an
   expect(drawGraph(swarm, 3, new Set(), true, true).key).toContain('(1 in all), drawn by Expand @all')
   // a post that names nobody leaves a dashed outline on its sender, as the key says
   expect(collapsed).toMatch(/<title>coordinator · waiting · 1 post with no mention · 1 to @all<\/title>.*?class="pill sender quiet"/)
-  expect(collapsed).toContain('class="pill quiet" x="336"')
+  expect(collapsed).toContain('class="pill quiet" x="350"')
   expect(drawGraph(swarm, 3, new Set(), true, true).key).toContain('Dashed outline: posted with no mention')
 
   const expanded = graphSvg(swarm, 3, new Set(), true, true, false, 0, true)
@@ -293,7 +293,7 @@ test('peer detours separate solid and @all edges, badges expand for 3 digits and
   expect(svg).toContain('class="presence-x failed"')
   expect(svg).toContain('class="presence not-started"')
   expect(statusDot('coordinating')).toContain('<path')
-  expect(statusDot('waiting')).toContain('r="1.6"')
+  expect(statusDot('waiting')).toContain('r="1.5"')
   expect(statusDot('failed')).toContain('stroke-linecap="round"')
   expect(statusDot('not started')).toContain('stroke-width="1.5"')
 })
@@ -324,7 +324,7 @@ test('a large team is drawn in two arcs: names keep their size and no two overla
   // a ring of twenty such names is over 1300 wide and is scaled to less than half its size in the pane
   expect(width).toBeLessThan(760)
   expect(graphHeight(75, members)).toBeGreaterThan(450)
-  const spots = [...svg.matchAll(/<g transform="translate\(([\d.-]+) ([\d.-]+)\)"><title>/g)].map(match => [Number(match[1]), Number(match[2])] as const)
+  const spots = [...svg.matchAll(/<g class="node[^"]*" transform="translate\(([\d.-]+) ([\d.-]+)\)"><title>/g)].map(match => [Number(match[1]), Number(match[2])] as const)
   expect(spots.length).toBe(21)
   for (const [i, a] of spots.entries()) {
     expect(a[0]).toBeGreaterThan(80)
@@ -628,14 +628,18 @@ test('a dense graph stays within the host limit, keeps the latest route, and say
   expect(drawGraph(swarm, 48, new Set(), false, true, false, 0, false, 2000).svg).toBeUndefined()
 })
 
-test('a closed run shows no live state on its graph, only who was retired', () => {
+test('a closed run shows no live state on its graph, only who was closed or retired', () => {
   const members = teamOf(['coordinator', 'parser', 'old'], 'closed')
   members[2]!.status = 'killed'
   const posts: Post[] = [{ seq: 1, agent: 'coordinator', to: ['parser'], text: '@parser go', time: '' }]
-  const svg = graphSvg({ title: 'T', dir: '/r', isClosed: true, attention: [], budget: 0, tokens: {}, posts, members }, 1, new Set(), false, true)
-  expect(svg).toContain('<title>parser</title>')
-  expect(svg).not.toMatch(/<title>[^<]*(?:waiting|working|closed)|class="presence[^"]*(?:waiting|working|closed)"/)
-  expect(svg).toContain('class="killed"')
+  const svg = graphSvg({ title: 'T', dir: '/r', isClosed: true, attention: [], budget: 0, tokens: {}, posts, members }, 1, new Set(), false, true, true)
+  expect(svg).toContain('<title>parser · closed</title>')
+  expect(svg).toContain('class="presence closed"')
+  expect(svg).not.toMatch(/<title>[^<]*(?:waiting|working)|class="presence[^"]*(?:waiting|working)"/)
+  expect(svg).not.toContain('p-ping')
+  expect(svg).not.toContain('repeatCount="indefinite"')
+  expect(svg).toContain('class="node killed"')
+  expect(svg).toContain('class="presence killed"')
   // the current route has one description, on the line always drawn
   expect(svg.split('<title>coordinator to parser').length - 1).toBe(1)
 })
@@ -713,4 +717,94 @@ test('a redraw of an unchanged layout reuses its routes, and another layout in b
   expect(moved.svg).not.toBe(first.svg)
   const routesOf = (svg = '') => svg.match(/class="(?:edge|route)[^"]*" d="[^"]*"/g)
   expect(routesOf(moved.svg)).toEqual(routesOf(first.svg))
+})
+
+test('graph regression: scoped .node hover, UTF-8 byte SVG_LIMIT, clamped badges, scaled @all ripples, and all status node treatments', () => {
+  const baseMember = { id: undefined, profile: undefined, model: '', effort: '', depends: [], owns: '', detail: '', unread: 0, posts: 1 }
+  const statusMembers = [
+    { ...baseMember, name: 'coordinator', role: 'coordinator', type: 'coordinator', status: 'coordinating' },
+    { ...baseMember, name: 'w-work', role: 'worker', type: 'worker', status: 'working' },
+    { ...baseMember, name: 'w-wait', role: 'worker', type: 'worker', status: 'waiting' },
+    { ...baseMember, name: 'w-pause', role: 'worker', type: 'worker', status: 'paused' },
+    { ...baseMember, name: 'w-queue', role: 'worker', type: 'worker', status: 'not started' },
+    { ...baseMember, name: 'w-stop', role: 'worker', type: 'worker', status: 'stopped' },
+    { ...baseMember, name: 'w-fail', role: 'worker', type: 'worker', status: 'failed' },
+    { ...baseMember, name: 'w-unreach', role: 'worker', type: 'worker', status: 'unreachable' },
+    { ...baseMember, name: 'w-killed', role: 'worker', type: 'worker', status: 'killed' },
+  ]
+  const posts: Post[] = [
+    { seq: 1, agent: 'coordinator', to: ['w-work', 'w-wait'], text: '@all sync now', time: '' },
+    { seq: 2, agent: 'w-work', to: ['coordinator', 'w-wait'], text: '@all update from outer', time: '' },
+  ]
+  const swarm: Swarm = {
+    title: 'AllStatuses', dir: '/r', isClosed: false, attention: [], budget: 0, tokens: {},
+    total: 2, earlierEdges: { 'coordinator>w-work': 12 }, posts, members: statusMembers,
+  }
+
+  // Scoped .node:hover>.pill so legend sample pills never light up on hover
+  const liveCenter = drawGraph(swarm, 1, new Set(), true, true, true, 120, false)
+  expect(liveCenter.svg).toContain('.node:hover>.pill{stroke:var(--accent)}')
+  expect(liveCenter.svg).not.toMatch(/(?<!>)\.pill:hover/)
+  // Center @all ripple scales to 154; outer @all ripple scales to 100; expandAll uses origin-pulse 24;54
+  expect(liveCenter.svg).toContain('values="24;154;154"')
+  const liveOuter = drawGraph(swarm, 2, new Set(), true, true, true, 120, false)
+  expect(liveOuter.svg).toContain('values="24;100;100"')
+  const expanded = drawGraph(swarm, 2, new Set(), true, true, true, 120, true)
+  expect(expanded.svg).toContain('class="motion origin-pulse"')
+  expect(expanded.svg).toContain('values="24;54;54"')
+  expect(expanded.svg).not.toContain('class="motion ripple"')
+
+  // Distinct status treatments on nodes + coordinating hex ping + status legend row
+  expect(liveCenter.svg).toContain('class="motion p-ping coordinating"')
+  expect(liveCenter.svg).toContain('class="node paused"')
+  expect(liveCenter.svg).toContain('class="node not-started"')
+  expect(liveCenter.svg).toContain('class="node stopped"')
+  expect(liveCenter.svg).toContain('class="node failed"')
+  expect(liveCenter.svg).toContain('class="node unreachable"')
+  expect(liveCenter.svg).toContain('class="node killed"')
+  expect(liveCenter.key).toContain('Statuses: coordinating, working, waiting, paused, not started, stopped, failed, unreachable, killed')
+
+  // Paused run gates live route loops and p-ping, while showing paused treatment on live workers
+  const pausedRun = drawGraph({ ...swarm, isPaused: true }, 1, new Set(), false, true, true, 120, false)
+  expect(pausedRun.svg).not.toContain('repeatCount="indefinite"')
+  expect(pausedRun.svg).not.toContain('p-ping')
+  expect(pausedRun.svg).toContain('class="presence-ring paused p-pause"')
+  // Terminal/broken statuses remain distinct even when the run is paused
+  expect(pausedRun.svg).toContain('class="node failed"')
+  expect(pausedRun.svg).toContain('class="node killed"')
+
+  // Count badges are clamped inside the stage bounds
+  const badgeSvg = graphSvg(
+    { ...swarm, posts: [{ seq: 1, agent: 'coordinator', to: ['w-work'], text: '@w-work hi', time: '' }], earlierEdges: { 'coordinator>w-work': 999 } },
+    1, new Set(), false, true,
+  )
+  const vb = badgeSvg.match(/viewBox="0 0 ([\d.]+) ([\d.]+)"/)!
+  const vw = Number(vb[1]), vh = Number(vb[2])
+  const badgePos = badgeSvg.match(/<g transform="translate\(([\d.]+) ([\d.]+)\)"><rect class="badge" x="[^"]+" y="-10" width="([\d.]+)"/)
+  expect(badgePos).not.toBeNull()
+  const bx = Number(badgePos![1]), by = Number(badgePos![2]), bw = Number(badgePos![3])
+  expect(bx).toBeGreaterThanOrEqual(bw / 2 + 4)
+  expect(bx).toBeLessThanOrEqual(vw - bw / 2 - 4)
+  expect(by).toBeGreaterThanOrEqual(12)
+  expect(by).toBeLessThanOrEqual(vh - 12)
+
+  // SVG_LIMIT is enforced in UTF-8 bytes, not JS UTF-16 code units
+  const utf8 = new TextEncoder()
+  const mbNames = ['coordinator', '🐝-αβγδ-1', '🐝-αβγδ-2', '🐝-αβγδ-3', '🐝-αβγδ-4']
+  const mbPosts: Post[] = [
+    { seq: 1, agent: mbNames[1]!, to: [mbNames[2]!], text: `@${mbNames[2]} hi`, time: '' },
+    { seq: 2, agent: mbNames[2]!, to: [mbNames[3]!], text: `@${mbNames[3]} hi`, time: '' },
+    { seq: 3, agent: mbNames[3]!, to: [mbNames[4]!], text: `@${mbNames[4]} hi`, time: '' },
+    { seq: 4, agent: 'coordinator', to: [mbNames[1]!], text: `@${mbNames[1]} go`, time: '' },
+  ]
+  const mbSwarm = swarmOf(mbNames, mbPosts)
+  const fullMb = drawGraph(mbSwarm, 4, new Set(), false, true, false, 0, false, Infinity).svg!
+  const fullBytes = utf8.encode(fullMb).length
+  expect(fullBytes).toBeGreaterThan(fullMb.length)
+  // A limit between JS length and UTF-8 byte length must trim history so actual UTF-8 bytes <= limit
+  const midLimit = Math.floor((fullMb.length + fullBytes) / 2)
+  const bounded = drawGraph(mbSwarm, 4, new Set(), false, true, false, 0, false, midLimit)
+  expect(bounded.svg).toBeDefined()
+  expect(utf8.encode(bounded.svg!).length).toBeLessThanOrEqual(midLimit)
+  expect(bounded.hidden).toBeGreaterThan(0)
 })

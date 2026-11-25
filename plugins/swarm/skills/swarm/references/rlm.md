@@ -66,7 +66,7 @@ The exceptions: a JSON document on one line has no line ranges, so reformat it i
 
 ### 3. State the cost before spawning
 
-Tell the user the number of slices and that each is one Haiku agent at low effort. Above 8 slices, ask before you spawn. The user's own limits still apply. This replaces the `swarm` skill's ask-first rule for plans over five members: slice analysts are many, cheap and identical.
+Tell the user the number of slices and that each is one Haiku agent at low effort. Above 8 slices, ask before you spawn. The user's own limits still apply. This replaces the `swarm` skill's ask-first rule for plans over three members: slice analysts are many, cheap and identical.
 
 ### 4. Register the team
 

@@ -148,17 +148,17 @@ def repository(project):
     return root, os.fsencode((project.resolve() / ".swarm").relative_to(root).as_posix()).split(b"/")
 
 
-def _hash_entry(digest, path, mode):
+def _hash_entry(update, path, mode):
     if stat.S_ISLNK(mode):
         content = hashlib.sha256(os.fsencode(os.readlink(path)))
-        digest.update(b"link\0" + content.digest())
+        update(b"link\0" + content.digest())
     elif stat.S_ISREG(mode):
         # A concurrent replacement with a pipe must never block the fingerprint.
         with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW), "rb") as f:
             before = os.fstat(f.fileno())
             if not stat.S_ISREG(before.st_mode):
                 raise ValueError(f"source changed while fingerprinting {path}")
-            digest.update(b"x" if before.st_mode & stat.S_IXUSR else b"f")
+            update(b"x" if before.st_mode & stat.S_IXUSR else b"f")
             content = hashlib.sha256()
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 content.update(chunk)
@@ -166,12 +166,12 @@ def _hash_entry(digest, path, mode):
             if any(getattr(before, key) != getattr(after, key) for key in (
                     "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")):
                 raise ValueError(f"source changed while fingerprinting {path}")
-            digest.update(content.digest())
+            update(content.digest())
     else:
         raise ValueError(f"cannot fingerprint {path}")
 
 
-def _hash_dir(digest, root_dir):
+def _hash_dir(update, root_dir):
     entries = []
     for dirpath, dirnames, filenames in os.walk(root_dir):
         for d in dirnames:
@@ -182,17 +182,18 @@ def _hash_dir(digest, root_dir):
             entries.append((Path(dirpath) / fn).relative_to(root_dir))
     for rel in sorted(entries):
         name = os.fsencode(rel)
-        digest.update(len(name).to_bytes(8, "big") + name)
-        _hash_entry(digest, root_dir / rel, (root_dir / rel).lstat().st_mode)
+        update(len(name).to_bytes(8, "big") + name)
+        _hash_entry(update, root_dir / rel, (root_dir / rel).lstat().st_mode)
 
 
-def source_digest(project, nested=False, seen_roots=None, pointers=False):
+def source_digest(project, nested=False, seen_roots=None, pointers=False, entries=None):
     """Fingerprint the sources. The project's own .swarm folder holds run data and is left out; a folder of that
     name anywhere else, a nested repository's included, is the user's and counts as source.
     With POINTERS, as for an isolated candidate, a clean checked-out submodule stands for its commit, as an empty one
     does: the integration checkout never has it checked out, and the commit that lands records only the pointer.
     Without, the checks read the submodule's files in place, so a checked-out one is fingerprinted by its contents,
-    which staging its pointer does not change, and one deinitialised after a pass no longer matches it."""
+    which staging its pointer does not change, and one deinitialised after a pass no longer matches it.
+    ENTRIES, when supplied, collects each source entry's fingerprint for comparing candidates."""
     if seen_roots is None:
         seen_roots = set()
     resolved_project = project.resolve()
@@ -241,8 +242,15 @@ def source_digest(project, nested=False, seen_roots=None, pointers=False):
             # A tracked file replaced by a folder: the files in it are listed on their own, as they are once staged.
             continue
         digest.update(len(name).to_bytes(8, "big") + name)
+        update = digest.update
+        if entries is not None:
+            entry = hashlib.sha256()
+
+            def update(data):
+                digest.update(data)
+                entry.update(data)
         if stat.S_ISLNK(mode) or stat.S_ISREG(mode):
-            _hash_entry(digest, path, mode)
+            _hash_entry(update, path, mode)
         elif stat.S_ISDIR(mode) and found is not None and name in gitlinks:
             if checked_out(path):
                 sub_head = git(path, "rev-parse", "HEAD", optional=True) if pointers else None
@@ -250,27 +258,29 @@ def source_digest(project, nested=False, seen_roots=None, pointers=False):
                         path, "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none"):
                     # A clean submodule stands for its commit, the one staging records: the recorded one, or a new one
                     # whose pointer is staged or not yet, alike.
-                    digest.update(b"gitlink\0" + sub_head.strip())
+                    update(b"gitlink\0" + sub_head.strip())
                 else:
-                    digest.update(b"repo\0" + bytes.fromhex(
+                    update(b"repo\0" + bytes.fromhex(
                         source_digest(path, nested=True, seen_roots=seen_roots, pointers=pointers)))
             elif not any(path.iterdir()):
-                digest.update(b"gitlink\0" + gitlinks[name])
+                update(b"gitlink\0" + gitlinks[name])
             else:
-                digest.update(b"dir\0")
-                _hash_dir(digest, path)
+                update(b"dir\0")
+                _hash_dir(update, path)
         elif stat.S_ISDIR(mode) and (path / ".git").exists():  # a nested repository, or a dir with a non-repo .git
             sub_top = toplevel(path)
             if sub_top is not None and Path(os.fsdecode(sub_top.rstrip(b"\n"))).resolve() == path.resolve() and path.resolve() not in seen_roots:
-                digest.update(b"repo\0" + bytes.fromhex(
+                update(b"repo\0" + bytes.fromhex(
                     source_digest(path, nested=True, seen_roots=seen_roots, pointers=pointers)))
             elif found is not None and name in tracked:
-                digest.update(b"dir\0")
+                update(b"dir\0")
             else:
-                digest.update(b"dir\0")
-                _hash_dir(digest, path)
+                update(b"dir\0")
+                _hash_dir(update, path)
         else:
             raise ValueError(f"cannot fingerprint {path}")
+        if entries is not None:
+            entries[os.fsdecode(name)] = entry.hexdigest()
     return digest.hexdigest()
 
 
@@ -279,6 +289,13 @@ def board_lock(run):
     with (run / ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
+
+
+def lock_directory(project, run):
+    """Where the verification lock of PROJECT's checkout lives: its Git folder, which every project in the checkout
+    shares, or RUN's .swarm folder outside Git."""
+    git_dir = git(project, "rev-parse", "--absolute-git-dir", optional=True)
+    return Path(os.fsdecode(git_dir.rstrip(b"\n"))) if git_dir else Path(run).parent
 
 
 @contextmanager
@@ -932,15 +949,17 @@ def prepare(run, project, mode, checks, onto=None, subset=None, baseline=False, 
             if not work.is_dir():
                 raise ValueError("the requested project directory is missing in the candidate")
             check_hygiene(run, integration, base, commit, recorded, [run_data], allowed)
+        entries = {}
         candidate = {
             "candidate": identifier, "project": str(project), "path": str(work),
             "mode": mode, "base": base, "onto": onto, "commit": commit, "checks": checks or [], "no_checks": checks is None,
             "branch": os.fsdecode(branch).strip() if branch else None,
             "worktree": str(integration) if integration else None,
-            "inputs": recorded, "digest": source_digest(work, pointers=mode == "isolated"),
+            "inputs": recorded,
+            "digest": source_digest(work, pointers=mode == "isolated", entries=entries if mode == "shared" else None),
             # Every file as prepared: the digest reads a clean submodule of an isolated checkout as its commit, so one
             # filled in afterwards, with files the landed commit will not bring, would go unseen.
-            "exact": source_digest(work) if mode == "isolated" else None,
+            "exact": source_digest(work, entries=entries) if mode == "isolated" else None,
             "partial": subset is not None, "members": sorted(recorded), "baseline": baseline,
         }
         if allowed:  # the record of what the coordinator let through, for the verifier's report and the export
@@ -952,6 +971,7 @@ def prepare(run, project, mode, checks, onto=None, subset=None, baseline=False, 
             found = repository(project)
             if found is not None and git(project, "rev-parse", "--verify", "-q", "HEAD^{commit}", optional=True):
                 check_hygiene(run, found[0], "HEAD", None, recorded, not_source(found), allowed)
+        comparison = {}
         with board_lock(run):
             current_inputs = inputs(run, mode, subset)
             check_checks_field(run, candidate, current_inputs)
@@ -977,7 +997,20 @@ def prepare(run, project, mode, checks, onto=None, subset=None, baseline=False, 
             elif isinstance(previous, dict) and isinstance(previous.get("candidate"), str):
                 earlier = previous.get("superseded") if isinstance(previous.get("superseded"), list) else []
                 candidate["superseded"] = [*earlier, {"candidate": previous["candidate"], "inputs": previous.get("inputs")}]
+                old_entries = sources_of(run, previous)
+                if (isinstance(old_entries, dict) and previous.get("mode") == mode
+                        and previous.get("project") == str(project)):
+                    changed = sorted(name for name in old_entries.keys() | entries.keys()
+                                     if old_entries.get(name) != entries.get(name))
+                    comparison = {"previous_candidate": previous["candidate"], "changed_files": changed[:20],
+                                  "changed_file_count": len(changed)}
             if standing is None:
+                # Apart from the candidate's record, which each verifier attempt rewrites: this never changes. Only the
+                # next candidate's comparison reads it, so a failed write costs that comparison, never this candidate.
+                try:
+                    atomic_write(run / SOURCES_FILE, json.dumps({"candidate": identifier, "entries": entries}))
+                except OSError as error:
+                    print(f"note: the next candidate will not list the files it changes: {error}", file=sys.stderr)
                 save_candidate(run, candidate)
         if standing is not None:
             if integration is not None and integration.exists():
@@ -997,7 +1030,21 @@ def prepare(run, project, mode, checks, onto=None, subset=None, baseline=False, 
         print(f"The checkout of the candidate this one replaces is kept at {stale}: it holds changes or files of its own, "
               "which removing it would lose", file=sys.stderr)
     print(json.dumps({"candidate": identifier, "path": str(work), "commit": commit,
-                      "digest": candidate["digest"], "partial": candidate["partial"]}))
+                      "digest": candidate["digest"], "partial": candidate["partial"], **comparison}))
+
+
+SOURCES_FILE = "candidate-sources.json"
+
+
+def sources_of(run, candidate):
+    """The fingerprint of each source entry of CANDIDATE as prepared, for comparing the next one with it; None unknown."""
+    try:
+        saved = json.loads((run / SOURCES_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = None
+    if isinstance(saved, dict) and saved.get("candidate") == candidate.get("candidate"):
+        return saved.get("entries")
+    return candidate.get("source_entries")  # a run prepared before the fingerprints moved out of verification.json
 
 
 def remove_checkout(project, path):
@@ -1762,6 +1809,27 @@ def pending_commit_hooks(root, private, scratch, message):
     return msg
 
 
+def mode_drift(project):
+    """The tracked files whose executable bit differs from the one Git records, as paths from the top of the checkout,
+    when core.filemode is false (Git then sees no such difference), each with the mode Git records; None when it is
+    true or there is no checkout."""
+    found = repository(project)
+    if found is None or git(found[0], "config", "--bool", "--get", "core.filemode", optional=True) != b"false\n":
+        return None
+    root, drift = found[0], {}
+    for entry in git(root, "ls-files", "-s", "-z").split(b"\0"):
+        mode, _, name = entry.partition(b"\t")
+        mode = mode.split()[0] if mode else b""
+        if mode not in (b"100644", b"100755"):
+            continue
+        try:
+            if bool((root / os.fsdecode(name)).lstat().st_mode & stat.S_IXUSR) != (mode == b"100755"):
+                drift[os.fsdecode(name)] = mode.decode()
+        except OSError:
+            continue
+    return drift
+
+
 def keeps_modes(root):
     """Whether the volume under ROOT keeps an executable bit as set, both ways: on one that reports every file
     executable, the bit the checks saw says nothing, and Git sets core.filemode=false for that very reason."""
@@ -1861,6 +1929,11 @@ def commit(run, project, identifier, message):
             checkout.mkdir()
             git(root, "checkout-index", "--all", f"--prefix={checkout}/", index=private)
             turned, flipped, changed = [], [], set(names)
+            # Each path whose bit already differed at `init`, with the mode Git recorded for it then.
+            # "unknown" when `init` could not read them: every differing bit is then held to what the checks ran.
+            drift = load_state(run).get("mode_drift")
+            drifted = drift if isinstance(drift, dict) else None
+            unknown = drift == "unknown"
             for name, mode in modes.items():
                 if in_worktree(name, skip) or mode not in (b"100644", b"100755"):
                     continue
@@ -1869,8 +1942,11 @@ def commit(run, project, identifier, message):
                 try:
                     same = filecmp.cmp(source, restored, shallow=False)
                     # With core.filemode=false `git add` keeps the mode the index had, whatever the checks ran. Only
-                    # files this commit changes: a stray bit on an untouched one would refuse every commit.
-                    if same and name in changed and bool(source.lstat().st_mode & stat.S_IXUSR) != (mode == b"100755"):
+                    # files this commit changes, or whose difference is not the one `init` recorded: the same index
+                    # mode, so the same bit on disk. A stray bit from before the run would refuse every commit, while
+                    # one the run staged and then took back off would land unseen.
+                    if same and bool(source.lstat().st_mode & stat.S_IXUSR) != (mode == b"100755") and (
+                            name in changed or unknown or (drifted is not None and drifted.get(path) != mode.decode())):
                         flipped.append(path)
                 except FileNotFoundError:
                     # A sparse checkout omits these paths from both the source and the private checkout.
@@ -1884,10 +1960,11 @@ def commit(run, project, identifier, message):
             if flipped and keeps_modes(root):
                 raise ValueError("the commit would record %s with another executable bit than the checks ran it with "
                                  "(core.filemode is false, so staging keeps the mode the index had). Stage the mode "
-                                 "with %s (no file changes), then commit again" % (", ".join(map(shown, flipped[:5])), "; ".join(
+                                 "with %s (no file changes), then commit again%s" % (", ".join(map(shown, flipped[:5])), "; ".join(
                                      shlex.join(["git", "add", "--chmod=" + ("+x" if (root / path).lstat().st_mode & stat.S_IXUSR
                                                                              else "-x"), "--", ":(top,literal)" + path])
-                                     for path in flipped)))
+                                     for path in flipped), ". The run could not record at its start which bits already "
+                                 "differed, so every one that differs is held to the checks" if unknown else ""))
             left = [shown(os.fsdecode(path)) for code, path in pending_changes(project, codes=True, git_index=private)
                     if code[1:] != b" "]
             if left:
@@ -2064,10 +2141,8 @@ def main():
     if run.parent != (project / ".swarm").resolve() or not (run / "members.json").is_file():
         raise ValueError("expected an initialized Swarm run in the specified project")
     private(run)
-    git_dir = git(project, "rev-parse", "--absolute-git-dir", optional=True)
-    lock_directory = Path(os.fsdecode(git_dir.rstrip(b"\n"))) if git_dir else run.parent
     planned = False
-    with verification_lock(lock_directory):
+    with verification_lock(lock_directory(project, run)):
         if args.action == "prepare":
             if any(not check.strip() for check in args.check or []):
                 raise ValueError("each verification check must be a nonempty command")
@@ -2093,8 +2168,17 @@ def main():
                     raise ValueError("--when-ready plans the whole candidate; a partial one is prepared by hand")
                 # The command as given, for `ready` to run again: every later READY that completes the team makes a
                 # candidate from it, so no turn of the coordinator's is spent on a step the board's state decides.
-                plan = [arg for arg in sys.argv[sys.argv.index("prepare") + 1:] if arg not in ("--when-ready", "--keep-standing")]
-                (run / PLAN_FILE).write_text(json.dumps(plan), encoding="utf-8")
+                plan = [args.mode]
+                plan.extend("--check=" + check for check in args.check or [])
+                if args.no_checks:
+                    plan.append("--no-checks")
+                if args.base is not None:
+                    plan.append("--base=" + args.base)
+                for rule in args.allow or []:
+                    plan.append("--allow=" + rule)
+                if args.baseline_diff:
+                    plan.append("--baseline-diff")
+                atomic_write(run / PLAN_FILE, json.dumps(plan))
                 planned = True
             if not planned:
                 prepare(run, project, args.mode, None if args.no_checks else args.check, args.base, subset,

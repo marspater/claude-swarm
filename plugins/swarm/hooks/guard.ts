@@ -2,7 +2,7 @@
 // as the shell runs it. Needs the engine only for the file system and git.
 import type { EngineInterface } from 'claude-code'
 
-import { boardCalls, CASE_PATTERN, closesAfter, COMMITTING, GIT_BUILTINS, launches, makesCommit, NAMES_COMMIT, RUNNERS, scanShell, scriptsRun, shellLaunch, SHELLS, shellWords, type Statement, UNREAD, unwrap, withoutRedirects } from './command'
+import { boardCalls, CASE_PATTERN, closesAfter, COMMITTING, GIT_BUILTINS, launches, makesCommit, NAMES_COMMIT, type ParsedBoardCall, RUNNERS, scanShell, scriptsRun, shellLaunch, SHELLS, shellWords, type Statement, UNREAD, unwrap, withoutRedirects } from './command'
 import type { Roster } from './roster'
 
 export function normalizePath(p: string): string {
@@ -81,7 +81,18 @@ const INERT = new Set(['echo', 'printf', 'cat', 'grep', 'egrep', 'fgrep', 'rg', 
  */
 export async function commitsInSharedCheckout($: EngineInterface, command: string, checkout: string): Promise<boolean> {
   // Compared as the file system names them: the run folder and a `cd` may spell one checkout two ways.
-  const cwd = await resolveRealPath($, checkout)
+  return inspectBash($, command, await resolveRealPath($, checkout))
+}
+
+type CheckLimit = (call: ParsedBoardCall, target: string | undefined) => Promise<boolean>
+
+/** Check relative board limits from every directory in which Bash might reach them. */
+export async function blocksRelativeBoardLimit($: EngineInterface, command: string, check: CheckLimit): Promise<boolean> {
+  const cwd = await $.session.cwd().catch(() => '')
+  return cwd ? inspectBash($, command, cwd, check) : true
+}
+
+async function inspectBash($: EngineInterface, command: string, cwd: string, checkLimit?: CheckLimit): Promise<boolean> {
   const directoryAfter = (current: string | undefined, path?: string) => {
     // A path the shell expands (`$PWD`, `~`, a glob) leads where this cannot tell: it may be the checkout.
     if (path === undefined || path === '_' || /[$`~*?[{]/.test(path)) return undefined
@@ -221,7 +232,7 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
   }
   // One simple command, its words read as the shell runs them (`"git" commit`, `\git commit` and `git "commit"` are
   // all a commit), run from `here`. `isChildAlready`: it runs as a process of its own, so a cd there moves nothing.
-  const simple = async (input: readonly string[], here: Dirs, depth: number, isChildAlready = false): Promise<End> => {
+  const simple = async (input: readonly string[], here: Dirs, depth: number, isChildAlready = false, text = ''): Promise<End> => {
     const words = [...input]
     // A repository named by --git-dir, --work-tree or their variables cannot be told from the folder: refused.
     let isElsewhere = isNamedElsewhere
@@ -299,11 +310,23 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
     const from: Dirs = chdirs.length === 0 ? here
       : new Set([...here].map(dir => chdirs.reduce<string | undefined>((current, path) => directoryAfter(current, path), dir)))
     const end = (ok: Dirs, failed: Dirs = here): End => ({ hit: false, ok, failed })
+    if (checkLimit) {
+      const call = boardCalls(text)[0]
+      if (call?.action === 'limit' && !call.dir.startsWith('/')) {
+        for (const dir of from) {
+          // Bash can keep a logical cwd, but the board process resolves relative paths from the physical directory.
+          const current = dir === undefined ? undefined : await resolveRealPath($, dir)
+          if (await checkLimit(call, directoryAfter(current, call.dir))) return HIT
+        }
+        return end(here)
+      }
+    }
     if (name === undefined) return end(here, here)
     // A word this cannot read for sure (`$'\U…'`) may be git or a commit, unless the command only prints or reads.
     if (words.slice(at).some(word => word.includes(UNREAD)) && !INERT.has(name)) return HIT
     // A command named by a variable, a substitution or a placeholder (`$GIT commit`, `{}` under xargs) is any command.
     if (/[$`{}*?]/.test(words[at]!) || words[at] === '_') {
+      if (checkLimit) return isChild ? end(here) : end(union(here, UNKNOWN), union(here, UNKNOWN))
       return mayCommit(words.slice(at)) || (fromStdin && NAMES_COMMIT.test(command)) ||
         (words[at] === '_' && namesDirectCommit.test(command)) ? HIT : end(here)
     }
@@ -314,6 +337,7 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
     }
     if (!isChild && (name === 'exit' || name === 'return')) return end(new Set(), new Set())
     if (name === 'git' || /^git-./.test(name)) {
+      if (checkLimit) return end(here)
       // A redirection between git and its command (`git 2>/dev/null status`) is no word git gets.
       const gitArgs = withoutRedirects(name === 'git' ? args : [name.slice(4), ...args]).words
       return await git(gitArgs, from, isElsewhere, fromStdin, depth) ? HIT : end(here)
@@ -329,13 +353,14 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
       // A here-string is the script: `sh <<< 'git status'`.
       if (shell.stdin && shell.fed !== undefined) return (await run(shell.fed, from, depth + 1)).hit ? HIT : end(here)
       // A shell reading its script from a pipe, a heredoc or its input, or from a file, runs text this does not follow.
-      if (fromStdin || shell.stdin || args.some(arg => arg.startsWith('<'))) return NAMES_COMMIT.test(command) ? HIT : end(here)
+      if (fromStdin || shell.stdin || args.some(arg => arg.startsWith('<'))) return !checkLimit && NAMES_COMMIT.test(command) ? HIT : end(here)
       // A script that a substitution or a variable names (`bash <(…)`, `sh "$F"`) is text this does not have.
-      if (shell.file === '_' || /[$`]/.test(shell.file ?? '')) return NAMES_COMMIT.test(command) ? HIT : end(here)
+      if (shell.file === '_' || /[$`]/.test(shell.file ?? '')) return !checkLimit && NAMES_COMMIT.test(command) ? HIT : end(here)
       return end(here)
     }
     if (name === 'eval') {
       // eval runs its words in this shell: a cd there moves it. Words a variable fills in may be any command.
+      if (checkLimit && args.some(arg => arg === '_' || /[$`]/.test(arg))) return isChild ? end(here) : end(UNKNOWN, UNKNOWN)
       if ((/[$`]/.test(args.join(' ')) || args.includes('_')) && (mayCommit(args) || NAMES_COMMIT.test(command))) return HIT
       const ran = await run(args.join(' '), from, depth + 1)
       return ran.hit ? HIT : isChild ? end(here) : ran
@@ -355,7 +380,7 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
     if (name === 'source' || name === '.') {
       // A script read into this shell may go anywhere, and what it runs is not on this line. One a substitution
       // makes (`. <(…)`) runs what the line itself wrote: refused when it names a commit.
-      if (args.some(arg => arg === '_' || /[$`]/.test(arg)) && NAMES_COMMIT.test(command)) return HIT
+      if (!checkLimit && args.some(arg => arg === '_' || /[$`]/.test(arg)) && NAMES_COMMIT.test(command)) return HIT
       return end(union(here, UNKNOWN), union(here, UNKNOWN))
     }
     if (name === 'trap') {
@@ -370,11 +395,11 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
         const [, alias, value] = /^([^=\s]+)=([\s\S]*)$/.exec(arg) ?? []
         if (alias !== undefined) shellAliases.set(alias, value!)
       }
-      return NAMES_COMMIT.test(`git ${args.join(' ')}`) ? HIT : end(here)
+      return !checkLimit && NAMES_COMMIT.test(`git ${args.join(' ')}`) ? HIT : end(here)
     }
     // A command this does not know (or a strict wrapper whose flag could not be read) that runs git or a shell after
     // it is a commit when it names one, when its shell script commits, or when its further words come from its input.
-    if (!INERT.has(name)) {
+    if (!checkLimit && !INERT.has(name)) {
       if (/^(?:python\d*|perl|node|ruby|osascript|su|tmux)$/.test(name) &&
           (name === 'tmux' || args.some(arg => /^-[A-Za-z]*[ce]/.test(arg))) &&
           // Inline code names git and the subcommand any way it likes: `git commit`, or `['git', 'commit']`.
@@ -422,7 +447,7 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
   const copyFrames = (frames: Frame[]) => frames.map(frame => ({ ...frame, ends: [...frame.ends] }))
   // Reads a script from `from`: whether it commits, and where it may leave the shell when it ends well or badly.
   const run = async (script: string, from: Dirs, depth = 0): Promise<End> => {
-    if (depth > 8) return NAMES_COMMIT.test(script) ? HIT : { hit: false, ok: union(from, UNKNOWN), failed: union(from, UNKNOWN) }
+    if (depth > 8) return checkLimit || NAMES_COMMIT.test(script) ? HIT : { hit: false, ok: union(from, UNKNOWN), failed: union(from, UNKNOWN) }
     const statements = scanShell(script)
     // ponytail: depth and passes bound a script that nests or loops without end; past them the script is refused when it names a commit
     let s: State = { op: ';', ok: from, failed: new Set(), listStart: from, pipeStart: from, carryOk: new Set(), carryFailed: new Set() }
@@ -434,7 +459,7 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
     statements: for (let index = 0; index < statements.length; index++) {
       const { text, plain = text, inner = [], next, unread } = statements[index]!
       // A substitution that never closes runs what this cannot list: refused when the script names a commit.
-      if (unread && NAMES_COMMIT.test(script)) return HIT
+      if (unread && (checkLimit || NAMES_COMMIT.test(script))) return HIT
       let here: Dirs
       let rest: string
       if (resume) {
@@ -494,7 +519,7 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
           if (rest === '') break
           const pattern = CASE_PATTERN.exec(rest)
           // A case this cannot read: refused when the script names a commit anywhere, as a failed check is.
-          if (!pattern) return NAMES_COMMIT.test(script) ? HIT : { hit: false, ok: UNKNOWN, failed: UNKNOWN }
+          if (!pattern) return checkLimit || NAMES_COMMIT.test(script) ? HIT : { hit: false, ok: UNKNOWN, failed: UNKNOWN }
           rest = rest.slice(pattern[0].length)
           frame.state = 'body'
           here = okNext = failedNext = union(frame.entry, frame.fall ?? new Set())
@@ -581,7 +606,7 @@ export async function commitsInSharedCheckout($: EngineInterface, command: strin
       for (const body of inner) if ((await run(body, here, depth + 1)).hit) return HIT
       const { text: commandText, closes } = closesAfter(rest)
       if (commandText.trim() !== '') {
-        const ran = await simple(shellWords(commandText), here, depth, (isPiped && !framed) || next === '&')
+        const ran = await simple(shellWords(commandText), here, depth, (isPiped && !framed) || next === '&', commandText)
         if (ran.hit) return HIT
         okNext = ran.ok
         failedNext = ran.failed
@@ -676,6 +701,26 @@ function executableIndex(words: readonly string[]): number {
     at += wrapper.operands ?? 0
   }
   return at
+}
+
+/** A Bash budget change has to be a top-level board call whose arguments can be checked before it runs. */
+export function hasHiddenBoardLimit(command: string): boolean {
+  if (!command.includes('limit') && !command.includes('board')) return false
+  const file = 'board.py'
+  const { statements, expand } = possibleCommands(command)
+  for (const { text, words, script } of statements) {
+    const parsed = boardCalls(text)[0]
+    if (script === command && parsed?.action === 'limit' && launches(words, file) === 'script') continue
+    const scriptAt = words.findIndex(word => expand(word).some(value => /(?:^|\/)board\.py$/.test(value) || globNames(value, file)))
+    if (scriptAt >= 0) {
+      const action = words[scriptAt + 2] ?? ''
+      if ((expand(action).includes('limit') || /[$`*?\[{]/.test(action)) &&
+          launches(words.map((word, i) => i === scriptAt ? file : word), file)) return true
+    } else if (/\blimit\b/.test(text) && launches(words, file, script)) {
+      return true
+    }
+  }
+  return false
 }
 
 /**
