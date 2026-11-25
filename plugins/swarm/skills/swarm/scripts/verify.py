@@ -299,12 +299,24 @@ def lock_directory(project, run):
 
 
 @contextmanager
-def verification_lock(directory):
+def verification_lock(directory, wait=0):
+    """Held for one verification action in the checkout. Refused at once when another holds it, or after WAIT seconds
+    of asking: a verifier's test waits its turn, since every verifier is sent the same candidate and a refusal read
+    as a result was posted as NOT VERIFIED, which withdrew the pass the other verifier had just earned."""
     with (directory / ".verification.lock").open("a") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise ValueError("another verification action is already running in this checkout") from None
+        deadline, told = time.monotonic() + wait, False
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ValueError("another verification action is already running in this checkout") from None
+            if not told:
+                print("Waiting for the verification action running in this checkout (another verifier's test?) to end. "
+                      "This is no result: post no verdict on it", file=sys.stderr, flush=True)
+                told = True
+            time.sleep(0.2)
         yield
 
 
@@ -918,6 +930,15 @@ def prepare(run, project, mode, checks, onto=None, subset=None, baseline=False, 
                                  "post-checkout hook?), so the checks would read files the commit does not hold. Stop "
                                  "the hook from writing tracked or new files, then prepare again"
                                  % ", ".join(shown(os.fsdecode(name)) for name in unlike[:5]))
+            # With core.filemode=false that status sees no executable bit, and neither does acceptance's merge: a
+            # check that needs the bit would pass here on a mode the commit never brings.
+            flipped = mode_drift(integration)
+            if flipped and keeps_modes(integration):
+                raise ValueError("the integration checkout's executable bit differs from the mode its commit records, in %s "
+                                 "(a post-merge or post-checkout hook, with core.filemode false?), so the checks would read "
+                                 "a mode the commit does not hold. Record the mode in the worker's commit with `git add "
+                                 "--chmod`, or stop the hook from changing it, then prepare again"
+                                 % ", ".join(map(shown, sorted(flipped)[:5])))
             # Whatever chain it came down: `ready` reads only the members a worker waits for.
             state, posts = load(run)
             try:
@@ -985,8 +1006,19 @@ def prepare(run, project, mode, checks, onto=None, subset=None, baseline=False, 
             # The same files, checks and reports of the same workers as the candidate on the table: a READY that
             # changed nothing it holds (a follow-up worker's, or a second one racing the first) makes no new candidate,
             # so a pass that stands is not thrown away and the verifier is not sent to test the same thing twice.
-            same = ("mode", "project", "base", "onto", "checks", "no_checks", "baseline", "partial", "digest", "exact")
-            if (keep_standing and isinstance(previous, dict) and isinstance(previous.get("candidate"), str)
+            same = ("mode", "project", "base", "onto", "checks", "no_checks", "baseline", "partial")
+            if mode == "isolated":
+                # Both fingerprints hold the commit, and a merge made again is a new commit of the same files: the
+                # tree says whether they are the same, and the checkout the pass was tested in must still be there, as prepared.
+                def tree(commit):
+                    return isinstance(commit, str) and git(project, "rev-parse", "--verify", "-q", commit + "^{tree}", optional=True)
+
+                unchanged = (isinstance(previous, dict) and (tree(previous.get("commit")) or None) == tree(commit)
+                             and Path(str(previous.get("path"))).is_dir()
+                             and source_digest(Path(previous["path"]), pointers=True) == previous.get("digest"))
+            else:
+                unchanged = isinstance(previous, dict) and all(previous.get(key) == candidate[key] for key in ("digest", "exact"))
+            if (keep_standing and unchanged and isinstance(previous.get("candidate"), str)
                     and all(previous.get(key) == candidate[key] for key in same)
                     and previous.get("allowed", []) == candidate.get("allowed", [])
                     and isinstance(previous.get("members"), list) and previous.get("inputs") == {
@@ -996,7 +1028,9 @@ def prepare(run, project, mode, checks, onto=None, subset=None, baseline=False, 
             # late is the board's to tell from a verdict on this one.
             elif isinstance(previous, dict) and isinstance(previous.get("candidate"), str):
                 earlier = previous.get("superseded") if isinstance(previous.get("superseded"), list) else []
-                candidate["superseded"] = [*earlier, {"candidate": previous["candidate"], "inputs": previous.get("inputs")}]
+                # With its commit: `prune` removes a checkout left behind only while it is still on the commit made for it.
+                candidate["superseded"] = [*earlier, {"candidate": previous["candidate"], "inputs": previous.get("inputs"),
+                                                      "commit": previous.get("commit")}]
                 old_entries = sources_of(run, previous)
                 if (isinstance(old_entries, dict) and previous.get("mode") == mode
                         and previous.get("project") == str(project)):
@@ -1026,8 +1060,8 @@ def prepare(run, project, mode, checks, onto=None, subset=None, baseline=False, 
     # tested and stays, and nothing outside this run's folder is ever removed.
     stale = Path(previous.get("worktree") or "") if isinstance(previous, dict) and not previous.get("accepted") else None
     if stale and stale.parent == run and stale.name.startswith("integration-") and stale.exists() \
-            and not remove_checkout(project, stale):
-        print(f"The checkout of the candidate this one replaces is kept at {stale}: it holds changes or files of its own, "
+            and not remove_checkout(project, stale, previous.get("commit")):
+        print(f"The checkout of the candidate this one replaces is kept at {stale}: it holds changes, files or commits of its own, "
               "which removing it would lose", file=sys.stderr)
     print(json.dumps({"candidate": identifier, "path": str(work), "commit": commit,
                       "digest": candidate["digest"], "partial": candidate["partial"], **comparison}))
@@ -1047,12 +1081,23 @@ def sources_of(run, candidate):
     return candidate.get("source_entries")  # a run prepared before the fingerprints moved out of verification.json
 
 
-def remove_checkout(project, path):
-    """Remove the integration checkout at PATH unless that would lose something: a change, or a file of its own,
-    ignored ones included, which `git worktree remove` deletes unasked. True once it is gone."""
+def remove_checkout(project, path, commit=None):
+    """Remove the integration checkout at PATH unless that would lose something: a change, a file of its own,
+    ignored ones included, which `git worktree remove` deletes unasked, or a commit made there since COMMIT, the
+    candidate's own. True once it is gone."""
     held = git(path, "status", "--porcelain", "--ignored", "--untracked-files=all", "--ignore-submodules=none",
                optional=True)
-    return held == b"" and git(project, "worktree", "remove", str(path), optional=True) is not None
+    return (held == b"" and not holds_commits(path, commit)
+            and git(project, "worktree", "remove", str(path), optional=True) is not None)
+
+
+def holds_commits(path, commit=None):
+    """Whether the checkout at PATH is on commits that removing it would leave to no ref: any its HEAD reaches that
+    no branch, tag or remote does, nor COMMIT, the one Swarm made for it (a candidate's merge has no ref of its own).
+    Seen in an audit: a commit made on an integration checkout's detached HEAD left it clean, and it was removed.
+    True when Git cannot say."""
+    return git(path, "rev-list", "--max-count=1", "HEAD", "--not", "--branches", "--tags", "--remotes",
+               *([commit] if commit else []), optional=True) != b""
 
 
 DEFAULT_CHECK_TIMEOUT = 900
@@ -1473,6 +1518,13 @@ def test_candidate(run, project, identifier, verifier, timeout_arg=None):
         if candidate.get("accepted"):
             raise ValueError("this candidate was accepted; prepare a new candidate to test again")
         check_inputs(run, candidate)  # before anything is cleared: a test that cannot run voids nothing
+        passed_by = candidate.get("verified_by")
+        if passed_by and passed_by != verifier:
+            # Every verifier is sent the same candidate. A second test would take the pass from the verifier that
+            # earned it before that one has posted its line, which the board then refuses as no longer its own.
+            print(f"Candidate {identifier} already passed: @{passed_by} verified it, and nothing it holds has changed since. "
+                  "Nothing was run. This is no result of yours: post no verdict on it, only what your own review finds")
+            return
         candidate.pop("verified_by", None)
         candidate.pop("waived", None)  # the last attempt's: this one says anew what it waives
         candidate["attempt"] = attempt
@@ -2101,7 +2153,7 @@ def accept(run, project, identifier):
     if guidance:
         print(guidance)
     integration = candidate.get("worktree") or candidate["path"]
-    if candidate["mode"] == "isolated" and not remove_checkout(project, Path(integration)):
+    if candidate["mode"] == "isolated" and not remove_checkout(project, Path(integration), candidate["commit"]):
         print(f"Integration checkout retained at {integration}")
 
 
@@ -2142,7 +2194,7 @@ def main():
         raise ValueError("expected an initialized Swarm run in the specified project")
     private(run)
     planned = False
-    with verification_lock(lock_directory(project, run)):
+    with verification_lock(lock_directory(project, run), DEFAULT_ATTEMPT_TIMEOUT if args.action == "test" else 0):
         if args.action == "prepare":
             if any(not check.strip() for check in args.check or []):
                 raise ValueError("each verification check must be a nonempty command")
@@ -2196,7 +2248,10 @@ def main():
     if planned:
         # Prepared and handed to the verifier by the board, as each later READY will have it: one path for both. Run
         # once the lock above is let go, since the board's prepare takes it.
-        done = subprocess.run([sys.executable, "-B", str(Path(__file__).with_name("board.py")), str(run), "dispatch"])
+        # By the run's path through the project: the board reads the project off that path, and RUN is where the
+        # run is stored, which is somewhere else when .swarm is a link.
+        done = subprocess.run([sys.executable, "-B", str(Path(__file__).with_name("board.py")),
+                               str(project / ".swarm" / run.name), "dispatch"])
         sys.exit(done.returncode)
 
 

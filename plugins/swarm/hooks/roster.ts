@@ -240,6 +240,8 @@ export const memberNamed = (members: Roster, name?: string) => name && Object.ha
 // What `board.py attention --json` answers: the items, and each member as the board sees it.
 export type Report = {
   items: AttentionItem[]
+  /** Each name's newest unread post, over the whole journal. */
+  unread_through?: Record<string, number>
   members: Record<string, {
     type: string
     model: string

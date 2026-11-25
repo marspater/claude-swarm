@@ -2055,6 +2055,115 @@ test('a turn\'s end whose write failed is charged in full when it is reported ag
   expect([run.state.usage.tokens.coordinator, run.landed.length]).toEqual([105, 1])
 })
 
+test('an advisor charge whose response was lost is not charged again under the next step\'s report', async ($, on) => {
+  const state = {
+    title: 'Demo swarm', usage: { tokens: {} as Record<string, number>, detail: {} as Record<string, Record<string, number[]>> },
+    members: { coordinator: { role: 'coordinator', last_read_seq: 1 }, parser: { role: 'worker', id: 'a1', last_read_seq: 1 } },
+  }
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['parser'], text: '@parser BRIEF' }),
+    roster: () => JSON.stringify(state),
+  })
+  const clock = mock.clock(on)
+  const advisorCharges: number[] = []
+  on('process.run', (_, e) => {
+    const stdout = board(e)
+    if (e.argv[3] !== 'account') return answer(stdout)
+    const [actor, amount, detail] = [e.argv[5] ?? '', Number(e.argv[6]), e.argv[7] ?? '']
+    state.usage.tokens[actor] = (state.usage.tokens[actor] ?? 0) + amount
+    if (!detail.startsWith('advisor:')) return answer(JSON.stringify({ title: state.title, total: 0, budget: 0, paused: false }))
+    // The board saves the charge, as board.py does, and the hook never hears: the first response is lost.
+    const row = ((state.usage.detail[actor] ??= {}).advisor ??= [0, 0, 0, 0, 0])
+    const counts = detail.slice('advisor:'.length).split(',').map(Number)
+    row[0]! += 1
+    counts.forEach((count, index) => { row[index + 1]! += count })
+    advisorCharges.push(amount)
+    return advisorCharges.length === 1 ? { value: { ...answer('').value, exitCode: 1 } }
+      : answer(JSON.stringify({ title: state.title, total: 0, budget: 0, paused: false }))
+  })
+  on('settings.read', () => ({ value: { advisorModel: 'opus' } }))
+  let advisorInput = 0
+  on('agent.list', () => ({ value: [{
+    id: 'a1', description: '@parser', type: 'swarm:worker', status: 'running',
+    usage: [{ model: 'claude-opus-5-5', input_tokens: advisorInput, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }],
+  }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  let consulted = true
+  on('turn.step', async function* (_, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'tool_use' as const,
+      serverToolUses: consulted ? [{ name: 'advisor', startedAt: 0, endedAt: 1000 }] : [],
+      usage: { model: 'claude-sonnet-5-5', input_tokens: 10, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } as never
+  })
+  const step = async (index: number) => {
+    for await (const _ of $.turn.step({ turnId: 'member-turn', index, model: 'claude-sonnet-5-5', messageCount: 1, agentId: 'a1' })) { /* no chunks */ }
+    await clock.advance(1)
+  }
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  // The first steps find the agent's run and what the roster holds of its advisor: nothing yet.
+  await step(0)
+  await step(1)
+  expect(advisorCharges).toEqual([])
+  advisorInput = 100
+  await step(2)
+  expect(advisorCharges.length).toBe(1)
+  consulted = false  // the agent's advisor total is the same from here on: nothing new was spent
+  await step(3)
+  await step(4)
+  expect(advisorCharges).toEqual([advisorCharges[0]!])
+  // What it spends after that is charged, and only that.
+  advisorInput = 150
+  await step(5)
+  expect(advisorCharges).toEqual([advisorCharges[0]!, advisorCharges[0]! / 2])
+})
+
+test('advisor tokens the roster already holds are not charged again by the first step after a reload', async ($, on) => {
+  // sha256 of `swarm-agent:a1`, the name the board keeps the agent's usage under
+  const actor = '94c9b65bf96c9e06c2d77853e988488aa7b2221c8e6aabaf673536e2855f3b09'
+  const state = {
+    title: 'Demo swarm', usage: { tokens: { [actor]: 100 }, detail: { [actor]: { advisor: [1, 100, 0, 0, 0] } } },
+    members: { coordinator: { role: 'coordinator', last_read_seq: 1 }, parser: { role: 'worker', id: 'a1', last_read_seq: 1 } },
+  }
+  const { answer, board } = owning(on, {
+    board: () => posts({ agent: 'coordinator', to: ['parser'], text: '@parser BRIEF' }),
+    roster: () => JSON.stringify(state),
+  })
+  const clock = mock.clock(on)
+  const advisorCharges: string[] = []
+  on('process.run', (_, e) => {
+    const stdout = board(e)
+    if (e.argv[3] !== 'account') return answer(stdout)
+    if ((e.argv[7] ?? '').startsWith('advisor:')) advisorCharges.push(e.argv[7]!)
+    return answer(JSON.stringify({ title: state.title, total: 0, budget: 0, paused: false }))
+  })
+  on('settings.read', () => ({ value: { advisorModel: 'opus' } }))
+  let advisorInput = 100
+  on('agent.list', () => ({ value: [{
+    id: 'a1', description: '@parser', type: 'swarm:worker', status: 'running',
+    usage: [{ model: 'claude-opus-5-5', input_tokens: advisorInput, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }],
+  }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  on('turn.step', async function* (_, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'tool_use' as const,
+      serverToolUses: [{ name: 'advisor', startedAt: 0, endedAt: 1000 }],
+      usage: { model: 'claude-sonnet-5-5', input_tokens: 10, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } as never
+  })
+  const step = async (index: number) => {
+    for await (const _ of $.turn.step({ turnId: 'member-turn', index, model: 'claude-sonnet-5-5', messageCount: 1, agentId: 'a1' })) { /* no chunks */ }
+    await clock.advance(1)
+  }
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await clock.advance(2000)
+  // The hooks remember no charge and know no run for the agent yet: the roster says what was taken.
+  await step(0)
+  expect(advisorCharges).toEqual([])
+  advisorInput = 130
+  await step(1)
+  expect(advisorCharges).toEqual(['advisor:30,0,0,0'])
+})
+
 test('losing the response to an END charge preserves its amount when a step and a revised total arrive', async ($, on) => {
   const { answer, board } = owning(on, { board: () => '', roster: () => ROSTER })
   const usage = (input_tokens: number) => ({ model: 'm', input_tokens, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 })
@@ -3192,6 +3301,38 @@ test('a mention older than the tail of a large board is still delivered', async 
   expect(seen.commands).toContain('claim parser a1 1')
   expect(sends.join('\n')).toContain('mentions through #1')
   expect(seen.commands).toContain(`woke parser 1 ${'a'.repeat(32)}`)
+})
+
+test('a mention of the coordinator older than the tail of a large board still prompts it', async ($, on) => {
+  const state = {
+    title: 'Demo swarm',
+    members: { coordinator: { role: 'coordinator', last_read_seq: 5 }, parser: { role: 'worker', id: 'a1', last_read_seq: 2000 } },
+  }
+  const tail = JSON.stringify({ seq: 2000, agent: 'coordinator', to: [], text: 'a later note for nobody', time: '2026-11-16T14:03:22+0100' }) + '\n'
+  const { seen, answer, board } = owning(on, { board: () => tail, roster: () => JSON.stringify(state) })
+  on('fs.stat', () => ({ value: { size: 5_000_000, mtimeMs: 1 } as never }))
+  // The board counts over the whole journal: #7 asks the coordinator something, and the tail starts long after it.
+  const report_ = { text: '' }
+  report_.text = JSON.stringify({ items: [{ kind: 'question', member: 'parser', seq: 7, text: '@parser asks: which file?' }], members: {}, sent: {}, unread: { coordinator: 1 }, unread_through: { coordinator: 7 } })
+  on('process.run', (_, e) => {
+    const stdout = board(e)
+    const action = e.argv[3]
+    return answer(action === 'tail' ? tail : action === 'attention' ? report_.text : stdout)
+  })
+  on('agent.list', () => ({ value: [{ id: 'a1', description: '@parser', type: 'swarm:worker', status: 'idle' }] as never }))
+  on('tool.call', () => ({ result: {} }))
+  const clock = mock.clock(on)
+
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Bash', command: `python3 /p/board.py "${OWNED}" read coordinator` })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'c', reason: 'answer' })
+  for (let waited = 0; waited < 16_000; waited += 2000) await clock.advance(2000)
+  expect(seen.prompts.filter(text => text.includes('Unread board mentions'))).toHaveLength(1)
+  // Read, the board names none, and nothing more is asked.
+  state.members.coordinator.last_read_seq = 2000
+  report_.text = JSON.stringify({ items: [], members: {}, sent: {}, unread: {}, unread_through: {} })
+  for (let waited = 0; waited < 16_000; waited += 2000) await clock.advance(2000)
+  expect(seen.prompts.filter(text => text.includes('Unread board mentions'))).toHaveLength(1)
 })
 
 test('a retired member that is still mid-turn has its tool calls refused, and its replacement does not', async ($, on) => {

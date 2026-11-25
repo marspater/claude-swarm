@@ -844,6 +844,30 @@ def stale_pass(d, candidate, closed=False):
     return None
 
 
+STALE_CHECK_S = 30
+
+
+def recent_stale_pass(d, candidate, count):
+    """stale_pass for attention, which every board change asks: the answer is kept beside the run for STALE_CHECK_S
+    while the candidate, its attempt and the number of posts are the same, since it reads every source file.
+    shortcut: an edit no post reports shows up to STALE_CHECK_S late here; `accept` and a VERIFIED post always check
+    anew. Upgrade to a stat-based fingerprint if that delay is ever felt."""
+    key, path = [candidate.get("candidate"), candidate.get("attempt"), count], os.path.join(d, ".stale-pass.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            kept = json.load(f)
+        if kept["key"] == key and 0 <= time.time() - kept["at"] < STALE_CHECK_S:
+            return kept["stale"]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    stale = stale_pass(d, candidate)
+    try:
+        atomic_write(path, json.dumps({"key": key, "at": time.time(), "stale": stale}))
+    except OSError:
+        pass  # asked again next time
+    return stale
+
+
 def held(candidate, members):
     """The workers whose work CANDIDATE holds: those whose reports it records, and every worker they depend on, since a
     dependent's commit contains its dependency's and its readiness falls with it."""
@@ -1457,7 +1481,22 @@ def attention(state, posts, d=None):
                 and not post.get("partial"))
 
     verified = [p for p in posts if passed(p)]
-    if verified:
+    candidate = None
+    if d is not None:
+        try:
+            with open(os.path.join(d, "verification.json"), encoding="utf-8") as f:
+                candidate = json.load(f)
+        except (OSError, ValueError):
+            pass
+    if (isinstance(candidate, dict) and candidate.get("verified_by") and not candidate.get("accepted")
+            and not candidate.get("partial") and not state.get("closed")):
+        # A pass on the table is judged as acceptance judges it, not by the posts after it. Seen in an audit: a
+        # follow-up worker's READY that changed no file was called stale, and a file edited with no report was not.
+        why = recent_stale_pass(d, candidate, len(posts))
+        if why:
+            items.append({"kind": "stale", "member": candidate["verified_by"], "seq": verified[-1]["seq"] if verified else 0,
+                          "text": "The pass of candidate %s no longer holds: %s" % (candidate.get("candidate"), why)})
+    elif verified:
         changed = [p for p in posts if p["seq"] > verified[-1]["seq"] and p.get("kind") in {"ready", "revise"}
                    and members.get(p.get("subject", p["agent"]), {}).get("consult") != "1"]
         if changed:
@@ -1486,14 +1525,16 @@ def attention(state, posts, d=None):
                    "paused": bool(member.get("paused")), "heavy": not closed and heavy(name, member, posts)}
             for name, member in members.items() if name != COORDINATOR}
     # Counted over the whole journal: the pane reads only the newest posts of a board past its read limit.
-    sent, unread = {}, {}
+    sent, unread, through = {}, {}, {}
     for post in posts:
         sent[post["agent"]] = sent.get(post["agent"], 0) + 1
         for name in post.get("to", []):
             seen = members[name].get("last_read_seq") if isinstance(members.get(name), dict) else None
             if isinstance(seen, int) and post["seq"] > seen:
                 unread[name] = unread.get(name, 0) + 1
-    return {"items": items, "members": view, "sent": sent, "unread": unread}
+                through[name] = post["seq"]
+    # `unread_through` is each one's newest unread post: the pane prompts the coordinator for one older than its tail.
+    return {"items": items, "members": view, "sent": sent, "unread": unread, "unread_through": through}
 
 
 ROUTES_MAX_BYTES = 1_000_000
@@ -1768,6 +1809,10 @@ def prune(root, args):
                     if not isinstance(candidate, dict):
                         candidate = {}
                     kept = None if state.get("closed") or candidate.get("accepted") else "integration-%s" % candidate.get("candidate")
+                    # The commit Swarm made for each candidate's checkout: one on any other commit no ref holds is kept.
+                    made = {"integration-%s" % c.get("candidate"): c.get("commit")
+                            for c in [candidate, *(candidate.get("superseded") if isinstance(candidate.get("superseded"), list) else [])]
+                            if isinstance(c, dict) and isinstance(c.get("commit"), str)}
                     baselines_path = os.path.join(root, run, verify.BASELINES_FILE)
                     try:
                         with open(baselines_path, encoding="utf-8") as f:
@@ -1791,6 +1836,8 @@ def prune(root, args):
                         elif (wt_status := verify.git(path, "status", "--porcelain", "--untracked-files=all", "--ignored", optional=True)) is None or wt_status.strip():
                             # Ignored files count: `git worktree remove` refuses untracked ones but deletes those.
                             print("kept %s: worktree has uncommitted changes, or untracked or ignored files" % path)
+                        elif verify.holds_commits(path, made.get(name)):
+                            print("kept %s: it holds commits no branch has. Put a branch on them, or reset it, to remove it" % path)
                         elif would or verify.git(project, "worktree", "remove", path, optional=True) is not None:
                             print("%sremove worktree %s" % (would, path))
                             gone.add(os.path.realpath(path))
@@ -2269,6 +2316,10 @@ def main(argv):
                           % (made.get("candidate"), current))
                     return "done"
             verifiers = [name for name, entry in members.items() if entry.get("role") == "verifier" and not entry.get("killed")]
+            if made and isinstance(state.get("owed_dispatch"), dict) and state["owed_dispatch"].get("failed"):
+                # A failure nobody waits on any more, and the plan has prepared since, whoever's step ran it.
+                state.pop("owed_dispatch")
+                save(d, state)
             if made:
                 # Each verifier is asked once for a candidate, whichever dispatch reached it first: two dispatches can
                 # meet on one candidate, and a second test of it clears the first one's result. Read off the requests
@@ -2582,6 +2633,13 @@ def main(argv):
                 if before and outcome in ("done", None) and isinstance(current, dict) and current.get("token") == before.get("token"):
                     state.pop("owed_dispatch")
                     save(d, state)
+                if outcome == "failed":
+                    # Kept where attention shows it, and the command fails. Seen in an audit: the failure was printed,
+                    # the command exited 0, and nothing on the board said a candidate was owed.
+                    state["owed_dispatch"] = {"token": uuid.uuid4().hex, "author": COORDINATOR,
+                                              "failed": failure["why"] or "the planned candidate could not be prepared"}
+                    save(d, state)
+                    sys.exit(1)
 
         elif cmd == "limit":
             raising = "--raise" in args
@@ -2806,6 +2864,16 @@ def main(argv):
                             "<evidence>` or `F1: disputed — <evidence>`:\n- " + "\n- ".join(inherited) if inherited else ""),
                          [new], save_roster=True)
             print("spawn @%s as swarm:%s, then record its id" % (new, kind_of(entry)))
+            try:
+                with open(os.path.join(d, "verification.json"), encoding="utf-8") as f:
+                    landed = json.load(f).get("accepted")
+            except (OSError, ValueError, AttributeError):
+                landed = False
+            if entry.get("role") == "verifier" and not landed:
+                # The request for the candidate on the table went to the old verifier, by name, and dispatch counts
+                # it as sent: the plan runs again, keeps that candidate and sends its command to the successor. An
+                # accepted candidate asks for no test.
+                run_plan(COORDINATOR)
 
         elif cmd == "post":
             sender = known(args[0])

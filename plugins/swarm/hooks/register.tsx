@@ -1704,12 +1704,17 @@ async function refresh($: EngineInterface): Promise<void> {
       ? full.posts.filter(post => post.seq > Math.max(state.members.coordinator?.last_read_seq ?? 0, shownPosts.through) &&
         post.to.includes('coordinator') && !shownPosts.posts.has(post.seq))
       : []
-    const last = unread.at(-1)?.seq ?? 0
-    const firstPending = unread.find(post => post.seq > prompted)?.seq
+    // Only the tail of a large board is read, and a mention older than it is in no post here: the board, which counts
+    // over the whole journal, names the newest one. Seen in an audit: Attention showed the question and no prompt came.
+    const tailFrom = full.posts[0]?.seq ?? 1
+    const beforeTail = owned && !state.closed && tailFrom > 1 && lastReport?.dir === dir ? lastReport.report.unread_through?.coordinator ?? 0 : 0
+    const unreadSeqs = [...(beforeTail > 0 && beforeTail < tailFrom ? [beforeTail] : []), ...unread.map(post => post.seq)]
+    const last = unreadSeqs.at(-1) ?? 0
+    const firstPending = unreadSeqs.find(seq => seq > prompted)
     const since = firstPending !== undefined && owedSeqs.includes(firstPending) && owed.last > prompted
       ? owed.since : now
-    owed = last === 0 ? NONE : { count: unread.length, first: unread[0]?.seq ?? last, last, since }
-    owedSeqs = unread.map(post => post.seq)
+    owed = last === 0 ? NONE : { count: unreadSeqs.length, first: unreadSeqs[0] ?? last, last, since }
+    owedSeqs = unreadSeqs
     // A consultant's READY is the answer the coordinator asked for, a READY that asks something is a question, and one
     // that mentions the coordinator asks it to rule on something. Independent FINDING posts (no active dependent) also
     // coalesce while other members still work.
@@ -2302,10 +2307,13 @@ async function advised(
   const agent = agents.find(one => one.id === agentId)
   const perModel = (agent as { usage?: Parameters<typeof advisorSpent>[0] } | undefined)?.usage
   const spent = advisorSpent(perModel, familyOf(model), familyOf(ownModel), familyOf)
-  if (!advisorTaken.has(agentId) && dir) {
-    // The agent's total goes on over a reload of these hooks, which forgets what was charged: the roster has it.
+  if (!advisorTaken.has(agentId)) {
+    // The agent's total goes on over a reload of these hooks, which forgets what was charged: the roster has it. Its
+    // run is found as `account` finds it: charged with no roster read, the whole total was taken again after a reload.
+    const at = dir ?? await agentRun($, agentId, agent, false, expectedEpoch, typeof owner === 'number' ? owner : undefined)
+    if (expectedEpoch !== sessionEpoch || isEnding || !at) return
     const actor = await digest(`swarm-agent:${teammateOf($, agentId, agent) ?? agentId}`)
-    const row = await $.fs.read(`${dir}/members.json`)
+    const row = await $.fs.read(`${at}/members.json`)
       .then(text => (JSON.parse(text) as { usage?: { detail?: Record<string, Record<string, number[]>> } }).usage?.detail?.[actor]?.advisor)
     if (expectedEpoch !== sessionEpoch || isEnding) return
     advisorTaken.set(agentId, { input_tokens: row?.[1] ?? 0, cache_creation_input_tokens: row?.[2] ?? 0, cache_read_input_tokens: row?.[3] ?? 0, output_tokens: row?.[4] ?? 0, model: '' })
@@ -2313,7 +2321,10 @@ async function advised(
   const owed = owedOf(spent, advisorTaken.get(agentId))
   if (owed.amount <= 0) return
   const taken = await account($, turnId, `${turnId}:${index}:advisor`, agentId, owed.amount, owner, expectedEpoch, owed.detail, spent.model, 'advisor')
+  // Unconfirmed, the board may still have saved it: the roster is asked again before the next charge, as after a
+  // reload. Charged from memory, a lost response had the same tokens taken twice, under the next step's report.
   if (typeof taken === 'number') advisorTaken.set(agentId, spent)
+  else advisorTaken.delete(agentId)
 }
 
 // Charges `amount` tokens to the actor's run under `report`, a name the board records once: a model step
