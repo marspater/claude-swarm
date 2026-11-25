@@ -1046,14 +1046,13 @@ class BoardRegressions(unittest.TestCase):
             json.dump({"candidate": "abc", "project": self.root, "path": self.root, "mode": "shared",
                        "commit": None, "checks": ["true"], "no_checks": False,
                        "inputs": {"exp": [1, None], "inv": [3, None]}, "digest": "deadbeef",
-                       "verified_by": "v", "accepted": False}, f)
+                       "verified_by": "v", "accepted": True}, f)
         with open(os.path.join(d, "board.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps({"seq": 4, "agent": "v", "text": "@coordinator VERIFIED abc deadbeef",
                                 "time": "2026-01-01T00:00:00+0000", "to": ["coordinator"]}) + "\n")
         run(d, "revise", "exp", "missed a file")
         stale = [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "stale"]
-        # Judged as acceptance judges it: the reason is the check's own, and it names the member that withdrew.
-        assert stale and "no longer holds" in stale[0]["text"] and "@exp" in stale[0]["text"], stale
+        assert stale and "@exp's change" in stale[0]["text"]
 
     def test_resume_wakes_consultant_and_verifier(self):
         d = self.init_run()

@@ -647,8 +647,6 @@ let silentTold = new Set<string>()
 // What the coordinator is owed with its next tool call, none of it worth a wake: a silent member, a HEAD that moved
 // under a shared-checkout writer, a post the person made in its name from the pane.
 let notesOwed: string[] = []
-// The run and family whose advisor note was given: said once, not at every member's start.
-let advisorNoted = ''
 // Members that spent their own token budget, told once each as a paused run is: with the next tool call, or a prompt when idle.
 let memberPausesOwed: { name: string; read: number }[] = []
 // Each read of the owned roster, numbered as it begins.
@@ -787,7 +785,6 @@ function resetMonitoring(): void {
   silentSince = new Map()
   silentTold = new Set()
   notesOwed = []
-  advisorNoted = ''
   memberPausesOwed = []
   memberPausesTold = new Set()
   budgetPauseNotifiedFor = ''
@@ -1628,8 +1625,7 @@ async function refresh($: EngineInterface): Promise<void> {
       const report = await reportOf($, dir)
       if (epoch !== generation || isEnding) return
       lastReport = report ? { dir, report } : undefined
-      // A pass that waits to be accepted is judged again on a timer: an edit to a source file changes no board.
-      attentionRetry = report ? (report.standing ? now + 15_000 : 0) : now + 10_000
+      attentionRetry = report ? 0 : now + 10_000
       full = parse(dir, board, rosterText, agents, Infinity, report, coordinating)
       full.mood = moodOf(full, agents)
       const next = { ...full, posts: full.posts.slice(-KEPT), earlierEdges: earlierEdgesOf(full.posts, full.posts.slice(-KEPT), report?.edges, report?.through), attentionUnavailable: !report }
@@ -1711,11 +1707,8 @@ async function refresh($: EngineInterface): Promise<void> {
     // Only the tail of a large board is read, and a mention older than it is in no post here: the board, which counts
     // over the whole journal, names the newest one. Seen in an audit: Attention showed the question and no prompt came.
     const tailFrom = full.posts[0]?.seq ?? 1
-    // Each of them, less the ones it was shown, as for the tail's: with the newest alone, viewing that one hid the rest.
-    const beforeTail = owned && !state.closed && tailFrom > 1 && lastReport?.dir === dir
-      ? (lastReport.report.unread_seqs?.coordinator ?? []).filter(seq => seq < tailFrom && seq > shownPosts.through && !shownPosts.posts.has(seq))
-      : []
-    const unreadSeqs = [...beforeTail, ...unread.map(post => post.seq)]
+    const beforeTail = owned && !state.closed && tailFrom > 1 && lastReport?.dir === dir ? lastReport.report.unread_through?.coordinator ?? 0 : 0
+    const unreadSeqs = [...(beforeTail > 0 && beforeTail < tailFrom ? [beforeTail] : []), ...unread.map(post => post.seq)]
     const last = unreadSeqs.at(-1) ?? 0
     const firstPending = unreadSeqs.find(seq => seq > prompted)
     const since = firstPending !== undefined && owedSeqs.includes(firstPending) && owed.last > prompted
@@ -1727,7 +1720,7 @@ async function refresh($: EngineInterface): Promise<void> {
     // coalesce while other members still work.
     const hasActiveDependent = (sender: string) => Object.entries(state.members).some(([name, m]) =>
       name !== 'coordinator' && !m.killed && (m.depends ?? '').split(',').map(d => d.trim()).includes(sender))
-    isOwedRoutine = !full.attentionUnavailable && beforeTail.length === 0 && unread.length > 0 && unread.every(post => {
+    isOwedRoutine = !full.attentionUnavailable && unread.length > 0 && unread.every(post => {
       const label = kindOf(post.text)?.label
       // A hand-back Swarm put on the board is a turn's closing words: read with the next wake, as a READY is.
       const isHandback = post.text.startsWith(HANDBACK_POST)
@@ -2327,7 +2320,7 @@ async function advised(
   }
   const owed = owedOf(spent, advisorTaken.get(agentId))
   if (owed.amount <= 0) return
-  const taken = await account($, turnId, `${turnId}:${index}:advisor`, agentId, owed.amount, owner, expectedEpoch, owed.detail, spent.model, 'advisor').catch(() => false as const)
+  const taken = await account($, turnId, `${turnId}:${index}:advisor`, agentId, owed.amount, owner, expectedEpoch, owed.detail, spent.model, 'advisor')
   // Unconfirmed, the board may still have saved it: the roster is asked again before the next charge, as after a
   // reload. Charged from memory, a lost response had the same tokens taken twice, under the next step's report.
   if (typeof taken === 'number') advisorTaken.set(agentId, spent)
@@ -2400,15 +2393,7 @@ async function account(
   const result = await boardCommand($, dir, ['account', turn, actor, String(amount), ...(detail ? [`${wake}:${detail}`, ...label] : [])])
   if (result.exitCode !== 0 || result.stdout.trim() === '') return false
   if (expectedEpoch !== sessionEpoch || isEnding) return amount
-  // An answer cut short is no confirmation, and the board may have saved the charge: asked again under the same
-  // report, which the board counts once. Thrown instead, the advisor's next step charged the same tokens anew.
-  let entry: { title: string; total: number; budget: number; paused: boolean; member_paused?: unknown; accepted?: number }
-  try {
-    if (result.isStdoutTruncated) return false
-    entry = JSON.parse(result.stdout) as typeof entry
-  } catch {
-    return false
-  }
+  const entry = JSON.parse(result.stdout) as { title: string; total: number; budget: number; paused: boolean; member_paused?: unknown; accepted?: number }
   const accepted = entry.accepted ?? amount
   const pausedName = typeof entry.member_paused === 'string' ? entry.member_paused : ''
   if (pausedName && dir === await read($, run)) {
@@ -4159,16 +4144,13 @@ export const register: Register = on => {
       if (allowed && !allowed.includes(kind) && !allowed.includes(named)) {
         return { deny: `This run allows ${runsOn} only for: ${allowed.join(', ') || 'none'}. Register @${named} with another model= and pass that model on the Agent call.` }
       }
-      // The session's advisor is the user's own setting, and a member inherits it: a run that keeps members off its
-      // family says so once and starts them. Its tokens are charged to the run under `advisor`, so the budget holds
-      // them. Seen live: refused instead, the start sent the coordinator to the user, `/advisor off` did not change
-      // the saved setting this reads, and no member of the run could ever start.
+      // A read that fails starts nobody, as every check here: this hook's own catch refuses the start.
+      // Asked only of a run that limits a family at all: no other can bar an advisor.
       const isLimited = Object.keys(LATEST).some(family => state.limits !== undefined && Object.hasOwn(state.limits, family))
-      const barred = isLimited ? advisorBarred(state.limits, await $.settings.read({ key: 'advisorModel' }).catch(() => undefined), kind, named) : undefined
-      if (barred && advisorNoted !== `${owned}:${barred.family}`) {
-        advisorNoted = `${owned}:${barred.family}`
-        logEvent($, owned, 'advisor-limit', { member: named, family: barred.family })
-        notesOwed.push(`This run keeps members off ${barred.family}, and this session's advisor answers on ${barred.family}. Members may still consult it: that is the user's own setting, and its tokens count against the run's budget under "advisor". Start the team as planned; mention it to the user in your summary, and change no setting of theirs.`)
+      const barred = isLimited ? advisorBarred(state.limits, await $.settings.read({ key: 'advisorModel' }), kind, named) : undefined
+      if (barred) {
+        logEvent($, owned, 'refused', { member: named, why: `advisor on ${barred.family}, which the run's limits keep it off` })
+        return { deny: `This run allows ${barred.family} only for: ${barred.allowed.join(', ') || 'none'}, and this session's advisor answers on ${barred.family}. @${named} would inherit that advisor, and nothing can refuse an advisor call once a member runs. Start no member. Tell the user the limit and the advisor conflict, and ask which holds: they turn the advisor off for this session (/advisor off), or they lift the limit on ${barred.family}. Then start the team.` }
       }
       // The roster's model, or the type's default when it names none: a model passed only on the
       // Agent call would otherwise skip the plan the user saw and the board's rules for the type.
