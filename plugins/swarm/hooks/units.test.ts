@@ -1754,9 +1754,11 @@ test('TS audit regressions (#2, #4, #8, #11, #17): figuresIn thousands+unit, ask
     'no budget change',
     'no budget changes',
     'make no budget changes for this run',
+    'No budget increases. Keep the current cap.',
     'budget=0.5M',
     'budget=0,5M',
     'budget=3000000',
+    'budget= 3000000',
     'give it 3M',
   ]) {
     expect(asksLiftBudget(neg), neg).toBe(false)
@@ -1781,7 +1783,7 @@ test('TS audit regressions (#2, #4, #8, #11, #17): figuresIn thousands+unit, ask
 
   // Bug #8: silent false positives for heavy specialists, investigator review items, and full-journal unread > 0
   const baseMember = { role: 'worker', id: 'a1', last_read_seq: 1 }
-  const tailBoard = JSON.stringify({ seq: 2, agent: 'coordinator', to: ['dev', 'inv', 'heavy-inv'], text: '@dev @inv @heavy-inv BRIEF', time: '2026-11-25T10:00:00Z' })
+  const tailBoard = JSON.stringify({ seq: 3, agent: 'coordinator', to: ['dev', 'inv', 'heavy-inv'], text: '@dev @inv @heavy-inv BRIEF', time: '2026-11-25T10:00:00Z' })
   const agents = [
     { id: 'a1', type: 'swarm:worker', status: 'completed' },
     { id: 'a2', type: 'swarm:investigator', status: 'completed' },
@@ -1790,7 +1792,7 @@ test('TS audit regressions (#2, #4, #8, #11, #17): figuresIn thousands+unit, ask
   const rosterJson = JSON.stringify({
     title: 'T',
     members: {
-      coordinator: { role: 'coordinator', last_read_seq: 2 },
+      coordinator: { role: 'coordinator', last_read_seq: 3 },
       dev: baseMember,
       inv: { role: 'worker', profile: 'investigator', id: 'a2', last_read_seq: 1 },
       'heavy-inv': { role: 'worker', profile: 'investigator', id: 'a3', last_read_seq: 1 },
@@ -1798,7 +1800,7 @@ test('TS audit regressions (#2, #4, #8, #11, #17): figuresIn thousands+unit, ask
   })
   const memberHint = { type: 'worker', model: 'sonnet', effort: 'medium', depends: [], owns: '', ready: false, blocked_on: [], asked: 0, unreachable: false }
   const report = {
-    items: [{ kind: 'review', member: 'inv', seq: 2, text: '@inv review' }],
+    items: [{ kind: 'review', member: 'inv', seq: 3, text: '@inv review' }],
     members: {
       dev: memberHint,
       inv: { ...memberHint, type: 'investigator' },
@@ -1806,10 +1808,15 @@ test('TS audit regressions (#2, #4, #8, #11, #17): figuresIn thousands+unit, ask
     },
     unread: { dev: 1, inv: 0, 'heavy-inv': 0 },
   }
-  // dev has unread=1 in full journal (simulated when KEPT tail only has older/other posts: pass board without dev in `to`, or test directly)
+  // dev has unread=1 in full journal even when local tail posts don't address dev (local unread = 0)
   const devBoard = JSON.stringify({ seq: 2, agent: 'coordinator', to: ['dev'], text: '@dev BRIEF', time: '2026-11-25T10:00:00Z' })
   const parsedSuppressed = parse('/r', `${devBoard}\n${tailBoard.replace('"to":["dev","inv","heavy-inv"]', '"to":["inv","heavy-inv"]')}`, rosterJson, agents, 300, report)
   expect(parsedSuppressed.attention.filter(item => item.kind === 'silent')).toEqual([])
+
+  // Local unread = 0 on the kept tail (only seq 3 to inv/heavy-inv) still suppresses silent when full-journal report.unread.dev = 1
+  const localZeroTail = tailBoard.replace('"to":["dev","inv","heavy-inv"]', '"to":["inv","heavy-inv"]')
+  const parsedReportUnread = parse('/r', localZeroTail, rosterJson, agents, 300, report)
+  expect(parsedReportUnread.attention.filter(item => item.kind === 'silent')).toEqual([])
 
   // When unread is 0, not heavy, and no investigator review item, waiting member IS flagged silent
   const parsedSilent = parse('/r', tailBoard, rosterJson, agents, 300, { ...report, items: [], unread: { dev: 0, inv: 0, 'heavy-inv': 0 } })

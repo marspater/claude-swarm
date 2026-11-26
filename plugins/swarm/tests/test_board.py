@@ -4421,20 +4421,24 @@ class EngineRegressions(unittest.TestCase):
         run(d, "ready", "w", stdin="followup")
         stale = [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "stale"]
         assert len(stale) == 1 and "VERIFIED (#2)" in stale[0]["text"], stale
-        # In resume, historical VERIFIED at #2 still counts as verified_seq=2 so earlier READY doesn't trigger unverified wake.
+        # In resume, historical VERIFIED still counts as verified_seq so earlier READY doesn't trigger unverified wake.
         d2, proj2 = self._fresh("r2")
         run(d2, "member", "w", "id=agent-w")
         run(d2, "member", "v", "role=verifier", "id=agent-v")
+        run(d2, "member", "v_old", "role=verifier", "id=agent-vold")
         run(d2, "member", "v2", "role=verifier", "id=agent-v2")
+        run(d2, "member", "v", "role=worker")
         run(d2, "ready", "w", stdin="done")
+        run(d2, "ready", "v", stdin="done too")
         cand2 = json.loads(subprocess.run(
             [sys.executable, verify_script, d2, proj2, "prepare", "shared", "--check", "true"],
             check=True, capture_output=True, text=True).stdout)["candidate"]
         line2 = subprocess.run(
-            [sys.executable, verify_script, d2, proj2, "test", cand2, "v"],
+            [sys.executable, verify_script, d2, proj2, "test", cand2, "v_old"],
             check=True, capture_output=True, text=True).stdout.splitlines()[-1]
-        run(d2, "post", "v", "@coordinator " + line2)
-        run(d2, "member", "v", "role=worker")
+        run(d2, "post", "v_old", "@coordinator " + line2)
+        run(d2, "member", "v_old", "role=worker", "profile=architect", "consult=1")
+        run(d2, "read", "v2")
         run(d2, "pause", "stop")
         out = run(d2, "resume")
         assert "@v2" not in out, out

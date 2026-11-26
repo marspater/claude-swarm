@@ -2717,10 +2717,11 @@ async function resetView($: EngineInterface): Promise<void> {
 /** Reads a run looked at through the switcher, once: a board or attention report that cannot be read is said to be so. */
 async function readRun($: EngineInterface, dir: string, roster: string, isClosed: boolean): Promise<NonNullable<typeof browsed>> {
   let boardUnavailable = false
-  const [board, report] = await Promise.all([readBoard($, dir).catch(() => {
+  const board = await readBoard($, dir).catch(() => {
     boardUnavailable = true
     return ''
-  }), reportOf($, dir)])
+  })
+  const report = await reportOf($, dir)
   const agents = isClosed ? [] : await $.agent.list().catch(() => [])
   const parsed = parse(dir, board, roster, agents, KEPT, report)
   const mood: Mood = parsed.isClosed ? 'sleep'
