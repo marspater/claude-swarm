@@ -23,6 +23,7 @@ usage: board.py DIR init TITLE                    prints the run folder it creat
        board.py DIR wake                          list pending wakes, including the post sequence
        board.py DIR claim NAME ID SEQ             claim delivery through SEQ and print its token
        board.py DIR woke NAME SEQ TOKEN           acknowledge a successful delivery
+       board.py DIR unclaim NAME SEQ TOKEN        give back a claim nothing was sent for: it counts as no failed attempt
        board.py DIR rearm TURN_MS ID...           after agent ID's turn of TURN_MS: wake it again for mentions it left unread
        board.py DIR pause [REASON]                 pause automation while awaiting a decision
        board.py DIR resume [NAME]                  resume automation, or one member its own token budget paused
@@ -172,7 +173,7 @@ ARG_COUNTS = {
     "limit": (0, None), "dispatch": (0, 1), "plan": (0, 0), "attention": (0, 1), "retry": (1, 1),
     "replace": (2, None), "post": (1, None), "ready": (1, 2), "revise": (1, None),
     "confirm": (2, 2), "read": (1, 4), "show": (0, 2), "wake": (0, 0),
-    "claim": (3, 3), "woke": (3, 3), "rearm": (2, None), "bind": (1, 1),
+    "claim": (3, 3), "unclaim": (3, 3), "woke": (3, 3), "rearm": (2, None), "bind": (1, 1),
     "pause": (0, None), "resume": (0, 1), "close": (0, 0), "kill": (0, None), "status": (0, 0), "account": (3, 5), "tail": (0, 1),
     "event": (1, 2),
     "prune": (0, 2), "sync": (1, 2), "export": (0, 1),
@@ -198,7 +199,7 @@ EVENTS_FILE = "events.jsonl"
 # Commands polled or run many times a second by the pane, and the ones that record their own, richer event.
 UNLOGGED = {"tail", "wake", "show", "status", "plan", "attention", "account", "event", "locate", "agent-run", "restore"}
 # Their arguments are binding keys, claim tokens and agent addresses: the command is logged, its arguments are not.
-UNLOGGED_ARGS = {"bind", "adopt", "claim", "woke", "rearm", "started"}
+UNLOGGED_ARGS = {"bind", "adopt", "claim", "unclaim", "woke", "rearm", "started"}
 
 
 def event(d, kind, /, **fields):
@@ -216,15 +217,16 @@ def event(d, kind, /, **fields):
 
 def events_of(d):
     try:
-        with open(os.path.join(d, EVENTS_FILE), encoding="utf-8") as f:
+        with open(os.path.join(d, EVENTS_FILE), "rb") as f:
             lines = f.read().splitlines()
     except OSError:
         return []
     found = []
-    for line in lines:
+    for raw in lines:
         try:
+            line = raw.decode("utf-8")
             entry = json.loads(line)
-        except ValueError:
+        except (UnicodeDecodeError, ValueError):
             continue  # a line cut by a crash
         if isinstance(entry, dict) and isinstance(entry.get("kind"), str) and isinstance(entry.get("time"), str):
             found.append(entry)
@@ -308,7 +310,28 @@ def is_post(post):
     return True
 
 
+SHARED_LOCK = "SWARM_BOARD_SHARED_LOCK"  # set while this process holds the board's lock shared, with other readers
+
+
+@contextlib.contextmanager
+def lock_flag(shared):
+    """SHARED_LOCK for as long as the lock is held, and what it was before once it is not: a caller in this process
+    (a test, verify.py) that loads a run afterwards holds no shared lock and repairs as usual."""
+    before = os.environ.get(SHARED_LOCK)
+    # In the environment, not a global: verify.py imports this file as another module than the one that runs.
+    os.environ[SHARED_LOCK] = "1" if shared else "0"
+    try:
+        yield
+    finally:
+        if before is None:
+            os.environ.pop(SHARED_LOCK, None)
+        else:
+            os.environ[SHARED_LOCK] = before
+
+
 def load(d, *, repair=True):
+    # Under the shared lock nothing is repaired, whoever asks: verify.py's reads reach here with no word on the lock.
+    repair = repair and os.environ.get(SHARED_LOCK) != "1"
     state = load_state(d)
     path = os.path.join(d, "board.jsonl")
     posts = []
@@ -339,6 +362,8 @@ def load(d, *, repair=True):
             if not line.endswith(b"\n") and writable:
                 f.write(b"\n")
     pending = state.pop("pending_post", None)
+    pending_void = state.pop("pending_void", None)
+    pending_from = state.pop("pending_from", None)
     if pending is not None:
         if not is_post(pending):  # appended as it is, it would make the whole journal unreadable
             raise ValueError("the pending board update in members.json is not a post")
@@ -349,7 +374,11 @@ def load(d, *, repair=True):
             posts.append(pending)
         elif not posts or posts[-1] != pending:
             raise ValueError("a pending board update conflicts with the saved history")
+        if writable and isinstance(pending_void, list):
+            void_pass(d, state["members"], pending_void)
         if writable:  # a read-only copy shows the recovered post and repairs nothing
+            if pending_from:  # its command never said "posted": typed again, it is this post and no second one
+                state["recovered_post"] = {"seq": pending["seq"], "from": pending_from}
             save(d, state)
     for post in posts:
         if "to" not in post:
@@ -2047,14 +2076,23 @@ def main(argv):
         return prune(d, args)
     if cmd == "agent-run":
         binding_file(d, args[0])
-        matches = [(name, state) for name, state in saved_runs(d) if state.get("binding") == args[0] and any(
-            member.get("id") in args[1:] for member in state["members"].values())]
-        open_matches = [name for name, state in matches if not state.get("closed")]
+        ids = set(args[1:])
+
+        def has_agent(state):
+            return state.get("binding") == args[0] and any(m.get("id") in ids for m in state["members"].values())
+
+        matches = [(os.path.join(d, name), name, state) for name, state in saved_runs(d) if has_agent(state)]
+        open_matches = [path for path, _, state in matches if not state.get("closed")]
         # With no open run, the latest that had the agent: a native teammate's address comes back in each run of the
         # conversation, and a killed run must still own it so its tool calls stay refused. Two open runs stay unknown.
-        chosen = open_matches if len(open_matches) == 1 else [] if open_matches else [name for name, _ in matches[:1]]
-        if len(chosen) == 1:
-            print(os.path.abspath(os.path.join(d, chosen[0])))
+        if len(open_matches) == 1:
+            print(os.path.abspath(open_matches[0]))
+        elif not open_matches:
+            archive = os.path.join(d, "archive")
+            matches += [(os.path.join(archive, name), name, state) for name, state in saved_runs(archive) if has_agent(state)]
+            matches.sort(key=lambda item: (item[1].rstrip("x")[-15:], item[1]), reverse=True)
+            if matches:
+                print(os.path.abspath(matches[0][0]))
         return
     if cmd in {"adopt", "locate"}:
         # The conversation that starts a registered member owns its run, however its board commands were typed.
@@ -2159,7 +2197,7 @@ def main(argv):
         except FileNotFoundError:  # an old read-only copy may lack a lock file
             lock = open(os.path.join(d, "members.json"), "rb")
         lock_mode = fcntl.LOCK_SH
-    with lock:
+    with lock, lock_flag(lock_mode == fcntl.LOCK_SH):
         fcntl.flock(lock, lock_mode)  # released when the process exits
         if cmd == "account":
             return account(d, args)
@@ -2182,7 +2220,9 @@ def main(argv):
                 sys.exit("unknown member @%s; members: %s" % (name, " ".join("@" + n for n in members)))
             return name
 
-        def post_message(sender, text, recipients, *, save_roster=False, told=True, **extra):
+        submitted = ""  # set by `post`: what names its submission, should it be cut short and typed again
+
+        def post_message(sender, text, recipients, *, save_roster=False, told=True, void_rejects=None, **extra):
             post = {"seq": len(posts) + 1, "agent": sender, "text": text,
                     "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "to": recipients, **extra}
             if sender == COORDINATOR and (head := REPORT_WORD.match(text)) and head[1] == "BRIEF":
@@ -2205,10 +2245,19 @@ def main(argv):
             marked = progress(state, members[sender])
             if save_roster:
                 state["pending_post"] = post
+                if submitted:
+                    state["pending_from"] = submitted
+                if void_rejects is not None:
+                    state["pending_void"] = list(void_rejects)
                 save(d, state)
             append_post(d, post)
+            if void_rejects is not None:
+                # While the roster still says a void is owed: cut short after this, the next load does it again.
+                void_pass(d, members, void_rejects)
             if save_roster:
                 del state["pending_post"]
+                state.pop("pending_void", None)
+                state.pop("pending_from", None)
             if save_roster or marked:
                 save(d, state)
             print("posted #%d -> %s" % (post["seq"], " ".join("@" + t for t in recipients) or "nobody"))
@@ -2292,6 +2341,32 @@ def main(argv):
             plan = planned(d)
             if not plan:
                 return None
+            try:
+                with open(os.path.join(d, "verification.json"), encoding="utf-8") as f:
+                    standing_table = json.load(f)
+            except (OSError, ValueError):
+                standing_table = None
+            if isinstance(standing_table, dict) and standing_table.get("accepted"):
+                # The accepted record stays on the table after its commit, so it holds the plan back only while it still
+                # describes the reports and the files: a later READY or edit is new work. Seen in a test: after the
+                # commit, no candidate of the run's was ever prepared again.
+                import verify  # late: verify.py imports this module
+                held_in = standing_table.get("inputs") if isinstance(standing_table.get("inputs"), dict) else {}
+                # `stands` reads the accepted candidate's own workers alone: a worker registered since, or a
+                # report or withdrawal posted since, is new work it does not see.
+                is_new = (any(p["seq"] > state.get("accepted_seq", 0) and p.get("kind") in {"ready", "revise"} for p in posts)
+                          or any(entry.get("role") == "worker" and entry.get("consult") != "1" and name not in held_in
+                                 for name, entry in team_of(members).items()))
+                try:
+                    # A plan recorded since asks for other checks, and those have not run.
+                    is_new = is_new or not (verify.same_plan(plan, standing_table)
+                                            and verify.stands(verify.Path(os.path.abspath(d)), standing_table))
+                except Exception:  # what it cannot judge is prepared, as before this check
+                    is_new = True
+                if not is_new:
+                    print("candidate %s was already accepted and nothing has changed since: no new candidate is prepared"
+                          % standing_table.get("candidate"))
+                    return "done"
             fcntl.flock(lock, fcntl.LOCK_UN)
             run_dir = os.path.abspath(d)
             project = os.path.dirname(os.path.dirname(run_dir))
@@ -2924,6 +2999,19 @@ def main(argv):
                     sys.exit(f"@{sender} has been retired")
                 if sender != COORDINATOR and members[sender].get("id") != sender_id:
                     sys.exit(f"@{sender}'s agent changed while reading stdin. Nothing was posted")
+            # The command as typed, before a verdict's defects are numbered: the same one typed again after it was cut
+            # short is the post a load has since recovered, and adds no second one.
+            submitted = hashlib.sha256(json.dumps([sender, text]).encode()).hexdigest()
+            # Kept until its sender types again, however many posts others add meanwhile: by its saved number, not by
+            # being the newest. Typed again it is acknowledged, once; anything else from that sender ends the wait.
+            recovered = state.get("recovered_post")
+            at = recovered.get("seq") if isinstance(recovered, dict) else None
+            if type(at) is int and 1 <= at <= len(posts) and posts[at - 1]["agent"] == sender:
+                del state["recovered_post"]
+                if recovered.get("from") == submitted:
+                    save(d, state)
+                    print("posted #%d -> %s" % (at, " ".join("@" + t for t in posts[at - 1]["to"]) or "nobody"))
+                    return
             # A report typed as a post records no readiness: verification would wait for it forever.
             protocol = REPORT_WORD.match(text)
             word = protocol[1] if protocol else ""
@@ -2960,6 +3048,7 @@ def main(argv):
             if word == "NOT PASSED" and members[sender].get("role") == "verifier":
                 verdict["rejects"] = rejected({"agent": sender, "text": text, "to": recipients}, members)
             answer = why = current = None
+            should_void = False
             if word in {"NOT PASSED", "NOT VERIFIED"} and members[sender].get("role") == "verifier":
                 answer, held, why, current, sure = answered(d, sender, first, members, posts)
                 if answer:  # the candidate a verdict answers, so `resume` knows whose review is finished
@@ -2968,7 +3057,7 @@ def main(argv):
                     if "rejects" in verdict:  # about a candidate the accepted one replaced: it rejects no standing report
                         verdict["rejects"] = []
                 elif answer == current:
-                    void_pass(d, members, verdict.get("rejects", ()))
+                    should_void = True
                 elif held is not None and "rejects" in verdict:
                     # A verdict on a candidate since replaced withdraws the reports it held that still stand. A worker's
                     # newer report it withdraws only when the verifier has read it and nothing ties the verdict to the
@@ -3027,7 +3116,8 @@ def main(argv):
                         ", ".join(finding["id"] for finding in kept), sender)
                 if stuck:
                     state["paused"] = stuck
-            post = post_message(sender, text, recipients, save_roster=bool(stuck) or done, **verdict)
+            post = post_message(sender, text, recipients, save_roster=bool(stuck) or done or should_void,
+                                void_rejects=verdict.get("rejects", ()) if should_void else None, **verdict)
             # An answer that cites nothing closes nothing: said now, it is corrected in the same step.
             still = [(seq, asker) for seq, asker, asked in unanswered(members, [*posts, post])
                      if not word and asked == sender and asker in post["to"]]
@@ -3579,6 +3669,17 @@ def main(argv):
                                     "until": now + WAKE_LEASE_SECONDS}
             save(d, state)
             print(token)
+
+        elif cmd == "unclaim":  # a claim its taker sent nothing for: no attempt that failed, so it is not counted as one
+            member = members[known(args[0])]
+            claim = member.get("wake_claim", {})
+            # By its token, once: a send that went out is answered by `woke` or by the lease, never given back here.
+            if claim.get("token") == args[2] and str(claim.get("seq")) == args[1]:
+                if claim.get("attempts", 0) > 1:
+                    member["wake_claim"] = dict(claim, token="", attempts=claim["attempts"] - 1, until=0)
+                else:
+                    del member["wake_claim"]
+                save(d, state)
 
         elif cmd == "woke":
             if state.get("closed"):

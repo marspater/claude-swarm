@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 import type { Post } from '../types'
 import { BOARD_CALL, CASE_PATTERN, COORDINATOR_READ, RUN, boardCalls, closesAfter, launches, makesCommit, runsNamed, scanShell, scriptsRun, shellLaunch, shellWords, splitShellSegments, substitutions, UNREAD, unwrap, wakeMessage, wakeSequence } from './command'
 import { edgesOf, graphSvg, isBroadcast } from './graph'
-import { actsAsAnother, commitsInSharedCheckout, hasHiddenBoardLimit, waitsOnLooseMatch } from './guard'
+import { actsAsAnother, commitsInSharedCheckout, hasHiddenBoardLimit, resolveRealPath, waitsOnLooseMatch } from './guard'
 import { BOARD_ACTIONS, MEMBER_BEE_SIZE, hiveArt, memberBee, toolMood, toolSummary } from './hive'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, SWARM_AGENTS, advisorBarred, familyOf, latestOf, sizedEffort } from './models'
 import { elapsedMs, hashSeed, loopDelay, pickVariant, seededPhase } from './motion'
@@ -1755,6 +1755,9 @@ test('TS audit regressions (#2, #4, #8, #11, #17): figuresIn thousands+unit, ask
     'no budget changes',
     'make no budget changes for this run',
     'No budget increases. Keep the current cap.',
+    'There is no budget left; stop all agents.',
+    'There is no budget currently available. Stop all agents.',
+    'no budget still remaining',
     'budget=0.5M',
     'budget=0,5M',
     'budget=3000000',
@@ -1821,4 +1824,84 @@ test('TS audit regressions (#2, #4, #8, #11, #17): figuresIn thousands+unit, ask
   // When unread is 0, not heavy, and no investigator review item, waiting member IS flagged silent
   const parsedSilent = parse('/r', tailBoard, rosterJson, agents, 300, { ...report, items: [], unread: { dev: 0, inv: 0, 'heavy-inv': 0 } })
   expect(parsedSilent.attention.filter(item => item.kind === 'silent').map(item => item.member)).toEqual(['dev', 'inv'])
+})
+
+test('F01 & F03: resolveRealPath resolves symlinks left-to-right before .. and actsAsAnother enforces authorizedDir', async () => {
+  const realMap: Record<string, string> = {
+    '/repo': '/repo',
+    '/repo/allowed': '/repo/allowed',
+    '/repo/allowed/link': '/repo/protected/sub',
+    '/repo/protected': '/repo/protected',
+    '/repo/protected/sub': '/repo/protected/sub',
+    '/repo/a': '/repo/a',
+    '/repo/a/l1': '/repo/b',
+    '/repo/b/l2': '/repo/c/sub',
+  }
+  const fakeEngine = {
+    fs: {
+      stat: async (p: string) => {
+        const realPath = realMap[p]
+        if (!realPath) throw new Error('ENOENT')
+        return { realPath }
+      },
+    },
+  } as never
+  expect(await resolveRealPath(fakeEngine, '/repo/allowed/link/../file.txt')).toBe('/repo/protected/file.txt')
+  expect(await resolveRealPath(fakeEngine, '/repo/a/l1/l2/../file.txt')).toBe('/repo/c/file.txt')
+  expect(await resolveRealPath(fakeEngine, '/repo/allowed/link/../missing/newfile.txt')).toBe('/repo/protected/missing/newfile.txt')
+
+  const worker = { role: 'worker' as const, last_read_seq: 0 }
+  const verifier = { role: 'verifier' as const, last_read_seq: 0 }
+  const run1 = '/repo/.swarm/run-1'
+  const run2 = '/repo/.swarm/run-2'
+  expect(actsAsAnother(`python3 /p/board.py ${run1} post alice "hi"`, 'alice', worker, run1, '/repo')).toBeUndefined()
+  expect(actsAsAnother('python3 /p/board.py .swarm/run-1 post alice "hi"', 'alice', worker, run1, '/repo')).toBeUndefined()
+  expect(actsAsAnother(`python3 /p/board.py ${run2} post alice "hi"`, 'alice', worker, run1, '/repo')).toContain('own run')
+  expect(actsAsAnother('python3 /p/board.py .swarm/run-2 read alice', 'alice', worker, run1, '/repo')).toContain('own run')
+  expect(actsAsAnother(`python3 /p/verify.py ${run1} /repo test cand1 vera`, 'vera', verifier, run1, '/repo')).toBeUndefined()
+  expect(actsAsAnother(`python3 /p/verify.py ${run2} /repo test cand1 vera`, 'vera', verifier, run1, '/repo')).toContain('own run')
+  // Relative run dir after directory change (cd /other) and symlink/.. traversal in run dir are refused.
+  expect(actsAsAnother('cd /other; python3 /p/board.py .swarm/run-1 post alice hi', 'alice', worker, run1, '/repo')).toContain('own run')
+  expect(actsAsAnother('python3 /p/board.py /repo/link/../.swarm/run-1 post alice hi', 'alice', worker, run1, '/repo')).toContain('own run')
+})
+
+test('a board command that names the run folder by its real path is the member\'s own run', () => {
+  const run = '/tmp/p/.swarm/demo-20261116-101010', real = '/private/tmp/p/.swarm/demo-20261116-101010'
+  const alice = { role: 'worker', id: 'alice-1' } as never
+  expect(actsAsAnother(`python3 /p/board.py ${real} read alice`, 'alice', alice, run, '/tmp/p')).toContain('own run')
+  expect(actsAsAnother(`python3 /p/board.py ${real} read alice`, 'alice', alice, [run, real], '/tmp/p')).toBeUndefined()
+  expect(actsAsAnother(`python3 /p/board.py ${run} read alice`, 'alice', alice, [run, real], '/tmp/p')).toBeUndefined()
+  expect(actsAsAnother('python3 /p/board.py /tmp/p/.swarm/other-20261116-101010 read alice', 'alice', alice, [run, real], '/tmp/p')).toContain('own run')
+})
+
+test('an advisor\'s charge is the same however often its usage is sampled', () => {
+  const reads = (n: number) => ({ input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: n })
+  // Cached reads weigh a tenth and round: rounded a sample, 5 then 10 charged 2 where 10 at once charges 1.
+  const first = owedOf(reads(5), undefined)
+  const second = owedOf(reads(10), reads(5))
+  expect([first.amount + second.amount, owedOf(reads(10), undefined).amount]).toEqual([1, 1])
+  expect([first.detail, second.detail]).toEqual(['0,0,5,0', '0,0,5,0'])
+})
+
+test('a board command run through a wrapper that changes folder names no run by a relative path', () => {
+  const run = '/project/.swarm/demo-20261116-101010'
+  const alice = { role: 'worker', id: 'alice-1' } as never
+  for (const moved of [
+    'env -C /other python3 /p/board.py .swarm/demo-20261116-101010 read alice',
+    'env --chdir=/other python3 /p/board.py .swarm/demo-20261116-101010 read alice',
+    'env --chdir /other python3 /p/board.py .swarm/demo-20261116-101010 read alice',
+  ]) expect([moved, actsAsAnother(moved, 'alice', alice, run, '/project')]).toEqual([moved, expect.stringContaining('own run')])
+  expect(actsAsAnother(`env -C /other python3 /p/board.py ${run} read alice`, 'alice', alice, run, '/project')).toBeUndefined()
+  expect(actsAsAnother('env A=1 python3 /p/board.py .swarm/demo-20261116-101010 read alice', 'alice', alice, run, '/project')).toBeUndefined()
+})
+
+test('a folder change the guard cannot read off the command word still unsettles a relative run folder', () => {
+  const run = '/project/.swarm/demo-20261116-101010'
+  const alice = { role: 'worker', id: 'alice-1' } as never
+  const relative = 'python3 /p/board.py .swarm/demo-20261116-101010 post alice hi'
+  for (const moved of [`D=cd; "$D" /other; ${relative}`, `"$UNSET" /other; ${relative}`, `builtin cd /other; ${relative}`, `command cd /other && ${relative}`]) {
+    expect([moved, actsAsAnother(moved, 'alice', alice, run, '/project')]).toEqual([moved, expect.stringContaining('own run')])
+  }
+  expect(actsAsAnother(`D=cd; "$D" /other; python3 /p/board.py ${run} post alice hi`, 'alice', alice, run, '/project')).toBeUndefined()
+  expect(actsAsAnother(`echo hi; ${relative}`, 'alice', alice, run, '/project')).toBeUndefined()
 })
