@@ -8,7 +8,7 @@ import { DEFAULT_EFFORT, DEFAULT_MODEL, SWARM_AGENTS, advisorBarred, familyOf, l
 import { elapsedMs, hashSeed, loopDelay, pickVariant, seededPhase } from './motion'
 import { beehivePalette, hairlineDivider, liveIndicator, progressBar, semanticIcon, statusCss, statusDot, statusInk, statusKey, swarmEmblem } from './palette'
 import { END, advisorSpent, budgetOf, contextState, detailOf, heldAt, isWindingDown, findAgent, ledger, mentions, owedOf, parse, parsePosts, postFields, statusOf, targets, tokensUsed } from './roster'
-import { bodyOf, chipped, clean, clip, compact, fenceAfter, fenced, figuresIn, hasQuestion, head, kindOf, openedText, pointsAt, repeatsPosts, stripKind, unquoted, verdictOf } from './text'
+import { asksLiftBudget, bodyOf, chipped, clean, clip, clipPlain, compact, fenceAfter, fenced, figuresIn, hasQuestion, head, kindOf, openedText, pointsAt, repeatsPosts, stripKind, unquoted, verdictOf } from './text'
 
 const post = (text: string, to: string[] = []): Post => ({ seq: 1, agent: 'parser', to, text, time: '2026-11-16T14:03:22+0100' })
 
@@ -1716,4 +1716,109 @@ test('a not-started bee keeps its pips and its antenna inside the icon at the pe
   const angle = Number(perk[1]) * Math.PI / 180, stretch = Number(perk[2] ?? 1)
   const top = 7.5 + (30.7 - 24) * Math.sin(angle) + (3.9 - 7.5) * stretch * Math.cos(angle) + hop - 1.05 * stretch
   expect(top).toBeGreaterThanOrEqual(0)
+})
+
+test('TS audit regressions (#2, #4, #8, #11, #17): figuresIn thousands+unit, asksLiftBudget, clipPlain, hasHiddenBoardLimit, and silent false positives', () => {
+  // Bug #11: comma-grouped thousands with k/M suffixes vs European decimal commas
+  expect(figuresIn('2,000k and 15,000k and 1,200,000k')).toEqual([2_000_000, 15_000_000, 1_200_000_000])
+  expect(figuresIn('2,5 mln and 0,125M and 1,000M')).toEqual([2_500_000, 125_000, 1_000_000_000])
+
+  // Bug #2 helper: asksLiftBudget matches explicit lift/clear/zero requests and respects negations
+  for (const pos of [
+    'no budget',
+    'no token budget',
+    'remove budget',
+    'lift the token budget',
+    'clear budget',
+    'disable the budget',
+    'zero out the budget',
+    'unlimited budget',
+    'uncapped budget',
+    'budget=0',
+    'budget=',
+    'limit budget= ',
+    'set budget to 0',
+    'budget to unlimited',
+    'budget to none',
+    'budget to off',
+    "don't stop at 1M, remove the budget",
+  ]) {
+    expect(asksLiftBudget(pos), pos).toBe(true)
+  }
+  for (const neg of [
+    "don't remove budget",
+    'do not lift the token budget',
+    'never clear budget',
+    "don't set budget to 0",
+    'do not set budget=0',
+    'no budget change',
+    'no budget changes',
+    'make no budget changes for this run',
+    'No budget increases. Keep the current cap.',
+    'budget=0.5M',
+    'budget=0,5M',
+    'budget=3000000',
+    'budget= 3000000',
+    'give it 3M',
+  ]) {
+    expect(asksLiftBudget(neg), neg).toBe(false)
+  }
+
+  // Bug #17: clipPlain cuts cleanly at word + grapheme/surrogate boundary with … and no Markdown fence closing
+  const mdDiff = `diff --git a/README.md b/README.md\n+\`\`\`ts\n+${'const x = 1\n'.repeat(20)}`
+  const plainClip = clipPlain(mdDiff, 60)
+  expect(plainClip.endsWith(' …')).toBe(true)
+  expect(plainClip).not.toContain('\n```')
+  const emojiPlain = clipPlain(`${'a'.repeat(19)}😀${'b'.repeat(20)}`, 20)
+  expect(emojiPlain).toBe(`${'a'.repeat(19)} …`)
+  const dashDiff = clipPlain(`diff --git a/f b/f\n- removed line here\n- ${'x'.repeat(40)}`, 40)
+  expect(dashDiff).toContain('\n- ')
+
+  // Bug #4: hasHiddenBoardLimit catches quoted/escaped limit/board bypasses
+  expect(hasHiddenBoardLimit('python3 /p/b"o"ard.py /p/.swarm/r-20260101-000000 l"i"mit budget=9000000')).toBe(true)
+  expect(hasHiddenBoardLimit('python3 /p/boar\\d.py /p/.swarm/r-20260101-000000 limi\\t budget=9000000')).toBe(true)
+  expect(hasHiddenBoardLimit('python3 -c \'run("/p/board.py")\' l"i"mit')).toBe(true)
+  expect(hasHiddenBoardLimit('python3 /p/board.py /p/.swarm/r-20260101-000000 limit budget=9000000')).toBe(false)
+  expect(hasHiddenBoardLimit('echo "hello world"')).toBe(false)
+
+  // Bug #8: silent false positives for heavy specialists, investigator review items, and full-journal unread > 0
+  const baseMember = { role: 'worker', id: 'a1', last_read_seq: 1 }
+  const tailBoard = JSON.stringify({ seq: 3, agent: 'coordinator', to: ['dev', 'inv', 'heavy-inv'], text: '@dev @inv @heavy-inv BRIEF', time: '2026-11-25T10:00:00Z' })
+  const agents = [
+    { id: 'a1', type: 'swarm:worker', status: 'completed' },
+    { id: 'a2', type: 'swarm:investigator', status: 'completed' },
+    { id: 'a3', type: 'swarm:investigator', status: 'completed' },
+  ] as never
+  const rosterJson = JSON.stringify({
+    title: 'T',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 3 },
+      dev: baseMember,
+      inv: { role: 'worker', profile: 'investigator', id: 'a2', last_read_seq: 1 },
+      'heavy-inv': { role: 'worker', profile: 'investigator', id: 'a3', last_read_seq: 1 },
+    },
+  })
+  const memberHint = { type: 'worker', model: 'sonnet', effort: 'medium', depends: [], owns: '', ready: false, blocked_on: [], asked: 0, unreachable: false }
+  const report = {
+    items: [{ kind: 'review', member: 'inv', seq: 3, text: '@inv review' }],
+    members: {
+      dev: memberHint,
+      inv: { ...memberHint, type: 'investigator' },
+      'heavy-inv': { ...memberHint, type: 'investigator', heavy: true },
+    },
+    unread: { dev: 1, inv: 0, 'heavy-inv': 0 },
+  }
+  // dev has unread=1 in full journal even when local tail posts don't address dev (local unread = 0)
+  const devBoard = JSON.stringify({ seq: 2, agent: 'coordinator', to: ['dev'], text: '@dev BRIEF', time: '2026-11-25T10:00:00Z' })
+  const parsedSuppressed = parse('/r', `${devBoard}\n${tailBoard.replace('"to":["dev","inv","heavy-inv"]', '"to":["inv","heavy-inv"]')}`, rosterJson, agents, 300, report)
+  expect(parsedSuppressed.attention.filter(item => item.kind === 'silent')).toEqual([])
+
+  // Local unread = 0 on the kept tail (only seq 3 to inv/heavy-inv) still suppresses silent when full-journal report.unread.dev = 1
+  const localZeroTail = tailBoard.replace('"to":["dev","inv","heavy-inv"]', '"to":["inv","heavy-inv"]')
+  const parsedReportUnread = parse('/r', localZeroTail, rosterJson, agents, 300, report)
+  expect(parsedReportUnread.attention.filter(item => item.kind === 'silent')).toEqual([])
+
+  // When unread is 0, not heavy, and no investigator review item, waiting member IS flagged silent
+  const parsedSilent = parse('/r', tailBoard, rosterJson, agents, 300, { ...report, items: [], unread: { dev: 0, inv: 0, 'heavy-inv': 0 } })
+  expect(parsedSilent.attention.filter(item => item.kind === 'silent').map(item => item.member)).toEqual(['dev', 'inv'])
 })

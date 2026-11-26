@@ -452,11 +452,13 @@ export function parse(
     // Its agent ended, it has read everything addressed to it, and it answered none of it: no report, no question,
     // nothing it waits for. While others work nobody notices, and whoever depends on it waits for good.
     const lastHeard = heard.get(name) ?? 0
+    const unreadCount = report?.unread ? countIn(report.unread, name) : counts(name).unread
+    const isInvestigatorReview = member.profile === 'investigator' && Boolean(report?.items?.some(item => item.kind === 'review' && item.member === name))
     if (!isClosed && !state.paused && !member.paused && (member.role ?? 'worker') === 'worker' &&
         member.profile !== 'explorer' && member.profile !== 'architect' && member.consult !== '1' &&
         member.id !== undefined && status === 'waiting' &&
-        hint !== undefined && !hint.ready && !hint.asked && !hint.paused && !hint.blocked_on?.length &&
-        counts(name).unread === 0 && lastHeard > 0 && (said.get(name) ?? 0) < lastHeard) {
+        hint !== undefined && !hint.ready && !hint.asked && !hint.paused && !hint.heavy && !hint.blocked_on?.length &&
+        !isInvestigatorReview && unreadCount === 0 && lastHeard > 0 && (said.get(name) ?? 0) < lastHeard) {
       zombieAttention.push({
         kind: 'silent',
         member: name,

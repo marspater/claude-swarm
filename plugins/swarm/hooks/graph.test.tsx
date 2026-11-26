@@ -1,7 +1,8 @@
 import { expect, test } from 'claude-code/testing'
 import type { Post, Swarm } from '../types'
-import { SVG_LIMIT, drawGraph, edgesOf, graphHeight, graphSvg, isBroadcast, labelPx, orderOuterMembers, visibleMembers } from './graph'
-import { statusDot } from './palette'
+import { SVG_LIMIT, drawGraph, edgesOf, graphHeight, graphSvg, graphWidth, isBroadcast, labelPx, orderOuterMembers, visibleMembers } from './graph'
+import { hexDivider, memberHex, sectionHex, semanticIcon, statusDot, swarmEmblem } from './palette'
+import { hiveArt } from './hive'
 
 test('the graph counts posts the pane no longer keeps', async () => {
   const posts: Post[] = Array.from({ length: 10 }, (_, index) => ({
@@ -852,4 +853,68 @@ test('Bug 9 & Bug 10: closed renders inline on Row 2 right-aligned, legendHeight
     expect(svg).toContain('dur="2.6s"')
     expect(svg).toContain('svg[data-mode=dark]')
   }
+})
+
+test('wide-panel graphBox scales up to MAX_GRAPH_SCALE (1.2) via graphWidth, graphHeight, and labelPx', () => {
+  const members = teamOf(['coordinator', 'parser', 'verifier'], 'working')
+  const svg = graphSvg({ title: 'Wide', dir: '/r', isClosed: false, attention: [], budget: 0, tokens: {}, posts: [], members }, 0, new Set(), false, true)
+  const [, vw = 0, vh = 0] = /viewBox="0 0 (\d+) (\d+)"/.exec(svg)?.map(Number) ?? []
+  // On wide panels (e.g. 160 columns = ~1403px), width & height cap at 1.2x viewBox instead of stretching indefinitely
+  expect(graphWidth(160, members)).toBe(Math.round(vw * 1.2))
+  expect(graphHeight(160, members)).toBe(Math.round(vh * 1.2))
+  expect(Math.abs(labelPx(160, members) - 14 * 1.2)).toBeLessThan(1e-4)
+  // On narrow panels, graphWidth tracks slotW and maintains aspect ratio
+  expect(graphWidth(60, members)).toBe(Math.round(60 * 8.77))
+  expect(graphWidth(160, members)).toBe(graphWidth(240, members))
+})
+
+test('hexagonal beehive design: z-order, honeycomb grid, sockets, hex packets, palette helpers, and hiveArt highlights', () => {
+  const members = teamOf(['coordinator', 'parser', 'verifier'], 'working')
+  const posts: Post[] = [{ seq: 1, agent: 'coordinator', to: ['parser'], text: '@parser go', time: '' }]
+  const svg = graphSvg({ title: 'Hex', dir: '/r', isClosed: false, attention: [], budget: 0, tokens: {}, posts, members }, 1, new Set(), true, true, true, 0, false)
+
+  // Forbidden contracts
+  expect(svg).not.toContain('id="hub"')
+  expect(svg).not.toContain('url(#hub)')
+  expect(svg).not.toContain('<pattern')
+  expect(svg).not.toContain('class="surface"')
+
+  // Coordinator hex frame behind pill, coord-crown AFTER pill
+  const coordNode = svg.slice(svg.indexOf('<title>coordinator'), svg.indexOf('<title>parser'))
+  expect(coordNode).toContain('class="coord-hex-outer"')
+  expect(coordNode).toContain('class="coord-hex"')
+  expect(coordNode.indexOf('class="coord-hex"')).toBeLessThan(coordNode.indexOf('<rect class="pill'))
+  expect(coordNode.indexOf('class="coord-crown"')).toBeGreaterThan(coordNode.indexOf('<rect class="pill'))
+
+  // Honeycomb rosette + corner accents, outer node hex sockets, and hexagonal crystal packets
+  expect(svg).toContain('class="hive-grid"')
+  expect(svg).toContain('class="node-hex-socket"')
+  expect(svg).toContain('<path class="motion packet-halo"')
+  expect(svg).toContain('<path class="motion packet"')
+  expect(svg).toContain('<path class="motion packet-tail"')
+  expect(svg).not.toContain('<circle class="motion packet')
+
+  // Palette hexagonal helpers
+  const regularHex = memberHex('#628fd2', false)
+  const coordHex = memberHex('#c26952', true)
+  expect(regularHex).toContain('viewBox="0 0 12 12"')
+  expect(coordHex).toContain('viewBox="0 0 12 12"')
+  expect(coordHex.split('<path ').length).toBeGreaterThan(regularHex.split('<path ').length)
+
+  const div = hexDivider(640)
+  expect(div).toContain('viewBox="0 0 640 9" width="640" height="9"')
+  expect(div).toContain('class="cell-c"')
+  expect(hexDivider(NaN)).toContain('viewBox="0 0 200 9" width="200" height="9"')
+
+  for (const tone of ['coordinating', 'working', 'waiting', 'failed', 'inactive'] as const) {
+    const sh = sectionHex(tone)
+    expect(sh).toContain('viewBox="0 0 12 12"')
+    expect(sh).toContain(`var(--status-${tone})`)
+  }
+
+  expect(semanticIcon('warn')).toContain('stroke-opacity=".55"')
+  expect(semanticIcon('pass')).toContain('stroke-opacity=".55"')
+  expect(statusDot('coordinating')).toContain('stroke-opacity=".55"')
+  expect(swarmEmblem('working')).toContain('stroke-width:1.5')
+  expect(hiveArt('forage', 100)).toContain('stroke="var(--honey)"')
 })

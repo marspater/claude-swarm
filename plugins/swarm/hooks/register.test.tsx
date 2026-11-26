@@ -187,7 +187,7 @@ test('the pane draws the board, the members and the graph', async ($, on) => {
     } else {
       // a diagram, following the newest post; stepping back replays an earlier one
       const svg = await findSvg(ui, /^Post /)
-      expect(Number(svg?.props.width)).toBeGreaterThan(580)
+      expect(Number(svg?.props.width)).toBeGreaterThan(500)
       expect(Number(svg?.props.height)).toBeGreaterThan(250)
       expect(String(svg?.props.source)).toContain('repeatCount="indefinite"')
       expect(String(svg?.props.source)).toContain('dur="2.6s"')
@@ -7533,11 +7533,12 @@ test('token-economy #1 & #2: auto-injects roster model on spawn and registers co
   mock.clock(on)
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
 
-  // #2: compressed board schema preserves isDeferred: false, all 10 properties and 18 actions
+  // #2: compressed board schema preserves isDeferred: false, all 10 properties and 19 actions
   expect(boardSpec).toBeDefined()
   expect(boardSpec!.isDeferred).toBe(false)
   expect(Object.keys(boardSpec!.inputSchema.properties).sort()).toEqual(['action', 'commit', 'member', 'name', 'newName', 'options', 'out', 'seq', 'text', 'title'])
-  expect(boardSpec!.inputSchema.properties.action!.enum!.length).toBe(18)
+  expect(boardSpec!.inputSchema.properties.action!.enum!.length).toBe(19)
+  expect(boardSpec!.inputSchema.properties.action!.enum).toContain('dispatch')
   const totalDescLen = boardSpec!.description.length + Object.values(boardSpec!.inputSchema.properties).reduce((n, p) => n + (p.description?.length ?? 0), 0)
   expect(totalDescLen).toBeLessThan(520)
 
@@ -8390,4 +8391,230 @@ test('Bugs 3, 4, 10 & UX layout: pane-close, openBoard reopen preserving state, 
   expect(await placed.find({ type: 'Text', text: /Swarm Board/ })).toBeDefined()
   expect(await placed.find({ type: 'Button', key: 'open-swarm', text: 'Open Swarm Board' })).toBeDefined()
   await placed.unmount()
+})
+
+test('TS audit regressions (#1, #2, #7, #12, #13, #16, #17, Task 5): board limit --raise/lift, dispatch, resume guards, session resets, final advisor step, resetView history, diff clipPlain, and routine @coordinator cite', async ($, on) => {
+  const RUN_A = '/project/.swarm/run-a-20261125-100000'
+  const RUN_B = '/project/.swarm/run-b-20261125-110000'
+  const boardCallsSeen: { dir: string; argv: string[] }[] = []
+  let advisorInput = 0
+  let advisorSetting: string | undefined = 'opus'
+  let activeRun = RUN_A
+  let stateA: Record<string, unknown> = {
+    title: 'Run A',
+    limits: { budget: '1000000', opus: 'none' },
+    usage: { tokens: {}, detail: {} },
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 1 },
+      w1: { role: 'worker', id: 'a1', model: 'sonnet', paused: 'member budget spent', last_read_seq: 1 },
+      w2: { role: 'worker', id: 'a2', model: 'opus', last_read_seq: 1 },
+      w3: { role: 'worker', id: 'a3', model: 'sonnet', last_read_seq: 1 },
+      v1: { role: 'verifier', id: 'v1', model: 'sonnet', last_read_seq: 1 },
+    },
+  }
+  const stateB = {
+    title: 'Run B',
+    members: { coordinator: { role: 'coordinator', last_read_seq: 0 }, b1: { role: 'worker', id: 'b1', last_read_seq: 0 } },
+  }
+  let boardA = [
+    { seq: 2, agent: 'coordinator', to: ['w1', 'w2', 'w3'], text: '@w1 @w2 @w3 BRIEF\nWork.', time: '2026-11-25T10:00:00Z' },
+    { seq: 3, agent: 'w3', to: ['coordinator'], text: 'READY\nDone, per @coordinator #1 and `@coordinator`.', time: '2026-11-25T10:00:01Z', revision: 'a'.repeat(40) },
+  ].map(p => JSON.stringify(p)).join('\n') + '\n'
+  const earlierPostA = JSON.stringify({ seq: 1, agent: 'coordinator', to: ['w3'], text: '@w3 EARLIER BRIEF', time: '2026-11-25T09:59:00Z' })
+  const boardB = [
+    { seq: 1, agent: 'coordinator', to: ['b1'], text: '@b1 BRIEF\nRun B.', time: '2026-11-25T11:00:00Z' },
+  ].map(p => JSON.stringify(p)).join('\n') + '\n'
+  const mdDiff = `diff --git a/README.md b/README.md\n+\`\`\`ts\n+${'const line = 1\n'.repeat(1200)}`
+
+  const submitted: string[] = []
+  let agents: Record<string, unknown>[] = [
+    { id: 'a1', description: '@w1', type: 'swarm:worker', status: 'completed' },
+    { id: 'a2', description: '@w2', type: 'swarm:worker', status: 'completed' },
+    { id: 'a3', description: '@w3', type: 'swarm:worker', status: 'running', usage: [{ model: 'claude-opus-5-5', input_tokens: advisorInput, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }] },
+  ]
+  on('command.register', (_, spec) => ({ value: { command: spec.name } }))
+  on('tool.register', (_, spec) => ({ value: { tool: `mcp__swarm__${spec.name}` } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.end', () => ({ sessionId: 'conv-audit' }))
+  on('session.id', () => ({ value: 'conv-audit' }))
+  on('session.cwd', () => ({ value: '/project' }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.panes', () => ({ value: [] }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('settings.read', () => ({ value: advisorSetting ? { advisorModel: advisorSetting } : {} }))
+  on('agent.list', () => ({ value: agents.map(a => a.id === 'a3' ? { ...a, usage: [{ model: 'claude-opus-5-5', input_tokens: advisorInput, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }] } : a) as never }))
+  on('agent.spawn', (_, e) => ({ model: e.model ?? 'sonnet', agentId: e.resume?.agentId ?? 'spawned-1' }))
+  on('fs.exists', () => ({ value: true }))
+  on('fs.list', () => ({ value: [{ name: 'run-b-20261125-110000', kind: 'dir' }, { name: 'run-a-20261125-100000', kind: 'dir' }] as never }))
+  on('fs.read', (_, e) => {
+    if (e.path.endsWith('/current')) return { value: `${activeRun.split('/').at(-1)}\n` }
+    if (e.path === `${RUN_A}/board.jsonl`) return { value: boardA }
+    if (e.path === `${RUN_B}/board.jsonl`) return { value: boardB }
+    if (e.path === `${RUN_B}/members.json`) return { value: JSON.stringify(stateB) }
+    return { value: JSON.stringify(stateA) }
+  })
+  on('process.run', (_, e) => {
+    if (e.argv[0] === 'git') {
+      return { value: { exitCode: 0, stdout: mdDiff, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    const dir = e.argv[2] ?? ''
+    const args = e.argv.slice(3)
+    if (args[0] !== 'attention' && args[0] !== 'event') boardCallsSeen.push({ dir, argv: args })
+    if (args[0] === 'restore') return { value: { exitCode: 0, stdout: activeRun, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (args[0] === 'attention') return { value: { exitCode: 0, stdout: JSON.stringify({ items: [], members: {} }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (args[0] === 'show' && args[1]?.startsWith('--before=')) return { value: { exitCode: 0, stdout: earlierPostA, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (args[0] === 'account') return { value: { exitCode: 0, stdout: JSON.stringify({ title: 'Run A', total: 0, budget: 1000000, paused: false }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    return { value: { exitCode: 0, stdout: 'ok', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('prompt.submit', (_, e) => {
+    submitted.push(e.text)
+    return { text: e.text }
+  })
+  on('command.run', () => ({ text: '' }))
+  on('tool.call', () => ({ result: {} }))
+  on('turn.complete', () => ({ text: '' }))
+  let consulted = true
+  on('turn.step', async function* (_, e) {
+    return {
+      turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'tool_use' as const,
+      serverToolUses: consulted ? [{ name: 'advisor', startedAt: 0, endedAt: 500 }] : [],
+      usage: { model: 'claude-sonnet-5-5', input_tokens: 10, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    } as never
+  })
+  const clock = mock.clock(on)
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await clock.advance(2000)
+
+  // Task 5: @coordinator inside a citation ("per @coordinator #1") or inline code ("`@coordinator`") keeps isOwedRoutine=true (no wake within 10s)
+  await clock.advance(12_000)
+  expect(submitted.filter(t => t.includes('Unread board mentions'))).toEqual([])
+
+  // Bug #13: dispatch action works on mcp__swarm__board
+  const dispatched = await toolCall($, { tool: 'mcp__swarm__board', action: 'dispatch' } as never)
+  expect(dispatched.deny).toBeUndefined()
+  expect(boardCallsSeen.some(c => c.dir === RUN_A && c.argv[0] === 'dispatch')).toBe(true)
+
+  // Bug #1 & #2: raising with user figure injects --raise; --raise in options is accepted; lifting requires user ask
+  expect((await toolCall($, { tool: 'mcp__swarm__board', action: 'limit', options: ['budget=0'] } as never)).deny).toContain('the budget is the user')
+  await $.prompt.submit({ text: 'ok give it 3,000k', origin: { kind: 'composer' }, wait: false })
+  expect((await toolCall($, { tool: 'mcp__swarm__board', action: 'limit', options: ['budget=3000000'] } as never)).deny).toBeUndefined()
+  expect(boardCallsSeen.at(-1)?.argv).toEqual(['limit', '--raise', 'budget=3000000'])
+  // Explicit --raise in options is allowed without duplicating --raise
+  expect((await toolCall($, { tool: 'mcp__swarm__board', action: 'limit', options: ['--raise', 'budget=3000000'] } as never)).deny).toBeUndefined()
+  expect(boardCallsSeen.at(-1)?.argv).toEqual(['limit', '--raise', 'budget=3000000'])
+
+  // Swarm: notice mentioning "lift the budget" must NOT set userLiftedBudget
+  await $.prompt.submit({ text: 'Swarm: Run paused. Ask whether to lift the budget.', origin: { kind: 'composer' }, wait: false })
+  expect((await toolCall($, { tool: 'mcp__swarm__board', action: 'limit', options: ['budget=0'] } as never)).deny).toContain('the budget is the user')
+  // Negated user message must NOT set userLiftedBudget
+  await $.prompt.submit({ text: "don't lift the budget", origin: { kind: 'composer' }, wait: false })
+  expect((await toolCall($, { tool: 'mcp__swarm__board', action: 'limit', options: ['budget=0'] } as never)).deny).toContain('the budget is the user')
+  // Explicit user request via composer prompt allows budget=0 and injects --raise
+  await $.prompt.submit({ text: 'please lift the token budget', origin: { kind: 'composer' }, wait: false })
+  expect((await toolCall($, { tool: 'mcp__swarm__board', action: 'limit', options: ['budget=0'] } as never)).deny).toBeUndefined()
+  expect(boardCallsSeen.at(-1)?.argv).toEqual(['limit', '--raise', 'budget=0'])
+
+  // Bug #7: e.resume checks member.paused, family limits, and advisorBarred
+  const resumeBase = {
+    tool_use_id: 'res-1', prompt: 'continue', subagentType: 'swarm:worker',
+    provider: { plugin: 'swarm', tier: 'core' as const }, parentModel: 'claude-sonnet-5-5', background: true, fork: false,
+  }
+  expect((await $.agent.spawn({ ...resumeBase, description: '@w1: resume', resume: { agentId: 'a1' } })).deny).toContain('is paused')
+  expect((await $.agent.spawn({ ...resumeBase, description: '@w2: resume', resume: { agentId: 'a2' } })).deny).toContain('allows opus only for: none')
+  expect((await $.agent.spawn({ ...resumeBase, description: '@w3: resume', resume: { agentId: 'a3' } })).deny).toContain('this session\'s advisor answers on opus')
+
+  // Bug #12: final-step advisor accounting on turn.complete under `${turnId}:end:advisor`
+  advisorSetting = 'opus'
+  for await (const _ of $.turn.step({ turnId: 'adv-t1', index: 0, model: 'claude-sonnet-5-5', messageCount: 1, agentId: 'a3' })) { /* */ }
+  await clock.advance(1)
+  // Advisor usage arrives AFTER the final turn.step, before turn.complete
+  advisorInput = 250
+  consulted = false
+  await $.turn.complete({ answer: 'done', durationMs: 50, isAborted: false, reason: 'answer', turnId: 'adv-t1', agentId: 'a3', usage: { model: 'claude-sonnet-5-5', input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } })
+  const advisorAccount = boardCallsSeen.filter(c => c.argv[0] === 'account' && c.argv[4]?.startsWith('advisor:'))
+  expect(advisorAccount.length).toBe(1)
+  expect(advisorAccount[0]!.argv[4]).toBe('advisor:250,0,0,0')
+
+  // Bug #16 & Bug #17: resetView() clears history when switching runs, and showDiff() uses clipPlain (no spurious ``` inside diff)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'diff-3' })
+  const diffMd = await ui.find({ type: 'Markdown', text: /const line = 1/ })
+  expect(diffMd).toBeDefined()
+  // The clipped diff text inside the outer ````diff ... ```` fence must not contain a spurious inner ``` closing fence before ` …`
+  expect(String(diffMd?.props.text)).toContain(' …\n````')
+  expect(String(diffMd?.props.text)).not.toContain(' …\n```\n')
+
+  await ui.press({ key: 'history-page' })
+  expect(await ui.find({ key: 'history-latest' })).toBeDefined()
+  await ui.press({ key: 'run-next' })
+  expect(await ui.find({ key: 'history-latest' })).toBeUndefined()
+  await ui.press({ key: 'run-prev' })
+  expect(await ui.find({ key: 'history-latest' })).toBeUndefined()
+  await ui.unmount()
+
+  // Bug #12: session.end + session.start clears userLiftedBudget & commandArgs
+  await $.command.run({ command: 'swarm:swarm', args: 'no budget', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 80 } })
+  expect((await toolCall($, { tool: 'mcp__swarm__board', action: 'limit', options: ['budget=0'] } as never)).deny).toBeUndefined()
+  await $.session.end({ reason: 'clear', sessionId: 'conv-audit', resume: { id: 'conv-audit' } })
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await clock.advance(2000)
+  expect((await toolCall($, { tool: 'mcp__swarm__board', action: 'limit', options: ['budget=0'] } as never)).deny).toContain('the budget is the user')
+})
+
+test('Board history row shares one line with right-aligned earlier posts, and wide Graph scales proportionally', async ($, on) => {
+  const clock = mock.clock(on)
+  const RUN = '/project/.swarm/ui-wide-20261126-100000'
+  const posts = Array.from({ length: 18 }, (_, i) => ({
+    seq: i + 1,
+    agent: i % 2 === 0 ? 'coordinator' : 'worker-a',
+    to: [i % 2 === 0 ? 'worker-a' : 'coordinator'],
+    text: `@${i % 2 === 0 ? 'worker-a' : 'coordinator'} message ${i + 1}`,
+    time: '2026-11-26T00:00:00+0100',
+  }))
+  const board = posts.map(p => JSON.stringify(p)).join('\n') + '\n'
+  const state = {
+    title: 'Wide UI Check',
+    members: {
+      coordinator: { role: 'coordinator', last_read_seq: 18 },
+      'worker-a': { role: 'worker', id: 'w1', last_read_seq: 18 },
+    },
+  }
+  on('command.register', (_, spec) => ({ value: { command: spec.name } }))
+  on('tool.register', (_, spec) => ({ value: { tool: `mcp__swarm__${spec.name}` } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 'conv-wide-ui' }))
+  on('session.cwd', () => ({ value: '/project' }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.panes', () => ({ value: [] }))
+  on('ui.scroll', () => ({}))
+  on('ui.toast', () => ({ value: undefined }))
+  on('agent.list', () => ({ value: [{ id: 'w1', description: '@worker-a', type: 'swarm:worker', status: 'idle' }] as never }))
+  on('fs.exists', () => ({ value: true }))
+  on('fs.list', () => ({ value: [{ name: 'ui-wide-20261126-100000', kind: 'dir' }] as never }))
+  on('fs.read', (_, e) => {
+    if (e.path.endsWith('/current')) return { value: 'ui-wide-20261126-100000\n' }
+    if (e.path === `${RUN}/board.jsonl`) return { value: board }
+    return { value: JSON.stringify(state) }
+  })
+  on('process.run', () => ({ value: { exitCode: 0, stdout: JSON.stringify({ items: [], members: {} }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: true })
+  await clock.advance(2000)
+
+  const ui = await $.ui.mount({ plugin: 'swarm', surface: 'desktop', component: 'Pane', requestId: 'swarm', props: { title: 'Swarm Board', isFocused: true, bodyColumns: 200, placement: 'dock', scroll: { offset: 0, bodyRows: 18 }, view: {} } })
+  const historyRow = await ui.find({ key: 'board-history-row' })
+  expect(historyRow).toBeDefined()
+  expect(historyRow?.props.flexDirection).toBe('row')
+  expect(historyRow?.props.justifyContent).toBe('space-between')
+  expect(await ui.find({ key: 'collapse-history' })).toBeDefined()
+  expect(await ui.find({ key: 'earlier-posts' })).toBeDefined()
+
+  await ui.press({ key: 'tab-graph' })
+  const graphSvgEl = (await ui.findAll({ type: 'Svg' })).find(el => String(el.props.alt).startsWith('Post '))
+  expect(graphSvgEl).toBeDefined()
+  expect(Number(graphSvgEl?.props.width)).toBeLessThanOrEqual(700)
+  expect(Number(graphSvgEl?.props.height)).toBeLessThanOrEqual(620)
+  const timelineSvg = (await ui.findAll({ type: 'Svg' })).find(el => String(el.props.alt).startsWith('Timeline position '))
+  expect(Number(timelineSvg?.props.width)).toBeGreaterThan(600)
+  await ui.unmount()
 })

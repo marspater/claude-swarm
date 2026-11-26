@@ -2681,9 +2681,9 @@ class DiffHygiene(unittest.TestCase):
         sys.path.insert(0, str(SCRIPTS))
         try:
             import verify
-            diff = ("--- a/m.py\n+++ b/m.py\n-def gone(a):\n-    def inner(): pass\n-class Moved:\n+def gone(a, b):\n"
-                    "--- a/x.ts\n+++ /dev/null\n-export default async function load() {}\n-  export const enum Kind { A }\n-const local = 1\n"
-                    "--- /dev/null\n+++ b/y.py\n+class Moved:\n")
+            diff = ("diff --git a/m.py b/m.py\n--- a/m.py\n+++ b/m.py\n@@ -1,3 +1 @@\n-def gone(a):\n-    def inner(): pass\n-class Moved:\n+def gone(a, b):\n"
+                    "diff --git a/x.ts b/x.ts\n--- a/x.ts\n+++ /dev/null\n@@ -1,3 +0,0 @@\n-export default async function load() {}\n-  export const enum Kind { A }\n-const local = 1\n"
+                    "diff --git a/y.py b/y.py\n--- /dev/null\n+++ b/y.py\n@@ -0,0 +1 @@\n+class Moved:\n")
             assert verify.removed_public_symbols(diff) == {"load": ["x.ts"], "Kind": ["x.ts"]}
             for source, expected in (
                     ("from pkg.m import (\n    a,\n    sym as s,\n)\n", True), ("from pkg.m import *\n", True),
@@ -2736,12 +2736,12 @@ class DiffHygiene(unittest.TestCase):
                     ("from other import setup\nsetup()\n", False)):
                 assert verify.imports_symbol("app.py", source, "setup", "pkg/__init__.py", True) is expected, source
             # Each module a symbol left is kept; one that defines it again, with another signature, lost nothing.
-            two = "--- a/a.ts\n+++ b/a.ts\n-export const h = 1\n%s--- a/b.ts\n+++ b/b.ts\n-export const h = 1\n"
+            two = "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-export const h = 1\n%sdiff --git a/b.ts b/b.ts\n--- a/b.ts\n+++ b/b.ts\n@@ -1 +0,0 @@\n-export const h = 1\n"
             assert verify.removed_public_symbols(two % "") == {"h": ["a.ts", "b.ts"]}
             moved = {}
             assert verify.removed_public_symbols(two % "+export const h = 2\n", moved) == {} and moved == {"h": ["b.ts"]}
             moved = {}
-            assert verify.removed_public_symbols("--- a/m.py\n+++ b/m.py\n-def go():\n--- /dev/null\n+++ b/n.py\n+def go():\n", moved) == {}
+            assert verify.removed_public_symbols("diff --git a/m.py b/m.py\n--- a/m.py\n+++ b/m.py\n@@ -1 +0,0 @@\n-def go():\ndiff --git a/n.py b/n.py\n--- /dev/null\n+++ b/n.py\n@@ -0,0 +1 @@\n+def go():\n", moved) == {}
             assert moved == {"go": ["m.py"]}
             said = verify.declared("- REWRITE: src/a.py (the task asks for it)\nsee REWRITE: no.py", "```\nopen", "NEWLINE: cfg")
             assert said["REWRITE"] == {"src/a.py (the task asks for it"} and said["NEWLINE"] == {"cfg"}, said
@@ -3589,6 +3589,106 @@ class LandingDataLoss(unittest.TestCase):
             run(*post, "ready", "b", downstream, text="done")
             assert json.loads(run(*gate, "prepare", "isolated", "--check", "true", "--members", "a,b"))["partial"]
             assert json.loads(run(*gate, "prepare", "isolated", "--check", "true", "--members", "b"))["partial"]
+
+    def test_keep_standing_does_not_reuse_accepted_candidate_and_run_plan_skips_accepted(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            self._init_git(proj)
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "KeepStanding"))
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            (proj / "file.txt").write_text("v2\n")
+            run(*post, "ready", "w", text="done")
+            first = json.loads(run(*gate, "prepare", "shared", "--check", "true"))
+            line = run(*gate, "test", first["candidate"], "v").splitlines()[-1]
+            run(*post, "post", "v", "@coordinator " + line)
+            run(*gate, "accept", first["candidate"])
+            # Accepted candidate must never be returned as standing to test again.
+            reprepared = json.loads(run(*gate, "prepare", "shared", "--check", "true", "--keep-standing"))
+            assert not reprepared.get("standing") and reprepared["candidate"] != first["candidate"], reprepared
+            current = json.loads((board / "verification.json").read_text())
+            assert not current.get("accepted") and current["candidate"] == reprepared["candidate"]
+            # If verification.json becomes accepted while run_plan runs, dispatch must not post a test command for it.
+            sys.path.insert(0, str(SCRIPTS))
+            try:
+                import board as board_module
+                from unittest import mock
+                line2 = run(*gate, "test", reprepared["candidate"], "v").splitlines()[-1]
+                run(*post, "post", "v", "@coordinator " + line2)
+                run(*gate, "accept", reprepared["candidate"])
+                (board / "verification-plan.json").write_text(json.dumps(["shared", "--check", "true"]))
+                real = subprocess.run
+
+                def fake_prepare(argv, *args, **kwargs):
+                    if "prepare" in argv:
+                        return subprocess.CompletedProcess(argv, 0, json.dumps({"candidate": reprepared["candidate"], "standing": True}) + "\n", "")
+                    return real(argv, *args, **kwargs)
+                before_posts = (board / "board.jsonl").read_text().splitlines()
+                with mock.patch.object(board_module.subprocess, "run", fake_prepare), \
+                        contextlib.redirect_stdout(io.StringIO()) as said:
+                    board_module.main(["board.py", str(board), "dispatch"])
+                assert "already accepted" in said.getvalue(), said.getvalue()
+                assert (board / "board.jsonl").read_text().splitlines() == before_posts
+            finally:
+                sys.path.remove(str(SCRIPTS))
+
+    def test_exact_mismatch_preserves_verified_by_and_candidate_state(self):
+        with tempfile.TemporaryDirectory() as t_sub, tempfile.TemporaryDirectory() as t:
+            library, proj = Path(t_sub).resolve(), Path(t).resolve()
+            self._init_git(library)
+            g = self._init_git(proj)
+            g("-c", "protocol.file.allow=always", "submodule", "add", str(library), "vendor/lib")
+            g("commit", "-q", "-m", "add library")
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Exact"))
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            g("switch", "-q", "-c", "work")
+            (proj / "file.txt").write_text("v2")
+            g("commit", "-q", "-am", "work")
+            commit = g("rev-parse", "HEAD")
+            g("switch", "-q", "main")
+            run(*post, "ready", "w", commit, text="done")
+            made = json.loads(run(*gate, "prepare", "isolated", "--check", "true"))
+            run(*gate, "test", made["candidate"], "v")
+            before = json.loads((board / "verification.json").read_text())
+            assert before["verified_by"] == "v"
+            # Mutate the candidate's checkout (populate submodule) so exact digest fails before checks run.
+            subprocess.run(["git", "-c", "protocol.file.allow=always", "submodule", "update", "--init", "-q", "vendor/lib"],
+                           cwd=made["path"], check=True, capture_output=True)
+            refused = subprocess.run([*gate, "test", made["candidate"], "v"], capture_output=True, text=True)
+            assert refused.returncode and "changed since it was prepared" in refused.stderr, refused.stderr
+            after = json.loads((board / "verification.json").read_text())
+            assert after == before
+
+    def test_removed_public_symbols_resets_across_diff_git_and_requires_hunk(self):
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import verify
+            diff = (
+                "diff --git a/a.py b/a.py\n"
+                "--- a/a.py\n"
+                "+++ b/a.py\n"
+                "@@ -1 +0,0 @@\n"
+                "-def gone():\n"
+                "diff --git a/b.py b/b.py\n"
+                "Binary files a/b.py and b/b.py differ\n"
+                "-def binary_noise():\n"
+                "+def added_noise():\n"
+                "diff --git a/c.py b/c.py\n"
+                "--- a/c.py\n"
+                "+++ b/c.py\n"
+                "-def before_hunk():\n"
+                "@@ -1 +1 @@\n"
+                "-def real_removed():\n"
+                "+def real_added():\n"
+            )
+            assert verify.removed_public_symbols(diff) == {"gone": ["a.py"], "real_removed": ["c.py"]}
+        finally:
+            sys.path.remove(str(SCRIPTS))
 
 
 if __name__ == "__main__":

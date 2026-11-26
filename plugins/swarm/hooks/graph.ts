@@ -207,19 +207,35 @@ function stageOf(all: Swarm['members'], direct?: ReadonlyMap<string, number>) {
 
 // What one text column measures across the frame, as the pane draws it.
 const COLUMN_WIDTH = 8.77
+const MAX_GRAPH_SCALE = 1.2
+
+function graphBox(columns: number, members: Swarm['members'], legendHeight = LEGEND) {
+  const { width, height } = stageOf(members)
+  const totalH = height + legendHeight
+  const slotW = columns * COLUMN_WIDTH
+  const maxH = members.length > 22 ? 780 : 620
+  const scale = Math.min(slotW / width, maxH / totalH, MAX_GRAPH_SCALE)
+  return {
+    width: Math.max(200, Math.round(width * scale)),
+    height: Math.max(200, Math.round(totalH * scale)),
+    scale,
+  }
+}
+
+export function graphWidth(columns: number, members: Swarm['members'], legendHeight = LEGEND): number {
+  return graphBox(columns, members, legendHeight).width
+}
 
 export function graphHeight(columns: number, members: Swarm['members'], legendHeight = LEGEND): number {
   // The desktop clamps the frame width to the actual slot. Columns estimate its height only, so a change in font
   // metrics cannot narrow the frame. The height follows the drawing's shape: a frame taller than the drawing
   // leaves the difference empty above the graph and below its legend.
-  const { width, height } = stageOf(members)
-  return Math.max(200, Math.min(members.length > 22 ? 780 : 620, Math.round(columns * COLUMN_WIDTH * (height + legendHeight) / width)))
+  return graphBox(columns, members, legendHeight).height
 }
 
 /** The on-screen size of a member's name, in CSS pixels, in a pane `columns` wide: an estimate, at 8.77 px a column. */
 export function labelPx(columns: number, members: Swarm['members'], legendHeight = LEGEND): number {
-  const { width, height } = stageOf(members)
-  return 14 * Math.min(columns * COLUMN_WIDTH / width, graphHeight(columns, members, legendHeight) / (height + legendHeight))
+  return 14 * graphBox(columns, members, legendHeight).scale
 }
 
 /** Each member's name as its pill shows it: a long one keeps its start and its end, and two never read the same. */
@@ -594,12 +610,12 @@ export function drawGraph(
       }
       const headMotion = motion()
       active.push(
-        '<circle class="motion packet-tail" r="2.2" opacity="0">' +
-        motion(TAIL_DELAY_MS) + opacity('.48', TAIL_DELAY_MS) + '</circle>' +
-        '<circle class="motion packet-halo" r="7.5" opacity="0">' +
-        headMotion + opacity('.3') + '</circle>' +
-        '<circle class="motion packet" r="3.5" opacity="0">' +
-        headMotion + opacity('1') + '</circle>',
+        '<path class="motion packet-tail" d="M0 -2.4L2.1 -1.2V1.2L0 2.4L-2.1 1.2V-1.2Z" opacity="0">' +
+        motion(TAIL_DELAY_MS) + opacity('.48', TAIL_DELAY_MS) + '</path>' +
+        '<path class="motion packet-halo" d="M0 -7.5L6.5 -3.75V3.75L0 7.5L-6.5 3.75V-3.75Z" opacity="0">' +
+        headMotion + opacity('.3') + '</path>' +
+        '<path class="motion packet" d="M0 -4L3.5 -2V2L0 4L-3.5 2V-2Z" opacity="0">' +
+        headMotion + opacity('1') + '</path>',
       )
     }
     if (total > 1 && (current?.to.length ?? 0) <= 3) {
@@ -642,44 +658,51 @@ export function drawGraph(
     if (member.status === 'paused' || member.detail === 'its token budget is spent') return 'paused'
     return member.status
   }
+  const hexPath = (cx: number, cy: number, r: number) => {
+    const dx = r * 0.866
+    const dy = r * 0.5
+    return `M${n1(cx)} ${n1(cy - r)}L${n1(cx + dx)} ${n1(cy - dy)}V${n1(cy + dy)}L${n1(cx)} ${n1(cy + r)}L${n1(cx - dx)} ${n1(cy + dy)}V${n1(cy - dy)}Z`
+  }
   const statusGlyph = (status: string, px: number, animateNode: boolean, seed: number): string => {
     if (status === '') return ''
     const dly = (dur: number) => animateNode ? ` style="animation-delay:${loopDelay(ms, dur, seed % dur)}"` : ''
     const x = n1(px)
     switch (status) {
       case 'coordinating': {
-        const d = `M${x} -4L${n1(px + 3.5)} -2V2L${x} 4L${n1(px - 3.5)} 2V-2Z`
+        const d = hexPath(px, 0, 4)
         return (animateNode && liveMotion ? `<path class="motion p-ping coordinating" d="${d}"${dly(3400)}/>` : '') +
           `<path class="presence coordinating" d="${d}"/>`
       }
-      case 'working':
-        return (animateNode && liveMotion ? `<circle class="motion p-ping working" cx="${x}" r="3.6"${dly(2800)}/>` : '') +
-          `<circle class="presence working" cx="${x}" r="3.7"/>`
+      case 'working': {
+        const d = hexPath(px, 0, 3.8)
+        return (animateNode && liveMotion ? `<path class="motion p-ping working" d="${d}"${dly(2800)}/>` : '') +
+          `<path class="presence working" d="${d}"/>`
+      }
       case 'waiting':
-        return `<circle class="presence-ring waiting" cx="${x}" r="3.3"/>` +
-          `<circle class="presence waiting${animateNode && liveMotion ? ' p-wait' : ''}" cx="${x}" r="1.5"${liveMotion ? dly(3600) : ''}/>`
+        return `<path class="presence-ring waiting" d="${hexPath(px, 0, 3.7)}"/>` +
+          `<circle class="presence waiting${animateNode && liveMotion ? ' p-wait' : ''}" cx="${x}" r="1.4"${liveMotion ? dly(3600) : ''}/>`
       case 'not started':
-        return `<path class="presence not-started${animateNode && liveMotion ? ' p-queue' : ''}" d="M${x} -3.5L${n1(px + 3)} -1.8V1.8L${x} 3.5L${n1(px - 3)} 1.8V-1.8Z"${liveMotion ? dly(4400) : ''}/>`
+        return `<path class="presence not-started${animateNode && liveMotion ? ' p-queue' : ''}" d="${hexPath(px, 0, 3.5)}"${liveMotion ? dly(4400) : ''}/>`
       case 'paused':
-        return `<circle class="presence-ring paused${animateNode && pausedMotion ? ' p-pause' : ''}" cx="${x}" r="3.8"${pausedMotion ? dly(4800) : ''}/>` +
+        return `<path class="presence-ring paused${animateNode && pausedMotion ? ' p-pause' : ''}" d="${hexPath(px, 0, 3.9)}"${pausedMotion ? dly(4800) : ''}/>` +
           `<path class="presence paused" d="M${n1(px - 1.2)} -1.8V1.8M${n1(px + 1.2)} -1.8V1.8"/>`
       case 'closed':
-        return `<path class="presence closed" d="M${x} -3.4L${n1(px + 2.9)} -1.7V1.7L${x} 3.4L${n1(px - 2.9)} 1.7V-1.7Z"/>` +
+        return `<path class="presence closed" d="${hexPath(px, 0, 3.4)}"/>` +
           `<circle class="presence-core closed" cx="${x}" r="1.2"/>`
       case 'killed':
-        return `<circle class="presence killed" cx="${x}" r="3.4"/>` +
-          `<path class="presence-slash killed" d="M${n1(px - 2.4)} 2.4L${n1(px + 2.4)} -2.4"/>`
+        return `<path class="presence killed" d="${hexPath(px, 0, 3.6)}"/>` +
+          `<path class="presence-slash killed" d="M${n1(px - 2.3)} 2.3L${n1(px + 2.3)} -2.3"/>`
       case 'stopped':
-        return `<rect class="presence stopped" x="${n1(px - 3.3)}" y="-3.3" width="6.6" height="6.6" rx="1.1"/>` +
-          `<rect class="presence-core stopped${animateNode && liveMotion ? ' p-stop' : ''}" x="${n1(px - 1.5)}" y="-1.5" width="3" height="3" rx=".4"${liveMotion ? dly(3600) : ''}/>`
+        return `<path class="presence stopped" d="${hexPath(px, 0, 3.8)}"/>` +
+          `<rect class="presence-core stopped${animateNode && liveMotion ? ' p-stop' : ''}" x="${n1(px - 1.4)}" y="-1.4" width="2.8" height="2.8" rx=".4"${liveMotion ? dly(3600) : ''}/>`
       case 'failed':
-        return (animateNode && liveMotion ? `<circle class="motion p-alert failed" cx="${x}" r="4.8"${dly(2800)}/>` : '') +
+        return (animateNode && liveMotion ? `<path class="motion p-alert failed" d="${hexPath(px, 0, 4.8)}"${dly(2800)}/>` : '') +
           `<path class="presence-x failed" d="M${n1(px - 2.6)} -2.6L${n1(px + 2.6)} 2.6M${n1(px + 2.6)} -2.6L${n1(px - 2.6)} 2.6"/>`
       case 'unreachable':
-        return `<circle class="presence unreachable" cx="${x}" r="3.4"/>` +
+        return `<path class="presence unreachable" d="${hexPath(px, 0, 3.6)}"/>` +
           `<path class="presence-sig unreachable${animateNode && liveMotion ? ' p-sig' : ''}" d="M${n1(px - 2)} -4.6Q${x} -6.2 ${n1(px + 2)} -4.6"${liveMotion ? dly(3200) : ''}/>`
       default:
-        return `<circle class="presence ${esc(status.replace(/\s+/g, '-'))}" cx="${x}" r="3.1"/>`
+        return `<path class="presence ${esc(status.replace(/\s+/g, '-'))}" d="${hexPath(px, 0, 3.3)}"/>`
     }
   }
   const nodeStatuses = new Set<string>()
@@ -735,15 +758,19 @@ export function drawGraph(
       : ''
     const px = -p.half + 14
     const scls = status ? esc(status.replace(/\s+/g, '-')) : ''
-    const coordFrame = member === coordinator
-      ? `<path class="coord-hex" d="M${n1(-p.half + 5)} -22H${n1(p.half - 5)}L${n1(p.half + 5)} 0L${n1(p.half - 5)} 22H${n1(-p.half + 5)}L${n1(-p.half - 5)} 0Z"/>` +
-        `<path class="coord-crown" d="M${n1(px)} -6.8L${n1(px + 5.9)} -3.4V3.4L${n1(px)} 6.8L${n1(px - 5.9)} 3.4V-3.4Z"/>`
+    const coordHex = member === coordinator
+      ? `<path class="coord-hex-outer" d="M${n1(-p.half + 3)} -25H${n1(p.half - 3)}L${n1(p.half + 8)} 0L${n1(p.half - 3)} 25H${n1(-p.half + 3)}L${n1(-p.half - 8)} 0Z"/>` +
+        `<path class="coord-hex" d="M${n1(-p.half + 5)} -22H${n1(p.half - 5)}L${n1(p.half + 5)} 0L${n1(p.half - 5)} 22H${n1(-p.half + 5)}L${n1(-p.half - 5)} 0Z"/>`
       : ''
+    const statusSocket = status === '' ? ''
+      : member === coordinator
+        ? `<path class="coord-crown" d="${hexPath(px, 0, 6.8)}"/>`
+        : `<path class="node-hex-socket" d="${hexPath(px, 0, 5.6)}"/>`
     const dot = statusGlyph(status, px, true, hashSeed(member.name))
     return (
       `<g class="node${scls ? ` ${scls}` : ''}" transform="translate(${p.x.toFixed(1)} ${p.y.toFixed(1)})">` +
-      `<title>${esc(title)}</title>${coordFrame}<rect class="pill${emphasis}${silent > 0 ? ' quiet' : ''}" ${rect}/>` +
-      arrival + dot +
+      `<title>${esc(title)}</title>${coordHex}<rect class="pill${emphasis}${silent > 0 ? ' quiet' : ''}" ${rect}/>` +
+      arrival + statusSocket + dot +
       `<text class="name" x="${dot ? 7 : 0}" dy=".35em">${esc(p.label)}</text>` + chip + '</g>'
     )
   })
@@ -832,11 +859,14 @@ export function drawGraph(
     '.via-all{stroke-dasharray:6 5;stroke-linecap:butt}' +
     '.route-base{stroke:var(--accent);opacity:.15}' +
     '.route{stroke:var(--accent)}.motion-route{stroke-dasharray:102 102}.tip-current{fill:var(--accent)}' +
-    '.packet-tail{fill:var(--accent)}.packet-halo{fill:var(--packet)}.packet{fill:var(--packet);stroke:var(--accent);stroke-width:1.6}' +
+    '.packet-tail{fill:var(--accent)}.packet-halo{fill:var(--packet)}.packet{fill:var(--packet);stroke:var(--accent);stroke-width:1.4;stroke-linejoin:round}' +
     '.pill{fill:var(--pill);stroke:var(--border);filter:url(#sh);transition:stroke .16s ease,fill .16s ease}' +
     '.node:hover>.pill{stroke:var(--accent)}' +
-    '.coord-hex{fill:none;stroke:var(--status-coordinating);stroke-opacity:.38;stroke-width:1.15}' +
-    '.coord-crown{fill:var(--status-coordinating);fill-opacity:.11;stroke:var(--status-coordinating);stroke-opacity:.42;stroke-width:1;stroke-linejoin:round}' +
+    '.hive-grid{fill:var(--tint);fill-opacity:.18;stroke:var(--accent);stroke-opacity:.14;stroke-width:1;stroke-linejoin:round}' +
+    '.coord-hex-outer{fill:none;stroke:var(--status-coordinating);stroke-opacity:.32;stroke-width:1;stroke-linejoin:round}' +
+    '.coord-hex{fill:var(--tint);fill-opacity:.35;stroke:var(--status-coordinating);stroke-opacity:.78;stroke-width:1.75;stroke-linejoin:round}' +
+    '.coord-crown{fill:var(--status-coordinating);fill-opacity:.18;stroke:var(--status-coordinating);stroke-opacity:.68;stroke-width:1.15;stroke-linejoin:round}' +
+    '.node-hex-socket{fill:var(--tint);fill-opacity:.28;stroke:var(--border);stroke-opacity:.38;stroke-width:.85;stroke-linejoin:round}' +
     '.sender{fill:url(#sg);stroke:var(--accent);stroke-width:1.8}.recipient{stroke:var(--accent);stroke-width:1.5}' +
     '.quiet{stroke-dasharray:5 4}' +
     '.not-started .pill{opacity:.86}.closed .pill{opacity:.88}' +
@@ -873,7 +903,32 @@ export function drawGraph(
     (liveMotion ? '.p-wait,.p-queue,.p-pause,.p-stop,.p-sig{animation:none;opacity:1}' : pausedMotion ? '.p-pause{animation:none;opacity:1}' : '') +
     '.history-edge,.edge,.tip,.pill{transition:none}}' +
     '</style>' +
-    `<g clip-path="url(#stage)">${ripples.join('')}</g>`
+    `<g clip-path="url(#stage)">` +
+    (() => {
+      const r = 16
+      const dx = r * 1.732
+      const dy = r * 1.5
+      const rosette = coordinator
+        ? `<path class="hive-grid" d="${([
+            [width / 2, height / 2],
+            [width / 2 - dx, height / 2],
+            [width / 2 + dx, height / 2],
+            [width / 2 - dx / 2, height / 2 - dy],
+            [width / 2 + dx / 2, height / 2 - dy],
+            [width / 2 - dx / 2, height / 2 + dy],
+            [width / 2 + dx / 2, height / 2 + dy],
+          ] as const).map(([hx, hy]) => hexPath(hx, hy, r)).join('')}"/>`
+        : ''
+      const cornerCluster = (cx: number, cy: number) => {
+        const cr = 10
+        const cdx = cr * 1.732
+        const cdy = cr * 1.5
+        return `${hexPath(cx, cy, cr)}${hexPath(cx + cdx, cy, cr)}${hexPath(cx + cdx / 2, cy + cdy, cr)}`
+      }
+      const corners = `<path class="hive-grid" opacity=".55" d="${cornerCluster(18, 16)}${cornerCluster(width - 36, height - 30)}"/>`
+      return rosette + corners
+    })() +
+    `${ripples.join('')}</g>`
   const close = active.join('') + nodes.join('') + badges.join('') +
     `<line x1="16" y1="${height + 0.5}" x2="${width - 16}" y2="${height + 0.5}" stroke="var(--border)" opacity=".35"/>` +
     legend + '</svg>'

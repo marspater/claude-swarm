@@ -765,7 +765,10 @@ export function hiveArt(shown: Mood | 'paused' | 'attention', elapsed = 0): stri
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 44 22" shape-rendering="crispEdges"><style>${HIVE_TOKENS}${scene.style}</style>` +
     `${aura}<path fill="var(--wax)" d="M19 6h6v1h2v2h2v3h1v7H14v-7h1V9h2V7h2z"/>` +
     '<path fill="var(--honey)" d="M17 8h10v1H17zM15 11h14v2H15zM14 14h16v2H14z"/>' +
-    '<path fill="var(--spark)" fill-opacity=".18" d="M20 7h4v1h-4zM16 10h2v1h-2zM26 10h2v1h-2zM16 13h2v1h-2zM26 13h2v1h-2zM15 17h2v1h-2zM27 17h2v1h-2z"/>' +
+    '<path fill="var(--spark)" fill-opacity=".28" d="M20 7h4v1h-4zM16 10h2v1h-2zM26 10h2v1h-2zM16 13h2v1h-2zM26 13h2v1h-2zM15 17h2v1h-2zM27 17h2v1h-2z"/>' +
+    '<g shape-rendering="auto" fill="var(--honey)" fill-opacity=".22" stroke="var(--honey)" stroke-opacity=".5" stroke-width=".6" stroke-linejoin="round">' +
+    '<path d="M11.8 16.2L13.1 17V18.5L11.8 19.3L10.5 18.5V17Z"/>' +
+    '<path d="M32.2 16.2L33.5 17V18.5L32.2 19.3L30.9 18.5V17Z"/></g>' +
     `<path fill="var(--ink)" d="M21 14h2v1h1v4h-4v-4h1z"/>${doorwayGlow}` +
     `${bee(resting ? 3 : 2, resting ? 13 : 11, 'left')}${bee(resting ? 33 : 34, resting ? 13 : 6, 'right')}` +
     `${scene.art}</svg>`
