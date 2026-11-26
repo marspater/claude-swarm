@@ -60,7 +60,7 @@ const weigh = (spent: Spent | undefined) => spent === undefined ? 0
 // `pending` holds unacknowledged charges by step index (END for turn totals), and `landing` waits for their step calls.
 // `raw` is what each pending report spent before weighting and `taken` what the board holds of that, so the usage
 // detail follows the charge through every retry.
-type Turn = { steps: Set<number>; sum: Spent; charged: number; endCharged: number; pending: Map<number, number>; raw: Map<number, Spent>; taken: Spent; landing: Promise<unknown>; agentId?: string; last: number }
+type Turn = { steps: Set<number>; sum: Spent; charged: number; endCharged: number; pending: Map<number, number>; raw: Map<number, Spent>; lent: Map<number, Spent>; unbilled: Spent; taken: Spent; landing: Promise<unknown>; agentId?: string; last: number }
 const KINDS = ['input_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens', 'output_tokens'] as const
 
 /**
@@ -83,10 +83,12 @@ export function advisorSpent(usage: readonly (Partial<Spent> & { model: string }
 export function owedOf(spent: Spent, took: Spent | undefined): { amount: number; detail: string } {
   const rest = none()
   for (const kind of KINDS) rest[kind] = Math.max(0, spent[kind] - (took?.[kind] ?? 0))
-  return { amount: weigh(rest), detail: `${rest.input_tokens},${rest.cache_creation_input_tokens},${rest.cache_read_input_tokens},${rest.output_tokens}` }
+  // The difference of the two weighed totals, not the weight of the difference: cached reads round once over the
+  // total, so sampling the same usage more often charges no more.
+  return { amount: Math.max(0, weigh(spent) - weigh(took)), detail: `${rest.input_tokens},${rest.cache_creation_input_tokens},${rest.cache_read_input_tokens},${rest.output_tokens}` }
 }
 const none = (): Spent => ({ input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 })
-const fresh = (agentId: string | undefined, last: number): Turn => ({ steps: new Set(), sum: none(), charged: 0, endCharged: 0, pending: new Map(), raw: new Map(), taken: none(), landing: Promise.resolve(), agentId, last })
+const fresh = (agentId: string | undefined, last: number): Turn => ({ steps: new Set(), sum: none(), charged: 0, endCharged: 0, pending: new Map(), raw: new Map(), lent: new Map(), unbilled: none(), taken: none(), landing: Promise.resolve(), agentId, last })
 /**
  * What each turn's model steps have been charged so far, so its end charges only what the board did not take. A
  * running turn keeps its entry however long it runs or waits between steps, or its end would charge its steps a
@@ -98,6 +100,22 @@ export const END = -1
 export function ledger(kept = 256, graceMs = 600_000) {
   const running = new Map<string, Turn>()
   const ended = new Map<string, Turn>()
+  // What a turn's end could not report: counts too few to weigh anything, kept for the agent's next charge.
+  const carried = new Map<string, Spent>()
+  // COUNTS with what the agent's earlier turns left, which is then left no more: taken by a report that is sent.
+  // What a report takes over is kept apart from its turn's own counts (`lent`, beside `raw`): the turn's remainder is
+  // worked out from its own alone, and the rest goes back if that report is never sent.
+  const take = (turn: Turn, index: number, agentId: string | undefined, counts: Spent): Spent => {
+    const left = carried.get(agentId ?? '')
+    if (left) turn.lent.set(index, left)
+    carried.delete(agentId ?? '')
+    return { ...counts }
+  }
+  const leave = (agentId: string | undefined, counts: Spent) => {
+    const left = carried.get(agentId ?? '') ?? none()
+    for (const kind of KINDS) left[kind] += counts[kind]
+    carried.set(agentId ?? '', left)
+  }
   const of = (turnId: string) => running.get(turnId) ?? ended.get(turnId)
   const end = (turnId: string, turn: Turn) => {
     running.delete(turnId)
@@ -106,15 +124,20 @@ export function ledger(kept = 256, graceMs = 600_000) {
     if (ended.size > kept) {
       // The oldest the board owes nothing for goes first: one with a charge still pending is kept while it can be.
       const settled = [...ended].find(([id, old]) => id !== turnId && old.pending.size === 0)
-      ended.delete(settled ? settled[0] : ended.keys().next().value!)
+      if (settled) ended.delete(settled[0])
     }
   }
   return {
     of,
     get running() { return running.size },
+    /** Drops what the coordinator's turns left: counts spent in one run are not reported with a charge in the next. */
+    unbind() {
+      carried.delete('')
+    },
     clear() {
       running.clear()
       ended.clear()
+      carried.clear()
     },
     /**
      * What this report adds to the turn's charge: a step's own usage, or at the turn's end its whole usage (what its
@@ -135,10 +158,15 @@ export function ledger(kept = 256, graceMs = 600_000) {
           const owing = [...closed.raw].reduce((sum, [index, raw]) => index === END ? sum : sum + raw[kind], 0)
           rest[kind] = Math.max(0, (whole[kind] || 0) - closed.taken[kind] - owing)
         }
+        const owed = Math.max(0, total - closed.charged - pending)
+        // An end that owes nothing sends no report: its counts go with the agent's next one. Once, however often it ends.
+        if (owed === 0 && !closed.raw.has(END) && KINDS.some(kind => rest[kind] > 0)) {
+          leave(closed.agentId ?? agentId, rest)
+        }
         // A repeated end leaves the detail of the end still pending as it is: its retry carries that one.
-        if (!closed.pending.has(END)) closed.raw.set(END, rest)
+        if (!closed.pending.has(END)) closed.raw.set(END, owed > 0 ? take(closed, END, closed.agentId ?? agentId, rest) : rest)
         end(turnId, closed)
-        return Math.max(0, total - closed.charged - pending)
+        return owed
       }
       if (spent === undefined) return 0
       // A step that reports after its turn's end was charged with the end.
@@ -152,13 +180,13 @@ export function ledger(kept = 256, graceMs = 600_000) {
       turn.steps.add(index)
       const before = weigh(turn.sum)
       for (const key of Object.keys(turn.sum) as (keyof Spent)[]) turn.sum[key] += spent[key] || 0
+      for (const kind of KINDS) turn.unbilled[kind] += spent[kind] || 0
       const after = weigh(turn.sum)
       const delta = after - before
       if (delta > 0) {
         turn.pending.set(index, delta)
-        const raw = none()
-        for (const kind of KINDS) raw[kind] = spent[kind] || 0
-        turn.raw.set(index, raw)
+        turn.raw.set(index, take(turn, index, turn.agentId, turn.unbilled))
+        turn.unbilled = none()
       }
       return delta
     },
@@ -170,14 +198,25 @@ export function ledger(kept = 256, graceMs = 600_000) {
       if (!turn.pending.delete(index)) return
       const raw = turn.raw.get(index)
       turn.raw.delete(index)
+      // Never sent, its own tokens go under the turn's end; what it took over from earlier turns is no turn's to find again.
+      const lent = turn.lent.get(index)
+      turn.lent.delete(index)
+      if (lent && amount <= 0) leave(turn.agentId, lent)
       if (raw && amount > 0) for (const kind of KINDS) turn.taken[kind] += raw[kind]
       turn.charged += amount
       if (index === END) turn.endCharged += amount
+      if (turn.pending.size === 0 && ended.size > kept) {
+        for (const [id, old] of ended) {
+          if (ended.size <= kept) break
+          // Never the turn settled just now: its caller goes on to its end, which would charge it whole as a new turn.
+          if (old !== turn && old.pending.size === 0) ended.delete(id)
+        }
+      }
     },
     /** What a pending report spent, as the board's `account` takes it: fresh input, cache writes, cache reads, output. */
     detail(turn: Turn, index: number): string {
-      const raw = turn.raw.get(index)
-      return raw ? KINDS.map(kind => raw[kind]).join(',') : ''
+      const raw = turn.raw.get(index), lent = turn.lent.get(index)
+      return raw ? KINDS.map(kind => raw[kind] + (lent?.[kind] ?? 0)).join(',') : ''
     },
     /** Keep a turn's end charge pending under the same report until the board takes it. */
     held(turn: Turn, amount: number): void {

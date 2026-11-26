@@ -5,6 +5,7 @@
     python3 tests/check.py --base REF      what changed since REF (a branch, a commit), uncommitted work included
     python3 tests/check.py --all           everything: before a version bump
     python3 tests/check.py --only py|ts    one side of the selection
+    python3 tests/check.py --strict        do not retry parallel failures sequentially (or CHECK_STRICT=1)
     python3 tests/check.py --list          print what would run, and run nothing
 
 Python tests run one test per process, several at once: each spawns board.py or verify.py many times, so the suite
@@ -59,7 +60,9 @@ def touched_tests(path, base):
     an import): then the whole module runs."""
     lines = set()
     for start, count in re.findall(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@", git("diff", "-U0", base or "HEAD", "--", path), re.M):
-        lines.update(range(int(start), int(start) + int(count or 1)))  # a pure deletion (count 0) names no line
+        if count == "0":
+            return None  # a pure deletion may have removed a test, helper, or import
+        lines.update(range(int(start), int(start) + int(count or 1)))
     if not lines:
         return None  # an untracked file, or deletions only
     module = "tests." + os.path.basename(path)[:-3]
@@ -106,17 +109,21 @@ def command(args):
     return done.returncode == 0, done.stdout + done.stderr, time.time() - started
 
 
-def python_tests(ids):
+def python_tests(ids, strict=False):
     """Every id in a process of its own, on all cores but two (CHECK_JOBS sets another count); a failure is tried
-    once more alone. Measured on ten cores: eight workers finish in the time of the longest single test."""
+    once more alone unless strict is set. Measured on ten cores: eight workers finish in the time of the longest single test."""
     def one(name):
         return (name, *command([sys.executable, "-B", "-m", "unittest", name]))
     started = time.time()
     with ThreadPoolExecutor(max_workers=int(os.environ.get("CHECK_JOBS") or max(2, (os.cpu_count() or 4) - 2))) as pool:
         results = list(pool.map(one, ids))
-    failed = [one(name) for name, passed, _, _ in results if not passed]
-    retried = [name for name, passed, _, _ in failed if passed]
-    failed = [(name, output) for name, passed, output, _ in failed if not passed]
+    if strict:
+        failed = [(name, output) for name, passed, output, _ in results if not passed]
+        retried = []
+    else:
+        failed = [one(name) for name, passed, _, _ in results if not passed]
+        retried = [name for name, passed, _, _ in failed if passed]
+        failed = [(name, output) for name, passed, output, _ in failed if not passed]
     slowest = sorted(results, key=lambda result: -result[3])[:3]
     note = "%d tests, slowest %s" % (len(ids), ", ".join("%s %.0fs" % (name.rsplit(".", 1)[1], took) for name, _, _, took in slowest))
     if retried:
@@ -143,11 +150,38 @@ def selector():
     listed = [line.split(":")[0] for line in done.stdout.split("\n") if line]
     if done.returncode != 0 or listed != [check for check in ORDER if check != "parity"]:
         wrong.append("--all --list printed %r%s" % (listed, done.stderr))
+    strict_done = subprocess.run([sys.executable, "-B", os.path.abspath(__file__), "--all", "--strict", "--list"], cwd=ROOT, capture_output=True, text=True)
+    if strict_done.returncode != 0 or [line.split(":")[0] for line in strict_done.stdout.split("\n") if line] != listed:
+        wrong.append("--all --strict --list failed: %r%s" % (strict_done.stdout, strict_done.stderr))
+    # Mixed modification + pure deletion hunk must fall back to running the whole module (None).
+    orig_git = globals()["git"]
+    try:
+        globals()["git"] = lambda *a: "@@ -5,2 +5,2 @@\n@@ -20,3 +20,0 @@\n"
+        if touched_tests("tests/test_board.py", None) is not None:
+            wrong.append("touched_tests did not return None on mixed deletion hunk")
+    finally:
+        globals()["git"] = orig_git
+    # Strict mode must not mask a first-attempt parallel failure with a sequential retry.
+    orig_cmd = globals()["command"]
+    calls = {"n": 0}
+    try:
+        def flaky_cmd(_args):
+            calls["n"] += 1
+            return (calls["n"] > 1, "flaky", 0.01)
+        globals()["command"] = flaky_cmd
+        if not python_tests(["t.one"], strict=False)[0]:
+            wrong.append("python_tests(strict=False) did not retry flaky failure")
+        calls["n"] = 0
+        if python_tests(["t.one"], strict=True)[0]:
+            wrong.append("python_tests(strict=True) masked first-attempt failure")
+    finally:
+        globals()["command"] = orig_cmd
     return not wrong, "\n".join(wrong), time.time() - started
 
 
 def main(argv):
-    flags = {"--all", "--list"}
+    flags = {"--all", "--list", "--strict"}
+    strict = "--strict" in argv or os.environ.get("CHECK_STRICT") == "1"
     base = argv[argv.index("--base") + 1] if "--base" in argv and argv.index("--base") + 1 < len(argv) else None
     only = argv[argv.index("--only") + 1] if "--only" in argv and argv.index("--only") + 1 < len(argv) else None
     rest = [arg for i, arg in enumerate(argv) if arg not in flags and arg not in ("--base", "--only") and (i == 0 or argv[i - 1] not in ("--base", "--only"))]
@@ -185,7 +219,7 @@ def main(argv):
     for check in [check for check in picked if check not in ids] + (["engine"] if engine else []):
         note = ""
         if check == "engine":
-            passed, output, took, note = python_tests([name for module in engine for name in ids[module]])
+            passed, output, took, note = python_tests([name for module in engine for name in ids[module]], strict=strict)
             note = "%s: %s" % (" and ".join(engine), note)
         elif check == "selector":
             passed, output, took = selector()

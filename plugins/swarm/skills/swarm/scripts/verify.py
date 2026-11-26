@@ -186,7 +186,7 @@ def _hash_dir(update, root_dir):
         _hash_entry(update, root_dir / rel, (root_dir / rel).lstat().st_mode)
 
 
-def source_digest(project, nested=False, seen_roots=None, pointers=False, entries=None):
+def source_digest(project, nested=False, seen_roots=None, pointers=False, entries=None, head=None):
     """Fingerprint the sources. The project's own .swarm folder holds run data and is left out; a folder of that
     name anywhere else, a nested repository's included, is the user's and counts as source.
     With POINTERS, as for an isolated candidate, a clean checked-out submodule stands for its commit, as an empty one
@@ -228,7 +228,8 @@ def source_digest(project, nested=False, seen_roots=None, pointers=False, entrie
         skip = not_source(found)[1:] if nested else not_source(found)
         files = (file for file in [*tracked, *git(root, "ls-files", "-z", "--others", "--exclude-standard").split(b"\0")]
                  if file and not in_worktree(file, skip))
-        head = git(root, "rev-parse", "HEAD", optional=True) or b"unborn"
+        # HEAD, when given, stands for the checkout's own: the files as they are, fingerprinted as of another commit.
+        head = head or git(root, "rev-parse", "HEAD", optional=True) or b"unborn"
     digest = hashlib.sha256(head + b"\0")
     for name in sorted(set(files)):
         path = root / os.fsdecode(name)
@@ -289,6 +290,13 @@ def board_lock(run):
     with (run / ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
+
+
+def read_board(run):
+    """The roster and the posts, read under the board's lock: a load completes a post its writer has saved and not yet
+    appended, so beside that writer it would append the post a second time. For a caller that does not hold the lock."""
+    with board_lock(run):
+        return load(run)
 
 
 def lock_directory(project, run):
@@ -840,7 +848,7 @@ def allowances(given):
 def check_hygiene(run, root, base, commit, recorded, skip, allowed=()):
     """Raise when the candidate's change has a hygiene defect that neither its workers declared in their READY reports
     nor the coordinator allowed (ALLOWED, what `allowances` returns)."""
-    state, posts = load(run)
+    state, posts = read_board(run)
     reports = {seq for seq, _ in recorded.values()}
     if commit:
         # A partial candidate holds the commits of the workers its members built on, and their changes come with the
@@ -872,6 +880,40 @@ def check_current(run, candidate, *, allow_closed=False):
         raise ValueError("the project moved off the accepted commit")
     if source_digest(project, pointers=candidate["mode"] == "isolated") != candidate["digest"]:
         raise ValueError("source files changed after acceptance")
+
+
+def same_plan(plan, candidate):
+    """Whether PLAN, the `prepare` arguments `--when-ready` recorded, asks for the candidate CANDIDATE was prepared as."""
+    given, flags, rest = {"--check": [], "--base": [], "--allow": []}, set(), list(plan[1:])
+    while rest:
+        key, equals, value = rest.pop(0).partition("=")
+        if key in given:
+            given[key].append(value if equals else rest.pop(0) if rest else "")
+        else:
+            flags.add(key)
+    return (plan[0] == candidate.get("mode") and given["--check"] == (candidate.get("checks") or [])
+            and ("--no-checks" in flags) == bool(candidate.get("no_checks"))
+            and (given["--base"] or [None])[-1] == candidate.get("onto")
+            and list(allowances(given["--allow"] or None)) == list(candidate.get("allowed") or [])
+            and ("--baseline-diff" in flags) == bool(candidate.get("baseline")))
+
+
+def stands(run, candidate):
+    """Whether an accepted candidate still describes the reports and the files: as it was accepted, or as its own commit
+    landed them. The fingerprint holds HEAD, so the commit `commit` made is told apart from a change by its id."""
+    try:
+        check_current(run, candidate, allow_closed=True)
+        return True
+    except ValueError:
+        landed, project = candidate.get("landed"), Path(candidate["project"])
+        if candidate["mode"] != "shared" or not landed:
+            return False
+        recorded = inputs(run, "shared", allow_closed=True, among=candidate.get("members"))
+        # Every file read again, as of the commit the landing was made on: Git's status passes over an entry marked
+        # assume-unchanged or skip-worktree, so a clean status is no proof the files are the ones that landed.
+        before = git(project, "rev-parse", "--verify", "-q", landed + "^", optional=True) or b"unborn"
+        return (candidate["inputs"] == recorded and git(project, "rev-parse", "HEAD").decode().strip() == landed
+                and source_digest(project, head=before) == candidate["digest"])
 
 
 def active_verifier(run, verifier):
@@ -941,7 +983,7 @@ def prepare(run, project, mode, checks, onto=None, subset=None, baseline=False, 
                                  "--chmod`, or stop the hook from changing it, then prepare again"
                                  % ", ".join(map(shown, sorted(flipped)[:5])))
             # Whatever chain it came down: `ready` reads only the members a worker waits for.
-            state, posts = load(run)
+            state, posts = read_board(run)
             try:
                 held = withdrawn_in(integration, state["members"], state["members"], posts, commit, base)
             except SystemExit as error:
@@ -1016,7 +1058,9 @@ def prepare(run, project, mode, checks, onto=None, subset=None, baseline=False, 
 
                 unchanged = (isinstance(previous, dict) and (tree(previous.get("commit")) or None) == tree(commit)
                              and Path(str(previous.get("path"))).is_dir()
-                             and source_digest(Path(previous["path"]), pointers=True) == previous.get("digest"))
+                             and source_digest(Path(previous["path"]), pointers=True) == previous.get("digest")
+                             # Every file, as `test` reads it: a checkout it refuses is no candidate to keep.
+                             and (previous.get("exact") is None or source_digest(Path(previous["path"])) == previous["exact"]))
             else:
                 unchanged = isinstance(previous, dict) and all(previous.get(key) == candidate[key] for key in ("digest", "exact"))
             if (keep_standing and unchanged and isinstance(previous.get("candidate"), str)
@@ -1183,14 +1227,14 @@ def run_check(command, cwd, timeout, output=None, *, output_dir=None):
             signal.signal(number, handler)
 
 
-def descendant_groups(pid):
-    """Process groups of everything below pid, found from one ps snapshot."""
+def descendant_snapshot(pid):
+    """(pids, groups) below pid, found from one ps snapshot."""
     try:
         listed = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid="], capture_output=True, text=True)
     except OSError:
-        return set()
+        return set(), set()
     if listed.returncode != 0:
-        return set()
+        return set(), set()
     rows = [tuple(map(int, fields)) for fields in map(str.split, listed.stdout.splitlines())
             if len(fields) == 3 and all(field.isdigit() for field in fields)]
     below, grew = {pid}, True
@@ -1200,8 +1244,15 @@ def descendant_groups(pid):
             if parent in below and child not in below:
                 below.add(child)
                 grew = True
+    pids = {child for child in below if child > 1 and child != os.getpid()}
     # Group 0 is the caller's own to killpg, and group 1 is init's.
-    return {group for child, _, group in rows if child in below and group > 1} - {os.getpgrp()}
+    groups = {group for child, _, group in rows if child in below and group > 1} - {os.getpgrp()}
+    return pids, groups
+
+
+def descendant_groups(pid):
+    """Process groups of everything below pid, found from one ps snapshot."""
+    return descendant_snapshot(pid)[1]
 
 
 def cleanup(process):
@@ -1211,9 +1262,22 @@ def cleanup(process):
     # groups are gone. The caller's finally restores the previous handlers.
     for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(number, signal.SIG_IGN)
-    groups = {process.pid} | descendant_groups(process.pid)
+    pids, groups = descendant_snapshot(process.pid)
+    pids.add(process.pid)
+    groups.add(process.pid)
 
-    def gone(group):
+    def pid_alive(pid):
+        if pid == process.pid and process.poll() is not None:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def group_gone(group):
         if group == process.pid:
             process.poll()
         try:
@@ -1222,17 +1286,44 @@ def cleanup(process):
             return True
         return False
 
-    for number in (signal.SIGTERM, signal.SIGKILL):
-        for group in groups:
-            if not gone(group):
+    def signal_all(target_pids, target_groups, sig):
+        for group in target_groups:
+            if not group_gone(group):
                 try:
-                    os.killpg(group, number)
+                    os.killpg(group, sig)
                 except (ProcessLookupError, PermissionError):
                     pass
-        deadline = time.monotonic() + 0.5
-        while not all(gone(g) for g in groups) and time.monotonic() < deadline:
+        for pid in target_pids:
+            if pid_alive(pid):
+                try:
+                    os.kill(pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    pass
+
+    def wait_gone(deadline):
+        while (not all(group_gone(g) for g in groups) or any(pid_alive(p) for p in pids)) and time.monotonic() < deadline:
             time.sleep(0.02)
-    process.wait()
+
+    # Each signal goes to the descendants a snapshot taken at that moment lists, never to a number read earlier: its
+    # process may have exited since and the number been given to another, which the signal would end.
+    for number in (signal.SIGTERM, signal.SIGKILL):
+        pids, more = descendant_snapshot(process.pid)
+        pids.add(process.pid)
+        groups |= more
+        signal_all(pids, groups, number)
+        wait_gone(time.monotonic() + 0.5)
+    pids = descendant_snapshot(process.pid)[0] | {process.pid}
+
+    survivors = sorted(p for p in pids if pid_alive(p))
+    if survivors:
+        print(f"warning: cleanup could not terminate pid(s): {', '.join(map(str, survivors))}", file=sys.stderr)
+    if process.pid in survivors:
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            pass
+    else:
+        process.wait()
 
 
 # What the verifier sees of a check's output; the log holds all of it. Everything printed stays in its conversation
@@ -1611,6 +1702,9 @@ def test_candidate(run, project, identifier, verifier, timeout_arg=None):
         raise ValueError("verification failed: " + "; ".join(failed))
 
     with board_lock(run):
+        # Before the candidate is read: a rejection cut short while the checks ran is completed here, and withdraws
+        # this attempt as it would have. Read first, the attempt it withdrew was published as a pass.
+        load(run)
         candidate = candidate_for(run, project, identifier)
         if candidate.get("attempt") != attempt:
             raise ValueError("the verification attempt was withdrawn or superseded")
@@ -1678,14 +1772,31 @@ def landing_guards(found):
     submodules = list(pointers)
     # A pointer no .gitmodules entry backs is one nobody else can resolve: refused once the commit would record
     # or move it, staged already or not.
-    registered = {entry.partition(b"\n")[2] for entry in (git(
-        found[0], "config", "-z", "-f", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$", optional=True) or b"").split(b"\0")}
+    def entries(key, *source):  # {submodule name: value} of the .gitmodules entries `submodule.<name>.<key>`
+        listed = git(found[0], "config", "-z", *(source or ("-f", ".gitmodules")), "--get-regexp",
+                     r"^submodule\..*\.%s$" % key, optional=True) or b""
+        return {name[len(b"submodule."):-len(key) - 1]: value for name, _, value in (
+            entry.partition(b"\n") for entry in listed.split(b"\0") if entry)}
+    # Registered is a path with a URL to fetch it from: `git submodule init` refuses an entry that has none.
+    urls = entries("url")
+    registered = {path for name, path in entries("path").items() if urls.get(name)}
     # The commit holds .gitmodules as staging takes it: untracked and ignored, it stays out, and registers nothing there.
     if (git(found[0], "ls-files", "--error-unmatch", "--", ":(top,literal).gitmodules", optional=True) is None
             and git(found[0], "check-ignore", "-q", "--", ".gitmodules", optional=True) is not None):
         registered = set()
     loose = [name for name in submodules if os.fsencode(name) not in registered and git(
         found[0], "status", "--porcelain", "--ignore-submodules=none", "--", ":(top,literal)" + name)]
+    # The registration alone removed: the pointer stays as it was, and the commit would take its .gitmodules entry away.
+    # Read against HEAD's: a pointer that had no entry there loses none, whatever else in .gitmodules changes.
+    head = ("--blob", "HEAD:.gitmodules")
+    head_urls = entries("url", *head)
+    had = {path for name, path in entries("path", *head).items() if head_urls.get(name)}
+    dropped = [name for name in submodules if os.fsencode(name) not in registered and os.fsencode(name) in had
+               and name not in loose]
+    if dropped:
+        raise ValueError("the commit after `accept` would keep the submodule %s and remove its .gitmodules entry or its url, so a "
+                         "fresh clone could not fetch what the checks read. Restore the entry, or remove the submodule "
+                         "(`git rm <path>`), then prepare and test a new candidate" % ", ".join(map(shown, dropped)))
     if loose:
         raise ValueError("%s is a Git repository of its own that no .gitmodules entry names, so the commit after "
                          "`accept` would record a pointer to it and none of its files. Add it as a submodule, or "
@@ -1988,11 +2099,24 @@ def commit(run, project, identifier, message):
             drift = load_state(run).get("mode_drift")
             drifted = drift if isinstance(drift, dict) else None
             unknown = drift == "unknown"
+            relinked = []
             for name, mode in modes.items():
-                if in_worktree(name, skip) or mode not in (b"100644", b"100755"):
-                    continue
                 path = os.fsdecode(name)
                 source, restored = root / path, checkout / path
+                if mode == b"120000" and not in_worktree(name, skip):
+                    # Git status passes over an entry marked assume-unchanged or skip-worktree, so staging leaves the
+                    # target the index held: the checks followed the link on disk. As a file where links are files.
+                    # Its kind too: a file holding the target's name is no link, though Git stores a link as those bytes.
+                    def target(link):
+                        try:
+                            return (True, os.fsencode(os.readlink(link))) if link.is_symlink() else (False, link.read_bytes())
+                        except OSError:
+                            return None
+                    if target(source) != target(restored):
+                        relinked.append(shown(path))
+                    continue
+                if in_worktree(name, skip) or mode not in (b"100644", b"100755"):
+                    continue
                 try:
                     same = filecmp.cmp(source, restored, shallow=False)
                     # With core.filemode=false `git add` keeps the mode the index had, whatever the checks ran. Only
@@ -2007,6 +2131,11 @@ def commit(run, project, identifier, message):
                     same = not source.exists() and not restored.exists()
                 if not same:
                     turned.append(shown(path))
+            if relinked:
+                raise ValueError("the commit would record the link %s, not what the checks read there: another target, or no link "
+                                 "(its index entry is marked assume-unchanged or skip-worktree?). Clear the mark (`git "
+                                 "update-index --no-assume-unchanged --no-skip-worktree <path>`), then prepare and test a "
+                                 "new candidate" % ", ".join(relinked[:5]))
             if turned:
                 raise ValueError("a fresh checkout of the commit would not bring back %s as the checks read it (a line-ending "
                                  "or filter rule converts it one way only). Fix the file or its .gitattributes rule, then "
@@ -2050,6 +2179,14 @@ def commit(run, project, identifier, message):
                 command = shlex.join([sys.executable, os.path.abspath(__file__), str(run), str(project),
                                       "recover-index", identifier])
                 raise ValueError(f"{error}\nRecover the index with: {command}") from error
+            # The commit this candidate landed as: HEAD moving to it is no change to what was accepted (see `stands`).
+            candidate["landed"] = revision
+            try:
+                save_candidate(run, candidate)
+            except OSError as error:
+                # The commit is published and its recovery record gone: failing here would hide a landing that happened.
+                # Without the note, the next dispatch prepares a candidate anew, which is the only cost.
+                print(f"note: the commit landed, but its id could not be noted on the candidate ({error})", file=sys.stderr)
         print(f"COMMITTED {identifier} {revision}", flush=True)
         try:
             commit_hook(root, "post-commit")
@@ -2084,6 +2221,10 @@ def accept(run, project, identifier):
             return
         active_verifier(run, candidate["verified_by"])
         check_inputs(run, candidate)
+        exact = candidate.get("exact")  # every file, as `test` read it; a record from before it was kept has none
+        if exact is not None and source_digest(Path(candidate["path"])) != exact:
+            raise ValueError("the candidate's checkout changed since it was prepared (a submodule filled in or emptied?); "
+                             "prepare and test a new candidate")
         state, posts = load(run)
         verifier = candidate["verified_by"]
         expected_line = f"VERIFIED {identifier} {candidate.get('commit') or candidate.get('digest')}"

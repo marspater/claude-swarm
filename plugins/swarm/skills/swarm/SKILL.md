@@ -70,6 +70,7 @@ python3 '/path/to/swarm/skills/swarm/scripts/board.py' '/path/to/project/.swarm/
 | `BOARD wake` | Inspect unread mentions that still need delivery |
 | `BOARD claim NAME ADDRESS SEQ` | Reserve delivery through an exact sequence, returning a token |
 | `BOARD woke NAME SEQ TOKEN` | Acknowledge a successful send for that claim |
+| `BOARD unclaim NAME SEQ TOKEN` | Give back a claim you sent nothing for, so it is not counted as a failed attempt |
 | `BOARD ready NAME [COMMIT\|HEAD]` | A member's command, never yours: records its readiness from the report on stdin and notifies you, and each dependent once the report makes it runnable. The verifiers hear once the last worker is ready; mention a verifier yourself when one piece needs it sooner. A commit that would conflict with another member's current `READY` commit prints `conflict:` |
 | `BOARD sync NAME [--check-only]` | A member's command, never yours: in an isolated writer's checkout, merges the `READY` commits of its dependencies that HEAD lacks |
 | `BOARD confirm NAME SEQ` | Confirm an investigator's exact finding after reviewing its evidence, then release dependents |

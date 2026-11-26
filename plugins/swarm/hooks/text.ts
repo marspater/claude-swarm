@@ -255,7 +255,7 @@ export function figuresIn(text: string): number[] {
   }).filter(value => value >= 10_000)
 }
 
-const LIFT_BUDGET_CLAUSE = /\b(?:no\s+(?:token\s+)?budget(?!\s+(?:changes?|increases?|raises?|bumps?|hikes?|extensions?|expansions?|adjustments?|overrides?)\b)|(?:unlimited|uncapped)\s+(?:token\s+)?budget|(?:lift|remove|clear|disable|drop|zero(?:\s+out)?)\s+(?:the\s+|any\s+|this\s+|run['’]?s\s+)?(?:token\s+)?budget|(?:set\s+)?(?:the\s+)?(?:token\s+)?budget\s*(?:to|=)\s*(?:0+(?![\d.,])|unlimited|none|off|zero))\b|\bbudget\s*=[ \t]*(?=$|[,.;!?)'"])/i
+const LIFT_BUDGET_CLAUSE = /\b(?:no\s+(?:token\s+)?budget(?!\s+(?:(?:currently|now|still|yet|anymore|any\s+more|at\s+all)\s+)*(?:changes?|increases?|raises?|bumps?|hikes?|extensions?|expansions?|adjustments?|overrides?|left|remaining|available|headroom|room)\b)|(?:unlimited|uncapped)\s+(?:token\s+)?budget|(?:lift|remove|clear|disable|drop|zero(?:\s+out)?)\s+(?:the\s+|any\s+|this\s+|run['’]?s\s+)?(?:token\s+)?budget|(?:set\s+)?(?:the\s+)?(?:token\s+)?budget\s*(?:to|=)\s*(?:0+(?![\d.,])|unlimited|none|off|zero))\b|\bbudget\s*=[ \t]*(?=$|[,.;!?)'"])/i
 const LIFT_BUDGET_NEGATION = /\b(?:don['’]?t|do\s+not|never)\b/i
 
 /** Whether a user message explicitly asks to lift, remove, clear, disable, or zero out the token budget. */

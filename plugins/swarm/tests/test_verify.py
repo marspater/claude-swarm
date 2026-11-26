@@ -3634,6 +3634,311 @@ class LandingDataLoss(unittest.TestCase):
             finally:
                 sys.path.remove(str(SCRIPTS))
 
+    def test_a_planned_candidate_is_prepared_for_work_that_follows_a_committed_one(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            self._init_git(proj)
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "FollowUp"))
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            (proj / "file.txt").write_text("v2\n")
+            run(*post, "ready", "w", text="done")
+            first = json.loads(run(*gate, "prepare", "shared", "--check", "true"))
+            run(*post, "post", "v", "@coordinator " + run(*gate, "test", first["candidate"], "v").splitlines()[-1])
+            run(*gate, "accept", first["candidate"])
+            assert "COMMITTED" in run(*gate, "commit", first["candidate"], "-m", "land")
+            # The accepted record stays on the table after its commit: the next round's READY still prepares the plan.
+            run(*post, "revise", "w", "one more change")
+            planned = run(*gate, "prepare", "shared", "--check", "true", "--when-ready")
+            assert planned.startswith("planned:"), planned
+            (proj / "file.txt").write_text("v3\n")
+            said = run(*post, "ready", "w", text="done again")
+            assert "was prepared from the run's plan" in said, said
+            second = json.loads((board / "verification.json").read_text())
+            assert second["candidate"] != first["candidate"] and not second.get("accepted"), second
+
+    def test_a_planned_candidate_is_prepared_for_a_worker_that_reports_after_an_isolated_acceptance(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+
+            def change(g):
+                (proj / "file.txt").write_text("v2")
+                g("add", "file.txt")
+            g, _, board, post, gate = self._isolated_candidate(proj, change)
+            first = json.loads(run(*gate, "prepare", "isolated", "--check", "true"))
+            run(*post, "post", "v", "@coordinator " + run(*gate, "test", first["candidate"], "v").splitlines()[-1])
+            assert "ACCEPTED" in run(*gate, "accept", first["candidate"])
+            # A second worker's commit moves neither the project nor the accepted candidate's own reports.
+            run(*post, "member", "w2")
+            planned = run(*gate, "prepare", "isolated", "--check", "true", "--when-ready")
+            assert planned.startswith("planned:"), planned
+            g("switch", "-q", "-c", "work2")
+            (proj / "other.txt").write_text("new")
+            g("add", "other.txt")
+            g("commit", "-q", "-m", "more work")
+            commit = g("rev-parse", "HEAD")
+            g("switch", "-q", "main")
+            said = run(*post, "ready", "w2", commit, text="done")
+            assert "was prepared from the run's plan" in said, said
+
+    def _accepted_shared(self, proj, check="true"):
+        """A shared run whose one worker's change was prepared with CHECK, passed and accepted."""
+        g = self._init_git(proj)
+        board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Accepted"))
+        post = [sys.executable, SCRIPTS / "board.py", board]
+        gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+        run(*post, "member", "w")
+        run(*post, "member", "v", "role=verifier")
+        (proj / "file.txt").write_text("v2\n")
+        run(*post, "ready", "w", text="done")
+        first = json.loads(run(*gate, "prepare", "shared", "--check", check))
+        run(*post, "post", "v", "@coordinator " + run(*gate, "test", first["candidate"], "v").splitlines()[-1])
+        run(*gate, "accept", first["candidate"])
+        return g, board, post, gate, first
+
+    def test_a_rejection_cut_short_while_the_checks_ran_withdraws_the_attempt(self):
+        with tempfile.TemporaryDirectory() as t, tempfile.TemporaryDirectory() as aside:
+            proj = Path(t).resolve()
+            self._init_git(proj)
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "cut", "init", "Cut"))
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            (proj / "file.txt").write_text("v2\n")
+            run(*post, "ready", "w", text="done")
+            # The check leaves the roster as a NOT VERIFIED does whose writer died before the journal had it.
+            cut = Path(aside) / "cut.py"
+            cut.write_text(
+                "import json, sys\n"
+                "d = sys.argv[1]\n"
+                "state = json.load(open(d + '/members.json'))\n"
+                "state['pending_post'] = {'seq': sum(1 for _ in open(d + '/board.jsonl')) + 1, 'agent': 'v',\n"
+                "                         'text': 'NOT VERIFIED the build is broken', 'time': '2026-01-01T00:00:00+0000', 'to': ['coordinator']}\n"
+                "state['pending_void'] = []\n"
+                "json.dump(state, open(d + '/members.json', 'w'))\n")
+            first = json.loads(run(*gate, "prepare", "shared", "--check", f"{shlex.quote(sys.executable)} {shlex.quote(str(cut))} {shlex.quote(str(board))}"))
+            result = subprocess.run([str(part) for part in (*gate, "test", first["candidate"], "v")], capture_output=True, text=True)
+            assert result.returncode and "withdrawn or superseded" in result.stderr, (result.stdout, result.stderr)
+            assert "verified_by" not in json.loads((board / "verification.json").read_text())
+
+    def test_a_plan_changed_after_acceptance_prepares_a_candidate_with_the_new_checks(self):
+        with tempfile.TemporaryDirectory() as t:
+            _, board, _, gate, first = self._accepted_shared(Path(t).resolve())
+            run(*gate, "prepare", "shared", "--check", "false", "--when-ready")
+            table = json.loads((board / "verification.json").read_text())
+            assert table["candidate"] != first["candidate"] and table["checks"] == ["false"] and not table.get("accepted"), table
+
+    def test_the_same_plan_after_a_shared_commit_asks_the_verifier_for_nothing(self):
+        with tempfile.TemporaryDirectory() as t:
+            _, board, post, gate, first = self._accepted_shared(Path(t).resolve())
+            assert "COMMITTED" in run(*gate, "commit", first["candidate"], "-m", "land")
+            before = (board / "board.jsonl").read_text()
+            said = run(*gate, "prepare", "shared", "--check", "true", "--when-ready") + run(*post, "dispatch")
+            assert "nothing has changed since" in said, said
+            assert json.loads((board / "verification.json").read_text())["candidate"] == first["candidate"]
+            assert (board / "board.jsonl").read_text() == before
+
+    def test_a_commit_refuses_a_link_whose_target_the_index_hides(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g = self._init_git(proj)
+            (proj / "new.txt").write_text("new")
+            os.symlink("file.txt", proj / "alias")
+            g("add", "alias", "new.txt")
+            g("commit", "-q", "-m", "alias")
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Link"))
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            g("update-index", "--assume-unchanged", "alias")
+            os.remove(proj / "alias")
+            os.symlink("new.txt", proj / "alias")
+            (proj / "file.txt").write_text("v2\n")
+            run(*post, "ready", "w", text="done")
+            made = json.loads(run(*gate, "prepare", "shared", "--check", 'test "$(readlink alias)" = new.txt'))
+            run(*post, "post", "v", "@coordinator " + run(*gate, "test", made["candidate"], "v").splitlines()[-1])
+            run(*gate, "accept", made["candidate"])
+            landed = subprocess.run([*gate, "commit", made["candidate"], "-m", "land"], capture_output=True, text=True)
+            assert landed.returncode and "alias" in landed.stderr, landed.stdout + landed.stderr
+            assert g("show", "HEAD:file.txt") == "v1"
+
+    def test_a_submodule_whose_registration_was_removed_is_no_candidate(self):
+        with tempfile.TemporaryDirectory() as t_sub, tempfile.TemporaryDirectory() as t:
+            library, proj = Path(t_sub).resolve(), Path(t).resolve()
+            self._init_git(library)
+            g = self._init_git(proj)
+            g("-c", "protocol.file.allow=always", "submodule", "add", str(library), "vendor/lib")
+            g("commit", "-q", "-m", "add library")
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Registration"))
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            os.remove(proj / ".gitmodules")
+            run(*post, "ready", "w", text="done")
+            made = json.loads(run(*gate, "prepare", "shared", "--check", "test -f vendor/lib/file.txt"))
+            run(*post, "post", "v", "@coordinator " + run(*gate, "test", made["candidate"], "v").splitlines()[-1])
+            # The guards of the landing run at `accept`: the commit would hold the pointer and no way to fetch it.
+            refused = subprocess.run([*gate, "accept", made["candidate"]], capture_output=True, text=True)
+            assert refused.returncode and "vendor/lib" in refused.stderr and ".gitmodules" in refused.stderr, refused.stdout + refused.stderr
+
+    def test_the_hygiene_scan_reads_the_board_under_its_lock(self):
+        import fcntl
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            self._init_git(proj)
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Locked"))
+            sys.path.insert(0, str(SCRIPTS))
+            try:
+                import verify
+                seen = []
+
+                class Read(Exception):
+                    pass
+
+                def spy(run_dir, **_kw):
+                    # A load repairs a post its writer saved and has not appended yet: it must not run beside that writer.
+                    with open(Path(run_dir) / ".lock", "a") as probe:
+                        try:
+                            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            seen.append("free")
+                        except BlockingIOError:
+                            seen.append("held")
+                    raise Read()
+
+                with mock.patch.object(verify, "load", spy), self.assertRaises(Read):
+                    verify.check_hygiene(board, proj, "HEAD", None, {}, [])
+                assert seen == ["held"], seen
+            finally:
+                sys.path.remove(str(SCRIPTS))
+
+    def test_a_commit_refuses_a_file_the_index_still_holds_as_a_link(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g = self._init_git(proj)
+            os.symlink("file.txt", proj / "alias")
+            g("add", "alias")
+            g("commit", "-q", "-m", "alias")
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Type"))
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            g("update-index", "--assume-unchanged", "alias")
+            os.remove(proj / "alias")
+            (proj / "alias").write_text("file.txt")  # the bytes a link to file.txt is stored as
+            (proj / "file.txt").write_text("v2\n")
+            run(*post, "ready", "w", text="done")
+            made = json.loads(run(*gate, "prepare", "shared", "--check", "test ! -L alias"))
+            run(*post, "post", "v", "@coordinator " + run(*gate, "test", made["candidate"], "v").splitlines()[-1])
+            run(*gate, "accept", made["candidate"])
+            landed = subprocess.run([*gate, "commit", made["candidate"], "-m", "land"], capture_output=True, text=True)
+            assert landed.returncode and "alias" in landed.stderr, landed.stdout + landed.stderr
+
+    def test_a_submodule_whose_url_was_removed_is_no_candidate(self):
+        with tempfile.TemporaryDirectory() as t_sub, tempfile.TemporaryDirectory() as t:
+            library, proj = Path(t_sub).resolve(), Path(t).resolve()
+            self._init_git(library)
+            g = self._init_git(proj)
+            g("-c", "protocol.file.allow=always", "submodule", "add", str(library), "vendor/lib")
+            g("commit", "-q", "-m", "add library")
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Url"))
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            g("config", "-f", ".gitmodules", "--unset", "submodule.vendor/lib.url")
+            run(*post, "ready", "w", text="done")
+            made = json.loads(run(*gate, "prepare", "shared", "--check", "test -f vendor/lib/file.txt"))
+            run(*post, "post", "v", "@coordinator " + run(*gate, "test", made["candidate"], "v").splitlines()[-1])
+            refused = subprocess.run([*gate, "accept", made["candidate"]], capture_output=True, text=True)
+            assert refused.returncode and "vendor/lib" in refused.stderr and ".gitmodules" in refused.stderr, refused.stdout + refused.stderr
+
+    def test_a_file_the_index_hides_is_still_a_change_after_a_shared_commit(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g, board, post, gate, first = self._accepted_shared(proj)
+            assert "COMMITTED" in run(*gate, "commit", first["candidate"], "-m", "land")
+            g("update-index", "--assume-unchanged", "file.txt")
+            (proj / "file.txt").write_text("v3\n")
+            said = run(*gate, "prepare", "shared", "--check", "true", "--when-ready")
+            assert "nothing has changed since" not in said, said
+            assert json.loads((board / "verification.json").read_text())["candidate"] != first["candidate"]
+
+    def test_attention_under_a_shared_lock_repairs_nothing_through_verification(self):
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            self._init_git(proj)
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Shared lock"))
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            (proj / "file.txt").write_text("v2\n")
+            run(*post, "ready", "w", text="done")
+            made = json.loads(run(*gate, "prepare", "shared", "--check", "true"))
+            run(*post, "post", "v", "@coordinator " + run(*gate, "test", made["candidate"], "v").splitlines()[-1])
+            journal = board / "board.jsonl"
+            with journal.open("ab") as f:
+                f.write(b'{"seq":')  # a record its writer is still appending
+            cut = journal.read_bytes()
+            os.chmod(board / ".lock", 0o444)
+            try:
+                # A real process: the lock it falls back to is the shared one, which other readers hold with it.
+                subprocess.run([*post, "attention", "--json"], capture_output=True, text=True)
+            finally:
+                os.chmod(board / ".lock", 0o644)
+            assert journal.read_bytes() == cut
+
+    def test_a_pointer_that_never_had_a_registration_survives_another_change_to_gitmodules(self):
+        with tempfile.TemporaryDirectory() as t_sub, tempfile.TemporaryDirectory() as t:
+            library, proj = Path(t_sub).resolve(), Path(t).resolve()
+            self._init_git(library)
+            g = self._init_git(proj)
+            g("-c", "protocol.file.allow=always", "submodule", "add", str(library), "vendor/lib")
+            g("-c", "protocol.file.allow=always", "submodule", "add", str(library), "vendor/old")
+            g("config", "-f", ".gitmodules", "--remove-section", "submodule.vendor/old")
+            g("add", ".gitmodules")
+            g("commit", "-q", "-m", "one registered, one not")
+            board = Path(run(sys.executable, SCRIPTS / "board.py", proj / ".swarm" / "reg", "init", "Legacy"))
+            post = [sys.executable, SCRIPTS / "board.py", board]
+            gate = [sys.executable, SCRIPTS / "verify.py", board, proj]
+            run(*post, "member", "w")
+            run(*post, "member", "v", "role=verifier")
+            g("config", "-f", ".gitmodules", "submodule.vendor/lib.branch", "main")
+            run(*post, "ready", "w", text="done")
+            made = json.loads(run(*gate, "prepare", "shared", "--check", "true"))
+            run(*post, "post", "v", "@coordinator " + run(*gate, "test", made["candidate"], "v").splitlines()[-1])
+            assert "ACCEPTED" in run(*gate, "accept", made["candidate"])
+
+    def test_a_commit_that_landed_is_reported_though_its_record_could_not_be_saved(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as t:
+            proj = Path(t).resolve()
+            g, board, _, _, first = self._accepted_shared(proj)
+            sys.path.insert(0, str(SCRIPTS))
+            try:
+                import verify
+                real = verify.save_candidate
+
+                def full(run_dir, candidate):
+                    if candidate.get("landed"):
+                        raise OSError("disk full")
+                    return real(run_dir, candidate)
+
+                with mock.patch.object(verify, "save_candidate", full), contextlib.redirect_stdout(io.StringIO()) as said, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    verify.commit(board, proj, first["candidate"], "land")
+            finally:
+                sys.path.remove(str(SCRIPTS))
+            assert "COMMITTED " + first["candidate"] in said.getvalue(), said.getvalue()
+            assert g("show", "HEAD:file.txt") == "v2"
+
     def test_exact_mismatch_preserves_verified_by_and_candidate_state(self):
         with tempfile.TemporaryDirectory() as t_sub, tempfile.TemporaryDirectory() as t:
             library, proj = Path(t_sub).resolve(), Path(t).resolve()
@@ -3653,7 +3958,7 @@ class LandingDataLoss(unittest.TestCase):
             g("switch", "-q", "main")
             run(*post, "ready", "w", commit, text="done")
             made = json.loads(run(*gate, "prepare", "isolated", "--check", "true"))
-            run(*gate, "test", made["candidate"], "v")
+            line = run(*gate, "test", made["candidate"], "v").splitlines()[-1]
             before = json.loads((board / "verification.json").read_text())
             assert before["verified_by"] == "v"
             # Mutate the candidate's checkout (populate submodule) so exact digest fails before checks run.
@@ -3663,6 +3968,15 @@ class LandingDataLoss(unittest.TestCase):
             assert refused.returncode and "changed since it was prepared" in refused.stderr, refused.stderr
             after = json.loads((board / "verification.json").read_text())
             assert after == before
+            # Acceptance reads every file too: the pass was earned on a checkout that is no longer the one there.
+            run(*post, "post", "v", "@coordinator " + line)
+            unaccepted = subprocess.run([*gate, "accept", made["candidate"]], capture_output=True, text=True)
+            assert unaccepted.returncode and "changed since it was prepared" in unaccepted.stderr, unaccepted.stderr
+            # Nor is it kept as the standing candidate: `test` refuses it, so a dispatch that kept it would ask for nothing.
+            again = json.loads(run(*gate, "prepare", "isolated", "--check", "true", "--keep-standing"))
+            assert again["candidate"] != made["candidate"] and not again.get("standing"), again
+            made_again = json.loads((board / "verification.json").read_text())
+            assert made_again["candidate"] == again["candidate"]
 
     def test_removed_public_symbols_resets_across_diff_git_and_requires_hunk(self):
         sys.path.insert(0, str(SCRIPTS))
@@ -3687,6 +4001,58 @@ class LandingDataLoss(unittest.TestCase):
                 "+def real_added():\n"
             )
             assert verify.removed_public_symbols(diff) == {"gone": ["a.py"], "real_removed": ["c.py"]}
+        finally:
+            sys.path.remove(str(SCRIPTS))
+
+    def test_cleanup_signals_descendant_pids_and_reports_survivors(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        import io
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import verify
+            table = "PID PPID PGID\n 10 1 10\n 11 10 11\n 12 11 1\n"
+            with mock.patch.object(verify.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=table, returncode=0)):
+                pids, groups = verify.descendant_snapshot(10)
+            assert {10, 11, 12} <= pids and groups == {10, 11} - {os.getpgrp()}, (pids, groups)
+
+            proc = SimpleNamespace(pid=10, poll=lambda: 0, wait=lambda **_k: 0)
+            killed_pids, killed_pgs = [], []
+            pg_dead = set()
+
+            def fake_kill(pid, sig):
+                killed_pids.append((pid, sig))
+                if sig == 0 and pid == 12:
+                    return  # pid 12 refuses to die
+                if sig == 0:
+                    raise ProcessLookupError
+
+            def fake_killpg(pg, sig):
+                killed_pgs.append((pg, sig))
+                if sig == 0:
+                    if pg in pg_dead:
+                        raise ProcessLookupError
+                    return
+                pg_dead.add(pg)
+
+            clock = [0.0]
+
+            def fake_sleep(dt):
+                clock[0] += dt
+
+            for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                self.addCleanup(signal.signal, number, signal.getsignal(number))
+            err = io.StringIO()
+            with (mock.patch.object(verify, "descendant_snapshot", return_value=({10, 11, 12}, {10, 11})),
+                  mock.patch.object(verify.os, "kill", side_effect=fake_kill),
+                  mock.patch.object(verify.os, "killpg", side_effect=fake_killpg),
+                  mock.patch.object(verify.time, "monotonic", side_effect=lambda: clock[0]),
+                  mock.patch.object(verify.time, "sleep", side_effect=fake_sleep),
+                  mock.patch.object(verify.sys, "stderr", err)):
+                verify.cleanup(proc)
+            assert (12, signal.SIGTERM) in killed_pids and (12, signal.SIGKILL) in killed_pids, killed_pids
+            assert (11, signal.SIGTERM) in killed_pgs, killed_pgs
+            assert "12" in err.getvalue(), err.getvalue()
         finally:
             sys.path.remove(str(SCRIPTS))
 

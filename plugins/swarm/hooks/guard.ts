@@ -21,20 +21,22 @@ export function normalizePath(p: string): string {
 }
 
 export async function resolveRealPath($: EngineInterface, absPath: string): Promise<string> {
-  let probe = absPath
-  const suffix: string[] = []
-  while (probe && probe !== '/') {
-    const st = await $.fs.stat(probe, { resolve: true }).catch(() => undefined)
-    if (st?.realPath) {
-      const base = normalizePath(st.realPath)
-      return suffix.length > 0 ? normalizePath(`${base}/${suffix.join('/')}`) : base
+  if (!absPath.startsWith('/')) return absPath
+  let current = '/'
+  for (const seg of absPath.split('/')) {
+    if (!seg || seg === '.') continue
+    if (seg === '..') {
+      if (current !== '/') {
+        const slash = current.lastIndexOf('/')
+        current = slash <= 0 ? '/' : current.slice(0, slash)
+      }
+      continue
     }
-    const slash = probe.lastIndexOf('/')
-    if (slash <= 0) break
-    suffix.unshift(probe.slice(slash + 1))
-    probe = probe.slice(0, slash)
+    const next = current === '/' ? `/${seg}` : `${current}/${seg}`
+    const st = await $.fs.stat(next, { resolve: true }).catch(() => undefined)
+    current = st?.realPath ? normalizePath(st.realPath) : next
   }
-  return absPath
+  return current
 }
 
 // What may stand before a command and leaves it the same command, with its own options: the short ones that take a
@@ -794,10 +796,39 @@ function globNames(word: string, file: string): boolean {
  * runs (its substitutions, `sh -c`, `eval`), through `cd …&&`, env prefixes and python's flags. A board or verify
  * command whose subcommand or name a variable, a substitution or a wrapper hides is refused, not guessed.
  */
-export function actsAsAnother(command: string, name: string, member: Roster[string]): string | undefined {
+export function actsAsAnother(
+  command: string,
+  name: string,
+  member: Roster[string],
+  authorizedDir?: string | string[],
+  cwd?: string,
+): string | undefined {
   const isVerifier = member.role === 'verifier'
+  // The run folder, and any other spelling of it the caller resolved (its real path, where a symlink leads to it).
+  const authorized = new Set([authorizedDir ?? []].flat().map(normalizePath))
+  const canonicalAuth = [...authorized][0]
   const unread = (script: string) => `a ${script} command is checked only when its subcommand and name are typed plainly: no wrapper, variable or substitution in them`
   const { statements, expand } = possibleCommands(command)
+  const hasChdir = statements.some(({ text, words }) => {
+    // Every command the word may stand for, and a word whose variable or substitution cannot be filled in may be `cd`.
+    const named = expand(words[executableIndex(words)] ?? '')
+    if (named.some(name => /[$`]/.test(name) || ['cd', 'pushd', 'popd'].includes(name.replace(/^.*\//, '')))) return true
+    // `words` has the wrappers taken off (unwrap): a wrapper's folder option is read off the statement as typed, before
+    // the script. Over-read (`env -i` counts): a relative run folder is then refused, and an absolute one never is.
+    const typed = shellWords(text)
+    const script = typed.findIndex(word => /(?:^|\/)(?:board|verify)\.py$/.test(word))
+    const before = typed.slice(0, script < 0 ? typed.length : script)
+    return before.some(word => /^(?:.*\/)?(?:env|sudo|doas)$/.test(word)) &&
+      before.some(word => /^(?:-[A-Za-z]*[CDi].*|--chdir(?:=.*)?|--login)$/.test(word))
+  })
+  const resolveTargetDir = (rawDir: string | undefined): string | undefined => {
+    if (!rawDir) return undefined
+    // Reject parent traversal after a non-`..` segment (symlink/../target can resolve differently from lexical normalization).
+    if (/(?:^|\/)(?!\.\.(?:\/|$))[^/]+\/\.\.(?:\/|$)/.test(rawDir)) return undefined
+    if (rawDir.startsWith('/')) return normalizePath(rawDir)
+    if (!cwd || hasChdir) return undefined
+    return normalizePath(`${cwd}/${rawDir}`)
+  }
   for (const { text, script, unread: isUnread } of statements) {
     // A substitution that never closes runs what this cannot list.
     if (isUnread && /\b(?:board|verify)\.py\b/.test(script)) return unread(/\bboard\.py\b/.test(script) ? 'board' : 'verify')
@@ -828,6 +859,9 @@ export function actsAsAnother(command: string, name: string, member: Roster[stri
     // A board command typed plainly, run so that more may follow it (`python3 -i`), runs what this cannot read.
     if (call && launches(words, 'board.py', command) === 'other') return unread('board')
     if (call) {
+      if (canonicalAuth && !authorized.has(resolveTargetDir(call.dir) ?? '')) {
+        return `the board's ${call.action} targets "${call.dir}", and @${name} may only access its own run, typed as its absolute path (${canonicalAuth})`
+      }
       if (MEMBER_READS.has(call.action)) continue
       const own = MEMBER_OWN.has(call.action) && !(isVerifier && call.action !== 'read' && call.action !== 'post')
       const named = withoutRedirects(shellWords(call.rest)).words.slice(1).find(word => !word.startsWith('-'))?.replace(/^@/, '').toLowerCase()
@@ -840,8 +874,12 @@ export function actsAsAnother(command: string, name: string, member: Roster[stri
     const at = cleanWords.findIndex(word => /(?:^|\/)verify\.py$/.test(word))
     // Run some other way (python -c, a module, a program from its input), its words are not the ones it gets.
     if (verify === 'other' || at < 0) return unread('verify')
+    const verifyDir = cleanWords[at + 1]
     const action = cleanWords.slice(at + 3).find(word => !word.startsWith('-'))
     if (action === undefined || !['prepare', 'test', 'accept', 'commit', 'recover-index'].includes(action)) return unread('verify')
+    if (canonicalAuth && !authorized.has(resolveTargetDir(verifyDir) ?? '')) {
+      return `verify.py ${action} targets "${verifyDir ?? '?'}", and @${name} may only access its own run, typed as its absolute path (${canonicalAuth})`
+    }
     // A verifier tests a candidate under its own name; preparing, accepting and committing candidates is the coordinator's.
     let tester: string | undefined
     if (action === 'test') {

@@ -3,7 +3,9 @@
 import sys
 
 sys.dont_write_bytecode = True  # a test run leaves no __pycache__ in the plugin folder
+import contextlib
 import fcntl
+import io
 import hashlib
 import json
 import os
@@ -1053,6 +1055,60 @@ class BoardRegressions(unittest.TestCase):
         run(d, "revise", "exp", "missed a file")
         stale = [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "stale"]
         assert stale and "@exp's change" in stale[0]["text"]
+
+    def test_unclaim_gives_back_the_attempt_of_a_claim_never_sent(self):
+        d = self.init_run()
+        run(d, "member", "w", "id=agent-1")
+        run(d, "member", "b", "id=agent-2")
+        run(d, "post", "coordinator", "@w @b BRIEF\nGoal: x")
+        # The third claim, taken as the roster changed under its taker, which then sent nothing; and one still in flight.
+        state = saved(d)
+        until = time.time() + 15
+        state["members"]["w"]["wake_claim"] = {"token": "t" * 32, "seq": 1, "attempts": 3, "until": until}
+        state["members"]["b"]["wake_claim"] = {"token": "b" * 32, "seq": 1, "attempts": 3, "until": until}
+        state["members"]["b"]["paused"] = "token budget"
+        with open(os.path.join(d, "members.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        run(d, "unclaim", "w", "1", "x" * 32)  # not its token: nothing is given back
+        assert saved(d)["members"]["w"]["wake_claim"]["attempts"] == 3
+        run(d, "unclaim", "w", "1", "t" * 32)
+        claim = saved(d)["members"]["w"]["wake_claim"]
+        assert claim["attempts"] == 2 and claim["until"] == 0, claim
+        run(d, "unclaim", "w", "1", "t" * 32)  # once only
+        assert saved(d)["members"]["w"]["wake_claim"]["attempts"] == 2
+        # A resume, of one member or of a run that was not paused, leaves a send in flight its lease and its count.
+        run(d, "resume")
+        run(d, "resume", "b")
+        assert saved(d)["members"]["b"]["wake_claim"] == {"token": "b" * 32, "seq": 1, "attempts": 3, "until": until}
+        assert re.fullmatch(r"[a-f0-9]{32}", run(d, "claim", "w", "agent-1", "1").strip())
+        state = saved(d)
+        token = state["members"]["w"]["wake_claim"]["token"]
+        state["members"]["w"]["wake_claim"]["attempts"] = 1
+        with open(os.path.join(d, "members.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        run(d, "unclaim", "w", "1", token)
+        assert "wake_claim" not in saved(d)["members"]["w"]
+
+    def test_main_leaves_the_shared_lock_flag_as_it_found_it(self):
+        d = self.init_run()
+        sys.path.insert(0, os.path.dirname(BOARD))
+        try:
+            import board
+            before = os.environ.pop(board.SHARED_LOCK, None)
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    board.main(["board.py", d, "status"])
+                assert board.SHARED_LOCK not in os.environ
+                os.environ[board.SHARED_LOCK] = "1"
+                with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+                    board.main(["board.py", d, "show", "nobody"])
+                assert os.environ[board.SHARED_LOCK] == "1"
+            finally:
+                os.environ.pop(board.SHARED_LOCK, None)
+                if before is not None:
+                    os.environ[board.SHARED_LOCK] = before
+        finally:
+            sys.path.remove(os.path.dirname(BOARD))
 
     def test_resume_wakes_consultant_and_verifier(self):
         d = self.init_run()
@@ -4460,6 +4516,106 @@ class EngineRegressions(unittest.TestCase):
         assert "parser long detail" not in coord and "[full: show --post=" in coord, coord
         run(d, "ready", "api", stdin="built per @coordinator #1\nsecond line\napi long detail")
         assert "api long detail" in run(d, "read", "coordinator", "--all")
+
+    def test_events_of_skips_malformed_utf8_lines(self):
+        d, _ = self._fresh()
+        sys.path.insert(0, os.path.dirname(BOARD))
+        try:
+            import board
+            ev = os.path.join(d, board.EVENTS_FILE)
+            with open(ev, "wb") as f:
+                f.write(b'{"time":"2026-01-01T00:00:00+0000","kind":"first"}\n')
+                f.write(b'\xff\xfe{"time":"2026-01-01T00:00:01+0000","kind":"bad"}\n')
+                f.write(b'{"time":"2026-01-01T00:00:02+0000","kind":"second"}\n')
+            got = board.events_of(d)
+            assert [e["kind"] for e in got] == ["first", "second"], got
+        finally:
+            sys.path.remove(os.path.dirname(BOARD))
+
+    def test_void_pass_runs_after_post_message(self):
+        from unittest import mock
+        d, _ = self._fresh()
+        run(d, "member", "w")
+        run(d, "member", "v", "role=verifier")
+        run(d, "ready", "w", stdin="done")
+        vpath = os.path.join(d, "verification.json")
+        with open(vpath, "w", encoding="utf-8") as f:
+            json.dump({"candidate": "c1", "inputs": {"w": [2, ""]}, "verified_by": "v", "attempt": 1}, f)
+        sys.path.insert(0, os.path.dirname(BOARD))
+        try:
+            import board
+
+            def fail_append(*_a, **_kw):
+                raise OSError("disk full")
+
+            with mock.patch.object(board, "append_post", fail_append):
+                with self.assertRaises(OSError):
+                    board.main(["board.py", d, "post", "v", "NOT PASSED c1\n- @w: broken"])
+        finally:
+            sys.path.remove(os.path.dirname(BOARD))
+        # Interruption before journal append must leave verification.json intact.
+        with open(vpath, encoding="utf-8") as f:
+            still = json.load(f)
+        assert still.get("verified_by") == "v" and still.get("attempt") == 1, still
+        # Another member's post completes the verdict first and adds its own; typed again, the verdict is still that
+        # one post, which a second would not be: it would withdraw whatever was reported ready since.
+        run(d, "post", "w", "@coordinator a note")
+        assert "posted #2" in run(d, "post", "v", "NOT PASSED c1\n- @w: broken")
+        with open(vpath, encoding="utf-8") as f:
+            after = json.load(f)
+        assert "verified_by" not in after and "attempt" not in after, after
+        verdicts = [post for post in self._read_posts(d) if "NOT PASSED c1" in post["text"]]
+        assert len(verdicts) == 1, verdicts
+        # Typed a third time it is a new verdict, and so is one that says something else.
+        run(d, "post", "v", "NOT PASSED c1\n- @w: broken")
+        run(d, "post", "v", "NOT PASSED c1\n- @w: still broken")
+        assert len([post for post in self._read_posts(d) if "NOT PASSED c1" in post["text"]]) == 3
+
+    def test_a_verdict_cut_short_after_its_post_still_voids_the_pass(self):
+        from unittest import mock
+        d, _ = self._fresh()
+        run(d, "member", "w")
+        run(d, "member", "v", "role=verifier")
+        run(d, "ready", "w", stdin="done")
+        vpath = os.path.join(d, "verification.json")
+        with open(vpath, "w", encoding="utf-8") as f:
+            json.dump({"candidate": "c1", "inputs": {"w": [2, ""]}, "verified_by": "v", "attempt": 1}, f)
+        sys.path.insert(0, os.path.dirname(BOARD))
+        try:
+            import board
+
+            real = board.event
+
+            def cut(run_dir, kind, /, **fields):
+                if kind == "post":
+                    raise BrokenPipeError("the reader is gone")
+                return real(run_dir, kind, **fields)
+
+            # The post is in the journal and the roster saved: what follows (the printed line, the event) is cut.
+            with mock.patch.object(board, "event", cut):
+                with self.assertRaises(BrokenPipeError):
+                    board.main(["board.py", d, "post", "v", "NOT PASSED c1\n- @w: broken"])
+        finally:
+            sys.path.remove(os.path.dirname(BOARD))
+        assert "NOT PASSED c1" in self._read_posts(d)[-1]["text"]
+        with open(vpath, encoding="utf-8") as f:
+            after = json.load(f)
+        assert "verified_by" not in after and "attempt" not in after, after
+
+    def test_agent_run_discovers_retired_agent_after_archive(self):
+        d, _ = self._fresh()
+        swarm = os.path.dirname(d)
+        key = "a" * 64
+        run(d, "bind", key)
+        run(d, "member", "w", "id=agent-archived-1")
+        run(d, "kill", "done")
+        # prune skips the run named by .swarm/current, so point current elsewhere (e.g. a newer run).
+        run(os.path.join(swarm, "other"), "init", "Other")
+        archived_msg = run(swarm, "prune", "--days=0")
+        assert "archive " + os.path.basename(d) in archived_msg, archived_msg
+        archived_path = os.path.abspath(os.path.join(swarm, "archive", os.path.basename(d)))
+        assert os.path.isdir(archived_path) and not os.path.exists(d)
+        assert run(swarm, "agent-run", key, "agent-archived-1").strip() == archived_path
 
 
 if __name__ == "__main__":
