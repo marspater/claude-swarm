@@ -177,6 +177,15 @@ export function clip(text: string, length = CLIP): string {
   return `${cleaned || trimmed} …`
 }
 
+// Cuts a long plain-text block (such as a raw git diff) at a word and grapheme/surrogate boundary without Markdown fence tracking.
+export function clipPlain(text: string, length = CLIP): string {
+  if (text.length <= length) return text
+  const cut = head(text, length)
+  const space = cut.search(/\s\S*$/)
+  const trimmed = (space > length / 2 ? cut.slice(0, space) : cut).trimEnd()
+  return `${trimmed || cut} …`
+}
+
 /**
  * TEXT inside a fence its own tildes cannot close. The board reads no mention inside one, so a report that quotes
  * `@name` wakes nobody. Seen live: a mirrored hand-back named two finished members, and each paid a turn to say so.
@@ -234,9 +243,24 @@ export function repeatsPosts(posts: string[], report: string): boolean {
  */
 export function figuresIn(text: string): number[] {
   return Array.from(text.matchAll(/(\d+(?:[ ,._]\d{3})+|\d+(?:[.,]\d+)?)(?:\s*(k|m|mln|mio|million|thousand)\b)?/gi), found => {
+    const raw = found[1]!
     const unit = (found[2] ?? '').toLowerCase()
-    // With a unit the figure is a decimal ("0.125M", "2,5 mln"); alone, its separators group thousands.
-    const value = unit === '' ? Number(found[1]!.replace(/[ ,._]/g, '')) : Number(found[1]!.replace(/[ _]/g, '').replace(',', '.'))
+    // With a unit, comma-grouped thousands ("2,000k", "1,200,000k") stay integers while European decimals ("2,5 mln", "0,125M") convert `,` to `.`.
+    const value = unit === ''
+      ? Number(raw.replace(/[ ,._]/g, ''))
+      : /^[1-9]\d{0,2}(?:,\d{3})+$/.test(raw)
+        ? Number(raw.replace(/,/g, ''))
+        : Number(raw.replace(/[ _]/g, '').replace(',', '.'))
     return Math.round(value * (unit === '' ? 1 : unit === 'k' || unit === 'thousand' ? 1e3 : 1e6))
   }).filter(value => value >= 10_000)
+}
+
+const LIFT_BUDGET_CLAUSE = /\b(?:no\s+(?:token\s+)?budget(?!\s+changes?\b)|(?:unlimited|uncapped)\s+(?:token\s+)?budget|(?:lift|remove|clear|disable|drop|zero(?:\s+out)?)\s+(?:the\s+|any\s+|this\s+|run['’]?s\s+)?(?:token\s+)?budget|(?:set\s+)?(?:the\s+)?(?:token\s+)?budget\s*(?:to|=)\s*(?:0+(?![\d.,])|unlimited|none|off|zero))\b|\bbudget\s*=(?=$|[\s,.;!?)'"])/i
+const LIFT_BUDGET_NEGATION = /\b(?:don['’]?t|do\s+not|never)\b/i
+
+/** Whether a user message explicitly asks to lift, remove, clear, disable, or zero out the token budget. */
+export function asksLiftBudget(text: string): boolean {
+  return text.split(/[\n!?;]+|[.,](?=\s|$)/).some(clause =>
+    !LIFT_BUDGET_NEGATION.test(clause) && LIFT_BUDGET_CLAUSE.test(clause),
+  )
 }

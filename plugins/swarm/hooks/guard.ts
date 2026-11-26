@@ -705,7 +705,7 @@ function executableIndex(words: readonly string[]): number {
 
 /** A Bash budget change has to be a top-level board call whose arguments can be checked before it runs. */
 export function hasHiddenBoardLimit(command: string): boolean {
-  if (!command.includes('limit') && !command.includes('board')) return false
+  if (!/['"\\$`*?\[{]/.test(command) && !command.includes('limit') && !command.includes('board')) return false
   const file = 'board.py'
   const { statements, expand } = possibleCommands(command)
   for (const { text, words, script } of statements) {
@@ -716,7 +716,7 @@ export function hasHiddenBoardLimit(command: string): boolean {
       const action = words[scriptAt + 2] ?? ''
       if ((expand(action).includes('limit') || /[$`*?\[{]/.test(action)) &&
           launches(words.map((word, i) => i === scriptAt ? file : word), file)) return true
-    } else if (/\blimit\b/.test(text) && launches(words, file, script)) {
+    } else if ((words.some(word => expand(word).includes('limit')) || /\blimit\b/.test(text)) && launches(words, file, script)) {
       return true
     }
   }

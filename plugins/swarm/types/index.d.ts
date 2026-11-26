@@ -89,7 +89,7 @@ declare module 'claude-code' {
     mcp__swarm__board: {
       /** A member's actions, then the coordinator's. */
       action: 'read' | 'show' | 'post' | 'ready' | 'revise' | 'status' |
-        'init' | 'member' | 'limit' | 'plan' | 'attention' | 'confirm' | 'retry' | 'replace' | 'pause' | 'resume' | 'close' | 'export'
+        'init' | 'member' | 'limit' | 'dispatch' | 'plan' | 'attention' | 'confirm' | 'retry' | 'replace' | 'pause' | 'resume' | 'close' | 'export'
       member?: string
       seq?: number
       text?: string

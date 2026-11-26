@@ -4263,6 +4263,200 @@ class EngineRegressions(unittest.TestCase):
         run(d, "post", "v", stdin="@coordinator NOT PASSED\n@w broke the build")
         assert not json.loads(run(d, "attention", "--json"))["members"]["w"]["ready"]
 
+    def _read_posts(self, d):
+        with open(os.path.join(d, "board.jsonl"), encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def test_reopening_closed_finding_clears_stale_dispute_state(self):
+        verify_script = os.path.join(os.path.dirname(BOARD), "verify.py")
+        for close_via in ("resolved", "verified"):
+            d, proj = self._fresh()
+            run(d, "member", "w")
+            run(d, "member", "v", "role=verifier")
+            run(d, "ready", "w", stdin="done")
+            run(d, "post", "v", stdin="@w NOT PASSED. The handler swallows the error.")
+            run(d, "ready", "w", stdin="F1: disputed — handler.py:30 logs and re-raises it")
+            if close_via == "resolved":
+                run(d, "post", "v", stdin="@w\nF1: resolved")
+            else:
+                cand = json.loads(subprocess.run(
+                    [sys.executable, verify_script, d, proj, "prepare", "shared", "--check", "true"],
+                    check=True, capture_output=True, text=True).stdout)["candidate"]
+                line = subprocess.run(
+                    [sys.executable, verify_script, d, proj, "test", cand, "v"],
+                    check=True, capture_output=True, text=True).stdout.splitlines()[-1]
+                run(d, "post", "v", stdin="@coordinator " + line)
+            # Reopening F1 later must start clean with no false dispute pause.
+            out = run(d, "post", "v", stdin="@w NOT PASSED\n- F1: the retry path swallows it again")
+            assert "paused:" not in out and not saved(d).get("paused"), (close_via, out)
+            assert not [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "dispute"]
+
+    def test_ledger_ready_and_dispute_attention_use_successor_names(self):
+        d, _ = self._fresh()
+        run(d, "member", "w1")
+        run(d, "member", "v1", "role=verifier")
+        run(d, "ready", "w1", stdin="done")
+        run(d, "post", "v1", stdin="@w1 NOT PASSED. The handler swallows the error.")
+        run(d, "ready", "w1", stdin="F1: disputed — handler.py:30 logs and re-raises it")
+        run(d, "replace", "w1", "w2")
+        run(d, "replace", "v1", "v2")
+        out = run(d, "post", "v2", stdin="@w2 NOT PASSED [F1]. Still swallowed on retry.")
+        assert "paused:" in out, out
+        dispute = [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "dispute"]
+        assert len(dispute) == 1 and dispute[0]["member"] == "w2", dispute
+        assert "have @v2 post `F1: resolved`" in dispute[0]["text"] and "@v1" not in dispute[0]["text"], dispute[0]["text"]
+        # Also verify an earlier READY from w1 clears latest[w2] and records answers under w2.
+        d2, _ = self._fresh("d2")
+        run(d2, "member", "w1")
+        run(d2, "member", "v", "role=verifier")
+        run(d2, "ready", "w1", stdin="initial")
+        run(d2, "post", "v", stdin="@w1 NOT PASSED. Missing check.")
+        run(d2, "ready", "w1", stdin="F1: fixed — added check")
+        run(d2, "replace", "w1", "w2")
+        sys.path.insert(0, os.path.dirname(BOARD))
+        try:
+            import board as board_module
+            found = board_module.ledger(saved(d2), self._read_posts(d2))
+            assert "w2" in found["F1"]["answers"] and found["F1"]["answers"]["w2"][0] == "fixed", found
+        finally:
+            sys.path.remove(os.path.dirname(BOARD))
+
+    def test_reviews_validation_and_cleanup_on_member_and_replace(self):
+        d, _ = self._fresh()
+        run(d, "member", "w")
+        run(d, "member", "ret")
+        run(d, "member", "ret", "killed=1")
+        run(d, "member", "adv", "profile=architect", "writes=0", "consult=1")
+        run(d, "member", "v", "role=verifier")
+        # set_reviews rejects retired members and consultants.
+        bad_ret = subprocess.run([sys.executable, BOARD, d, "member", "v", "reviews=ret"], capture_output=True, text=True)
+        assert bad_ret.returncode != 0 and "retired" in bad_ret.stderr, bad_ret.stderr
+        bad_adv = subprocess.run([sys.executable, BOARD, d, "member", "v", "reviews=adv"], capture_output=True, text=True)
+        assert bad_adv.returncode != 0 and "consultant" in bad_adv.stderr, bad_adv.stderr
+        # Changing a verifier's role to worker drops stale reviews.
+        run(d, "member", "v", "reviews=w")
+        assert saved(d)["members"]["v"]["reviews"] == "w"
+        run(d, "member", "v", "role=worker")
+        assert "reviews" not in saved(d)["members"]["v"]
+        # Replacing a verifier with role=worker drops inherited reviews.
+        run(d, "member", "v", "role=verifier", "reviews=w")
+        run(d, "replace", "v", "v2", "role=worker")
+        assert "reviews" not in saved(d)["members"]["v2"]
+        # Replacing a watched worker with role=verifier removes it from other verifiers' reviews instead of pointing at a verifier.
+        run(d, "member", "w2")
+        run(d, "member", "vc", "role=verifier", "reviews=w,w2")
+        run(d, "replace", "w", "w_ver", "role=verifier")
+        assert saved(d)["members"]["vc"]["reviews"] == "w2"
+        run(d, "replace", "w2", "w2_ver", "role=verifier")
+        assert "reviews" not in saved(d)["members"]["vc"]
+
+    def test_run_plan_in_serve_owed_posts_as_coordinator_not_retired_worker(self):
+        d, _ = self._fresh()
+        run(d, "member", "w")
+        run(d, "member", "w2")
+        run(d, "member", "v", "role=verifier")
+        run(d, "ready", "w2", stdin="done")
+        # Planned candidate without checks for coding workers will fail prepare.
+        with open(os.path.join(d, "verification-plan.json"), "w", encoding="utf-8") as f:
+            json.dump(["shared", "--no-checks"], f)
+        run(d, "member", "w", "killed=1")
+        # Simulate an owed_dispatch recorded for w before w was retired.
+        state = saved(d)
+        state["owed_dispatch"] = {"token": "t1", "author": "w"}
+        with open(os.path.join(d, "members.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        run(d, "dispatch", "--owed")
+        assert saved(d)["owed_dispatch"]["failed"]
+        failure_posts = [p for p in self._read_posts(d) if "could not be prepared" in p["text"]]
+        assert len(failure_posts) == 1 and failure_posts[0]["agent"] == "coordinator", failure_posts
+        # Also test non-waiter run_plan when author is retired while prepare runs.
+        d2, _ = self._fresh("r2")
+        run(d2, "member", "w")
+        run(d2, "member", "v", "role=verifier")
+        with open(os.path.join(d2, "verification-plan.json"), "w", encoding="utf-8") as f:
+            json.dump(["shared", "--no-checks"], f)
+        sys.path.insert(0, os.path.dirname(BOARD))
+        try:
+            import contextlib
+            import io
+            import board as board_module
+            from unittest import mock
+            real = subprocess.run
+
+            def kill_during_prepare(argv, *args, **kwargs):
+                done = real(argv, *args, **kwargs)
+                if "prepare" in argv:
+                    real([sys.executable, BOARD, d2, "member", "w", "killed=1"], check=True, capture_output=True, text=True)
+                return done
+
+            old_stdin = sys.stdin
+            sys.stdin = io.StringIO("done")
+            try:
+                with mock.patch.object(board_module.subprocess, "run", kill_during_prepare), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    board_module.main(["board.py", d2, "ready", "w"])
+            finally:
+                sys.stdin = old_stdin
+            posts2 = [p for p in self._read_posts(d2) if "could not be prepared" in p["text"]]
+            assert len(posts2) == 1 and posts2[0]["agent"] == "coordinator", posts2
+        finally:
+            sys.path.remove(os.path.dirname(BOARD))
+
+    def test_historical_verifier_verdicts_survive_role_change_in_attention_and_resume(self):
+        verify_script = os.path.join(os.path.dirname(BOARD), "verify.py")
+        d, proj = self._fresh()
+        run(d, "member", "w")
+        run(d, "member", "v", "role=verifier")
+        run(d, "ready", "w", stdin="done")
+        cand = json.loads(subprocess.run(
+            [sys.executable, verify_script, d, proj, "prepare", "shared", "--check", "true"],
+            check=True, capture_output=True, text=True).stdout)["candidate"]
+        line = subprocess.run(
+            [sys.executable, verify_script, d, proj, "test", cand, "v"],
+            check=True, capture_output=True, text=True).stdout.splitlines()[-1]
+        run(d, "post", "v", "@coordinator " + line)
+        os.remove(os.path.join(d, "verification.json"))
+        # Verifier later changes role to worker (or is replaced and changed role).
+        run(d, "member", "v", "role=worker")
+        run(d, "ready", "w", stdin="followup")
+        stale = [i for i in json.loads(run(d, "attention", "--json"))["items"] if i["kind"] == "stale"]
+        assert len(stale) == 1 and "VERIFIED (#2)" in stale[0]["text"], stale
+        # In resume, historical VERIFIED at #2 still counts as verified_seq=2 so earlier READY doesn't trigger unverified wake.
+        d2, proj2 = self._fresh("r2")
+        run(d2, "member", "w", "id=agent-w")
+        run(d2, "member", "v", "role=verifier", "id=agent-v")
+        run(d2, "member", "v2", "role=verifier", "id=agent-v2")
+        run(d2, "ready", "w", stdin="done")
+        cand2 = json.loads(subprocess.run(
+            [sys.executable, verify_script, d2, proj2, "prepare", "shared", "--check", "true"],
+            check=True, capture_output=True, text=True).stdout)["candidate"]
+        line2 = subprocess.run(
+            [sys.executable, verify_script, d2, proj2, "test", cand2, "v"],
+            check=True, capture_output=True, text=True).stdout.splitlines()[-1]
+        run(d2, "post", "v", "@coordinator " + line2)
+        run(d2, "member", "v", "role=worker")
+        run(d2, "pause", "stop")
+        out = run(d2, "resume")
+        assert "@v2" not in out, out
+
+    def test_cited_mentions_suppression_and_passed_on_edge_cases(self):
+        d, _ = self._fresh()
+        for name in ("parser", "api", "docs"):
+            run(d, "member", name)
+        run(d, "member", "v", "role=verifier")
+        # Cited mentions (from/per/see/by/in/of/via/cf. or parenthesized with #seq) wake nobody.
+        run(d, "post", "coordinator", "@parser FYI from @api (post #6), per @docs #5 and @v #4")
+        assert self._read_posts(d)[-1]["to"] == ["parser"] and woken(d) == ["@parser"], (self._read_posts(d)[-1], woken(d))
+        # A mention without a #seq citation still wakes the member.
+        run(d, "post", "coordinator", "@parser per @api")
+        assert self._read_posts(d)[-1]["to"] == ["parser", "api"], self._read_posts(d)[-1]
+        # A READY citing @coordinator #1 (not addressing @coordinator) is still summarized by passed_on; --all shows full.
+        run(d, "ready", "parser", stdin="built per @coordinator #1\nsecond line\nparser long detail")
+        coord = run(d, "read", "coordinator")
+        assert "parser long detail" not in coord and "[full: show --post=" in coord, coord
+        run(d, "ready", "api", stdin="built per @coordinator #1\nsecond line\napi long detail")
+        assert "api long detail" in run(d, "read", "coordinator", "--all")
+
 
 if __name__ == "__main__":
     unittest.main()

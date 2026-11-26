@@ -662,6 +662,7 @@ def removed_public_symbols(diff, moved=None):
     for line in diff.split("\n"):
         # A file's headers come before its first hunk: inside one, `--- x` is a removed line `-- x`.
         if line.startswith("diff --git "):
+            old = new = ""
             in_hunk = False
         elif line.startswith("@@ "):
             in_hunk = True
@@ -670,10 +671,10 @@ def removed_public_symbols(diff, moved=None):
             old = header[1] or ""
         elif not in_hunk and (header := re.fullmatch(r"\+\+\+ (?:b/([^\t]+)\t?|/dev/null)", line)):
             new = header[1] or ""
-        elif line.startswith("-") and old:
+        elif in_hunk and line.startswith("-") and old:
             if symbol := defined_symbol(old, line[1:]):
                 removed.setdefault(symbol, []).append(old)
-        elif line.startswith("+") and new:
+        elif in_hunk and line.startswith("+") and new:
             if symbol := defined_symbol(new, line[1:]):
                 added.setdefault(symbol, set()).add(new)
     left = {symbol: [name for name in dict.fromkeys(names) if name not in added.get(symbol, ())]
@@ -1019,6 +1020,7 @@ def prepare(run, project, mode, checks, onto=None, subset=None, baseline=False, 
             else:
                 unchanged = isinstance(previous, dict) and all(previous.get(key) == candidate[key] for key in ("digest", "exact"))
             if (keep_standing and unchanged and isinstance(previous.get("candidate"), str)
+                    and not previous.get("accepted")
                     and all(previous.get(key) == candidate[key] for key in same)
                     and previous.get("allowed", []) == candidate.get("allowed", [])
                     and isinstance(previous.get("members"), list) and previous.get("inputs") == {
@@ -1525,16 +1527,16 @@ def test_candidate(run, project, identifier, verifier, timeout_arg=None):
             print(f"Candidate {identifier} already passed: @{passed_by} verified it, and nothing it holds has changed since. "
                   "Nothing was run. This is no result of yours: post no verdict on it, only what your own review finds")
             return
-        candidate.pop("verified_by", None)
-        candidate.pop("waived", None)  # the last attempt's: this one says anew what it waives
-        candidate["attempt"] = attempt
-        save_candidate(run, candidate)
         # Every file as it is while the checks run: the candidate's own digest reads a clean submodule of an isolated
         # checkout as its commit, so checks that filled one in, with files the landed commit will not bring, went unseen.
         exact = candidate.get("exact") or (source_digest(Path(candidate["path"])) if candidate["mode"] == "isolated" else None)
         if exact is not None and source_digest(Path(candidate["path"])) != exact:
             raise ValueError("the candidate's checkout changed since it was prepared (a submodule filled in or emptied?); "
                              "prepare and test a new candidate")
+        candidate.pop("verified_by", None)
+        candidate.pop("waived", None)  # the last attempt's: this one says anew what it waives
+        candidate["attempt"] = attempt
+        save_candidate(run, candidate)
         # The candidate this verifier is testing, until it posts a verdict on it: a verdict that names none answers
         # this one, even once another candidate has replaced it.
         state = load_state(run)

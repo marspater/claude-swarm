@@ -199,6 +199,56 @@ export const hairlineDivider =
   `<style>${themeVars([['hairline', beehivePalette.waxHairline]])}rect{fill:var(--hairline)}</style>` +
   '<rect width="200" height="1"/></svg>'
 
+/** Wax-hairline section divider with a centered 3-cell honeycomb ornament. */
+export function hexDivider(width: number): string {
+  const w = Number.isFinite(width) && width > 0 ? Math.min(MAX_BAR_WIDTH, Math.max(48, Math.round(width))) : 200
+  const cx = w / 2
+  const leftW = Math.max(0, cx - 14)
+  const rightX = Math.min(w, cx + 14)
+  const rightW = Math.max(0, w - rightX)
+  const cell = (x: number, y: number) =>
+    `M${x.toFixed(1)} ${(y - 2.6).toFixed(1)}L${(x + 2.25).toFixed(1)} ${(y - 1.3).toFixed(1)}V${(y + 1.3).toFixed(1)}L${x.toFixed(1)} ${(y + 2.6).toFixed(1)}L${(x - 2.25).toFixed(1)} ${(y + 1.3).toFixed(1)}V${(y - 1.3).toFixed(1)}Z`
+  const style =
+    themeVars([
+      ['hairline', beehivePalette.waxHairline],
+      ['honey', beehivePalette.honeyCore],
+    ]) +
+    '.line{fill:var(--hairline)}' +
+    '.cell{fill:var(--honey);fill-opacity:.18;stroke:var(--hairline);stroke-width:1;stroke-linejoin:round}' +
+    '.cell-c{fill:var(--honey);fill-opacity:.32;stroke:var(--honey);stroke-opacity:.65;stroke-width:1;stroke-linejoin:round}'
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} 9" width="${w}" height="9"><style>${style}</style>` +
+    (leftW > 0 ? `<rect class="line" x="0" y="4" width="${leftW}" height="1"/>` : '') +
+    (rightW > 0 ? `<rect class="line" x="${rightX}" y="4" width="${rightW}" height="1"/>` : '') +
+    `<path class="cell" d="${cell(cx - 5.2, 4.5)}"/><path class="cell" d="${cell(cx + 5.2, 4.5)}"/><path class="cell-c" d="${cell(cx, 4.5)}"/></svg>`
+  )
+}
+
+/** 12x12 pointy-top hexagon member badge, double-ringed for the coordinator. */
+export function memberHex(accent: string, isCoordinator = false): string {
+  const outer = 'M6 1L10.33 3.5V8.5L6 11L1.67 8.5V3.5Z'
+  const mid = 'M6 2.5L9.03 4.25V7.75L6 9.5L2.97 7.75V4.25Z'
+  const core = 'M6 3.9L7.82 4.95V7.05L6 8.1L4.18 7.05V4.95Z'
+  const body = isCoordinator
+    ? `<path d="${outer}" fill="none" stroke="${accent}" stroke-opacity=".78" stroke-width="1.15" stroke-linejoin="round"/>` +
+      `<path d="${mid}" fill="${accent}" fill-opacity=".22" stroke="${accent}" stroke-width="1.2" stroke-linejoin="round"/>` +
+      `<path d="${core}" fill="${accent}"/>`
+    : `<path d="${DOT_HEX_OUTER}" fill="${accent}" fill-opacity=".22" stroke="${accent}" stroke-width="1.3" stroke-linejoin="round"/>` +
+      `<path d="${core}" fill="${accent}"/>`
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12">${body}</svg>`
+}
+
+/** 12x12 hexagonal section header icon tinted by status tone. */
+export function sectionHex(tone: StatusToken): string {
+  const color = `var(--status-${tone})`
+  const core = 'M6 3.9L7.82 4.95V7.05L6 8.1L4.18 7.05V4.95Z'
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><style>${statusCss}</style>` +
+    `<path d="${DOT_HEX_OUTER}" fill="${color}" fill-opacity=".18" stroke="${color}" stroke-width="1.3" stroke-linejoin="round"/>` +
+    `<path d="${core}" fill="${color}"/></svg>`
+  )
+}
+
 // 12x12 hexagonal cell geometry centered at (6, 6).
 const DOT_HEX_FILL = 'M6 2L9.5 4V8L6 10L2.5 8V4Z'
 const DOT_HEX_OUTER = 'M6 1.5L9.9 3.75V8.25L6 10.5L2.1 8.25V3.75Z'
@@ -233,6 +283,7 @@ export function statusDot(status: string, elapsed = 0, seed = ''): string {
       '@keyframes sw-aura{0%{transform:scale(.94);opacity:0}20%{opacity:.46}82%,100%{transform:scale(1.16);opacity:0}}'
     glyph =
       `<path class="aura" d="${DOT_HEX_OUTER}" fill="none" stroke="${color}" stroke-width="1.15" stroke-linejoin="round"/>` +
+      `<path d="${DOT_HEX_OUTER}" fill="none" stroke="${color}" stroke-opacity=".55" stroke-width="1.15" stroke-linejoin="round"/>` +
       `<path d="M6 2L10 6L6 10L2 6Z" fill="${color}"/>`
   } else if (status === 'waiting') {
     animTarget = '.breathe'
@@ -349,11 +400,11 @@ export function swarmEmblem(state: EmblemState, elapsed = 0): string {
   const style =
     `${statusCss}` +
     `${themeVars([['cell-warm', beehivePalette.honeyCore]])}` +
-    `svg{--cell-stroke:var(--status-${tone});--hi-op:.22;--hi-low:.14}` +
-    'svg[data-mode=dark]{--hi-op:.2;--hi-low:.12}' +
-    '@media(prefers-color-scheme:dark){svg:not([data-mode=light]){--hi-op:.2;--hi-low:.12}}' +
-    '.c{fill:var(--cell-stroke);fill-opacity:.13;stroke:var(--cell-stroke);stroke-width:1.3;stroke-linejoin:round}' +
-    '.c-hi{fill:var(--cell-warm);fill-opacity:var(--hi-op);stroke:var(--cell-stroke);stroke-width:1.3;stroke-linejoin:round}' +
+    `svg{--cell-stroke:var(--status-${tone});--hi-op:.32;--hi-low:.2}` +
+    'svg[data-mode=dark]{--hi-op:.28;--hi-low:.18}' +
+    '@media(prefers-color-scheme:dark){svg:not([data-mode=light]){--hi-op:.28;--hi-low:.18}}' +
+    '.c{fill:var(--cell-stroke);fill-opacity:.2;stroke:var(--cell-stroke);stroke-width:1.5;stroke-linejoin:round}' +
+    '.c-hi{fill:var(--cell-warm);fill-opacity:var(--hi-op);stroke:var(--cell-stroke);stroke-width:1.5;stroke-linejoin:round}' +
     `.dot{fill:var(--status-${tone})}` +
     (active
       ? `.ring{fill:none;stroke:var(--status-${tone});stroke-width:1;stroke-linejoin:round;opacity:0;transform-box:fill-box;transform-origin:center;animation:emb-ring 3.4s ${easeOut} ${loopDelay(elapsed, 3400)} infinite}` +
@@ -438,7 +489,7 @@ export function progressBar(
     const step = Math.max(10, Math.ceil(fillW / MAX_NOTCHES))
     for (let x = 8; x < fillW; x += step) segs.push(`M${x} 0L${x - 3} 6`)
     if (segs.length > 0) {
-      notches = `<path d="${segs.join('')}" fill="none" stroke="#fff" stroke-width="1" opacity=".14"/>`
+      notches = `<path d="${segs.join('')}" fill="none" stroke="#fff" stroke-width="1.15" opacity=".22"/>`
     }
   }
 
@@ -475,14 +526,14 @@ export function semanticIcon(kind: SemanticIconKind): string {
     paused: statusTokens.paused,
   }
   const style = themeVars([['ic', tokenMap[kind]]])
-  const backing = `<path d="${ICON_HEX}" fill="var(--ic)" fill-opacity=".14"/>`
+  const backing = `<path d="${ICON_HEX}" fill="var(--ic)" fill-opacity=".14" stroke="var(--ic)" stroke-opacity=".55" stroke-width="1" stroke-linejoin="round"/>`
   const glyph =
     kind === 'pass'
       ? `${backing}<path d="M3.5 6.2L5.2 7.9L8.6 4.3" fill="none" stroke="var(--ic)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>`
       : kind === 'ready'
         ? `${backing}<path d="M3.8 6H8.1M6.3 4.1L8.2 6L6.3 7.9" fill="none" stroke="var(--ic)" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round"/>`
         : kind === 'warn'
-          ? '<path d="M6 1.7L10.5 9.6H1.5Z" fill="var(--ic)" fill-opacity=".14" stroke="var(--ic)" stroke-width="1.2" stroke-linejoin="round"/><line x1="6" y1="4.4" x2="6" y2="6.1" stroke="var(--ic)" stroke-width="1.25" stroke-linecap="round"/><circle cx="6" cy="7.9" r=".6" fill="var(--ic)"/>'
+          ? `${backing}<path d="M6 2.7L9.3 8.4H2.7Z" fill="var(--ic)" fill-opacity=".16" stroke="var(--ic)" stroke-width="1.15" stroke-linejoin="round"/><line x1="6" y1="4.7" x2="6" y2="6.2" stroke="var(--ic)" stroke-width="1.2" stroke-linecap="round"/><circle cx="6" cy="7.5" r=".55" fill="var(--ic)"/>`
           : kind === 'error'
             ? `${backing}<path d="M4 4L8 8M8 4L4 8" fill="none" stroke="var(--ic)" stroke-width="1.6" stroke-linecap="round"/>`
             : kind === 'paused'

@@ -237,16 +237,22 @@ def save(d, state):
 
 
 def set_reviews(member, asked, members):
-    """Set MEMBER's reviews= to ASKED, as `member` and `replace` take it: registered workers or all, on a verifier."""
+    """Set MEMBER's reviews= to ASKED, as `member` and `replace` take it: registered active non-consultant workers or all, on a verifier."""
     asked = list(dict.fromkeys(n.strip().lstrip("@").lower() for n in asked.split(",") if n.strip()))
     if asked and member.get("role") != "verifier":
         sys.exit("reviews= is a verifier's: it names the workers whose READY it reviews as each arrives")
     unknown = [n for n in asked if n != "all" and (n not in members or members[n].get("role") != "worker")]
     if unknown:
         sys.exit("reviews= takes registered workers, or all, and not " + ", ".join("@" + n for n in unknown))
+    retired = [n for n in asked if n != "all" and members[n].get("killed") == "1"]
+    if retired:
+        sys.exit("reviews= cannot name retired member(s): " + ", ".join("@" + n for n in retired))
+    consultants = [n for n in asked if n != "all" and members[n].get("consult") == "1"]
+    if consultants:
+        sys.exit("reviews= cannot name consultant(s): " + ", ".join("@" + n for n in consultants))
     member["reviews"] = ",".join(asked)
     if not asked:
-        member.pop("reviews")
+        member.pop("reviews", None)
 
 
 # verify.py's refusal while another verification action holds the checkout, and how long a waiter waits it out.
@@ -1298,7 +1304,7 @@ def ledger(state, posts):
         if post["seq"] <= state.get("accepted_seq", 0):
             continue
         if post.get("kind") == "ready":
-            worker = post.get("subject", post["agent"])
+            worker = successor(post.get("subject", post["agent"]), members)
             latest.pop(worker, None)
             owed = {name: f for name, f in found.items() if f["open"] and worker in f["owners"]}
             answers = answers_in(post["text"], owed.keys())
@@ -1315,6 +1321,8 @@ def ledger(state, posts):
                 # Owners are their successors' (as a NOT PASSED's are below), so the workers a pass covered are too.
                 if not post.get("partial") or set(finding["owners"]) <= {successor(m, members) for m in post.get("members", [])}:
                     finding["open"] = False
+                    finding["streak"] = 0
+                    finding["answers"] = {}
             continue
         rulings = rulings_in(post["text"])
         # A replaced worker's findings are its successor's: the defects are still in the work it took over.
@@ -1326,6 +1334,8 @@ def ledger(state, posts):
             for name, ruling in rulings.items():
                 if name in found and ruling == "resolved":
                     found[name]["open"] = False
+                    found[name]["streak"] = 0
+                    found[name]["answers"] = {}
             continue
         raised = dict(tagged(post["text"]))
         # A second verdict on one candidate, such as test results added to a source review, is the same review.
@@ -1340,6 +1350,7 @@ def ledger(state, posts):
                 finding["text"] = raised[name]
             if not finding["open"]:
                 finding["streak"] = 0
+                finding["answers"] = {}
                 continue
             # Silence is no ruling: a verdict that raises only something else leaves the id open and judges nothing
             # about it. A second verdict on one candidate is the same review, but the first of them to rule on an
@@ -1405,11 +1416,12 @@ def attention(state, posts, d=None):
     for finding in disputes(ledger(state, posts)):
         owners = [name for name in disputers(finding) if name in team]
         if owners:
+            verifier_name = successor(finding["by"], members)
             items.append({"kind": "dispute", "member": owners[0], "seq": max(finding["judged"].values()),
                           "text": "@%s disputes %s and @%s keeps it open: %s. Settle it: decide, or give a consultant the "
                                   "finding and both positions. Then resume, and have @%s post `%s: resolved` or tell @%s to fix it"
-                                  % (owners[0], finding["id"], finding["by"], finding["text"][:160] or "see the post",
-                                     finding["by"], finding["id"], owners[0])})
+                                  % (owners[0], finding["id"], verifier_name, finding["text"][:160] or "see the post",
+                                     verifier_name, finding["id"], owners[0])})
     usage = state.get("usage", {})
     tokens = usage.get("tokens", {})
     actors = tokens.keys() - {COORDINATOR}
@@ -1477,7 +1489,9 @@ def attention(state, posts, d=None):
                               "text": "@%s waits for @%s, which %s" % (name, dep, why)})
     def passed(post):  # a partial candidate's pass is not the run's
         protocol = REPORT_WORD.match(post["text"])
-        return (members.get(post["agent"], {}).get("role") == "verifier" and protocol and protocol[1] == "VERIFIED"
+        return ((members.get(post["agent"], {}).get("role") == "verifier"
+                 or "rejects" in post or bool(post.get("rules")))
+                and protocol and protocol[1] == "VERIFIED"
                 and not post.get("partial"))
 
     verified = [p for p in posts if passed(p)]
@@ -2315,6 +2329,9 @@ def main(argv):
                     print("candidate %s was replaced by %s before its test command could be posted; the newer one's stands"
                           % (made.get("candidate"), current))
                     return "done"
+                elif table.get("accepted"):
+                    print("candidate %s was already accepted; no test command is posted" % current)
+                    return "done"
             verifiers = [name for name, entry in members.items() if entry.get("role") == "verifier" and not entry.get("killed")]
             if made and isinstance(state.get("owed_dispatch"), dict) and state["owed_dispatch"].get("failed"):
                 # A failure nobody waits on any more, and the plan has prepared since, whoever's step ran it.
@@ -2369,8 +2386,10 @@ def main(argv):
                 print("the planned candidate could not be prepared: " + why)
             else:
                 # Not this READY's to settle alone: the coordinator hears, and so does each worker a line names.
-                told = [COORDINATOR, *(n for n in targets(why, members, sender=author) if n not in (author, COORDINATOR))]
-                post_message(author, "@coordinator The planned candidate could not be prepared after this READY:\n" + why, told)
+                poster = COORDINATOR if (waiter or author not in members or members[author].get("killed")) else author
+                told = [COORDINATOR, *(n for n in targets(why, members, sender=poster) if n not in (poster, COORDINATOR))]
+                post_message(poster, "@coordinator The planned candidate could not be prepared after this READY:\n" + why,
+                             told, told=not waiter and poster == author)
                 print("the planned candidate could not be prepared: " + why)
             return "failed"
 
@@ -2534,6 +2553,8 @@ def main(argv):
             merge_after(member, changes, previous.get("after", ""))
             if "reviews" in changes:
                 set_reviews(member, changes["reviews"], members)
+            elif member.get("role") != "verifier":
+                member.pop("reviews", None)
             if member.get("killed"):  # a retired member runs no more turns: nothing is paused
                 member.pop("paused", None)
                 member.setdefault("retired_at", len(posts))
@@ -2796,6 +2817,8 @@ def main(argv):
             validate_member(new, entry, given, members)
             if "reviews" in given:
                 set_reviews(entry, given["reviews"], members)
+            elif entry.get("role") != "verifier":
+                entry.pop("reviews", None)
             if given.get("id"):  # started as it is registered, as in `member`
                 started_as(entry)
             if given.get("group") in {"", "-"}:
@@ -2810,8 +2833,15 @@ def main(argv):
                     member["depends"] = ",".join(dict.fromkeys(new if dep == old else dep for dep in dependencies(member)))
                 if member.get("after"):
                     member["after"] = ",".join(dict.fromkeys(new if dep == old else dep for dep in member["after"].split(",")))
-                if member.get("reviews"):  # and whoever reviewed its READY early reviews the successor's
-                    member["reviews"] = ",".join(dict.fromkeys(new if dep == old else dep for dep in member["reviews"].split(",")))
+                if member.get("reviews"):  # and whoever reviewed its READY early reviews the successor's, if still a non-consultant worker
+                    if entry.get("role") == "worker" and entry.get("consult") != "1":
+                        updated = list(dict.fromkeys(new if dep == old else dep for dep in member["reviews"].split(",") if dep))
+                    else:
+                        updated = list(dict.fromkeys(dep for dep in member["reviews"].split(",") if dep and dep != old))
+                    if updated:
+                        member["reviews"] = ",".join(updated)
+                    else:
+                        member.pop("reviews", None)
             stranded(new, members)
             # Only what this command asks for: an inherited wait for a removed member is the blocked
             # state Attention already lists, and replacing the waiter must stay possible.
@@ -3640,7 +3670,8 @@ def main(argv):
                 # confirmation or an answer, or already owed a wake needs no turn.
                 ready, reports = readiness(members, posts), latest_reports(posts)
                 asking = {asker for _, asker, _ in unanswered(members, posts)}
-                verified_seq = max((p["seq"] for p in posts if members.get(p["agent"], {}).get("role") == "verifier"
+                verified_seq = max((p["seq"] for p in posts if (members.get(p["agent"], {}).get("role") == "verifier"
+                                                                or "rejects" in p or bool(p.get("rules")))
                                     and (w := REPORT_WORD.match(p["text"])) and w[1] in {"VERIFIED", "NOT PASSED", "NOT VERIFIED"}
                                     and not (w[1] == "VERIFIED" and p.get("partial"))), default=0)  # a partial pass is not the run's
                 # A verifier is told of the work once every worker is ready (see `ready`): before that it was not
