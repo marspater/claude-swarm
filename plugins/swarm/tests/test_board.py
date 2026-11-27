@@ -1142,6 +1142,37 @@ class BoardRegressions(unittest.TestCase):
         assert saved(d)["members"]["reader"]["effort"] == "medium"
         assert "over limit:" not in run(d, "plan")
 
+    def test_invalid_effort_does_not_break_budget_estimation_or_setting_ceiling(self):
+        d = self.init_run()
+        run(d, "member", "reader", "effort=medium")
+        state = saved(d)
+        original_budget = state["limits"]["budget"]
+        for effort in (["medium"], []):
+            with self.subTest(effort=effort):
+                state["members"]["reader"]["effort"] = effort
+                with open(os.path.join(d, "members.json"), "w", encoding="utf-8") as f:
+                    json.dump(state, f)
+                for output in (run(d, "limit", "max_effort=medium"), run(d, "plan")):
+                    assert f"@reader has unsupported effort {effort!r}" in output
+                assert saved(d)["limits"]["budget"] == original_budget
+                run(d, "member", "reader", "effort=medium")
+                assert "over limit:" not in run(d, "plan")
+
+    def test_invalid_fable_investigator_effort_does_not_block_retirement(self):
+        d = self.init_run()
+        run(d, "member", "probe", "profile=investigator")
+        run(d, "replace", "probe", "fable-probe", "model=fable", "effort=medium")
+        state = saved(d)
+        state["members"]["fable-probe"]["effort"] = "turbo"
+        with open(os.path.join(d, "members.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        run(d, "limit", "max_effort=low")
+        run(d, "member", "fable-probe", "effort=medium", ok=False)
+        run(d, "member", "fable-probe", "killed=1")
+        retired = saved(d)["members"]["fable-probe"]
+        assert retired["killed"] == "1" and retired["effort"] == "turbo"
+        assert "over limit:" not in run(d, "plan")
+
     def test_resume_before_anyone_started_wakes_coordinator_once(self):
         d = self.init_run()
         run(d, "limit", "fable=none", "opus=none", "haiku=none")

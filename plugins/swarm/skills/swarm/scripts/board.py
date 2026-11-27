@@ -709,7 +709,7 @@ def validate_member(name, member, changes, members):
             raise ValueError(f"{flag} must be 0 or 1")
     if "size" in changes and changes["size"] not in {"", *SIZES}:
         raise ValueError("size is s, m or l: how large this member's piece of the task is")
-    if "effort" in changes and changes["effort"] not in {"", "low", "medium", "high", "xhigh", "max"}:
+    if "effort" in changes and changes["effort"] not in ("", *EFFORT_LEVELS):
         raise ValueError("effort must be low, medium, high, xhigh, or max")
     if "effort" in changes:  # named now, whatever it started on
         member.pop("sized", None)
@@ -766,13 +766,14 @@ def sized_effort(kind, size):
 
 
 def effort_of(member):
-    return member.get("effort") or sized_effort(kind_of(member), member.get("size"))
+    effort = member.get("effort")
+    return sized_effort(kind_of(member), member.get("size")) if effort in (None, "") else effort
 
 
 def started_as(member):
     """Records what MEMBER starts on. A default changed later, or a size, then moves no member already running, and a
     report of the run says what it really ran on."""
-    if not member.get("effort"):  # taken from its size, which the allocation has already counted
+    if member.get("effort") in (None, ""):  # taken from its size, which the allocation has already counted
         member["effort"], member["sized"] = effort_of(member), "1"
     if not member.get("model"):
         member["model"] = family(model_of(member))
@@ -1659,8 +1660,11 @@ def allocation(state):
     # Size sets the effort when none is named, so it is counted once: only an effort named for the member, against
     # its type's default, moves the share again.
     def named(m):
+        effort = m.get("effort")
+        if effort not in EFFORT_LEVELS or m.get("sized"):
+            return 1
         base = DEFAULTS.get(kind_of(m), ("", ""))[1]
-        return EFFORT_COST.get(m.get("effort"), 1) / EFFORT_COST.get(base, 1) if m.get("effort") and not m.get("sized") else 1
+        return EFFORT_COST[effort] / EFFORT_COST.get(base, 1)
     shares = {name: round(ALLOWANCE.get(kind_of(m), ALLOWANCE["worker"]) * SIZES.get(m.get("size") or "m", 1) * named(m))
               for name, m in team.items()}
     return shares, COORDINATOR_BASE + COORDINATOR_PER_MEMBER * len(team), int(sum(shares.values()) * RESERVE)
@@ -2661,7 +2665,8 @@ def main(argv):
                 member.pop("group", None)
             if "role" in changes or "consult" in changes:
                 stranded(name, members)
-            if kind_of(member) == "investigator" and family(model_of(member)) == "fable":
+            if (changes.keys() != {"killed"} and kind_of(member) == "investigator"
+                    and family(model_of(member)) == "fable"):
                 if not was_fable_inv:
                     sys.exit("an investigator starts on Opus. Fable is the escalation after an Opus investigator fails: "
                              "board.py DIR replace OLD NEW model=fable effort=medium")
@@ -2768,7 +2773,7 @@ def main(argv):
                    for k in changes if k in ("max_workers", "max_members", "budget", "member_budget")):
                 sys.exit("limits are max_workers=N max_members=N budget=TOKENS member_budget=TOKENS and <model>=<types>, "
                          "for models: " + " ".join(FAMILIES))
-            if changes.get("max_effort") not in (None, "", "low", "medium", "high", "xhigh", "max"):
+            if changes.get("max_effort") not in (None, "", *EFFORT_LEVELS):
                 sys.exit("invalid max_effort")
             if changes.get("advisor") not in (None, "", "off", "opus", "fable"):
                 sys.exit("advisor takes opus, fable, or off")
