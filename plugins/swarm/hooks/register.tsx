@@ -2416,6 +2416,8 @@ function logEvent($: EngineInterface, dir: string | undefined, kind: string, fie
 }
 
 // The agents that consulted the session's advisor, what the board has taken of its tokens, and the queue that charges them.
+let sawMessagesTransport = false
+const advisorWireModels = new Map<string, string>()
 const advisorUsers = new Set<string>()
 const advisorTaken = new Map<string, ReturnType<typeof advisorSpent>>()
 const advisorOwnModels = new Map<string, string>()
@@ -2436,7 +2438,7 @@ async function advised(
     $.agent.list().catch((): AgentInfo[] => []),
   ])
   if (expectedEpoch !== sessionEpoch || isEnding) return
-  const model = typeof setting === 'string' ? latestOf(setting.trim()) ?? '' : ''
+  const model = advisorWireModels.get(agentId) ?? (typeof setting === 'string' ? latestOf(setting.trim()) ?? '' : '')
   const dir = typeof owner === 'string' ? owner : agentRuns.get(agentId)
   const member = memberOfAgent(agentId)?.[0] ?? agentId
   for (const use of consults) {
@@ -3747,6 +3749,8 @@ export const register: Register = on => {
     pendingStarts.clear()
     cancelledSpawns.clear()
     startupReads.clear()
+    sawMessagesTransport = false
+    advisorWireModels.clear()
     advisorUsers.clear()
     advisorTaken.clear()
     advisorOwnModels.clear()
@@ -4119,11 +4123,14 @@ export const register: Register = on => {
     if (next.origin.plugin !== 'engine' || init?.method?.toUpperCase() !== 'POST' ||
         !/\/v1\/messages\/?$/.test(e.url.split('?')[0]!) ||
         typeof init.body !== 'string') return next(e)
+    sawMessagesTransport = true
     const header = Object.entries(init.headers ?? {}).find(([key]) => key.toLowerCase() === 'x-claude-code-agent-id')
     const id = header?.[1]
     const dir = (id && agentRuns.get(id)) || ownedPath
     if (!dir) return next(e)
     const epoch = sessionEpoch
+    // Resolve the optional host identity before reading the policy used for this send.
+    const live = id && !memberOfAgent(id) ? findAgent(await $.agent.list(), id) : undefined
     const state = JSON.parse(await $.fs.read(`${dir}/members.json`)) as BudgetState & { members: Roster; closed?: boolean }
     if (state.closed) return next(e)
     const sonnetOnly = ['haiku', 'opus', 'fable'].every(family => state.limits?.[family] === 'none')
@@ -4137,7 +4144,6 @@ export const register: Register = on => {
         member.id && (member.id === id || member.id === address))
       let member = memberById(teammates.get(id))
       if (!member) {
-        const live = findAgent(await $.agent.list(), id)
         member = memberById(live?.teammateId)
         if (!member && live && !SWARM_AGENTS.has(live.type)) return next(e)
         const starting = parseDescribedName(live?.description)
@@ -4156,9 +4162,9 @@ export const register: Register = on => {
     const barred = Object.keys(LATEST).filter(family => advisorBarred(state.limits, family, kind, name))
     const preferred = state.limits?.advisor === 'fable' ? LATEST.fable : LATEST.opus
     const requestedModel = id && sonnetCeiling ? (JSON.parse(init.body) as { model?: string }).model : undefined
-    const pinSonnet = requestedModel && (sonnetOnly || familyOf(requestedModel) !== 'haiku')
+    const pinSonnet = requestedModel && familyOf(requestedModel) !== 'sonnet' && (sonnetOnly || familyOf(requestedModel) !== 'haiku')
     const body = filterAdvisor(init.body, state.limits?.advisor === 'off' ? Object.keys(LATEST) : barred,
-      preferred, pinSonnet ? LATEST.sonnet : undefined, id ? maxEffort : undefined)
+      preferred, pinSonnet ? LATEST.sonnet : undefined, id ? maxEffort : undefined, model => { if (id) advisorWireModels.set(id, model) })
     if (body === init.body) return next(e)
     const headers = Object.fromEntries(Object.entries(init.headers ?? {}).filter(([key]) => key.toLowerCase() !== 'content-length'))
     return next({ ...e, init: { ...init, headers, body } })
@@ -4309,7 +4315,12 @@ export const register: Register = on => {
             : `This run allows ${runsOn} only for: ${allowed.join(', ') || 'none'}. Change @${memberName}'s model= with the board's member command before resuming it.` }
         }
       }
-      // The Messages hook applies the current advisor policy to resumed agents too.
+      // A restored agent keeps its old prompt. Managed hosts can withhold engine HTTP
+      // events from local plugins, so require evidence of the Messages route in this session.
+      if (!sawMessagesTransport && (state.limits?.advisor === 'off' ||
+          Object.keys(LATEST).some(family => advisorBarred(state.limits, family, kind, memberName)))) {
+        return { deny: 'This host has not exposed a Messages request to Swarm in this session. The restricted member cannot resume safely.' }
+      }
       if (epoch !== sessionEpoch || requestedUnder !== generation || isEnding || killedRun === owned) {
         return { deny: 'The Swarm run changed before the agent could resume.' }
       }
@@ -4784,6 +4795,8 @@ export const register: Register = on => {
     pendingStarts.clear()
     cancelledSpawns.clear()
     startupReads.clear()
+    sawMessagesTransport = false
+    advisorWireModels.clear()
     advisorUsers.clear()
     advisorTaken.clear()
     advisorOwnModels.clear()

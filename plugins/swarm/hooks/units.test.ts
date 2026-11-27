@@ -1929,7 +1929,10 @@ test('advisor limits remove active and deferred declarations while preserving me
       { role: 'system', content: [text] }, { role: 'user', content: [text, kept] },
     ],
   })
-  expect(JSON.parse(filterAdvisor(original, [], 'claude-opus-5-5')).tools[1].model).toBe('claude-opus-5-5')
+  let actual = ''
+  const rewritten = filterAdvisor(original, [], 'claude-opus-5-5', undefined, undefined, model => { actual = model })
+  expect(JSON.parse(rewritten).tools[1].model).toBe('claude-opus-5-5')
+  expect(advisorSpent([{ model: actual, input_tokens: 123 }], familyOf(actual), 'sonnet', familyOf).input_tokens).toBe(123)
   expect(filterAdvisor(original, [], 'claude-fable-5-2')).toBe(original)
   const strict = JSON.parse(filterAdvisor(original.replaceAll('claude-fable-5-2', 'claude-sonnet-5-5'), ['sonnet', 'haiku', 'opus', 'fable'], 'claude-opus-5-5', 'claude-sonnet-5-5'))
   expect(strict.tools).toEqual([read])

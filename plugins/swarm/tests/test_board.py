@@ -1117,6 +1117,16 @@ class BoardRegressions(unittest.TestCase):
         finally:
             sys.path.remove(os.path.dirname(BOARD))
 
+    def test_existing_effort_violation_cannot_grow_and_sonnet_release_is_independent(self):
+        d = self.init_run()
+        run(d, "member", "arch", "profile=architect", "model=claude-sonnet-4-6", "effort=xhigh")
+        run(d, "limit", "haiku=none", "opus=none", "fable=none", "max_effort=medium")
+        run(d, "member", "arch", "effort=max", ok=False)
+        run(d, "member", "arch", "effort=high")
+        run(d, "member", "arch", "id=test-arch")
+        run(d, "member", "reader", "model=claude-sonnet-4-6", "effort=medium")
+        assert saved(d)["members"]["arch"]["effort"] == "high"
+
     def test_resume_before_anyone_started_wakes_coordinator_once(self):
         d = self.init_run()
         run(d, "limit", "fable=none", "opus=none", "haiku=none")

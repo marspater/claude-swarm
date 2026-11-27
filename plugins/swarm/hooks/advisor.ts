@@ -8,7 +8,7 @@ type Message = { role: string; content: string | Block[] }
 
 const isAdvisor = (tool?: Tool) => tool?.name === 'advisor' || tool?.type?.startsWith('advisor_') === true
 
-export function filterAdvisor(body: string, barred: readonly string[], preferred?: string, memberModel?: string, maxEffort?: string): string {
+export function filterAdvisor(body: string, barred: readonly string[], preferred?: string, memberModel?: string, maxEffort?: string, onAdvisor?: (model: string) => void): string {
   if (!barred.length && !preferred && !memberModel && !maxEffort) return body
   const request = JSON.parse(body) as { model?: string; output_config?: { effort?: string | number }; tools?: Tool[]; messages?: Message[]; tool_choice?: Tool }
   if (!Array.isArray(request.messages)) return body
@@ -43,6 +43,7 @@ export function filterAdvisor(body: string, barred: readonly string[], preferred
   const declaration = request.tools?.find(isAdvisor)
   if (declaration) select(declaration)
   let blocked = declaration === undefined || forbidden(declaration)
+  if (declaration?.model && !blocked) onAdvisor?.(declaration.model)
   if (declaration && blocked) {
     request.tools = request.tools!.filter(tool => !isAdvisor(tool))
     changed = true
@@ -70,6 +71,7 @@ export function filterAdvisor(body: string, barred: readonly string[], preferred
         if (block.tool?.type === 'tool_definition') select(tool)
         blocked = block.tool?.type === 'tool_definition' ? forbidden(tool) : !declaration || forbidden(declaration)
       }
+      if (!blocked && block.type === 'tool_addition' && tool.model) onAdvisor?.(tool.model)
       return !blocked
     })
     if (content.length === message.content.length) return [message]

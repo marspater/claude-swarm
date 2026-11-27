@@ -800,10 +800,6 @@ def family_limit_errors(state):
         for member, entry in team.items():
             if efforts.index(effort_of(entry)) > efforts.index(ceiling):
                 errors.append("@%s exceeds the run's %s effort ceiling" % (member, ceiling))
-    if all(limits.get(f) == "none" for f in ("haiku", "opus", "fable")):
-        for member, entry in team.items():
-            if family(model_of(entry)) == "sonnet" and model_of(entry).lower() not in ("sonnet", "claude-sonnet-5-5"):
-                errors.append("@%s must use Sonnet 5.5 for this run" % member)
     for name in FAMILIES:
         if name in limits:
             allowed = set(limits[name].split(",")) - {"none", ""}
@@ -2676,6 +2672,11 @@ def main(argv):
                     if dep not in seen:
                         seen.add(dep)
                         frontier.extend(dependencies(members.get(dep, {})))
+            levels = ("low", "medium", "high", "xhigh", "max")
+            ceiling = state.get("limits", {}).get("max_effort")
+            if not created and ceiling in levels and not member.get("killed"):
+                if levels.index(effort_of(member)) > max(levels.index(ceiling), levels.index(effort_of(previous))):
+                    sys.exit("effort increase exceeds the run's %s ceiling" % ceiling)
             errors = added_limit_errors(state, before_counts, before_family)
             if errors:
                 sys.exit("over the run's limits, nothing was changed: " + "; ".join(errors))

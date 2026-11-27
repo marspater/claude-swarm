@@ -8583,7 +8583,7 @@ test('TS audit regressions (#1, #2, #7, #12, #13, #16, #17, Task 5): board limit
   }
   expect((await $.agent.spawn({ ...resumeBase, description: '@w1: resume', resume: { agentId: 'a1' } })).deny).toContain('is paused')
   expect((await $.agent.spawn({ ...resumeBase, description: '@w2: resume', resume: { agentId: 'a2' } })).deny).toContain('allows opus only for: none')
-  expect((await $.agent.spawn({ ...resumeBase, description: '@w3: resume', resume: { agentId: 'a3' } })).deny).toBeUndefined()
+  expect((await $.agent.spawn({ ...resumeBase, description: '@w3: resume', resume: { agentId: 'a3' } })).deny).toContain('has not exposed a Messages request')
 
   // Bug #12: final-step advisor accounting on turn.complete under `${turnId}:end:advisor`
   advisorSetting = 'opus'
