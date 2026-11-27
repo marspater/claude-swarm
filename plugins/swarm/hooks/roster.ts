@@ -69,11 +69,12 @@ const KINDS = ['input_tokens', 'cache_creation_input_tokens', 'cache_read_input_
  * ponytail: told apart by family, so an advisor of the member's own family is not counted apart; compare model ids
  * if such a pairing is ever allowed.
  */
-export function advisorSpent(usage: readonly (Partial<Spent> & { model: string })[] | undefined, advisorFamily: string, ownFamily: string, familyOf: (model: string) => string): Spent & { model: string } {
+export function advisorSpent(usage: readonly (Partial<Spent> & { model: string })[] | undefined, advisorFamily: string | ReadonlySet<string>, ownFamily: string, familyOf: (model: string) => string): Spent & { model: string } {
   const total = { ...none(), model: '' }
-  if (advisorFamily === '' || advisorFamily === ownFamily) return total
+  const families = typeof advisorFamily === 'string' ? new Set([advisorFamily]) : advisorFamily
   for (const entry of usage ?? []) {
-    if (familyOf(entry.model) !== advisorFamily) continue
+    const family = familyOf(entry.model)
+    if (!family || family === ownFamily || !families.has(family)) continue
     for (const kind of KINDS) total[kind] += positive(entry[kind])
     total.model = entry.model
   }

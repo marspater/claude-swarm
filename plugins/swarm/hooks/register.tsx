@@ -2416,7 +2416,8 @@ function logEvent($: EngineInterface, dir: string | undefined, kind: string, fie
 }
 
 // The agents that consulted the session's advisor, what the board has taken of its tokens, and the queue that charges them.
-let sawMessagesTransport = false
+const memberMessages = new Set<string>()
+const advisorFamilies = new Map<string, Set<string>>()
 const advisorWireModels = new Map<string, string>()
 const advisorUsers = new Set<string>()
 const advisorTaken = new Map<string, ReturnType<typeof advisorSpent>>()
@@ -2450,21 +2451,26 @@ async function advised(
   // A host whose agents carry no `usage` counts no advisor tokens: the calls are still logged.
   const agent = agents.find(one => one.id === agentId)
   const perModel = (agent as { usage?: Parameters<typeof advisorSpent>[0] } | undefined)?.usage
-  const spent = advisorSpent(perModel, familyOf(model), familyOf(ownModel), familyOf)
+  const families = advisorFamilies.get(agentId) ?? new Set<string>()
+  if (model) families.add(familyOf(model))
+  advisorFamilies.set(agentId, families)
   if (!advisorTaken.has(agentId)) {
     // The agent's total goes on over a reload of these hooks, which forgets what was charged: the roster has it. Its
     // run is found as `account` finds it: charged with no roster read, the whole total was taken again after a reload.
     const at = dir ?? await agentRun($, agentId, agent, false, expectedEpoch, typeof owner === 'number' ? owner : undefined)
     if (expectedEpoch !== sessionEpoch || isEnding || !at) return
     const actor = await digest(`swarm-agent:${teammateOf($, agentId, agent) ?? agentId}`)
-    const row = await $.fs.read(`${at}/members.json`)
-      .then(text => (JSON.parse(text) as { usage?: { detail?: Record<string, Record<string, number[]>> } }).usage?.detail?.[actor]?.advisor)
+    const usage = await $.fs.read(`${at}/members.json`)
+      .then(text => (JSON.parse(text) as { usage?: { advisorModels?: Record<string, string[]>; detail?: Record<string, Record<string, number[]>> } }).usage)
+    const row = usage?.detail?.[actor]?.advisor
+    for (const previous of usage?.advisorModels?.[actor] ?? []) families.add(familyOf(previous))
     if (expectedEpoch !== sessionEpoch || isEnding) return
     advisorTaken.set(agentId, { input_tokens: row?.[1] ?? 0, cache_creation_input_tokens: row?.[2] ?? 0, cache_read_input_tokens: row?.[3] ?? 0, output_tokens: row?.[4] ?? 0, model: '' })
   }
+  const spent = advisorSpent(perModel, families, familyOf(ownModel), familyOf)
   const owed = owedOf(spent, advisorTaken.get(agentId))
   if (owed.amount <= 0) return
-  const taken = await account($, turnId, `${turnId}:${index}:advisor`, agentId, owed.amount, owner, expectedEpoch, owed.detail, spent.model, 'advisor')
+  const taken = await account($, turnId, `${turnId}:${index}:advisor`, agentId, owed.amount, owner, expectedEpoch, owed.detail, spent.model, 'advisor', [...families].filter(family => Object.hasOwn(LATEST, family)))
   // Unconfirmed, the board may still have saved it: the roster is asked again before the next charge, as after a
   // reload. Charged from memory, a lost response had the same tokens taken twice, under the next step's report.
   if (typeof taken === 'number') advisorTaken.set(agentId, spent)
@@ -2486,6 +2492,7 @@ async function account(
   detail = '',
   model = '',
   wakeAs = '',
+  advisorHistory: string[] = [],
 ): Promise<number | false | undefined> {
   const at = typeof owner === 'string' ? owner : undefined
   const isCurrent = () => expectedEpoch === sessionEpoch && !isEnding && (at !== undefined || owner === generation)
@@ -2534,6 +2541,7 @@ async function account(
   const wake = wakeAs || (turnWakes.get(turnId) ?? (agentId ? 'wake' : 'user'))
   // The model is a label on the charge: one the board would refuse is left off, never the reason the charge fails.
   const label = /^[A-Za-z0-9._:@/[\]-]{1,100}$/.test(model) ? [model] : []
+  if (label.length && advisorHistory.length > 1) label.push(advisorHistory.join(','))
   const result = await boardCommand($, dir, ['account', turn, actor, String(amount), ...(detail ? [`${wake}:${detail}`, ...label] : [])])
   if (result.exitCode !== 0 || result.stdout.trim() === '') return false
   if (expectedEpoch !== sessionEpoch || isEnding) return amount
@@ -3749,7 +3757,8 @@ export const register: Register = on => {
     pendingStarts.clear()
     cancelledSpawns.clear()
     startupReads.clear()
-    sawMessagesTransport = false
+    memberMessages.clear()
+    advisorFamilies.clear()
     advisorWireModels.clear()
     advisorUsers.clear()
     advisorTaken.clear()
@@ -4123,7 +4132,6 @@ export const register: Register = on => {
     if (next.origin.plugin !== 'engine' || init?.method?.toUpperCase() !== 'POST' ||
         !/\/v1\/messages\/?$/.test(e.url.split('?')[0]!) ||
         typeof init.body !== 'string') return next(e)
-    sawMessagesTransport = true
     const header = Object.entries(init.headers ?? {}).find(([key]) => key.toLowerCase() === 'x-claude-code-agent-id')
     const id = header?.[1]
     const dir = (id && agentRuns.get(id)) || ownedPath
@@ -4136,7 +4144,6 @@ export const register: Register = on => {
     const sonnetOnly = ['haiku', 'opus', 'fable'].every(family => state.limits?.[family] === 'none')
     const sonnetCeiling = state.limits?.opus === 'none' && state.limits?.fable === 'none'
     const maxEffort = state.limits?.max_effort
-    if (!(id && (sonnetCeiling || maxEffort)) && !init.body.includes('"advisor')) return next(e)
     let name = 'coordinator'
     let kind = 'coordinator'
     if (id) {
@@ -4153,6 +4160,7 @@ export const register: Register = on => {
         if (!member && !live && !agentRuns.has(id) && !pendingStarts.size) return next(e)
       }
       // Before the host publishes an address, use no name or type exception.
+      if (member) memberMessages.add(JSON.stringify([dir, id]))
       name = member?.[0] ?? ''
       kind = member ? member[1].profile || member[1].role || 'worker' : ''
     }
@@ -4160,11 +4168,21 @@ export const register: Register = on => {
       return { deny: 'The Swarm run changed during its model request.' }
     }
     const barred = Object.keys(LATEST).filter(family => advisorBarred(state.limits, family, kind, name))
+    if (!(id && (barred.length || maxEffort)) && !init.body.includes('"advisor')) return next(e)
     const preferred = state.limits?.advisor === 'fable' ? LATEST.fable : LATEST.opus
-    const requestedModel = id && sonnetCeiling ? (JSON.parse(init.body) as { model?: string }).model : undefined
-    const pinSonnet = requestedModel && familyOf(requestedModel) !== 'sonnet' && (sonnetOnly || familyOf(requestedModel) !== 'haiku')
+    const requestedModel = id && barred.length ? (JSON.parse(init.body) as { model?: string }).model : undefined
+    const pinSonnet = sonnetCeiling && requestedModel && familyOf(requestedModel) !== 'sonnet' && (sonnetOnly || familyOf(requestedModel) !== 'haiku')
+    if (requestedModel && barred.includes(pinSonnet ? 'sonnet' : familyOf(requestedModel))) {
+      return { deny: 'This member request would use a model family barred by the run.' }
+    }
     const body = filterAdvisor(init.body, state.limits?.advisor === 'off' ? Object.keys(LATEST) : barred,
-      preferred, pinSonnet ? LATEST.sonnet : undefined, id ? maxEffort : undefined, model => { if (id) advisorWireModels.set(id, model) })
+      preferred, pinSonnet ? LATEST.sonnet : undefined, id ? maxEffort : undefined, model => {
+        if (!id) return
+        advisorWireModels.set(id, model)
+        const families = advisorFamilies.get(id) ?? new Set<string>()
+        families.add(familyOf(model))
+        advisorFamilies.set(id, families)
+      })
     if (body === init.body) return next(e)
     const headers = Object.fromEntries(Object.entries(init.headers ?? {}).filter(([key]) => key.toLowerCase() !== 'content-length'))
     return next({ ...e, init: { ...init, headers, body } })
@@ -4317,9 +4335,9 @@ export const register: Register = on => {
       }
       // A restored agent keeps its old prompt. Managed hosts can withhold engine HTTP
       // events from local plugins, so require evidence of the Messages route in this session.
-      if (!sawMessagesTransport && (state.limits?.advisor === 'off' ||
+      if (!memberMessages.has(JSON.stringify([owned, e.resume.agentId])) && (state.limits?.max_effort || state.limits?.advisor === 'off' ||
           Object.keys(LATEST).some(family => advisorBarred(state.limits, family, kind, memberName)))) {
-        return { deny: 'This host has not exposed a Messages request to Swarm in this session. The restricted member cannot resume safely.' }
+        return { deny: 'This host has not exposed a Messages request for this member in this run. The restricted member cannot resume safely.' }
       }
       if (epoch !== sessionEpoch || requestedUnder !== generation || isEnding || killedRun === owned) {
         return { deny: 'The Swarm run changed before the agent could resume.' }
@@ -4472,6 +4490,12 @@ export const register: Register = on => {
         return { deny: `The roster has @${named} on ${expected}, but this call would start it on ${actual || runsOn}. ${guidance}, or change the roster with the board's member command.` }
       }
       const effort = member.effort || sizedEffort(kind, member.size)
+      const ceiling = state.limits?.max_effort
+      const levels = ['low', 'medium', 'high', 'xhigh', 'max']
+      const callEffort = spawnEfforts.get(e.tool_use_id) ?? DEFAULT_EFFORT[kind] ?? ''
+      if (ceiling && [effort, callEffort].some(value => !levels.includes(value) || levels.indexOf(value) > levels.indexOf(ceiling))) {
+        return { deny: `Set @${named}'s roster and launch effort to ${ceiling} or lower before starting it.` }
+      }
       if (spawnEfforts.has(e.tool_use_id) && (spawnEfforts.get(e.tool_use_id) ?? DEFAULT_EFFORT[kind]) !== effort) {
         return { deny: `The roster has @${named} on ${effort} effort. Pass effort: "${effort}" on the Agent call, or change the roster first.` }
       }
@@ -4795,7 +4819,8 @@ export const register: Register = on => {
     pendingStarts.clear()
     cancelledSpawns.clear()
     startupReads.clear()
-    sawMessagesTransport = false
+    memberMessages.clear()
+    advisorFamilies.clear()
     advisorWireModels.clear()
     advisorUsers.clear()
     advisorTaken.clear()

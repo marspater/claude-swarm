@@ -174,7 +174,7 @@ ARG_COUNTS = {
     "replace": (2, None), "post": (1, None), "ready": (1, 2), "revise": (1, None),
     "confirm": (2, 2), "read": (1, 4), "show": (0, 2), "wake": (0, 0),
     "claim": (3, 3), "unclaim": (3, 3), "woke": (3, 3), "rearm": (2, None), "bind": (1, 1),
-    "pause": (0, None), "resume": (0, 1), "close": (0, 0), "kill": (0, None), "status": (0, 0), "account": (3, 5), "tail": (0, 1),
+    "pause": (0, None), "resume": (0, 1), "close": (0, 0), "kill": (0, None), "status": (0, 0), "account": (3, 6), "tail": (0, 1),
     "event": (1, 2),
     "prune": (0, 2), "sync": (1, 2), "export": (0, 1),
 }
@@ -1740,6 +1740,10 @@ def account(d, args):
         sys.exit("invalid usage detail")
     # The model that answered, by the id the API reported: a member's own, or its advisor's under the `advisor` wake.
     model = args[4] if len(args) > 4 else ""
+    families = args[5].split(",") if len(args) > 5 else []
+    if families and (not detail or detail[1] != "advisor" or not model
+                     or not set(families) <= {"haiku", "sonnet", "opus", "fable"}):
+        sys.exit("invalid advisor families")
     if model and not re.fullmatch(r"[A-Za-z0-9._:@/\[\]-]{1,100}", model):
         sys.exit("invalid model id")
     if not BIND_KEY.fullmatch(turn) or (actor != COORDINATOR and not BIND_KEY.fullmatch(actor)):
@@ -1777,6 +1781,11 @@ def account(d, args):
             # What each actor really ran on, counted in reports: the roster names a family, and the coordinator none.
             ran = usage.setdefault("models", {}).setdefault(actor, {})
             ran[model] = ran.get(model, 0) + 1
+            if detail and detail[1] == "advisor":
+                advisors = usage.setdefault("advisorModels", {}).setdefault(actor, [])
+                for used in families or [model]:
+                    if used not in advisors:
+                        advisors.append(used)
         # Only a retried report repeats a turn, and it does so at once: the oldest entries are never asked about again.
         for old in list(turns)[:-TURNS_KEPT]:
             del turns[old]

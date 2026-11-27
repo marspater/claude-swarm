@@ -2130,11 +2130,14 @@ test('an advisor charge whose response was lost is not charged again under the n
     return advisorCharges.length === 1 ? { value: { ...answer('').value, exitCode: 1 } }
       : answer(JSON.stringify({ title: state.title, total: 0, budget: 0, paused: false }))
   })
-  on('settings.read', () => ({ value: { advisorModel: 'opus' } }))
+  let advisorModel = 'opus'
+  let fableInput = 0
+  on('settings.read', () => ({ value: { advisorModel } }))
   let advisorInput = 0
   on('agent.list', () => ({ value: [{
     id: 'a1', description: '@parser', type: 'swarm:worker', status: 'running',
-    usage: [{ model: 'claude-opus-5-5', input_tokens: advisorInput, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }],
+    usage: [{ model: 'claude-opus-5-5', input_tokens: advisorInput, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      { model: 'claude-fable-5-2', input_tokens: fableInput }],
   }] as never }))
   on('tool.call', () => ({ result: {} }))
   let consulted = true
@@ -2165,6 +2168,15 @@ test('an advisor charge whose response was lost is not charged again under the n
   advisorInput = 150
   await step(5)
   expect(advisorCharges).toEqual([advisorCharges[0]!, advisorCharges[0]! / 2])
+  advisorModel = 'fable'
+  fableInput = 20
+  consulted = true
+  await step(6)
+  advisorInput += 15
+  consulted = false
+  await step(7)
+  await step(8)
+  expect(advisorCharges).toEqual([100, 50, 20, 15])
 })
 
 test('advisor tokens the roster already holds are not charged again by the first step after a reload', async ($, on) => {
@@ -8584,6 +8596,11 @@ test('TS audit regressions (#1, #2, #7, #12, #13, #16, #17, Task 5): board limit
   expect((await $.agent.spawn({ ...resumeBase, description: '@w1: resume', resume: { agentId: 'a1' } })).deny).toContain('is paused')
   expect((await $.agent.spawn({ ...resumeBase, description: '@w2: resume', resume: { agentId: 'a2' } })).deny).toContain('allows opus only for: none')
   expect((await $.agent.spawn({ ...resumeBase, description: '@w3: resume', resume: { agentId: 'a3' } })).deny).toContain('has not exposed a Messages request')
+
+  const originalLimits = stateA.limits
+  stateA.limits = { max_effort: 'medium' }
+  expect((await $.agent.spawn({ ...resumeBase, description: '@w3: resume', resume: { agentId: 'a3' } })).deny).toContain('has not exposed a Messages request')
+  stateA.limits = originalLimits
 
   // Bug #12: final-step advisor accounting on turn.complete under `${turnId}:end:advisor`
   advisorSetting = 'opus'
