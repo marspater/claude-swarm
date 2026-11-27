@@ -590,12 +590,12 @@ def readiness(members, posts):
 
 # The model and effort each agent type runs at unless the roster says otherwise.
 DEFAULTS = {"worker": ("sonnet", "medium"), "verifier": ("sonnet", "medium"), "explorer": ("haiku", "medium"),
-            "investigator": ("opus", "medium"), "architect": ("fable", "high"), "designer": ("opus", "high")}
+            "investigator": ("opus", "medium"), "architect": ("opus", "high"), "designer": ("opus", "high")}
 # Specialists read and report through the board tool. A designer is a profile that writes files, like a worker.
 READ_ONLY = {"explorer", "investigator", "architect"}
 PROFILES = {*READ_ONLY, "designer"}
 FAMILIES = ("haiku", "sonnet", "opus", "fable")
-LIMITS = {"max_workers", "max_members", "budget", "member_budget", *FAMILIES}
+LIMITS = {"max_effort", "advisor", "max_workers", "max_members", "budget", "member_budget", *FAMILIES}
 INHERITED = ("role", "group", "profile", "writes", "depends", "after", "owns", "paths", "model", "effort", "consult", "size", "reviews")
 MEMBER_FIELDS = {*INHERITED, "backend", "id", "killed", "isolated", "budget"}
 # The budget a run gets from its planned team, in charged tokens, until the user names one. A piece costs what its
@@ -794,6 +794,16 @@ def roster_counts(state):
 def family_limit_errors(state):
     limits, team = state.get("limits", {}), team_of(state["members"])
     errors = []
+    efforts = ("low", "medium", "high", "xhigh", "max")
+    ceiling = limits.get("max_effort")
+    if ceiling in efforts:
+        for member, entry in team.items():
+            if efforts.index(effort_of(entry)) > efforts.index(ceiling):
+                errors.append("@%s exceeds the run's %s effort ceiling" % (member, ceiling))
+    if all(limits.get(f) == "none" for f in ("haiku", "opus", "fable")):
+        for member, entry in team.items():
+            if family(model_of(entry)) == "sonnet" and model_of(entry).lower() not in ("sonnet", "claude-sonnet-5-5"):
+                errors.append("@%s must use Sonnet 5.5 for this run" % member)
     for name in FAMILIES:
         if name in limits:
             allowed = set(limits[name].split(",")) - {"none", ""}
@@ -2744,6 +2754,10 @@ def main(argv):
                    for k in changes if k in ("max_workers", "max_members", "budget", "member_budget")):
                 sys.exit("limits are max_workers=N max_members=N budget=TOKENS member_budget=TOKENS and <model>=<types>, "
                          "for models: " + " ".join(FAMILIES))
+            if changes.get("max_effort") not in (None, "", "low", "medium", "high", "xhigh", "max"):
+                sys.exit("invalid max_effort")
+            if changes.get("advisor") not in (None, "", "off", "opus", "fable"):
+                sys.exit("advisor takes opus, fable, or off")
             for model in FAMILIES:
                 if changes.get(model):  # stored as the list it is: "architect,,architect" and "," are not two more forms
                     changes[model] = ",".join(dict.fromkeys(token for token in changes[model].split(",") if token))
@@ -3809,7 +3823,15 @@ def main(argv):
                     or (member.get("role") == "verifier" and (bool(member.get("told", {}).get("ended"))
                                                               or (not unread(name) and (unverified or reviewing(name)))))
                 )]
-                if state.pop("paused", None) and halted:
+                was_paused = state.pop("paused", None)
+                team = team_of(members)
+                if (was_paused and team and not any(member.get("id") for member in team.values())
+                        and any(name not in ready and not member.get("paused") for name, member in team.items())):
+                    # No member has an address to wake. The pane's resume runs outside a coordinator turn.
+                    return post_message(COORDINATOR, "@coordinator The run resumed before anyone started. "
+                                        "Continue the existing plan and launch eligible members within the recorded "
+                                        "model limits. Swarm handles the advisor automatically.", [COORDINATOR], save_roster=True)
+                if was_paused and halted:
                     return post_message(COORDINATOR, "%s The run is resumed. Go on from where the pause stopped you."
                                         % " ".join("@" + name for name in halted), halted, save_roster=True)
             save(d, state)

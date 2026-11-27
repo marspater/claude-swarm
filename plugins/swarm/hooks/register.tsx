@@ -5,6 +5,7 @@ import type { AgentInfo, EngineInterface, Register, SessionMessage, Timer, ToolC
 import type { Member, Post, Swarm, Tab } from '../types'
 import { COORDINATOR_READ, RUN, boardCalls, type ParsedBoardCall, runsNamed, scanShell, shellWords, splitShellSegments, substitutions, unwrap, wakeMessage, wakeSequence, withoutRedirects } from './command'
 import { actsAsAnother, blocksRelativeBoardLimit, commitsInSharedCheckout, hasHiddenBoardLimit, normalizePath, resolveRealPath, waitsOnLooseMatch } from './guard'
+import { filterAdvisor } from './advisor'
 import { DEFAULT_EFFORT, DEFAULT_MODEL, LATEST, SPECIALISTS, SWARM_AGENTS, advisorBarred, familyOf, latestOf, sizedEffort } from './models'
 import { CONTEXT_EARLY, CONTEXT_STOP, END, KEPT, advisorSpent, budgetOf, contextState, findAgent, heldAt, isWindingDown, ledger, memberNamed, mentions, owedOf, parse, parsePosts, postFields, targets, tokensUsed, type BudgetState, type Report, type Roster } from './roster'
 import { CLIP, asksLiftBudget, bodyOf, chipped, clean, clip, clipPlain, compact, fenceAfter, fenced, figuresIn, hasQuestion, head, kindOf, openedText, pointsAt, repeatsPosts, verdictOf, type Fence } from './text'
@@ -4111,6 +4112,58 @@ export const register: Register = on => {
     return { isDelivered: false, reason: 'Swarm could not check this wake. Retry after checking the board.' }
   })
 
+  // The server executes advisor calls inside a model step. The outgoing declaration is the last place
+  // to enforce a limit, and carries the effective model even after a session override or a resume.
+  on('http.fetch', async ($, e, next) => {
+    const init = e.init
+    if (next.origin.plugin !== 'engine' || init?.method?.toUpperCase() !== 'POST' ||
+        !/\/v1\/messages\/?$/.test(e.url.split('?')[0]!) ||
+        typeof init.body !== 'string') return next(e)
+    const header = Object.entries(init.headers ?? {}).find(([key]) => key.toLowerCase() === 'x-claude-code-agent-id')
+    const id = header?.[1]
+    const dir = (id && agentRuns.get(id)) || ownedPath
+    if (!dir) return next(e)
+    const epoch = sessionEpoch
+    const state = JSON.parse(await $.fs.read(`${dir}/members.json`)) as BudgetState & { members: Roster; closed?: boolean }
+    if (state.closed) return next(e)
+    const sonnetOnly = ['haiku', 'opus', 'fable'].every(family => state.limits?.[family] === 'none')
+    const sonnetCeiling = state.limits?.opus === 'none' && state.limits?.fable === 'none'
+    const maxEffort = state.limits?.max_effort
+    if (!(id && (sonnetCeiling || maxEffort)) && !init.body.includes('"advisor')) return next(e)
+    let name = 'coordinator'
+    let kind = 'coordinator'
+    if (id) {
+      const memberById = (address?: string) => Object.entries(state.members).find(([, member]) =>
+        member.id && (member.id === id || member.id === address))
+      let member = memberById(teammates.get(id))
+      if (!member) {
+        const live = findAgent(await $.agent.list(), id)
+        member = memberById(live?.teammateId)
+        if (!member && live && !SWARM_AGENTS.has(live.type)) return next(e)
+        const starting = parseDescribedName(live?.description)
+        if (!member && starting && pendingStarts.has(`${dir}/${starting}`) && state.members[starting]) {
+          member = [starting, state.members[starting]!]
+        }
+        if (!member && !live && !agentRuns.has(id) && !pendingStarts.size) return next(e)
+      }
+      // Before the host publishes an address, use no name or type exception.
+      name = member?.[0] ?? ''
+      kind = member ? member[1].profile || member[1].role || 'worker' : ''
+    }
+    if (epoch !== sessionEpoch || dir !== ((id && agentRuns.get(id)) || ownedPath)) {
+      return { deny: 'The Swarm run changed during its model request.' }
+    }
+    const barred = Object.keys(LATEST).filter(family => advisorBarred(state.limits, family, kind, name))
+    const preferred = state.limits?.advisor === 'fable' ? LATEST.fable : LATEST.opus
+    const requestedModel = id && sonnetCeiling ? (JSON.parse(init.body) as { model?: string }).model : undefined
+    const pinSonnet = requestedModel && (sonnetOnly || familyOf(requestedModel) !== 'haiku')
+    const body = filterAdvisor(init.body, state.limits?.advisor === 'off' ? Object.keys(LATEST) : barred,
+      preferred, pinSonnet ? LATEST.sonnet : undefined, id ? maxEffort : undefined)
+    if (body === init.body) return next(e)
+    const headers = Object.fromEntries(Object.entries(init.headers ?? {}).filter(([key]) => key.toLowerCase() !== 'content-length'))
+    return next({ ...e, init: { ...init, headers, body } })
+  }).catch((_, e, next) => next.called ? next(e) : { deny: 'Swarm could not apply the run’s advisor limits to this model request.' })
+
   on('agent.spawn', async ($, e, next) => {
     if (!SWARM_AGENTS.has(e.subagentType)) return next(e)
     const epoch = sessionEpoch
@@ -4256,12 +4309,7 @@ export const register: Register = on => {
             : `This run allows ${runsOn} only for: ${allowed.join(', ') || 'none'}. Change @${memberName}'s model= with the board's member command before resuming it.` }
         }
       }
-      const isLimited = Object.keys(LATEST).some(family => state.limits !== undefined && Object.hasOwn(state.limits, family))
-      const barred = isLimited ? advisorBarred(state.limits, await $.settings.read({ key: 'advisorModel' }), kind, memberName) : undefined
-      if (barred) {
-        logEvent($, owned, 'refused', { member: memberName, why: `advisor on ${barred.family}, which the run's limits keep it off` })
-        return { deny: `This run allows ${barred.family} only for: ${barred.allowed.join(', ') || 'none'}, and this session's advisor answers on ${barred.family}. @${memberName} would inherit that advisor, and nothing can refuse an advisor call once a member runs. Start no member. Tell the user the limit and the advisor conflict, and ask which holds: they turn the advisor off for this session (/advisor off), or they lift the limit on ${barred.family}. Then start the team.` }
-      }
+      // The Messages hook applies the current advisor policy to resumed agents too.
       if (epoch !== sessionEpoch || requestedUnder !== generation || isEnding || killedRun === owned) {
         return { deny: 'The Swarm run changed before the agent could resume.' }
       }
@@ -4361,6 +4409,7 @@ export const register: Register = on => {
     }
     const isExactModel = (m: string) => /(?:^|\.)claude-/i.test(m) || (m !== 'inherit' && !Object.hasOwn(LATEST, m.toLowerCase()))
     let modelToUse: string | undefined
+    let advisorNote = ''
     {
       const kind = e.subagentType.slice('swarm:'.length)
       // The type is what the roster says: the default model, the limits and the board tool all follow it.
@@ -4393,13 +4442,9 @@ export const register: Register = on => {
       if (allowed && !allowed.includes(kind) && !allowed.includes(named)) {
         return { deny: `This run allows ${runsOn} only for: ${allowed.join(', ') || 'none'}. Register @${named} with another model= and pass that model on the Agent call.` }
       }
-      // A read that fails starts nobody, as every check here: this hook's own catch refuses the start.
-      // Asked only of a run that limits a family at all: no other can bar an advisor.
-      const isLimited = Object.keys(LATEST).some(family => state.limits !== undefined && Object.hasOwn(state.limits, family))
-      const barred = isLimited ? advisorBarred(state.limits, await $.settings.read({ key: 'advisorModel' }), kind, named) : undefined
-      if (barred) {
-        logEvent($, owned, 'refused', { member: named, why: `advisor on ${barred.family}, which the run's limits keep it off` })
-        return { deny: `This run allows ${barred.family} only for: ${barred.allowed.join(', ') || 'none'}, and this session's advisor answers on ${barred.family}. @${named} would inherit that advisor, and nothing can refuse an advisor call once a member runs. Start no member. Tell the user the limit and the advisor conflict, and ask which holds: they turn the advisor off for this session (/advisor off), or they lift the limit on ${barred.family}. Then start the team.` }
+      const barred = Object.keys(LATEST).filter(family => advisorBarred(state.limits, family, kind, named))
+      if (barred.length) {
+        advisorNote = `\n\nUse your assigned model for the work. Skip the advisor when its model is unknown or belongs to these restricted families: ${barred.join(', ')}.`
       }
       // The roster's model, or the type's default when it names none: a model passed only on the
       // Agent call would otherwise skip the plan the user saw and the board's rules for the type.
@@ -4451,8 +4496,8 @@ export const register: Register = on => {
       // of that family, and a call that names no model gets its type's default.
       const background = !e.isTeammate ? true : e.background
       const started = await next(
-        modelToUse !== e.model || background !== e.background
-          ? { ...e, model: modelToUse, background }
+        modelToUse !== e.model || background !== e.background || advisorNote
+          ? { ...e, model: modelToUse, background, prompt: e.prompt + advisorNote }
           : e,
       )
       if (started.agentId) {
@@ -4946,20 +4991,26 @@ export const register: Register = on => {
   on('ui.render', { component: 'AbovePromptList' }, async ($, e, next) => {
     const isOwn = (row: { plugin: string }) => row.plugin === $.plugin.name
     const peers = e.props.rows.filter(row => !isOwn(row))
-    // The row held while the pane is in view is drawn by nobody: the others' rows go on as they came.
-    if (e.props.rows.some(row => isOwn(row) && findKey(row.tree, BAND_HELD))) return next({ ...e, props: { ...e.props, rows: peers } })
+    const isHeld = e.props.rows.some(row => isOwn(row) && findKey(row.tree, BAND_HELD))
     // When Crab Buddy renders last its finished tree is available only here.
     // Keep its row intact so the host retains its animation and event handlers.
-    if (e.surface !== 'desktop' || e.props.hasSurvey || !e.props.rows.some(isOwn) ||
-        peers.length !== 1 || !findKey(peers[0]?.tree, 'crab-fill')) return next(e)
+    const isCrabOnly = e.surface === 'desktop' && !e.props.hasSurvey && peers.length === 1 && !!findKey(peers[0]?.tree, 'crab-fill')
+    // The row held while the pane is in view is drawn by nobody: the others' rows go on as they came.
+    if (isHeld && !isCrabOnly) return next({ ...e, props: { ...e.props, rows: peers } })
+    if (!isCrabOnly || !e.props.rows.some(isOwn)) return next(e)
     const { Box } = $.ui.resolve(e)
     const crab = await next({ ...e, props: { ...e.props, rows: peers } })
+    // Beside Swarm's row, held or drawn, Crab Buddy lays no ground of its own and stood on the app's gray card (seen
+    // 2026-11-26): the ground it lays when alone is laid here, with its reach into the card's padding. Over a
+    // backdrop the card is glass, and nothing is laid on it.
+    const ground = { backgroundColor: isFrosted ? undefined : 'userMessageBackground', marginTop: -2, paddingTop: 2, marginBottom: -1.16, paddingBottom: 1.16, marginRight: -2, paddingRight: 2 } as const
+    if (isHeld) return <Box flexDirection="column" {...ground} marginLeft={-2} paddingLeft={2}>{crab}</Box>
     const shown = await read($, swarm)
     const offset = phase(`${e.surface}:shortcut`, shown.dir, emblemStateOf(shown), await $.clock.now().catch(() => 0))
-    // 1.25 cells sits the caption about 6 px nearer the button than 2 did.
+    // 1.25 cells sits the caption about 6 px nearer the button than 2 did; the crab's ground reaches back over them.
     return <Box flexDirection="row" columnGap={1.25}>
       {shortcut($, e, textCount(findKey(peers[0]?.tree, 'crab-text')) === 1, shown, offset, true)}
-      <Box flexDirection="column" flexGrow={1} flexShrink={1}>{crab}</Box>
+      <Box flexDirection="column" flexGrow={1} flexShrink={1} {...ground} marginLeft={-1.25} paddingLeft={1.25}>{crab}</Box>
     </Box>
   })
 

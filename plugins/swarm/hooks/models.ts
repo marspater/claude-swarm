@@ -15,7 +15,7 @@ export const latestOf = (model: string | undefined) => {
 }
 // The model each agent type starts on when the Agent call names none; board.py holds the same table.
 export const DEFAULT_MODEL: Record<string, string> = {
-  worker: LATEST.sonnet!, verifier: LATEST.sonnet!, explorer: LATEST.haiku!, investigator: LATEST.opus!, architect: LATEST.fable!, designer: LATEST.opus!,
+  worker: LATEST.sonnet!, verifier: LATEST.sonnet!, explorer: LATEST.haiku!, investigator: LATEST.opus!, architect: LATEST.opus!, designer: LATEST.opus!,
 }
 export const DEFAULT_EFFORT: Record<string, string> = { worker: 'medium', verifier: 'medium', explorer: 'medium', investigator: 'medium', architect: 'high', designer: 'high' }
 // As board.py's sized_effort: with no effort named, a small piece runs a step under its type's default and a large
@@ -29,13 +29,7 @@ export const sizedEffort = (kind: string, size?: string) => {
 export const familyOf = (model: string) =>
   Object.keys(LATEST).find(name => model.toLowerCase().includes(name)) ?? model
 
-/**
- * The family the run's limits keep member NAME (of type KIND) off although the session's advisor answers on it, and
- * whom the limit allows. A member inherits the session's advisor (`advisorModel` in the settings), the API runs its
- * calls inside the member's own steps, and no hook can refuse one: so a limit on a family is kept at the start, or not
- * at all. Seen live: a run limited to `fable=none` had two Sonnet workers consult a Fable advisor, 135k tokens the
- * budget never counted and a six-minute call that timed out.
- */
+/** The run's restriction on this advisor family, taking the member's profile and name into account. */
 export function advisorBarred(limits: Record<string, string> | undefined, advisorModel: unknown, kind: string, name: string): { family: string; allowed: string[] } | undefined {
   if (typeof advisorModel !== 'string' || advisorModel.trim() === '') return undefined
   const family = familyOf(latestOf(advisorModel.trim()) ?? '')

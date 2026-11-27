@@ -136,7 +136,7 @@ def scenario():
         run(d, "limit", "fable=architect", "max_workers=6")
         run(d, "member", "probe", "profile=investigator", "writes=0", "model=fable", ok=False)  # Fable is an escalation only
         run(d, "member", "probe", "profile=investigator", "writes=0", "model=opus", "effort=high", "owns=the retry bug")
-        run(d, "member", "design", "profile=architect", "writes=0")
+        run(d, "member", "design", "profile=architect", "writes=0", "model=fable")
         run(d, "member", "extra", ok=False)  # a seventh worker
         plan = run(d, "plan")
         assert "@probe" in plan and "investigator" in plan and "the retry bug" in plan and "limits:" in plan
@@ -322,6 +322,13 @@ def scenario():
         run(escalation, "member", "trace", "model=claude-fable-5-2", ok=False)
         run(escalation, "replace", "trace", "trace-2", "model=fable", "effort=medium")
         assert "fable" in run(escalation, "plan")
+        # an architect starts on Opus and takes Fable at any time, a consultant too: the coordinator judges the scope
+        sage_run = run(name, "init", "Sage").strip()
+        run(sage_run, "member", "sage", "profile=architect", "writes=0", "consult=1")
+        assert "opus" in run(sage_run, "plan") and "fable" not in run(sage_run, "plan")
+        run(sage_run, "replace", "sage", "sage-2", "model=fable")
+        assert saved(sage_run)["members"]["sage-2"]["consult"] == "1" and "fable" in run(sage_run, "plan")
+        run(sage_run, "member", "plan", "profile=architect", "writes=0", "model=fable")
 
         # adopt: a conversation that never typed a recognisable board command still gets its run,
         # the newest open one that registers the member it is starting, and nobody else's
@@ -1109,6 +1116,17 @@ class BoardRegressions(unittest.TestCase):
                     os.environ[board.SHARED_LOCK] = before
         finally:
             sys.path.remove(os.path.dirname(BOARD))
+
+    def test_resume_before_anyone_started_wakes_coordinator_once(self):
+        d = self.init_run()
+        run(d, "limit", "fable=none", "opus=none", "haiku=none")
+        run(d, "member", "core", "profile=investigator", "model=sonnet")
+        run(d, "post", "coordinator", stdin="@core BRIEF\nTrace the timer.")
+        run(d, "pause", "waiting on advisor")
+        assert "@coordinator" in run(d, "resume")
+        assert run(d, "resume") == ""
+        assert "launch eligible members" in run(d, "read", "coordinator")
+        assert saved(d)["limits"]["fable"] == "none"
 
     def test_resume_wakes_consultant_and_verifier(self):
         d = self.init_run()

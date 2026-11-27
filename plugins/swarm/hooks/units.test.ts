@@ -1,5 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import type { Post } from '../types'
+import { filterAdvisor } from './advisor'
 import { BOARD_CALL, CASE_PATTERN, COORDINATOR_READ, RUN, boardCalls, closesAfter, launches, makesCommit, runsNamed, scanShell, scriptsRun, shellLaunch, shellWords, splitShellSegments, substitutions, UNREAD, unwrap, wakeMessage, wakeSequence } from './command'
 import { edgesOf, graphSvg, isBroadcast } from './graph'
 import { actsAsAnother, commitsInSharedCheckout, hasHiddenBoardLimit, resolveRealPath, waitsOnLooseMatch } from './guard'
@@ -1904,4 +1905,41 @@ test('a folder change the guard cannot read off the command word still unsettles
   }
   expect(actsAsAnother(`D=cd; "$D" /other; python3 /p/board.py ${run} post alice hi`, 'alice', alice, run, '/project')).toBeUndefined()
   expect(actsAsAnother(`echo hi; ${relative}`, 'alice', alice, run, '/project')).toBeUndefined()
+})
+
+test('advisor limits remove active and deferred declarations while preserving messages and other tools', async () => {
+  const read = { name: 'Read', input_schema: { type: 'object' } }
+  const advisor = { name: 'advisor', type: 'advisor_20260301', model: 'claude-fable-5-2', defer_loading: true }
+  const reference = { type: 'tool_reference', name: 'advisor' }
+  const choice = { type: 'tool', name: 'advisor' }
+  const text = { type: 'text', text: 'Keep this discussion of advisor verbatim.' }
+  const found = { type: 'tool_result', tool_use_id: 'lookup', content: [{ type: 'tool_reference', tool_name: 'advisor' }, text] }
+  const kept = { ...found, content: [text] }
+  const input = {
+    model: 'claude-sonnet-5-5', tools: [read, advisor], tool_choice: choice,
+    messages: [
+      { role: 'system', content: [{ type: 'tool_addition', tool: reference }] },
+      { role: 'system', content: [text, { type: 'tool_addition', tool: { type: 'tool_definition', definition: advisor } }] },
+      { role: 'user', content: [text, found] },
+    ],
+  }
+  const original = JSON.stringify(input)
+  expect(JSON.parse(filterAdvisor(original, ['fable']))).toEqual({
+    model: input.model, tools: [read], messages: [
+      { role: 'system', content: [text] }, { role: 'user', content: [text, kept] },
+    ],
+  })
+  expect(JSON.parse(filterAdvisor(original, [], 'claude-opus-5-5')).tools[1].model).toBe('claude-opus-5-5')
+  expect(filterAdvisor(original, [], 'claude-fable-5-2')).toBe(original)
+  const strict = JSON.parse(filterAdvisor(original.replaceAll('claude-fable-5-2', 'claude-sonnet-5-5'), ['sonnet', 'haiku', 'opus', 'fable'], 'claude-opus-5-5', 'claude-sonnet-5-5'))
+  expect(strict.tools).toEqual([read])
+  const offeredSonnet = original.replaceAll('claude-fable-5-2', 'claude-sonnet-5-5')
+  expect(JSON.parse(filterAdvisor(offeredSonnet, ['opus', 'fable'], 'claude-opus-5-5', undefined, 'medium')).tools[1].model).toBe('claude-sonnet-5-5')
+  expect(JSON.parse(filterAdvisor(original, ['opus', 'fable'], 'claude-opus-5-5', undefined, 'medium')).output_config.effort).toBe('medium')
+  expect(filterAdvisor(original, [])).toBe(original)
+  expect(filterAdvisor(original, ['opus'])).toBe(original)
+  const deferred = JSON.stringify({ messages: [input.messages[1], input.messages[2]] })
+  expect(JSON.parse(filterAdvisor(deferred, ['fable'])).messages).toEqual([
+    { role: 'system', content: [text] }, { role: 'user', content: [text, kept] },
+  ])
 })

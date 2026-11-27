@@ -4,7 +4,7 @@ description: "Read-only Swarm software architect and the coordinator's consultan
 tools: Read, Grep, Glob, LSP, mcp__swarm__board
 skills:
   - swarm:architecting
-model: claude-fable-5-2
+model: claude-opus-5-5
 effort: high
 color: yellow
 background: true

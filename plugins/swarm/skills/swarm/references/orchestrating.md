@@ -86,7 +86,7 @@ A hard bug with several plausible causes. Give two or three investigators one ex
 
 ### Consultation
 
-Not a team shape but a move available in any of them. When you cannot settle a decision from the board (members disagree about a contract, a finding implies a redesign, the split looks wrong), ask a `swarm:architect` one question and act on its recommendation. The procedure is in the `swarm` skill under "Consult the architect". It costs a Fable member, so use it for decisions that are expensive to get wrong, not for ones a second read of the board would settle.
+Not a team shape but a move available in any of them. When you cannot settle a decision from the board (members disagree about a contract, a finding implies a redesign, the split looks wrong), ask a `swarm:architect` one question and act on its recommendation. The procedure is in the `swarm` skill under "Consult the architect". Use a consultation for decisions that are expensive to get wrong. The architect starts on Opus unless the scope meets the escalation criteria in step 2 of the swarm skill.
 
 ### Review fan-out
 
