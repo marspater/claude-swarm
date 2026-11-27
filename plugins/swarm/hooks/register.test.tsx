@@ -566,6 +566,10 @@ test('the shortcut leads crab-buddy\'s row and Swarm\'s own row goes', async ($,
   const band = await $.ui.mount({ component: 'AbovePrompt', plugin: 'swarm', surface: 'desktop', props })
   // One row: the shortcut first on the crab's line, Swarm's own row left out.
   expect(keys(await band.drawn() as Tree)).toEqual(['swarm-board-shortcut', 'crab-band', 'crab-fill', 'crab-text', 'crab-buddy'])
+  // Beside another plugin's row crab-buddy lays no ground of its own: Swarm lays the chat's under it, as under its
+  // button, so neither stands on the app's gray card whether or not the other is drawn.
+  const grounds = async (drawn: typeof band) => (await drawn.findAll({ type: 'Box' })).map(one => one.props.backgroundColor).filter(Boolean)
+  expect(await grounds(band)).toEqual(['userMessageBackground', 'userMessageBackground'])
   expect(await band.find({ type: 'Button', text: /Swarm Board/ })).toBeDefined()
   await band.press({ key: 'swarm-board-shortcut' })
   expect(opened).toEqual(['swarm'])
@@ -582,6 +586,8 @@ test('the shortcut leads crab-buddy\'s row and Swarm\'s own row goes', async ($,
   shown = true
   const visible = await $.ui.mount({ component: 'AbovePrompt', plugin: 'swarm', surface: 'desktop', props })
   expect(keys(await visible.drawn() as Tree)).toEqual(['crab-band', 'crab-fill', 'crab-text', 'crab-buddy'])
+  // Seen live (2026-11-26): with the pane in view the crab stood alone on the gray card.
+  expect(await grounds(visible)).toEqual(['userMessageBackground'])
   // The app closes the pane and tells the plugin nothing: the button is back within a second, not at the next redraw.
   shown = false
   await clock.advance(1000)
@@ -1019,7 +1025,7 @@ test('a member starts only on the model the roster and the limits allow', async 
   const members = {
     coordinator: {},
     probe: { profile: 'investigator', model: 'sonnet' },
-    design: { profile: 'architect' },
+    design: { profile: 'architect', model: 'fable' },  // escalated: an architect's default is Opus
     scout: { profile: 'investigator' },
     art: { profile: 'designer' },
     parser: {},
@@ -1045,7 +1051,6 @@ test('a member starts only on the model the roster and the limits allow', async 
     }
   })
   on('fs.read', () => ({ value: JSON.stringify({ title: 'Demo', members, closed, limits: { fable: 'architect' } }) }))
-  on('settings.read', () => ({ value: {} }))  // a run that limits a family asks what the session's advisor answers on
   const startedOn: (string | undefined)[] = []
   on('agent.spawn', (_, e) => {
     startedOn.push(e.model)
@@ -1071,6 +1076,7 @@ test('a member starts only on the model the roster and the limits allow', async 
   expect(startedOn).toEqual(['claude-sonnet-5-5'])
   // fable is reserved for the architect
   expect((await $.agent.spawn({ ...spawn, description: '@design: storage plan', subagentType: 'swarm:architect' })).agentId).toBe('started')
+  expect(startedOn.at(-1)).toBe('claude-fable-5-2')
   const parser = { ...spawn, description: '@parser: date.ts', subagentType: 'swarm:worker' }
   expect((await $.agent.spawn({ ...parser, model: 'claude-fable-5-2' })).deny).toContain('only for: architect')
   expect((await $.agent.spawn(parser)).agentId).toBe('started')
@@ -2124,11 +2130,14 @@ test('an advisor charge whose response was lost is not charged again under the n
     return advisorCharges.length === 1 ? { value: { ...answer('').value, exitCode: 1 } }
       : answer(JSON.stringify({ title: state.title, total: 0, budget: 0, paused: false }))
   })
-  on('settings.read', () => ({ value: { advisorModel: 'opus' } }))
+  let advisorModel = 'opus'
+  let fableInput = 0
+  on('settings.read', () => ({ value: { advisorModel } }))
   let advisorInput = 0
   on('agent.list', () => ({ value: [{
     id: 'a1', description: '@parser', type: 'swarm:worker', status: 'running',
-    usage: [{ model: 'claude-opus-5-5', input_tokens: advisorInput, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }],
+    usage: [{ model: 'claude-opus-5-5', input_tokens: advisorInput, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      { model: 'claude-fable-5-2', input_tokens: fableInput }],
   }] as never }))
   on('tool.call', () => ({ result: {} }))
   let consulted = true
@@ -2159,6 +2168,15 @@ test('an advisor charge whose response was lost is not charged again under the n
   advisorInput = 150
   await step(5)
   expect(advisorCharges).toEqual([advisorCharges[0]!, advisorCharges[0]! / 2])
+  advisorModel = 'fable'
+  fableInput = 20
+  consulted = true
+  await step(6)
+  advisorInput += 15
+  consulted = false
+  await step(7)
+  await step(8)
+  expect(advisorCharges).toEqual([100, 50, 20, 15])
 })
 
 test('advisor tokens the roster already holds are not charged again by the first step after a reload', async ($, on) => {
@@ -2711,6 +2729,7 @@ test('agent.spawn handles model=inherit, exact older IDs, spawnEfforts, parallel
   let run1Deleted = false
   let boundDir = ''
   const spawned: { model?: string; background?: boolean }[] = []
+  const prompts: string[] = []
   const agents: { id: string; teammateId?: string; description: string; type: string; status: string }[] = []
   const state1 = {
     title: 'First',
@@ -2731,8 +2750,7 @@ test('agent.spawn handles model=inherit, exact older IDs, spawnEfforts, parallel
     title: 'Second',
     members: { coordinator: {}, w1: { role: 'worker' }, w2: { role: 'worker' } },
   }
-  let advisor: string | undefined
-  on('settings.read', () => ({ value: advisor === undefined ? {} : { advisorModel: advisor } }))
+  on('settings.read', () => ({ deny: 'fixture settings unavailable' }))
   on('command.register', (_, spec) => ({ value: { command: spec.name } }))
   on('tool.register', (_, spec) => ({ value: { tool: `mcp__swarm__${spec.name}` } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -2766,6 +2784,7 @@ test('agent.spawn handles model=inherit, exact older IDs, spawnEfforts, parallel
   })
   on('agent.spawn', (_, e) => {
     spawned.push({ model: e.model, background: e.background })
+    prompts.push(e.prompt)
     return { model: e.model ?? 'sonnet', agentId: `id-${spawned.length}` }
   })
   mock.clock(on)
@@ -2777,16 +2796,12 @@ test('agent.spawn handles model=inherit, exact older IDs, spawnEfforts, parallel
   }
   // `opus=none` is enforced even for a member literally named `none`
   expect((await $.agent.spawn({ ...base, description: '@none: test', model: 'opus' })).deny).toContain('allows opus only for: none')
-  // Seen live (2026-11-25): `fable=none`, and two Sonnet workers consulted the session's Fable advisor. A member
-  // inherits the advisor and no hook can refuse its calls, so a family the run keeps it off bars the start itself.
-  advisor = 'opus'
-  const barred = (await $.agent.spawn({ ...base, description: '@w1: test' })).deny
-  expect(barred).toContain('this session\'s advisor answers on opus')
-  expect(barred).toContain('/advisor off')
-  expect(spawned).toHaveLength(0)
-  advisor = 'haiku'  // a family the run does not limit
+  // A limited member starts on its registered model. Its prompt covers session overrides too.
+  expect((await $.agent.spawn({ ...base, description: '@w1: test' })).agentId).toBe('id-1')
+  expect(prompts.at(-1)).toContain('restricted families: opus')
   // `model=inherit` rewrites to parentModel and `background: true` when !isTeammate
-  expect((await $.agent.spawn({ ...base, description: '@inh: test' })).agentId).toBe('id-1')
+  expect((await $.agent.spawn({ ...base, description: '@inh: test' })).agentId).toBe('id-2')
+  expect(prompts.at(-1)).toStartWith('Use the board.')
   expect(spawned.at(-1)).toEqual({ model: 'claude-sonnet-5-5', background: true })
   // F7: the docs say to omit model or pass the matching family. A coordinator on an older model of that family
   // still starts the member on its own model, and a refusal never advises model: "inherit", which Agent does not take.
@@ -2800,9 +2815,9 @@ test('agent.spawn handles model=inherit, exact older IDs, spawnEfforts, parallel
   expect(spawned.at(-1)?.model).toBe('claude-sonnet-4-5')
   // exact older ID and Bedrock ID pass when e.model is omitted or matches family
   state1.limits = {} as never
-  expect((await $.agent.spawn({ ...base, description: '@exact: test' })).agentId).toBe('id-4')
+  expect((await $.agent.spawn({ ...base, description: '@exact: test' })).agentId).toBe('id-5')
   expect(spawned.at(-1)?.model).toBe('claude-opus-4-6')
-  expect((await $.agent.spawn({ ...base, description: '@bedrock: test', model: 'opus' })).agentId).toBe('id-5')
+  expect((await $.agent.spawn({ ...base, description: '@bedrock: test', model: 'opus' })).agentId).toBe('id-6')
   expect(spawned.at(-1)?.model).toBe('us.anthropic.claude-opus-4-6-v1')
   // spawnEfforts enforcement via tool.call('Agent')
   await toolCall($, { tool: 'Agent', tool_use_id: 'eff-1', effort: 'high' } as never)
@@ -8572,14 +8587,20 @@ test('TS audit regressions (#1, #2, #7, #12, #13, #16, #17, Task 5): board limit
   expect((await toolCall($, { tool: 'mcp__swarm__board', action: 'limit', options: ['budget=0'] } as never)).deny).toBeUndefined()
   expect(boardCallsSeen.at(-1)?.argv).toEqual(['limit', '--raise', 'budget=0'])
 
-  // Bug #7: e.resume checks member.paused, family limits, and advisorBarred
+  // Bug #7: e.resume checks member.paused and family limits. An advisor on a barred family refuses no resume: a
+  // resume keeps its prompt and the Messages hook applies the current advisor limits.
   const resumeBase = {
     tool_use_id: 'res-1', prompt: 'continue', subagentType: 'swarm:worker',
     provider: { plugin: 'swarm', tier: 'core' as const }, parentModel: 'claude-sonnet-5-5', background: true, fork: false,
   }
   expect((await $.agent.spawn({ ...resumeBase, description: '@w1: resume', resume: { agentId: 'a1' } })).deny).toContain('is paused')
   expect((await $.agent.spawn({ ...resumeBase, description: '@w2: resume', resume: { agentId: 'a2' } })).deny).toContain('allows opus only for: none')
-  expect((await $.agent.spawn({ ...resumeBase, description: '@w3: resume', resume: { agentId: 'a3' } })).deny).toContain('this session\'s advisor answers on opus')
+  expect((await $.agent.spawn({ ...resumeBase, description: '@w3: resume', resume: { agentId: 'a3' } })).deny).toContain('has not exposed a Messages request')
+
+  const originalLimits = stateA.limits
+  stateA.limits = { max_effort: 'medium' }
+  expect((await $.agent.spawn({ ...resumeBase, description: '@w3: resume', resume: { agentId: 'a3' } })).deny).toContain('has not exposed a Messages request')
+  stateA.limits = originalLimits
 
   // Bug #12: final-step advisor accounting on turn.complete under `${turnId}:end:advisor`
   advisorSetting = 'opus'

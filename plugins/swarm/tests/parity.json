@@ -1674,7 +1674,7 @@
  ],
  "actions": ["account", "adopt", "agent-run", "attention", "bind", "claim", "close", "confirm", "dispatch", "event", "export", "init", "kill", "limit", "locate", "member", "pause", "plan", "post", "prune", "read", "ready", "rearm", "replace", "restore", "resume", "retry", "revise", "show", "started", "status", "sync", "tail", "unclaim", "wake", "woke"],
  "effort": [["worker", "", "medium"], ["worker", "s", "low"], ["worker", "l", "high"], ["investigator", "s", "low"], ["investigator", "l", "high"], ["architect", "s", "medium"], ["architect", "l", "high"], ["explorer", "s", "low"], ["verifier", "m", "medium"]],
- "defaults": {"worker": ["sonnet", "medium"], "verifier": ["sonnet", "medium"], "explorer": ["haiku", "medium"], "investigator": ["opus", "medium"], "architect": ["fable", "high"], "designer": ["opus", "high"]},
+ "defaults": {"worker": ["sonnet", "medium"], "verifier": ["sonnet", "medium"], "explorer": ["haiku", "medium"], "investigator": ["opus", "medium"], "architect": ["opus", "high"], "designer": ["opus", "high"]},
  "edges": [
   {"posts": [{"agent": "a", "to": ["b"], "text": "@b hi"}], "expect": {"a>b": 1}},
   {"posts": [{"agent": "a", "to": ["b", "c"], "text": "@all heads up, @b first"}], "expect": {"a>@all": 1, "a>b": 1, "a>c>all": 1}},
