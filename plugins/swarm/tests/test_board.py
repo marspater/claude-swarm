@@ -1127,6 +1127,21 @@ class BoardRegressions(unittest.TestCase):
         run(d, "member", "reader", "model=claude-sonnet-4-6", "effort=medium")
         assert saved(d)["members"]["arch"]["effort"] == "high"
 
+    def test_invalid_saved_effort_can_be_repaired_under_ceiling(self):
+        d = self.init_run()
+        run(d, "member", "reader", "effort=medium")
+        state = saved(d)
+        state["members"]["reader"]["effort"] = "turbo"
+        with open(os.path.join(d, "members.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        for output in (run(d, "limit", "max_effort=medium"), run(d, "plan")):
+            assert "@reader has unsupported effort 'turbo'" in output
+        run(d, "member", "reader", "effort=high", ok=False)
+        assert saved(d)["members"]["reader"]["effort"] == "turbo"
+        run(d, "member", "reader", "effort=medium")
+        assert saved(d)["members"]["reader"]["effort"] == "medium"
+        assert "over limit:" not in run(d, "plan")
+
     def test_resume_before_anyone_started_wakes_coordinator_once(self):
         d = self.init_run()
         run(d, "limit", "fable=none", "opus=none", "haiku=none")

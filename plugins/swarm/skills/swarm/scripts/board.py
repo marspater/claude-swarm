@@ -755,6 +755,7 @@ def model_of(member):
 # The effort a piece runs at when none is named follows its size: a small piece one step under its type's default, a
 # large one a step over, never past high. An estimate, like the sizes: tune it against the Usage table.
 EFFORT_STEPS = ("low", "medium", "high")
+EFFORT_LEVELS = (*EFFORT_STEPS, "xhigh", "max")
 
 
 def sized_effort(kind, size):
@@ -794,11 +795,13 @@ def roster_counts(state):
 def family_limit_errors(state):
     limits, team = state.get("limits", {}), team_of(state["members"])
     errors = []
-    efforts = ("low", "medium", "high", "xhigh", "max")
     ceiling = limits.get("max_effort")
-    if ceiling in efforts:
+    if ceiling in EFFORT_LEVELS:
         for member, entry in team.items():
-            if efforts.index(effort_of(entry)) > efforts.index(ceiling):
+            effort = effort_of(entry)
+            if effort not in EFFORT_LEVELS:
+                errors.append("@%s has unsupported effort %r; set effort=%s or lower" % (member, effort, ceiling))
+            elif EFFORT_LEVELS.index(effort) > EFFORT_LEVELS.index(ceiling):
                 errors.append("@%s exceeds the run's %s effort ceiling" % (member, ceiling))
     for name in FAMILIES:
         if name in limits:
@@ -2681,10 +2684,11 @@ def main(argv):
                     if dep not in seen:
                         seen.add(dep)
                         frontier.extend(dependencies(members.get(dep, {})))
-            levels = ("low", "medium", "high", "xhigh", "max")
             ceiling = state.get("limits", {}).get("max_effort")
-            if not created and ceiling in levels and not member.get("killed"):
-                if levels.index(effort_of(member)) > max(levels.index(ceiling), levels.index(effort_of(previous))):
+            if not created and ceiling in EFFORT_LEVELS and not member.get("killed"):
+                old, new = effort_of(previous), effort_of(member)
+                if (old in EFFORT_LEVELS and new in EFFORT_LEVELS
+                        and EFFORT_LEVELS.index(new) > max(EFFORT_LEVELS.index(ceiling), EFFORT_LEVELS.index(old))):
                     sys.exit("effort increase exceeds the run's %s ceiling" % ceiling)
             errors = added_limit_errors(state, before_counts, before_family)
             if errors:
