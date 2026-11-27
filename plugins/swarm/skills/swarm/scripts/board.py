@@ -709,7 +709,7 @@ def validate_member(name, member, changes, members):
             raise ValueError(f"{flag} must be 0 or 1")
     if "size" in changes and changes["size"] not in {"", *SIZES}:
         raise ValueError("size is s, m or l: how large this member's piece of the task is")
-    if "effort" in changes and changes["effort"] not in {"", "low", "medium", "high", "xhigh", "max"}:
+    if "effort" in changes and changes["effort"] not in ("", *EFFORT_LEVELS):
         raise ValueError("effort must be low, medium, high, xhigh, or max")
     if "effort" in changes:  # named now, whatever it started on
         member.pop("sized", None)
@@ -755,6 +755,7 @@ def model_of(member):
 # The effort a piece runs at when none is named follows its size: a small piece one step under its type's default, a
 # large one a step over, never past high. An estimate, like the sizes: tune it against the Usage table.
 EFFORT_STEPS = ("low", "medium", "high")
+EFFORT_LEVELS = (*EFFORT_STEPS, "xhigh", "max")
 
 
 def sized_effort(kind, size):
@@ -765,13 +766,14 @@ def sized_effort(kind, size):
 
 
 def effort_of(member):
-    return member.get("effort") or sized_effort(kind_of(member), member.get("size"))
+    effort = member.get("effort")
+    return sized_effort(kind_of(member), member.get("size")) if effort in (None, "") else effort
 
 
 def started_as(member):
     """Records what MEMBER starts on. A default changed later, or a size, then moves no member already running, and a
     report of the run says what it really ran on."""
-    if not member.get("effort"):  # taken from its size, which the allocation has already counted
+    if member.get("effort") in (None, ""):  # taken from its size, which the allocation has already counted
         member["effort"], member["sized"] = effort_of(member), "1"
     if not member.get("model"):
         member["model"] = family(model_of(member))
@@ -794,11 +796,13 @@ def roster_counts(state):
 def family_limit_errors(state):
     limits, team = state.get("limits", {}), team_of(state["members"])
     errors = []
-    efforts = ("low", "medium", "high", "xhigh", "max")
     ceiling = limits.get("max_effort")
-    if ceiling in efforts:
+    if ceiling in EFFORT_LEVELS:
         for member, entry in team.items():
-            if efforts.index(effort_of(entry)) > efforts.index(ceiling):
+            effort = effort_of(entry)
+            if effort not in EFFORT_LEVELS:
+                errors.append("@%s has unsupported effort %r; set effort=%s or lower" % (member, effort, ceiling))
+            elif EFFORT_LEVELS.index(effort) > EFFORT_LEVELS.index(ceiling):
                 errors.append("@%s exceeds the run's %s effort ceiling" % (member, ceiling))
     for name in FAMILIES:
         if name in limits:
@@ -1656,8 +1660,11 @@ def allocation(state):
     # Size sets the effort when none is named, so it is counted once: only an effort named for the member, against
     # its type's default, moves the share again.
     def named(m):
+        effort = m.get("effort")
+        if effort not in EFFORT_LEVELS or m.get("sized"):
+            return 1
         base = DEFAULTS.get(kind_of(m), ("", ""))[1]
-        return EFFORT_COST.get(m.get("effort"), 1) / EFFORT_COST.get(base, 1) if m.get("effort") and not m.get("sized") else 1
+        return EFFORT_COST[effort] / EFFORT_COST.get(base, 1)
     shares = {name: round(ALLOWANCE.get(kind_of(m), ALLOWANCE["worker"]) * SIZES.get(m.get("size") or "m", 1) * named(m))
               for name, m in team.items()}
     return shares, COORDINATOR_BASE + COORDINATOR_PER_MEMBER * len(team), int(sum(shares.values()) * RESERVE)
@@ -2658,7 +2665,8 @@ def main(argv):
                 member.pop("group", None)
             if "role" in changes or "consult" in changes:
                 stranded(name, members)
-            if kind_of(member) == "investigator" and family(model_of(member)) == "fable":
+            if (changes.keys() != {"killed"} and kind_of(member) == "investigator"
+                    and family(model_of(member)) == "fable"):
                 if not was_fable_inv:
                     sys.exit("an investigator starts on Opus. Fable is the escalation after an Opus investigator fails: "
                              "board.py DIR replace OLD NEW model=fable effort=medium")
@@ -2681,10 +2689,11 @@ def main(argv):
                     if dep not in seen:
                         seen.add(dep)
                         frontier.extend(dependencies(members.get(dep, {})))
-            levels = ("low", "medium", "high", "xhigh", "max")
             ceiling = state.get("limits", {}).get("max_effort")
-            if not created and ceiling in levels and not member.get("killed"):
-                if levels.index(effort_of(member)) > max(levels.index(ceiling), levels.index(effort_of(previous))):
+            if not created and ceiling in EFFORT_LEVELS and not member.get("killed"):
+                old, new = effort_of(previous), effort_of(member)
+                if (old in EFFORT_LEVELS and new in EFFORT_LEVELS
+                        and EFFORT_LEVELS.index(new) > max(EFFORT_LEVELS.index(ceiling), EFFORT_LEVELS.index(old))):
                     sys.exit("effort increase exceeds the run's %s ceiling" % ceiling)
             errors = added_limit_errors(state, before_counts, before_family)
             if errors:
@@ -2764,7 +2773,7 @@ def main(argv):
                    for k in changes if k in ("max_workers", "max_members", "budget", "member_budget")):
                 sys.exit("limits are max_workers=N max_members=N budget=TOKENS member_budget=TOKENS and <model>=<types>, "
                          "for models: " + " ".join(FAMILIES))
-            if changes.get("max_effort") not in (None, "", "low", "medium", "high", "xhigh", "max"):
+            if changes.get("max_effort") not in (None, "", *EFFORT_LEVELS):
                 sys.exit("invalid max_effort")
             if changes.get("advisor") not in (None, "", "off", "opus", "fable"):
                 sys.exit("advisor takes opus, fable, or off")
